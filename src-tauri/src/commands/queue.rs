@@ -299,13 +299,19 @@ pub fn reorder_queue(state: State<'_, AppState>, job_ids: Vec<String>) -> Result
 }
 
 #[tauri::command]
-pub fn clear_completed(state: State<'_, AppState>) -> Result<(), String> {
+pub fn clear_completed(state: State<'_, AppState>, mode: String) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "DELETE FROM jobs WHERE status IN ('done', 'skipped')",
-        [],
-    )
-    .map_err(|e| e.to_string())?;
+    match mode.as_str() {
+        "errors" => {
+            conn.execute("DELETE FROM jobs WHERE status = 'error'", [])
+                .map_err(|e| e.to_string())?;
+        }
+        _ => {
+            // "all" - clear everything in history
+            conn.execute("DELETE FROM jobs WHERE status IN ('done', 'skipped', 'error')", [])
+                .map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 

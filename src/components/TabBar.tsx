@@ -15,7 +15,7 @@ const tabs: { id: Tab; label: string }[] = [
 
 export default function TabBar({ activeTab, onTabChange }: TabBarProps) {
   return (
-    <div className="tab-bar">
+    <div className="tab-bar" data-tauri-drag-region>
       {tabs.map((tab) => (
         <button
           key={tab.id}
@@ -25,11 +25,8 @@ export default function TabBar({ activeTab, onTabChange }: TabBarProps) {
           {tab.label}
         </button>
       ))}
-      <button
-        className="close-btn"
-        onClick={() => commands.hideWindow()}
-        title="Close popover"
-      >
+      <div className="tab-spacer" data-tauri-drag-region />
+      <button className="tab-btn close-tab-btn" onClick={() => commands.hideWindow()} title="Close">
         &times;
       </button>
     </div>

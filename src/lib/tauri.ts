@@ -71,7 +71,7 @@ export const commands = {
   removeJob: (id: string) => invoke<void>("remove_job", { id }),
   reorderQueue: (jobIds: string[]) =>
     invoke<void>("reorder_queue", { jobIds }),
-  clearCompleted: () => invoke<void>("clear_completed"),
+  clearCompleted: (mode: string) => invoke<void>("clear_completed", { mode }),
   startQueue: () => invoke<void>("start_queue"),
   pauseConversion: () => invoke<void>("pause_conversion"),
   resumeConversion: () => invoke<void>("resume_conversion"),

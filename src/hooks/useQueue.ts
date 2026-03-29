@@ -45,9 +45,6 @@ export function useQueue() {
     (j) => j.status === "encoding" || j.status === "paused",
   );
   const pendingJobs = queue.filter((j) => j.status === "queued");
-  const recentCompleted = queue
-    .filter((j) => j.status === "done" || j.status === "error" || j.status === "skipped")
-    .slice(0, 3);
 
-  return { queue, activeJob, pendingJobs, recentCompleted, progress, refresh };
+  return { queue, activeJob, pendingJobs, progress, refresh };
 }

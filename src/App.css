@@ -53,7 +53,7 @@ body {
 }
 
 .tab-btn {
-  flex: 1;
+  flex: 1 1 0;
   padding: 10px 0;
   background: none;
   border: none;
@@ -588,30 +588,28 @@ select.setting-input {
   color: var(--text-secondary);
 }
 
-/* Close button in tab bar */
-.close-btn {
-  position: absolute;
-  top: 6px;
-  right: 8px;
-  background: none;
-  border: none;
-  color: var(--text-dim);
+/* Tab spacer for drag region */
+.tab-spacer {
+  flex: 1;
+}
+
+/* Close button as tab-style button */
+.close-tab-btn {
+  flex: none;
+  width: 36px;
+  padding: 10px 0;
   font-size: 16px;
-  cursor: pointer;
-  padding: 2px 6px;
-  line-height: 1;
-  border-radius: var(--radius-sm);
-  transition: all 0.15s ease;
+  color: var(--text-dim);
+  border-bottom-color: transparent !important;
 }
 
-.close-btn:hover {
+.close-tab-btn:hover {
   color: var(--text-primary);
-  background: var(--bg-tertiary);
 }
 
-/* Tab bar needs relative positioning for close button */
-.tab-bar {
-  position: relative;
+.close-tab-btn.active {
+  color: var(--text-dim);
+  border-bottom-color: transparent;
 }
 
 /* Quit button */
@@ -640,14 +638,40 @@ select.setting-input {
   background: rgba(239, 83, 80, 0.25);
 }
 
-/* Clear history button */
-.btn-clear-history {
-  color: var(--text-secondary);
-  flex-shrink: 0;
+/* Clear history dropdown */
+.clear-dropdown {
+  position: relative;
 }
 
-.btn-clear-history:hover {
-  color: var(--red);
+.clear-dropdown-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 0;
+  z-index: 10;
+  min-width: 160px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.clear-dropdown-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+
+.clear-dropdown-menu button:hover {
+  background: var(--bg-hover);
 }
 
 .summary-left {
