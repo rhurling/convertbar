@@ -51,6 +51,7 @@ pub fn run() {
             commands::queue::get_history,
             commands::queue::get_history_summary,
             commands::queue::classify_paths,
+            commands::queue::clear_queue,
             commands::converter::start_queue,
             commands::converter::pause_conversion,
             commands::converter::resume_conversion,
@@ -176,10 +177,17 @@ pub fn run() {
                                     }
                                 }
                                 if show_queue {
-                                    if let Some(count) = update.queue_count {
-                                        if count > 0 {
-                                            parts.push(format!("+{}", count));
-                                        }
+                                    let count = update.queue_count.unwrap_or_else(|| {
+                                        // Progress updates don't include queue_count, so query DB
+                                        let db = db_for_tray.lock().unwrap();
+                                        db.query_row(
+                                            "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
+                                            [],
+                                            |row| row.get::<_, usize>(0),
+                                        ).unwrap_or(0)
+                                    });
+                                    if count > 0 {
+                                        parts.push(format!("+{}", count));
                                     }
                                 }
                                 if show_filename {

@@ -316,6 +316,14 @@ pub fn clear_completed(state: State<'_, AppState>, mode: String) -> Result<(), S
 }
 
 #[tauri::command]
+pub fn clear_queue(state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM jobs WHERE status = 'queued'", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn get_history(
     state: State<'_, AppState>,
     limit: u32,

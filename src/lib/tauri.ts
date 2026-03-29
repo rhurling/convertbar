@@ -95,6 +95,7 @@ export const commands = {
   detectHandbrake: () => invoke<string | null>("detect_handbrake"),
   classifyPaths: (paths: string[]) =>
     invoke<ClassifiedPaths>("classify_paths", { paths }),
+  clearQueue: () => invoke<void>("clear_queue"),
   generatePresetSuffix: (preset: string) =>
     invoke<PresetMetadata>("generate_preset_suffix", { preset }),
   pauseAfterCurrent: () => invoke<void>("pause_after_current"),

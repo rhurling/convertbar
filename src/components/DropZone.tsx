@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { commands } from "../lib/tauri";
+import { commands, FolderScanResult } from "../lib/tauri";
 
 interface DropZoneProps {
   onFilesAdded: () => void;
@@ -9,6 +9,7 @@ interface DropZoneProps {
 export default function DropZone({ onFilesAdded }: DropZoneProps) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [pendingFolders, setPendingFolders] = useState<FolderScanResult[]>([]);
 
   const handlePaths = useCallback(
     async (paths: string[]) => {
@@ -20,19 +21,24 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
           await commands.addFiles(classified.files);
         }
 
+        const toConfirm: FolderScanResult[] = [];
         for (const folder of classified.folders) {
           if (folder.file_count === 0) continue;
-          const ok = window.confirm(
-            `Add ${folder.file_count} video file(s) from "${folder.folder_name}"?`,
-          );
-          if (ok) {
+          if (folder.file_count <= 5) {
             await commands.confirmFolderAdd(folder.folder_path);
+          } else {
+            toConfirm.push(folder);
           }
         }
 
-        await commands.startQueue();
-        onFilesAdded();
-        setStatus(null);
+        if (toConfirm.length > 0) {
+          setPendingFolders(toConfirm);
+          setStatus(null);
+        } else {
+          await commands.startQueue();
+          onFilesAdded();
+          setStatus(null);
+        }
       } catch (e) {
         setStatus(`Error: ${e}`);
         setTimeout(() => setStatus(null), 3000);
@@ -63,6 +69,33 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
     <div className={`drop-zone ${isDragOver ? "drag-over" : ""}`}>
       {status ? (
         <span className="drop-zone-status">{status}</span>
+      ) : pendingFolders.length > 0 ? (
+        <div className="folder-confirm">
+          {pendingFolders.map((folder, i) => (
+            <div key={folder.folder_path} className="folder-confirm-item">
+              <span>Add {folder.file_count} files from &quot;{folder.folder_name}&quot;?</span>
+              <div className="folder-confirm-actions">
+                <button className="btn btn-small" onClick={async () => {
+                  await commands.confirmFolderAdd(folder.folder_path);
+                  const remaining = pendingFolders.filter((_, j) => j !== i);
+                  setPendingFolders(remaining);
+                  if (remaining.length === 0) {
+                    await commands.startQueue();
+                    onFilesAdded();
+                  }
+                }}>Add</button>
+                <button className="btn btn-small btn-dim" onClick={() => {
+                  const remaining = pendingFolders.filter((_, j) => j !== i);
+                  setPendingFolders(remaining);
+                  if (remaining.length === 0) {
+                    commands.startQueue();
+                    onFilesAdded();
+                  }
+                }}>Skip</button>
+              </div>
+            </div>
+          ))}
+        </div>
       ) : (
         <span className="drop-zone-label">
           Drop video files or folders here
