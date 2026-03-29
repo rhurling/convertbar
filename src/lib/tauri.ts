@@ -52,6 +52,14 @@ export interface ClassifiedPaths {
   folders: FolderScanResult[];
 }
 
+export interface PresetMetadata {
+  codec: string;
+  resolution: string;
+  quality: string;
+  preset: string;
+  device: string;
+}
+
 export const commands = {
   addFiles: (paths: string[]) => invoke<JobInfo[]>("add_files", { paths }),
   scanFolder: (path: string) =>
@@ -81,4 +89,6 @@ export const commands = {
   detectHandbrake: () => invoke<string | null>("detect_handbrake"),
   classifyPaths: (paths: string[]) =>
     invoke<ClassifiedPaths>("classify_paths", { paths }),
+  generatePresetSuffix: (preset: string) =>
+    invoke<PresetMetadata>("generate_preset_suffix", { preset }),
 };

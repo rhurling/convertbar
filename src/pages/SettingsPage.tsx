@@ -1,10 +1,47 @@
+import { useCallback, useRef } from "react";
 import { useSettings } from "../hooks/useSettings";
+import type { PresetMetadata } from "../lib/tauri";
+
+const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
+
+const VARIABLES: { key: keyof PresetMetadata; label: string }[] = [
+  { key: "codec", label: "{codec}" },
+  { key: "resolution", label: "{resolution}" },
+  { key: "quality", label: "{quality}" },
+  { key: "preset", label: "{preset}" },
+  { key: "device", label: "{device}" },
+];
+
+function resolveTemplate(
+  template: string,
+  metadata: PresetMetadata | null,
+): string {
+  if (!metadata) return template;
+
+  let result = template;
+  for (const { key } of VARIABLES) {
+    result = result.replace(
+      new RegExp(`\\{${key}\\}`, "g"),
+      metadata[key] || "",
+    );
+  }
+
+  // Clean up separators adjacent to empty values
+  result = result.replace(/[-_]{2,}/g, (m) => m[0]);
+  result = result.replace(/[-_]\./, ".");
+  result = result.replace(/\.[-_]/, ".");
+  result = result.replace(/[-_]$/, "");
+
+  return result;
+}
 
 export default function SettingsPage() {
   const {
     settings,
     presets,
     presetSuffix,
+    presetMetadata,
+    metadataLoading,
     presetsError,
     loading,
     updateSetting,
@@ -12,9 +49,31 @@ export default function SettingsPage() {
     detectHandbrake,
   } = useSettings();
 
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const handleChipClick = useCallback(
+    (variable: string) => {
+      const newSuffix = presetSuffix + variable;
+      updatePresetSuffix(newSuffix);
+      inputRef.current?.focus();
+    },
+    [presetSuffix, updatePresetSuffix],
+  );
+
+  const handleReset = useCallback(() => {
+    updatePresetSuffix(DEFAULT_SUFFIX_TEMPLATE);
+  }, [updatePresetSuffix]);
+
   if (loading || !settings) {
     return <div className="settings-page loading">Loading settings...</div>;
   }
+
+  const resolvedSuffix = resolveTemplate(presetSuffix, presetMetadata);
+  const previewFilename = `vacation${resolvedSuffix}.mp4`;
+
+  const visibleVariables = VARIABLES.filter(
+    ({ key }) => presetMetadata && presetMetadata[key],
+  );
 
   return (
     <div className="settings-page">
@@ -38,14 +97,53 @@ export default function SettingsPage() {
       </div>
 
       <div className="setting-group">
-        <label className="setting-label">Output suffix</label>
-        <input
-          className="setting-input"
-          type="text"
-          value={presetSuffix}
-          onChange={(e) => updatePresetSuffix(e.target.value)}
-          placeholder="e.g. _converted"
-        />
+        <div className="suffix-header">
+          <label className="setting-label">Output suffix template</label>
+          <button
+            className="btn btn-small"
+            onClick={handleReset}
+            title="Reset to default template"
+          >
+            Reset
+          </button>
+        </div>
+
+        {metadataLoading ? (
+          <div className="suffix-loading">Loading preset info...</div>
+        ) : (
+          <>
+            <input
+              ref={inputRef}
+              className="setting-input"
+              type="text"
+              value={presetSuffix}
+              onChange={(e) => updatePresetSuffix(e.target.value)}
+              placeholder={DEFAULT_SUFFIX_TEMPLATE}
+            />
+
+            {visibleVariables.length > 0 && (
+              <div className="variable-chips">
+                {visibleVariables.map(({ key, label }) => (
+                  <button
+                    key={key}
+                    className="variable-chip"
+                    onClick={() => handleChipClick(label)}
+                    title={`Click to append ${label}`}
+                  >
+                    <span className="variable-chip-name">{label}</span>
+                    <span className="variable-chip-value">
+                      {presetMetadata![key]}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="suffix-preview">
+              Preview: <span>{previewFilename}</span>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="setting-group">

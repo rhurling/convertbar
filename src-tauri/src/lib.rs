@@ -6,12 +6,14 @@ mod converter;
 
 use converter::{ConverterState, MenuBarUpdate};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{Listener, Manager};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
 
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    pub preset_cache: Mutex<HashMap<String, handbrake::PresetMetadata>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -26,6 +28,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             db: Arc::new(Mutex::new(conn)),
+            preset_cache: Mutex::new(HashMap::new()),
         })
         .manage(converter_state)
         .invoke_handler(tauri::generate_handler![
@@ -35,6 +38,7 @@ pub fn run() {
             commands::settings::set_preset_suffix,
             commands::handbrake::detect_handbrake,
             commands::handbrake::list_handbrake_presets,
+            commands::handbrake::generate_preset_suffix,
             commands::queue::add_files,
             commands::queue::scan_folder,
             commands::queue::confirm_folder_add,

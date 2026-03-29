@@ -516,3 +516,74 @@ select.setting-input {
 ::-webkit-scrollbar-thumb:hover {
   background: #4a4a4a;
 }
+
+/* Suffix Template Editor */
+.suffix-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0;
+}
+
+.suffix-header .setting-label {
+  margin-bottom: 0;
+}
+
+.suffix-header .btn {
+  flex-shrink: 0;
+}
+
+.variable-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.variable-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.variable-chip:hover {
+  border-color: var(--accent);
+  background: var(--bg-tertiary);
+}
+
+.variable-chip-name {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.variable-chip-value {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.suffix-preview {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.suffix-preview span {
+  color: var(--text-primary);
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 11px;
+}
+
+.suffix-loading {
+  padding: 8px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}

@@ -2,6 +2,7 @@ use rusqlite::params;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
+use crate::handbrake;
 use crate::types::{ClassifiedPaths, FolderScanResult, HistoryPage, HistorySummary, JobInfo};
 use crate::AppState;
 
@@ -58,29 +59,79 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobInfo> {
     })
 }
 
+fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
+    let configured: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'handbrake_path'",
+            params![],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(ref path) = configured {
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            return Ok(path.clone());
+        }
+    }
+
+    handbrake::detect_handbrake_path().ok_or_else(|| "HandBrakeCLI not found".to_string())
+}
+
 fn add_files_inner(
-    conn: &rusqlite::Connection,
+    state: &AppState,
     paths: &[String],
 ) -> Result<Vec<JobInfo>, String> {
-    // Get current preset
-    let preset: String = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'preset'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+    // First, read preset and suffix template from DB
+    let (preset, suffix_template, hb_path) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
 
-    // Get suffix for this preset
-    let suffix: String = conn
-        .query_row(
-            "SELECT suffix FROM preset_suffixes WHERE preset_name = ?1",
-            params![preset],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
+        let preset: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'preset'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
 
-    let mut queue_order = get_next_queue_order(conn)?;
+        let suffix_template: String = conn
+            .query_row(
+                "SELECT suffix FROM preset_suffixes WHERE preset_name = ?1",
+                params![preset],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+
+        let hb_path = if suffix_template.contains('{') {
+            // May need handbrake path for metadata fetch
+            get_handbrake_path(&conn).ok()
+        } else {
+            None
+        };
+
+        (preset, suffix_template, hb_path)
+    }; // db lock released
+
+    // Resolve template if needed
+    let suffix = if suffix_template.contains('{') {
+        let metadata = {
+            let mut cache = state.preset_cache.lock().map_err(|e| e.to_string())?;
+            if let Some(m) = cache.get(&preset) {
+                m.clone()
+            } else {
+                let hb_path = hb_path.ok_or("HandBrakeCLI not found")?;
+                let m = handbrake::get_preset_metadata(&hb_path, &preset)?;
+                cache.insert(preset.clone(), m.clone());
+                m
+            }
+        };
+        handbrake::resolve_suffix_template(&suffix_template, &metadata)
+    } else {
+        suffix_template
+    };
+
+    // Re-acquire db lock for inserting jobs
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut queue_order = get_next_queue_order(&conn)?;
     let mut jobs = Vec::new();
 
     for path_str in paths {
@@ -154,8 +205,7 @@ fn add_files_inner(
 
 #[tauri::command]
 pub fn add_files(state: State<'_, AppState>, paths: Vec<String>) -> Result<Vec<JobInfo>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    add_files_inner(&conn, &paths)
+    add_files_inner(&state, &paths)
 }
 
 #[tauri::command]
@@ -195,8 +245,7 @@ pub fn confirm_folder_add(
         .filter_map(|p| p.to_str().map(|s| s.to_string()))
         .collect();
 
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    add_files_inner(&conn, &paths)
+    add_files_inner(&state, &paths)
 }
 
 #[tauri::command]

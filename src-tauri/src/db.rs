@@ -38,6 +38,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO settings (key, value) VALUES ('cleanup_mode', 'trash');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('launch_at_login', 'false');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('handbrake_path', '');
-        INSERT OR IGNORE INTO preset_suffixes (preset_name, suffix) VALUES ('H.265 Apple VideoToolbox 1080p', '.1080p-h265');
+        INSERT OR IGNORE INTO preset_suffixes (preset_name, suffix) VALUES ('H.265 Apple VideoToolbox 1080p', '.{resolution}-{codec}');
     ")
 }
