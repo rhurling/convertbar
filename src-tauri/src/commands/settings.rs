@@ -1,0 +1,83 @@
+use rusqlite::params;
+use tauri::State;
+
+use crate::types::Settings;
+use crate::AppState;
+
+#[tauri::command]
+pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM settings")
+        .map_err(|e| e.to_string())?;
+
+    let mut preset = String::new();
+    let mut cleanup_mode = String::new();
+    let mut launch_at_login = false;
+    let mut handbrake_path = String::new();
+
+    let rows = stmt
+        .query_map([], |row| {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            Ok((key, value))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows {
+        let (key, value) = row.map_err(|e| e.to_string())?;
+        match key.as_str() {
+            "preset" => preset = value,
+            "cleanup_mode" => cleanup_mode = value,
+            "launch_at_login" => launch_at_login = value == "true",
+            "handbrake_path" => handbrake_path = value,
+            _ => {}
+        }
+    }
+
+    Ok(Settings {
+        preset,
+        cleanup_mode,
+        launch_at_login,
+        handbrake_path,
+    })
+}
+
+#[tauri::command]
+pub fn update_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+        params![key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_preset_suffix(state: State<'_, AppState>, preset: String) -> Result<Option<String>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let result = conn.query_row(
+        "SELECT suffix FROM preset_suffixes WHERE preset_name = ?1",
+        params![preset],
+        |row| row.get::<_, String>(0),
+    );
+
+    match result {
+        Ok(suffix) => Ok(Some(suffix)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn set_preset_suffix(state: State<'_, AppState>, preset: String, suffix: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO preset_suffixes (preset_name, suffix) VALUES (?1, ?2) ON CONFLICT(preset_name) DO UPDATE SET suffix = ?2",
+        params![preset, suffix],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
