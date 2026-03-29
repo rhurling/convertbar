@@ -4,6 +4,7 @@ import { commands } from "../lib/tauri";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
@@ -282,9 +283,24 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
               try {
                 const update = await check();
                 if (update) {
-                  setUpdateStatus(`Updating to v${update.version}...`);
+                  setUpdateStatus(`Downloading v${update.version}...`);
                   await update.downloadAndInstall();
-                  await relaunch();
+
+                  const queue = await commands.getQueue();
+                  const isEncoding = queue.some(j => j.status === "encoding" || j.status === "paused");
+
+                  if (!isEncoding) {
+                    await relaunch();
+                  } else {
+                    await commands.pauseAfterCurrent();
+                    setUpdateStatus("Update ready, restarting after current job...");
+                    const unlisten = await listen<{ status: string }>("menu-bar-update", async (event) => {
+                      if (event.payload.status === "idle" || event.payload.status === "error") {
+                        unlisten();
+                        await relaunch();
+                      }
+                    });
+                  }
                 } else {
                   setUpdateStatus("You're up to date");
                   setTimeout(() => setUpdateStatus(null), 3000);
@@ -294,7 +310,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
                 setTimeout(() => setUpdateStatus(null), 5000);
               }
             }}
-            disabled={updateStatus === "Checking..." || updateStatus?.startsWith("Updating")}
+            disabled={updateStatus === "Checking..." || updateStatus?.startsWith("Downloading") || updateStatus?.startsWith("Update ready")}
           >
             Check for updates
           </button>
