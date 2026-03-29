@@ -3,18 +3,24 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
+  "platforms": ["macOS", "windows", "linux"],
   "permissions": [
-    "core:default",
-    "opener:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+
     "core:window:allow-hide",
-    "core:window:allow-show",
-    "core:window:allow-set-focus",
-    "core:window:allow-is-visible",
     "core:window:allow-start-dragging",
-    "core:window:allow-outer-position",
-    "core:window:allow-set-position",
-    "core:window:allow-outer-size",
-    "core:window:allow-current-monitor",
-    "notification:default"
+
+    "core:app:allow-version",
+
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+
+    "process:allow-restart",
+
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled"
   ]
 }
