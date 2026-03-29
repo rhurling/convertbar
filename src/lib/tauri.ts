@@ -1,0 +1,77 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export interface JobInfo {
+  id: string;
+  source_path: string;
+  output_path: string;
+  preset: string;
+  status: "queued" | "encoding" | "paused" | "done" | "error" | "skipped";
+  original_size: number | null;
+  converted_size: number | null;
+  kept_file: "original" | "converted" | null;
+  space_saved: number | null;
+  error_message: string | null;
+  queue_order: number;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface FolderScanResult {
+  file_count: number;
+  folder_name: string;
+  folder_path: string;
+}
+
+export interface ConversionProgress {
+  job_id: string;
+  percent: number;
+  eta_seconds: number;
+  fps: number;
+  avg_fps: number;
+}
+
+export interface AppSettings {
+  preset: string;
+  cleanup_mode: string;
+  launch_at_login: boolean;
+  handbrake_path: string;
+}
+
+export interface HistorySummary {
+  total_saved_bytes: number;
+  total_files: number;
+}
+
+export interface HistoryPage {
+  jobs: JobInfo[];
+  total: number;
+}
+
+export const commands = {
+  addFiles: (paths: string[]) => invoke<JobInfo[]>("add_files", { paths }),
+  scanFolder: (path: string) =>
+    invoke<FolderScanResult>("scan_folder", { path }),
+  confirmFolderAdd: (path: string) =>
+    invoke<JobInfo[]>("confirm_folder_add", { path }),
+  getQueue: () => invoke<JobInfo[]>("get_queue"),
+  removeJob: (id: string) => invoke<void>("remove_job", { id }),
+  reorderQueue: (jobIds: string[]) =>
+    invoke<void>("reorder_queue", { jobIds }),
+  clearCompleted: () => invoke<void>("clear_completed"),
+  startQueue: () => invoke<void>("start_queue"),
+  pauseConversion: () => invoke<void>("pause_conversion"),
+  resumeConversion: () => invoke<void>("resume_conversion"),
+  cancelConversion: () => invoke<void>("cancel_conversion"),
+  getHistory: (limit: number, offset: number) =>
+    invoke<HistoryPage>("get_history", { limit, offset }),
+  getHistorySummary: () => invoke<HistorySummary>("get_history_summary"),
+  getSettings: () => invoke<AppSettings>("get_settings"),
+  updateSetting: (key: string, value: string) =>
+    invoke<void>("update_setting", { key, value }),
+  getPresetSuffix: (preset: string) =>
+    invoke<string | null>("get_preset_suffix", { preset }),
+  setPresetSuffix: (preset: string, suffix: string) =>
+    invoke<void>("set_preset_suffix", { preset, suffix }),
+  listHandbrakePresets: () => invoke<string[]>("list_handbrake_presets"),
+  detectHandbrake: () => invoke<string | null>("detect_handbrake"),
+};
