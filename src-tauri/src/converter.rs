@@ -369,22 +369,18 @@ fn process_queue(
 
                 // Notification logic for successful/skipped jobs
                 {
-                    let (notify_per_file, errors_only, _notify_queue_done) = {
+                    let (notify_per_file, errors_only) = {
                         let db = db.lock().unwrap();
                         let get = |k: &str, default: bool| -> bool {
                             db.query_row("SELECT value FROM settings WHERE key=?1", params![k], |r| r.get::<_,String>(0))
                                 .map(|v| v == "true")
                                 .unwrap_or(default)
                         };
-                        (
-                            get("notifications_per_file", true),
-                            get("notifications_errors_only", false),
-                            get("notifications_queue_done", true),
-                        )
+                        (get("notifications_per_file", true), get("notifications_errors_only", false))
                     };
 
                     if notify_per_file {
-                        let is_error = status_str == "error" || status_str == "skipped";
+                        let is_error = status_str == "error";
                         let should_notify = if errors_only { is_error } else { true };
 
                         if should_notify {
