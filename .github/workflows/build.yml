@@ -33,11 +33,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get previous tag
-        id: prev_tag
+      - name: Build release body
+        id: release_body
+        shell: bash
         run: |
           PREV=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
-          echo "tag=${PREV:-}" >> $GITHUB_OUTPUT
+          CURRENT=$(git describe --tags --abbrev=0)
+          if [ -n "$PREV" ]; then
+            echo "body=**Full changelog**: https://github.com/rhurling/convertbar/compare/${PREV}...${CURRENT}" >> $GITHUB_OUTPUT
+          else
+            echo "body=Initial release." >> $GITHUB_OUTPUT
+          fi
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -71,7 +77,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: "ConvertBar v__VERSION__"
-          releaseBody: ${{ steps.prev_tag.outputs.tag && format('**Full changelog**: https://github.com/rhurling/convertbar/compare/{0}...v__VERSION__', steps.prev_tag.outputs.tag) || 'Initial release.' }}
+          releaseBody: ${{ steps.release_body.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
