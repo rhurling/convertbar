@@ -1,16 +1,18 @@
-# ConvertBar — Improvement Recommendations (v0.4.0)
+# ConvertBar — Improvement Recommendations (v0.6.0)
 
 ## Current State Summary
 
-The app covers ~85% of the original spec. Core functionality works: drag-and-drop queuing, HandBrakeCLI encoding with progress parsing (stdout, `\r`-delimited), SIGSTOP/SIGCONT pause/resume, template-based suffix generation from preset metadata, configurable menu bar display, history with space savings tracking, draggable popup with position memory, and screen confinement.
+The app covers ~95% of the original spec. Core functionality works: drag-and-drop queuing, HandBrakeCLI encoding with progress parsing (stdout, `\r`-delimited), SIGSTOP/SIGCONT pause/resume, template-based suffix generation from preset metadata, configurable menu bar display, history with search/sort and space savings tracking, draggable popup with position memory, screen confinement, macOS notifications, tray context menu, and queue drag reordering.
 
 ### Known Working
-- Queue management (add files/folders, remove, clear queue, pause after current)
+- Queue management (add files/folders, remove, clear queue, pause after current, drag reorder)
 - Progress display in UI and menu bar (percent, ETA, fps, queue count, filename — all configurable)
-- History with "Clear All" / "Clear Errors Only" dropdown
-- Settings: preset, suffix template with {codec}/{resolution}/{quality}/{preset}/{device} variables, cleanup mode, launch at login, HandBrakeCLI path
-- Template tray icon (auto dark/light mode)
-- Close/Quit buttons, draggable window
+- History with search, sort, "Clear All" / "Clear Errors Only" dropdown
+- macOS native notifications (per-file, errors-only, queue complete — all configurable)
+- HandBrakeCLI startup validation with warning banner
+- Settings: preset, suffix template with variables, cleanup mode, launch at login, HandBrakeCLI path, menu bar display, notifications
+- Template tray icon (auto dark/light mode) with right-click context menu
+- Close/Quit buttons, draggable window with position memory
 
 ### Known Limitations
 - HandBrakeCLI already prevents macOS sleep during encoding (verified via `pmset -g assertions`) — no wrapper needed
@@ -20,36 +22,36 @@ The app covers ~85% of the original spec. Core functionality works: drag-and-dro
 
 ---
 
-## High Impact Recommendations
+## Implemented (completed)
 
-### 1. macOS Native Notifications
-**Why:** No feedback when conversion finishes or fails unless the popover is open. Users walk away during long encodes and have no way to know when it's done.
+### 1. macOS Native Notifications — *v0.5.0*
+- Per-file notifications (success replaces previous, errors stack individually)
+- "Errors only" sub-option for per-file notifications
+- Queue completion notification (independent toggle)
+- 3 settings toggles in Settings page
 
-**What:**
-- Notify on job completion: "movie.mkv converted — saved 340MB"
-- Notify on job error: "movie.mkv failed: HandBrakeCLI error"
-- Notify when entire queue finishes: "Queue complete — 5 files converted, 2.1GB saved"
-- Settings toggle to enable/disable notifications
+### 2. Startup HandBrakeCLI Validation — *v0.5.0*
+- Validates on app startup, after path change, after Detect click
+- Warning banner in Queue tab when not found
+- Shows install instructions (`brew install handbrake`)
 
-**How:** Use Tauri's `tauri-plugin-notification` or the `notify-rust` crate. Emit from `converter.rs` after job completion/error and after queue exhaustion.
+### 4. Tray Right-Click Context Menu — *v0.6.0*
+- Right-click tray icon shows: Show ConvertBar, separator, Quit
+- Left-click still toggles the popover window
 
-**Files:** `src-tauri/Cargo.toml` (add plugin), `src-tauri/src/converter.rs` (emit notifications), `src-tauri/src/db.rs` (add `notifications_enabled` setting), `src/pages/SettingsPage.tsx` (add toggle)
+### 5. History Search & Filter — *v0.6.0*
+- Text search by filename (debounced 300ms)
+- Sort buttons: Date, Saved, Size, Name
+- Summary updates to reflect filtered results
 
----
-
-### 2. Startup HandBrakeCLI Validation
-**Why:** Currently, missing HandBrakeCLI is only discovered when the first encode fails. The user queues files, waits, and gets a silent error.
-
-**What:**
-- On app launch, check if HandBrakeCLI is available
-- If not found: show a persistent banner in the Queue tab: "HandBrakeCLI not found. Install it via `brew install handbrake` or set the path in Settings."
-- Disable the drop zone / show it dimmed until HandBrakeCLI is configured
-
-**How:** Call `detect_handbrake` at startup in the frontend (or emit a Tauri event from `lib.rs` setup). Store result in React context/state.
-
-**Files:** `src/App.tsx` or `src/pages/QueuePage.tsx` (check on mount), `src-tauri/src/lib.rs` (optional startup check)
+### 8. Visual Queue Reordering (Drag Handles) — *v0.6.0*
+- Drag handle (≡) on each queue item
+- HTML5 drag-and-drop with visual drop target indicator
+- Calls `reorderQueue` on drop to persist new order
 
 ---
+
+## Open — High Impact
 
 ### 3. Keyboard Shortcuts
 **Why:** Power users want to control the app without clicking.
@@ -68,40 +70,7 @@ The app covers ~85% of the original spec. Core functionality works: drag-and-dro
 
 ---
 
-### 4. Tray Right-Click Context Menu
-**Why:** Quick access to common actions without opening the popover.
-
-**What:**
-- Right-click tray icon shows menu:
-  - "Pause" / "Resume" (depending on state)
-  - "Show ConvertBar"
-  - Separator
-  - "Quit"
-
-**How:** Use Tauri v2's `Menu` + `MenuItem` API in the tray setup. Update menu items dynamically based on converter state.
-
-**Files:** `src-tauri/src/lib.rs` (tray menu setup, dynamic updates in menu-bar-update listener)
-
----
-
-## Medium Impact Recommendations
-
-### 5. History Search & Filter
-**Why:** After dozens of conversions, finding a specific file or understanding patterns (which files grew larger?) becomes hard.
-
-**What:**
-- Text input at top of History tab to filter by filename
-- Sort buttons: by date (default), by space saved, by original size
-- Optional: date range filter
-
-**How:**
-- Frontend: add search input and sort state to `useHistory` hook
-- Backend: modify `get_history` command to accept `search` and `sort_by` parameters
-- SQL: `WHERE source_path LIKE '%search%' ORDER BY {sort_by} DESC`
-
-**Files:** `src-tauri/src/commands/queue.rs` (modify `get_history`), `src/hooks/useHistory.ts`, `src/pages/HistoryPage.tsx`
-
----
+## Open — Medium Impact
 
 ### 6. History Export (CSV)
 **Why:** Users may want a record of space savings for reporting or personal tracking.
@@ -132,20 +101,6 @@ The app covers ~85% of the original spec. Core functionality works: drag-and-dro
 
 ---
 
-### 8. Visual Queue Reordering (Drag Handles)
-**Why:** The `reorder_queue` backend command exists but there's no way to drag-reorder in the UI. Users with 10+ queued items want to prioritize.
-
-**What:**
-- Add drag handle icon (≡) on each QueueItem
-- HTML5 drag-and-drop or a lightweight library (e.g., `@dnd-kit/core`)
-- On drop: call `commands.reorderQueue(newOrderedIds)`
-
-**How:** Add `draggable` attribute and drag event handlers to QueueItem. Track drag source/target indices. On drop, compute new order and call backend.
-
-**Files:** `src/components/QueueItem.tsx` (drag handle + events), `src/pages/QueuePage.tsx` (drag state management), `src/App.css` (drag styles)
-
----
-
 ### 9. File Picker for HandBrakeCLI Path
 **Why:** Typing a file path manually is error-prone. A native file browser is more user-friendly.
 
@@ -159,7 +114,7 @@ The app covers ~85% of the original spec. Core functionality works: drag-and-dro
 
 ---
 
-## Polish Recommendations
+## Open — Polish
 
 ### 10. Better Empty States
 - Queue: "Drag video files or folders here to get started" with a subtle icon
@@ -193,10 +148,10 @@ The app covers ~85% of the original spec. Core functionality works: drag-and-dro
 
 | Spec Requirement | Status | Gap |
 |---|---|---|
-| US3: Queue drag reordering | Backend only | No drag handles in UI |
+| US3: Queue drag reordering | **Done** (v0.6.0) | — |
 | US1: Skipped files notification | Missing | Silent skip, no user feedback |
 | US2: Error state icon in menu bar | Missing | No `!` indicator on error |
-| Notifications on completion | Missing | Not implemented |
+| Notifications on completion | **Done** (v0.5.0) | — |
 | Global hotkey for popover | Missing | Not implemented |
 | Launch at login | Setting only | No actual macOS login item registration (SMAppService / tauri-plugin-autostart) |
 
@@ -204,8 +159,7 @@ The app covers ~85% of the original spec. Core functionality works: drag-and-dro
 
 ## Technical Debt
 
-- `window.confirm()` replaced with in-app UI but old import may still exist
-- Debug log file (`debug_progress.log`) may still be created in app data dir — cleanup code removed but file persists from testing
-- `clear_completed` accepts `mode` param but the Rust command signature change may not match all frontend callers
+- Debug log file (`debug_progress.log`) may still exist in app data dir from testing — can be manually deleted
 - CSS has some hardcoded colors instead of using CSS variables consistently
 - No tests (unit or integration) exist for either Rust or TypeScript code
+- Tray context menu is static (Show + Quit) — dynamic Pause/Resume items deferred due to complexity
