@@ -61,7 +61,7 @@ pub fn run() {
             // Task 7: System Tray
             let tray = TrayIconBuilder::new()
                 .tooltip("ConvertBar — No active conversions")
-                .title("◇")
+                .title("")
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png")).unwrap())
                 .icon_as_template(true)
                 .on_tray_icon_event(|tray_icon, event| {
@@ -95,7 +95,7 @@ pub fn run() {
                         match update.status.as_str() {
                             "encoding" => {
                                 if let Some(percent) = update.percent {
-                                    let _ = tray.set_title(Some(&format!("◇ {:.0}%", percent)));
+                                    let _ = tray.set_title(Some(&format!("{:.0}%", percent)));
                                 }
                                 // Build detailed tooltip
                                 let mut tooltip = String::from("ConvertBar");
@@ -118,11 +118,11 @@ pub fn run() {
                                 let _ = tray.set_tooltip(Some(&tooltip));
                             }
                             "paused" => {
-                                let _ = tray.set_title(Some("◇ ⏸"));
+                                let _ = tray.set_title(Some("⏸"));
                                 let _ = tray.set_tooltip(Some("ConvertBar — Paused"));
                             }
                             _ => {
-                                let _ = tray.set_title(Some("◇"));
+                                let _ = tray.set_title(Some(""));
                                 let _ = tray.set_tooltip(Some("ConvertBar — No active conversions"));
                             }
                         }
