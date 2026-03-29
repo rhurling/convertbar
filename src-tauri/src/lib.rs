@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Listener, Manager};
+use tauri_plugin_updater::UpdaterExt;
 
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
@@ -349,6 +350,14 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 converter::run_queue(app_handle, db_arc, conv_arc);
             }
+
+            // Check for updates on startup
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(Some(update)) = handle.updater().unwrap().check().await {
+                    let _ = update.download_and_install(|_, _| {}, || {}).await;
+                }
+            });
 
             Ok(())
         })
