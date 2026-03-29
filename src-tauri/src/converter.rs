@@ -46,10 +46,22 @@ pub struct MenuBarUpdate {
 }
 
 fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
+    use std::sync::OnceLock;
+
+    static FULL_RE: OnceLock<Regex> = OnceLock::new();
+    static SIMPLE_RE: OnceLock<Regex> = OnceLock::new();
+
+    // Only match lines containing "Encoding:" to avoid false positives from log lines
+    if !line.contains("Encoding:") {
+        return None;
+    }
+
     // Try full format: percent + fps + ETA
-    let full_re = Regex::new(
-        r"(\d+\.?\d*)\s*%\s*\((\d+\.?\d*)\s*fps,\s*avg\s*(\d+\.?\d*)\s*fps,\s*ETA\s*(\d+)h(\d+)m(\d+)s\)"
-    ).ok()?;
+    let full_re = FULL_RE.get_or_init(|| {
+        Regex::new(
+            r"Encoding:.*?(\d+\.?\d*)\s*%\s*\((\d+\.?\d*)\s*fps,\s*avg\s*(\d+\.?\d*)\s*fps,\s*ETA\s*(\d+)h(\d+)m(\d+)s\)"
+        ).unwrap()
+    });
 
     if let Some(caps) = full_re.captures(line) {
         let percent: f64 = caps.get(1)?.as_str().parse().ok()?;
@@ -62,8 +74,11 @@ fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
         return Some((percent, fps, avg_fps, eta));
     }
 
-    // Fallback: percent only (early lines without fps/ETA)
-    let simple_re = Regex::new(r"(\d+\.?\d*)\s*%").ok()?;
+    // Fallback: percent only (early progress lines without fps/ETA)
+    let simple_re = SIMPLE_RE.get_or_init(|| {
+        Regex::new(r"Encoding:.*?(\d+\.?\d*)\s*%").unwrap()
+    });
+
     if let Some(caps) = simple_re.captures(line) {
         let percent: f64 = caps.get(1)?.as_str().parse().ok()?;
         return Some((percent, 0.0, 0.0, 0));
