@@ -54,10 +54,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
     }
 
     // Read actual autostart state from the plugin (source of truth)
-    let launch_at_login = app
-        .autolaunch()
-        .is_enabled()
-        .unwrap_or(launch_at_login);
+    let launch_at_login = app.autolaunch().is_enabled().unwrap_or(launch_at_login);
 
     Ok(Settings {
         preset,
