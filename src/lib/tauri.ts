@@ -90,9 +90,10 @@ export const commands = {
   pauseConversion: () => invoke<void>("pause_conversion"),
   resumeConversion: () => invoke<void>("resume_conversion"),
   cancelConversion: () => invoke<void>("cancel_conversion"),
-  getHistory: (limit: number, offset: number) =>
-    invoke<HistoryPage>("get_history", { limit, offset }),
-  getHistorySummary: () => invoke<HistorySummary>("get_history_summary"),
+  getHistory: (limit: number, offset: number, search?: string, sortBy?: string) =>
+    invoke<HistoryPage>("get_history", { limit, offset, search: search || null, sortBy: sortBy || null }),
+  getHistorySummary: (search?: string) =>
+    invoke<HistorySummary>("get_history_summary", { search: search || null }),
   getSettings: () => invoke<AppSettings>("get_settings"),
   updateSetting: (key: string, value: string) =>
     invoke<void>("update_setting", { key, value }),

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQueue } from "../hooks/useQueue";
 import DropZone from "../components/DropZone";
 import ActiveJob from "../components/ActiveJob";
@@ -12,6 +13,19 @@ interface QueuePageProps {
 export default function QueuePage({ hbStatus }: QueuePageProps) {
   const { activeJob, pendingJobs, progress, refresh } =
     useQueue();
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+
+  const handleDrop = async (draggedId: string, targetId: string) => {
+    setDragOverId(null);
+    const ids = pendingJobs.map(j => j.id);
+    const fromIdx = ids.indexOf(draggedId);
+    const toIdx = ids.indexOf(targetId);
+    if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) return;
+    ids.splice(fromIdx, 1);
+    ids.splice(toIdx, 0, draggedId);
+    await commands.reorderQueue(ids);
+    refresh();
+  };
 
   return (
     <div className="queue-page">
@@ -39,7 +53,15 @@ export default function QueuePage({ hbStatus }: QueuePageProps) {
           </div>
           <div className="item-list">
             {pendingJobs.map((job) => (
-              <QueueItem key={job.id} job={job} onRemoved={refresh} />
+              <QueueItem
+                key={job.id}
+                job={job}
+                onRemoved={refresh}
+                onDragStart={() => {}}
+                onDragOver={(id) => setDragOverId(id)}
+                onDrop={handleDrop}
+                isDragOver={dragOverId === job.id}
+              />
             ))}
           </div>
         </div>

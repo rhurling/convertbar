@@ -328,48 +328,100 @@ pub fn get_history(
     state: State<'_, AppState>,
     limit: u32,
     offset: u32,
+    search: Option<String>,
+    sort_by: Option<String>,
 ) -> Result<HistoryPage, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
 
-    let total: i64 = conn
-        .query_row(
+    let search_param = search
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", s));
+    let has_search = search_param.is_some();
+
+    let order_clause = match sort_by.as_deref() {
+        Some("space_saved") => "space_saved DESC",
+        Some("original_size") => "original_size DESC",
+        Some("source_path") => "source_path ASC",
+        _ => "completed_at DESC",
+    };
+
+    // Count query
+    let total: i64 = if has_search {
+        let count_sql = "SELECT COUNT(*) FROM jobs WHERE status IN ('done', 'error', 'skipped') AND (source_path LIKE ?1 OR output_path LIKE ?1)";
+        conn.query_row(count_sql, params![search_param], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+    } else {
+        conn.query_row(
             "SELECT COUNT(*) FROM jobs WHERE status IN ('done', 'error', 'skipped')",
             [],
             |row| row.get(0),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+    };
 
-    let mut stmt = conn
-        .prepare(
+    // Data query
+    let jobs = if has_search {
+        let sql = format!(
+            "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
+                    kept_file, space_saved, error_message, queue_order, created_at, completed_at
+             FROM jobs
+             WHERE status IN ('done', 'error', 'skipped') AND (source_path LIKE ?1 OR output_path LIKE ?1)
+             ORDER BY {}
+             LIMIT ?2 OFFSET ?3",
+            order_clause
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let result = stmt.query_map(params![search_param, limit, offset], |row| row_to_job(row))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        result
+    } else {
+        let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                     kept_file, space_saved, error_message, queue_order, created_at, completed_at
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped')
-             ORDER BY completed_at DESC
+             ORDER BY {}
              LIMIT ?1 OFFSET ?2",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let jobs = stmt
-        .query_map(params![limit, offset], |row| row_to_job(row))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+            order_clause
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let result = stmt.query_map(params![limit, offset], |row| row_to_job(row))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        result
+    };
 
     Ok(HistoryPage { jobs, total })
 }
 
 #[tauri::command]
-pub fn get_history_summary(state: State<'_, AppState>) -> Result<HistorySummary, String> {
+pub fn get_history_summary(state: State<'_, AppState>, search: Option<String>) -> Result<HistorySummary, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
 
-    let (total_saved_bytes, total_files): (i64, i64) = conn
-        .query_row(
+    let search_param = search
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", s));
+
+    let (total_saved_bytes, total_files): (i64, i64) = if search_param.is_some() {
+        conn.query_row(
+            "SELECT COALESCE(SUM(space_saved), 0), COUNT(*) FROM jobs WHERE status = 'done' AND (source_path LIKE ?1 OR output_path LIKE ?1)",
+            params![search_param],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        conn.query_row(
             "SELECT COALESCE(SUM(space_saved), 0), COUNT(*) FROM jobs WHERE status = 'done'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+    };
 
     Ok(HistorySummary {
         total_saved_bytes,

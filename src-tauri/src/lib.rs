@@ -9,6 +9,7 @@ use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{Listener, Manager};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
 
 pub struct AppState {
@@ -64,11 +65,30 @@ pub fn run() {
         ])
         .setup(|app| {
             // Task 7: System Tray
+            let show_item = MenuItem::with_id(app, "show", "Show ConvertBar", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit ConvertBar", true, None::<&str>)?;
+            let sep = PredefinedMenuItem::separator(app)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &sep, &quit_item])?;
+
             let tray = TrayIconBuilder::new()
                 .tooltip("ConvertBar — No active conversions")
                 .title("")
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png")).unwrap())
                 .icon_as_template(true)
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => { app.exit(0); }
+                        _ => {}
+                    }
+                })
                 .on_tray_icon_event(|tray_icon, event| {
                     match event {
                         TrayIconEvent::Click {

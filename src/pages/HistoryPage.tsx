@@ -5,8 +5,9 @@ import { commands } from "../lib/tauri";
 import HistoryItem from "../components/HistoryItem";
 
 export default function HistoryPage() {
-  const { history, summary, hasMore, loading, loadMore, refresh } = useHistory();
+  const { history, summary, hasMore, loading, loadMore, refresh, setSearchDebounced, sortBy, setSortBy } = useHistory();
   const [showClearMenu, setShowClearMenu] = useState(false);
+  const [searchInput, setSearchInput] = useState("");
 
   return (
     <div className="history-page">
@@ -38,7 +39,33 @@ export default function HistoryPage() {
         </div>
       )}
 
-      <div className="item-list scrollable">
+      <div className="history-controls">
+        <input
+          className="setting-input search-input"
+          type="text"
+          placeholder="Search files..."
+          value={searchInput}
+          onChange={(e) => { setSearchInput(e.target.value); setSearchDebounced(e.target.value); }}
+        />
+        <div className="sort-buttons">
+          {[
+            { key: "completed_at", label: "Date" },
+            { key: "space_saved", label: "Saved" },
+            { key: "original_size", label: "Size" },
+            { key: "source_path", label: "Name" },
+          ].map(({ key, label }) => (
+            <button
+              key={key}
+              className={`btn btn-small ${sortBy === key ? "btn-active" : "btn-dim"}`}
+              onClick={() => setSortBy(key)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="item-list">
         {history.map((job) => (
           <HistoryItem key={job.id} job={job} />
         ))}

@@ -189,10 +189,6 @@ body {
   flex-direction: column;
 }
 
-.item-list.scrollable {
-  max-height: calc(100vh - 140px);
-  overflow-y: auto;
-}
 
 /* Queue Item */
 .queue-item {
@@ -783,3 +779,37 @@ select.setting-input {
   font-size: 11px;
 }
 .hb-warning p { margin: 4px 0 0; color: var(--text-secondary); }
+
+/* History search & sort controls */
+.history-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 12px;
+}
+.search-input {
+  font-size: 12px;
+}
+.sort-buttons {
+  display: flex;
+  gap: 4px;
+}
+.sort-buttons .btn {
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+/* Drag reorder */
+.drag-handle {
+  cursor: grab;
+  color: var(--text-dim);
+  padding: 0 4px;
+  font-size: 14px;
+  user-select: none;
+  flex-shrink: 0;
+}
+.drag-handle:active { cursor: grabbing; }
+.queue-item.drag-over {
+  border-top: 2px solid var(--accent);
+  margin-top: -2px;
+}

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   commands,
@@ -16,13 +16,21 @@ export function useHistory() {
   });
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState<string>("completed_at");
+
+  const searchTimeoutRef = useRef<number>(undefined);
+  const setSearchDebounced = useCallback((value: string) => {
+    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+    searchTimeoutRef.current = window.setTimeout(() => setSearch(value), 300);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
       setLoading(true);
       const [page, sum] = await Promise.all([
-        commands.getHistory(PAGE_SIZE, 0),
-        commands.getHistorySummary(),
+        commands.getHistory(PAGE_SIZE, 0, search || undefined, sortBy),
+        commands.getHistorySummary(search || undefined),
       ]);
       setHistory(page.jobs);
       setTotal(page.total);
@@ -32,12 +40,12 @@ export function useHistory() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [search, sortBy]);
 
   const loadMore = useCallback(async () => {
     try {
       setLoading(true);
-      const page = await commands.getHistory(PAGE_SIZE, history.length);
+      const page = await commands.getHistory(PAGE_SIZE, history.length, search || undefined, sortBy);
       setHistory((prev) => [...prev, ...page.jobs]);
       setTotal(page.total);
     } catch (e) {
@@ -45,7 +53,7 @@ export function useHistory() {
     } finally {
       setLoading(false);
     }
-  }, [history.length]);
+  }, [history.length, search, sortBy]);
 
   useEffect(() => {
     refresh();
@@ -66,5 +74,5 @@ export function useHistory() {
 
   const hasMore = history.length < total;
 
-  return { history, summary, hasMore, loading, loadMore, refresh };
+  return { history, summary, hasMore, loading, loadMore, refresh, search, setSearchDebounced, sortBy, setSortBy };
 }
