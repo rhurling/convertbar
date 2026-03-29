@@ -1,6 +1,6 @@
 use regex::Regex;
 use rusqlite::{params, Connection};
-use std::io::BufRead;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
@@ -12,6 +12,7 @@ pub struct ConverterState {
     pub current_job_id: Mutex<Option<String>>,
     pub is_paused: Mutex<bool>,
     pub is_running: Mutex<bool>,
+    pub pause_after_current: Mutex<bool>,
 }
 
 impl ConverterState {
@@ -21,6 +22,7 @@ impl ConverterState {
             current_job_id: Mutex::new(None),
             is_paused: Mutex::new(false),
             is_running: Mutex::new(false),
+            pause_after_current: Mutex::new(false),
         }
     }
 }
@@ -44,20 +46,30 @@ pub struct MenuBarUpdate {
 }
 
 fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
-    let re = Regex::new(
+    // Try full format: percent + fps + ETA
+    let full_re = Regex::new(
         r"(\d+\.?\d*)\s*%\s*\((\d+\.?\d*)\s*fps,\s*avg\s*(\d+\.?\d*)\s*fps,\s*ETA\s*(\d+)h(\d+)m(\d+)s\)"
     ).ok()?;
 
-    let caps = re.captures(line)?;
-    let percent: f64 = caps.get(1)?.as_str().parse().ok()?;
-    let fps: f64 = caps.get(2)?.as_str().parse().ok()?;
-    let avg_fps: f64 = caps.get(3)?.as_str().parse().ok()?;
-    let hours: u64 = caps.get(4)?.as_str().parse().ok()?;
-    let minutes: u64 = caps.get(5)?.as_str().parse().ok()?;
-    let seconds: u64 = caps.get(6)?.as_str().parse().ok()?;
-    let eta = hours * 3600 + minutes * 60 + seconds;
+    if let Some(caps) = full_re.captures(line) {
+        let percent: f64 = caps.get(1)?.as_str().parse().ok()?;
+        let fps: f64 = caps.get(2)?.as_str().parse().ok()?;
+        let avg_fps: f64 = caps.get(3)?.as_str().parse().ok()?;
+        let hours: u64 = caps.get(4)?.as_str().parse().ok()?;
+        let minutes: u64 = caps.get(5)?.as_str().parse().ok()?;
+        let seconds: u64 = caps.get(6)?.as_str().parse().ok()?;
+        let eta = hours * 3600 + minutes * 60 + seconds;
+        return Some((percent, fps, avg_fps, eta));
+    }
 
-    Some((percent, fps, avg_fps, eta))
+    // Fallback: percent only (early lines without fps/ETA)
+    let simple_re = Regex::new(r"(\d+\.?\d*)\s*%").ok()?;
+    if let Some(caps) = simple_re.captures(line) {
+        let percent: f64 = caps.get(1)?.as_str().parse().ok()?;
+        return Some((percent, 0.0, 0.0, 0));
+    }
+
+    None
 }
 
 fn get_next_job(db: &Connection) -> Option<JobInfo> {
@@ -222,25 +234,38 @@ fn process_queue(
 
         let progress_thread = if let Some(stderr) = stderr {
             let handle = std::thread::spawn(move || {
-                let reader = std::io::BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        if let Some((percent, fps, avg_fps, eta)) = parse_progress(&line) {
-                            let _ = app_clone.emit("conversion-progress", ConversionProgress {
-                                job_id: job_id.clone(),
-                                percent,
-                                fps,
-                                avg_fps,
-                                eta_seconds: eta,
-                            });
-                            let _ = app_clone.emit("menu-bar-update", MenuBarUpdate {
-                                status: "encoding".to_string(),
-                                percent: Some(percent),
-                                file_name: Some(file_name_clone.clone()),
-                                eta_seconds: Some(eta),
-                                queue_count: None,
-                            });
+                let mut reader = stderr;
+                let mut buf = [0u8; 1024];
+                let mut partial = String::new();
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            partial.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            while let Some(pos) = partial.find(|c: char| c == '\r' || c == '\n') {
+                                let line = partial[..pos].to_string();
+                                partial = partial[pos + 1..].to_string();
+                                if !line.is_empty() {
+                                    if let Some((percent, fps, avg_fps, eta)) = parse_progress(&line) {
+                                        let _ = app_clone.emit("conversion-progress", ConversionProgress {
+                                            job_id: job_id.clone(),
+                                            percent,
+                                            fps,
+                                            avg_fps,
+                                            eta_seconds: eta,
+                                        });
+                                        let _ = app_clone.emit("menu-bar-update", MenuBarUpdate {
+                                            status: "encoding".to_string(),
+                                            percent: Some(percent),
+                                            file_name: Some(file_name_clone.clone()),
+                                            eta_seconds: Some(eta),
+                                            queue_count: None,
+                                        });
+                                    }
+                                }
+                            }
                         }
+                        Err(_) => break,
                     }
                 }
             });
@@ -310,6 +335,19 @@ fn process_queue(
                     "job_id": job.id,
                     "status": status_str,
                 }));
+
+                // Check if we should pause after this job
+                if *converter.pause_after_current.lock().unwrap() {
+                    *converter.pause_after_current.lock().unwrap() = false;
+                    let _ = app.emit("menu-bar-update", MenuBarUpdate {
+                        status: "idle".to_string(),
+                        percent: None,
+                        file_name: None,
+                        eta_seconds: None,
+                        queue_count: None,
+                    });
+                    break;
+                }
             }
             Ok(_) | Err(_) => {
                 let _ = std::fs::remove_file(&job.output_path);

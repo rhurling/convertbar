@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { JobInfo, ConversionProgress } from "../lib/tauri";
 import { commands } from "../lib/tauri";
 import { fileName, formatEta } from "../lib/format";
@@ -8,6 +9,7 @@ interface ActiveJobProps {
 }
 
 export default function ActiveJob({ job, progress }: ActiveJobProps) {
+  const [pauseAfter, setPauseAfter] = useState(false);
   const isPaused = job.status === "paused";
   const percent =
     progress && progress.job_id === job.id ? progress.percent : 0;
@@ -15,6 +17,16 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
     progress && progress.job_id === job.id ? progress.eta_seconds : null;
   const fps =
     progress && progress.job_id === job.id ? progress.fps : null;
+
+  const togglePauseAfter = async () => {
+    if (pauseAfter) {
+      await commands.cancelPauseAfterCurrent();
+      setPauseAfter(false);
+    } else {
+      await commands.pauseAfterCurrent();
+      setPauseAfter(true);
+    }
+  };
 
   return (
     <div className="active-job">
@@ -56,6 +68,13 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
             Pause
           </button>
         )}
+        <button
+          className={`btn btn-small${pauseAfter ? " btn-active" : ""}`}
+          onClick={togglePauseAfter}
+          title={pauseAfter ? "Cancel pause after this job" : "Pause queue after this job finishes"}
+        >
+          {pauseAfter ? "Will pause" : "Pause after this"}
+        </button>
         <button
           className="btn btn-small btn-danger"
           onClick={() => commands.cancelConversion()}

@@ -53,13 +53,17 @@ pub fn run() {
             commands::converter::pause_conversion,
             commands::converter::resume_conversion,
             commands::converter::cancel_conversion,
+            commands::converter::pause_after_current,
+            commands::converter::cancel_pause_after_current,
+            commands::converter::quit_app,
         ])
         .setup(|app| {
             // Task 7: System Tray
             let tray = TrayIconBuilder::new()
                 .tooltip("ConvertBar — No active conversions")
                 .title("◇")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png")).unwrap())
+                .icon_as_template(true)
                 .on_tray_icon_event(|tray_icon, event| {
                     match event {
                         TrayIconEvent::Click {

@@ -1,3 +1,5 @@
+import { commands } from "../lib/tauri";
+
 type Tab = "queue" | "history" | "settings";
 
 interface TabBarProps {
@@ -23,6 +25,13 @@ export default function TabBar({ activeTab, onTabChange }: TabBarProps) {
           {tab.label}
         </button>
       ))}
+      <button
+        className="close-btn"
+        onClick={() => commands.hideWindow()}
+        title="Close popover"
+      >
+        &times;
+      </button>
     </div>
   );
 }

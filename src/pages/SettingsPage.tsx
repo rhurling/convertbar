@@ -1,5 +1,6 @@
 import { useCallback, useRef } from "react";
 import { useSettings } from "../hooks/useSettings";
+import { commands } from "../lib/tauri";
 import type { PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
@@ -207,6 +208,15 @@ export default function SettingsPage() {
             Detect
           </button>
         </div>
+      </div>
+
+      <div className="setting-group setting-group-quit">
+        <button
+          className="btn btn-quit"
+          onClick={() => commands.quitApp()}
+        >
+          Quit ConvertBar
+        </button>
       </div>
     </div>
   );

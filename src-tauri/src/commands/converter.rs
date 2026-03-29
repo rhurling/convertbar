@@ -193,3 +193,24 @@ pub fn cancel_conversion(
 
     Ok(())
 }
+
+#[tauri::command]
+pub fn pause_after_current(
+    converter_state: State<'_, Arc<ConverterState>>,
+) -> Result<(), String> {
+    *converter_state.pause_after_current.lock().map_err(|e| e.to_string())? = true;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_pause_after_current(
+    converter_state: State<'_, Arc<ConverterState>>,
+) -> Result<(), String> {
+    *converter_state.pause_after_current.lock().map_err(|e| e.to_string())? = false;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    app.exit(0);
+}

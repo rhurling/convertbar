@@ -587,3 +587,82 @@ select.setting-input {
   font-size: 12px;
   color: var(--text-secondary);
 }
+
+/* Close button in tab bar */
+.close-btn {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 6px;
+  line-height: 1;
+  border-radius: var(--radius-sm);
+  transition: all 0.15s ease;
+}
+
+.close-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+/* Tab bar needs relative positioning for close button */
+.tab-bar {
+  position: relative;
+}
+
+/* Quit button */
+.setting-group-quit {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.btn-quit {
+  width: 100%;
+  padding: 8px 14px;
+  background: var(--red-bg);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-sm);
+  color: var(--red);
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: center;
+}
+
+.btn-quit:hover {
+  background: rgba(239, 83, 80, 0.25);
+}
+
+/* Clear history button */
+.btn-clear-history {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.btn-clear-history:hover {
+  color: var(--red);
+}
+
+.summary-left {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Pause after current - active state */
+.btn-active {
+  background: var(--amber-bg);
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.btn-active:hover {
+  background: rgba(255, 183, 77, 0.25);
+}

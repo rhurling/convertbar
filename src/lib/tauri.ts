@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 export interface JobInfo {
   id: string;
@@ -91,4 +92,8 @@ export const commands = {
     invoke<ClassifiedPaths>("classify_paths", { paths }),
   generatePresetSuffix: (preset: string) =>
     invoke<PresetMetadata>("generate_preset_suffix", { preset }),
+  pauseAfterCurrent: () => invoke<void>("pause_after_current"),
+  cancelPauseAfterCurrent: () => invoke<void>("cancel_pause_after_current"),
+  quitApp: () => invoke<void>("quit_app"),
+  hideWindow: () => getCurrentWebviewWindow().hide(),
 };
