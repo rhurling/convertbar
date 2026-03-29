@@ -58,7 +58,10 @@ pub fn list_presets(handbrake_path: &str) -> Result<Vec<String>, String> {
     Ok(presets)
 }
 
-pub fn get_preset_metadata(handbrake_path: &str, preset_name: &str) -> Result<PresetMetadata, String> {
+pub fn get_preset_metadata(
+    handbrake_path: &str,
+    preset_name: &str,
+) -> Result<PresetMetadata, String> {
     let output = Command::new(handbrake_path)
         .arg("--preset")
         .arg(preset_name)
@@ -69,8 +72,13 @@ pub fn get_preset_metadata(handbrake_path: &str, preset_name: &str) -> Result<Pr
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse preset JSON: {}. Output: {}", e, &stdout[..stdout.len().min(200)]))?;
+    let json: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+        format!(
+            "Failed to parse preset JSON: {}. Output: {}",
+            e,
+            &stdout[..stdout.len().min(200)]
+        )
+    })?;
 
     let preset_obj = &json["PresetList"][0];
 
@@ -79,17 +87,16 @@ pub fn get_preset_metadata(handbrake_path: &str, preset_name: &str) -> Result<Pr
         .unwrap_or("")
         .to_string();
 
-    let picture_height = preset_obj["PictureHeight"]
-        .as_i64()
-        .unwrap_or(0);
+    let picture_height = preset_obj["PictureHeight"].as_i64().unwrap_or(0);
 
-    let quality_slider = preset_obj["VideoQualitySlider"]
-        .as_f64()
-        .unwrap_or(0.0);
+    let quality_slider = preset_obj["VideoQualitySlider"].as_f64().unwrap_or(0.0);
 
     // Codec
     let encoder_lower = video_encoder.to_lowercase();
-    let codec = if encoder_lower.contains("h265") || encoder_lower.contains("hevc") || encoder_lower.contains("x265") {
+    let codec = if encoder_lower.contains("h265")
+        || encoder_lower.contains("hevc")
+        || encoder_lower.contains("x265")
+    {
         "h265"
     } else if encoder_lower.contains("h264") || encoder_lower.contains("x264") {
         "h264"
@@ -105,7 +112,8 @@ pub fn get_preset_metadata(handbrake_path: &str, preset_name: &str) -> Result<Pr
         "ffv1"
     } else {
         "unknown"
-    }.to_string();
+    }
+    .to_string();
 
     // Resolution
     let resolution = if picture_height == 0 {
@@ -164,7 +172,8 @@ pub fn get_preset_metadata(handbrake_path: &str, preset_name: &str) -> Result<Pr
         "mf"
     } else {
         ""
-    }.to_string();
+    }
+    .to_string();
 
     Ok(PresetMetadata {
         codec,

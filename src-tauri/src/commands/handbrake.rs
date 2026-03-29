@@ -39,7 +39,10 @@ pub fn list_handbrake_presets(state: State<'_, AppState>) -> Result<Vec<String>,
 }
 
 #[tauri::command]
-pub fn generate_preset_suffix(state: State<'_, AppState>, preset: String) -> Result<PresetMetadata, String> {
+pub fn generate_preset_suffix(
+    state: State<'_, AppState>,
+    preset: String,
+) -> Result<PresetMetadata, String> {
     // Check cache first
     {
         let cache = state.preset_cache.lock().map_err(|e| e.to_string())?;
@@ -85,11 +88,13 @@ pub fn generate_preset_suffix(state: State<'_, AppState>, preset: String) -> Res
 pub fn validate_handbrake(state: State<'_, AppState>) -> Result<HandbrakeStatus, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
-    let configured: Option<String> = db.query_row(
-        "SELECT value FROM settings WHERE key = 'handbrake_path'",
-        params![],
-        |row| row.get(0),
-    ).ok();
+    let configured: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'handbrake_path'",
+            params![],
+            |row| row.get(0),
+        )
+        .ok();
 
     let path = if let Some(ref p) = configured {
         if !p.is_empty() && std::path::Path::new(p).exists() {
@@ -109,13 +114,21 @@ pub fn validate_handbrake(state: State<'_, AppState>) -> Result<HandbrakeStatus,
                 .ok()
                 .and_then(|o| {
                     let out = String::from_utf8_lossy(&o.stderr);
-                    out.lines().find(|l| l.contains("HandBrake")).map(|l| {
-                        l.split_whitespace().nth(1).unwrap_or("unknown").to_string()
-                    })
+                    out.lines()
+                        .find(|l| l.contains("HandBrake"))
+                        .map(|l| l.split_whitespace().nth(1).unwrap_or("unknown").to_string())
                 })
                 .unwrap_or_default();
-            Ok(HandbrakeStatus { found: true, path: p, version })
+            Ok(HandbrakeStatus {
+                found: true,
+                path: p,
+                version,
+            })
         }
-        None => Ok(HandbrakeStatus { found: false, path: String::new(), version: String::new() })
+        None => Ok(HandbrakeStatus {
+            found: false,
+            path: String::new(),
+            version: String::new(),
+        }),
     }
 }

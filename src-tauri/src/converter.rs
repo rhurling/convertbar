@@ -77,9 +77,7 @@ fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
     }
 
     // Fallback: percent only (early progress lines without fps/ETA)
-    let simple_re = SIMPLE_RE.get_or_init(|| {
-        Regex::new(r"Encoding:.*?(\d+\.?\d*)\s*%").unwrap()
-    });
+    let simple_re = SIMPLE_RE.get_or_init(|| Regex::new(r"Encoding:.*?(\d+\.?\d*)\s*%").unwrap());
 
     if let Some(caps) = simple_re.captures(line) {
         let percent: f64 = caps.get(1)?.as_str().parse().ok()?;
@@ -90,12 +88,14 @@ fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
 }
 
 fn get_next_job(db: &Connection) -> Option<JobInfo> {
-    let mut stmt = db.prepare(
-        "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
+    let mut stmt = db
+        .prepare(
+            "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                 kept_file, space_saved, error_message, queue_order, created_at, completed_at
          FROM jobs WHERE status = 'queued'
-         ORDER BY queue_order ASC LIMIT 1"
-    ).ok()?;
+         ORDER BY queue_order ASC LIMIT 1",
+        )
+        .ok()?;
 
     stmt.query_row([], |row| {
         Ok(JobInfo {
@@ -113,15 +113,18 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
             created_at: row.get(11)?,
             completed_at: row.get(12)?,
         })
-    }).ok()
+    })
+    .ok()
 }
 
 fn get_handbrake_path(db: &Connection) -> Option<String> {
-    let configured: Option<String> = db.query_row(
-        "SELECT value FROM settings WHERE key = 'handbrake_path'",
-        [],
-        |row| row.get(0),
-    ).ok();
+    let configured: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'handbrake_path'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
 
     if let Some(ref path) = configured {
         if !path.is_empty() && std::path::Path::new(path).exists() {
@@ -137,16 +140,13 @@ fn get_cleanup_mode(db: &Connection) -> String {
         "SELECT value FROM settings WHERE key = 'cleanup_mode'",
         [],
         |row| row.get::<_, String>(0),
-    ).unwrap_or_else(|_| "trash".to_string())
+    )
+    .unwrap_or_else(|_| "trash".to_string())
 }
 
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
-fn process_queue(
-    app: &AppHandle,
-    db: &Arc<Mutex<Connection>>,
-    converter: &ConverterState,
-) {
+fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &ConverterState) {
     loop {
         let job;
         let handbrake_path;
@@ -164,10 +164,13 @@ fn process_queue(
                         "UPDATE jobs SET status = 'error', error_message = 'HandBrakeCLI not found' WHERE id = ?1",
                         params![job.id],
                     );
-                    let _ = app.emit("job-error", serde_json::json!({
-                        "job_id": job.id,
-                        "error": "HandBrakeCLI not found"
-                    }));
+                    let _ = app.emit(
+                        "job-error",
+                        serde_json::json!({
+                            "job_id": job.id,
+                            "error": "HandBrakeCLI not found"
+                        }),
+                    );
                     continue;
                 }
             };
@@ -182,10 +185,13 @@ fn process_queue(
         *converter.current_job_id.lock().unwrap() = Some(job.id.clone());
         *converter.is_paused.lock().unwrap() = false;
 
-        let _ = app.emit("job-status-changed", serde_json::json!({
-            "job_id": job.id,
-            "status": "encoding"
-        }));
+        let _ = app.emit(
+            "job-status-changed",
+            serde_json::json!({
+                "job_id": job.id,
+                "status": "encoding"
+            }),
+        );
 
         let file_name = std::path::Path::new(&job.source_path)
             .file_name()
@@ -200,17 +206,21 @@ fn process_queue(
                 "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
                 [],
                 |row| row.get::<_, usize>(0),
-            ).unwrap_or(0)
+            )
+            .unwrap_or(0)
         };
 
-        let _ = app.emit("menu-bar-update", MenuBarUpdate {
-            status: "encoding".to_string(),
-            percent: Some(0.0),
-            file_name: Some(file_name.clone()),
-            eta_seconds: None,
-            queue_count: Some(queue_count),
-            fps: None,
-        });
+        let _ = app.emit(
+            "menu-bar-update",
+            MenuBarUpdate {
+                status: "encoding".to_string(),
+                percent: Some(0.0),
+                file_name: Some(file_name.clone()),
+                eta_seconds: None,
+                queue_count: Some(queue_count),
+                fps: None,
+            },
+        );
 
         // Spawn HandBrakeCLI
         let child = Command::new(&handbrake_path)
@@ -232,10 +242,13 @@ fn process_queue(
                     "UPDATE jobs SET status = 'error', error_message = ?2 WHERE id = ?1",
                     params![job.id, format!("Failed to start HandBrakeCLI: {}", e)],
                 );
-                let _ = app.emit("job-error", serde_json::json!({
-                    "job_id": job.id,
-                    "error": format!("Failed to start HandBrakeCLI: {}", e)
-                }));
+                let _ = app.emit(
+                    "job-error",
+                    serde_json::json!({
+                        "job_id": job.id,
+                        "error": format!("Failed to start HandBrakeCLI: {}", e)
+                    }),
+                );
                 *converter.current_job_id.lock().unwrap() = None;
                 continue;
             }
@@ -253,7 +266,9 @@ fn process_queue(
                 let mut reader = stderr;
                 let mut buf = [0u8; 4096];
                 while let Ok(n) = reader.read(&mut buf) {
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                 }
             });
         }
@@ -276,22 +291,30 @@ fn process_queue(
                                 let line = partial[..pos].to_string();
                                 partial = partial[pos + 1..].to_string();
                                 if !line.is_empty() {
-                                    if let Some((percent, fps, avg_fps, eta)) = parse_progress(&line) {
-                                        let _ = app_clone.emit("conversion-progress", ConversionProgress {
-                                            job_id: job_id.clone(),
-                                            percent,
-                                            fps,
-                                            avg_fps,
-                                            eta_seconds: eta,
-                                        });
-                                        let _ = app_clone.emit("menu-bar-update", MenuBarUpdate {
-                                            status: "encoding".to_string(),
-                                            percent: Some(percent),
-                                            file_name: Some(file_name_clone.clone()),
-                                            eta_seconds: Some(eta),
-                                            queue_count: None,
-                                            fps: Some(fps),
-                                        });
+                                    if let Some((percent, fps, avg_fps, eta)) =
+                                        parse_progress(&line)
+                                    {
+                                        let _ = app_clone.emit(
+                                            "conversion-progress",
+                                            ConversionProgress {
+                                                job_id: job_id.clone(),
+                                                percent,
+                                                fps,
+                                                avg_fps,
+                                                eta_seconds: eta,
+                                            },
+                                        );
+                                        let _ = app_clone.emit(
+                                            "menu-bar-update",
+                                            MenuBarUpdate {
+                                                status: "encoding".to_string(),
+                                                percent: Some(percent),
+                                                file_name: Some(file_name_clone.clone()),
+                                                eta_seconds: Some(eta),
+                                                queue_count: None,
+                                                fps: Some(fps),
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -325,15 +348,23 @@ fn process_queue(
                 let (kept_file, space_saved) = if conv_size > 0 && conv_size < original_size {
                     // Converted is smaller — keep converted, remove original
                     match cleanup_mode.as_str() {
-                        "delete" => { let _ = std::fs::remove_file(&job.source_path); }
-                        _ => { let _ = trash::delete(&job.source_path); }
+                        "delete" => {
+                            let _ = std::fs::remove_file(&job.source_path);
+                        }
+                        _ => {
+                            let _ = trash::delete(&job.source_path);
+                        }
                     }
                     ("converted".to_string(), original_size - conv_size)
                 } else if conv_size > 0 {
                     // Original is smaller or same — keep original, remove converted
                     match cleanup_mode.as_str() {
-                        "delete" => { let _ = std::fs::remove_file(&job.output_path); }
-                        _ => { let _ = trash::delete(&job.output_path); }
+                        "delete" => {
+                            let _ = std::fs::remove_file(&job.output_path);
+                        }
+                        _ => {
+                            let _ = trash::delete(&job.output_path);
+                        }
                     }
                     ("original".to_string(), original_size - conv_size)
                 } else {
@@ -355,28 +386,41 @@ fn process_queue(
                     );
                 }
 
-                let _ = app.emit("job-completed", serde_json::json!({
-                    "job_id": job.id,
-                    "status": status_str,
-                    "kept_file": kept_file,
-                    "space_saved": space_saved,
-                }));
+                let _ = app.emit(
+                    "job-completed",
+                    serde_json::json!({
+                        "job_id": job.id,
+                        "status": status_str,
+                        "kept_file": kept_file,
+                        "space_saved": space_saved,
+                    }),
+                );
 
-                let _ = app.emit("job-status-changed", serde_json::json!({
-                    "job_id": job.id,
-                    "status": status_str,
-                }));
+                let _ = app.emit(
+                    "job-status-changed",
+                    serde_json::json!({
+                        "job_id": job.id,
+                        "status": status_str,
+                    }),
+                );
 
                 // Notification logic for successful/skipped jobs
                 {
                     let (notify_per_file, errors_only) = {
                         let db = db.lock().unwrap();
                         let get = |k: &str, default: bool| -> bool {
-                            db.query_row("SELECT value FROM settings WHERE key=?1", params![k], |r| r.get::<_,String>(0))
-                                .map(|v| v == "true")
-                                .unwrap_or(default)
+                            db.query_row(
+                                "SELECT value FROM settings WHERE key=?1",
+                                params![k],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .map(|v| v == "true")
+                            .unwrap_or(default)
                         };
-                        (get("notifications_per_file", true), get("notifications_errors_only", false))
+                        (
+                            get("notifications_per_file", true),
+                            get("notifications_errors_only", false),
+                        )
                     };
 
                     if notify_per_file {
@@ -385,11 +429,18 @@ fn process_queue(
 
                         if should_notify {
                             let body = match status_str {
-                                "done" => format!("{} converted — saved {}", file_name, format_bytes_short(space_saved)),
-                                "skipped" => format!("{} — kept original (converted was larger)", file_name),
+                                "done" => format!(
+                                    "{} converted — saved {}",
+                                    file_name,
+                                    format_bytes_short(space_saved)
+                                ),
+                                "skipped" => {
+                                    format!("{} — kept original (converted was larger)", file_name)
+                                }
                                 _ => format!("{} failed", file_name),
                             };
-                            let _ = app.notification()
+                            let _ = app
+                                .notification()
                                 .builder()
                                 .title("ConvertBar")
                                 .body(&body)
@@ -401,49 +452,67 @@ fn process_queue(
                 // Check if we should pause after this job
                 if *converter.pause_after_current.lock().unwrap() {
                     *converter.pause_after_current.lock().unwrap() = false;
-                    let _ = app.emit("menu-bar-update", MenuBarUpdate {
-                        status: "idle".to_string(),
-                        percent: None,
-                        file_name: None,
-                        eta_seconds: None,
-                        queue_count: None,
-                        fps: None,
-                    });
+                    let _ = app.emit(
+                        "menu-bar-update",
+                        MenuBarUpdate {
+                            status: "idle".to_string(),
+                            percent: None,
+                            file_name: None,
+                            eta_seconds: None,
+                            queue_count: None,
+                            fps: None,
+                        },
+                    );
                     break;
                 }
             }
             Ok(_) | Err(_) => {
                 let _ = std::fs::remove_file(&job.output_path);
 
-                let current_status: Option<String> = db.lock().unwrap().query_row(
-                    "SELECT status FROM jobs WHERE id = ?1",
-                    params![job.id],
-                    |row| row.get(0),
-                ).ok();
+                let current_status: Option<String> = db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT status FROM jobs WHERE id = ?1",
+                        params![job.id],
+                        |row| row.get(0),
+                    )
+                    .ok();
 
                 if current_status.as_deref() != Some("error") {
                     let _ = db.lock().unwrap().execute(
                         "UPDATE jobs SET status = 'error', error_message = 'Conversion failed' WHERE id = ?1",
                         params![job.id],
                     );
-                    let _ = app.emit("job-error", serde_json::json!({
-                        "job_id": job.id,
-                        "error": "Conversion failed"
-                    }));
-                    let _ = app.emit("job-status-changed", serde_json::json!({
-                        "job_id": job.id,
-                        "status": "error",
-                    }));
+                    let _ = app.emit(
+                        "job-error",
+                        serde_json::json!({
+                            "job_id": job.id,
+                            "error": "Conversion failed"
+                        }),
+                    );
+                    let _ = app.emit(
+                        "job-status-changed",
+                        serde_json::json!({
+                            "job_id": job.id,
+                            "status": "error",
+                        }),
+                    );
 
                     // Error notification
                     let notify_per_file = {
                         let db = db.lock().unwrap();
-                        db.query_row("SELECT value FROM settings WHERE key='notifications_per_file'", params![], |r| r.get::<_,String>(0))
-                            .map(|v| v == "true")
-                            .unwrap_or(true)
+                        db.query_row(
+                            "SELECT value FROM settings WHERE key='notifications_per_file'",
+                            params![],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .map(|v| v == "true")
+                        .unwrap_or(true)
                     };
                     if notify_per_file {
-                        let _ = app.notification()
+                        let _ = app
+                            .notification()
                             .builder()
                             .title("ConvertBar")
                             .body(&format!("{} failed", file_name))
@@ -458,12 +527,17 @@ fn process_queue(
     {
         let notify_queue_done = {
             let db = db.lock().unwrap();
-            db.query_row("SELECT value FROM settings WHERE key='notifications_queue_done'", params![], |r| r.get::<_,String>(0))
-                .map(|v| v == "true")
-                .unwrap_or(true)
+            db.query_row(
+                "SELECT value FROM settings WHERE key='notifications_queue_done'",
+                params![],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|v| v == "true")
+            .unwrap_or(true)
         };
         if notify_queue_done {
-            let _ = app.notification()
+            let _ = app
+                .notification()
                 .builder()
                 .title("ConvertBar")
                 .body("Queue complete")
@@ -471,25 +545,24 @@ fn process_queue(
         }
     }
 
-    let _ = app.emit("menu-bar-update", MenuBarUpdate {
-        status: "idle".to_string(),
-        percent: None,
-        file_name: None,
-        eta_seconds: None,
-        queue_count: None,
-        fps: None,
-    });
+    let _ = app.emit(
+        "menu-bar-update",
+        MenuBarUpdate {
+            status: "idle".to_string(),
+            percent: None,
+            file_name: None,
+            eta_seconds: None,
+            queue_count: None,
+            fps: None,
+        },
+    );
 
     *converter.is_running.lock().unwrap() = false;
 }
 
 /// Starts queue processing in a new background thread.
 /// Sets `is_running` to true atomically before spawning.
-pub fn run_queue(
-    app: AppHandle,
-    db: Arc<Mutex<Connection>>,
-    converter: Arc<ConverterState>,
-) {
+pub fn run_queue(app: AppHandle, db: Arc<Mutex<Connection>>, converter: Arc<ConverterState>) {
     {
         let mut running = converter.is_running.lock().unwrap();
         if *running {
@@ -515,4 +588,3 @@ fn format_bytes_short(bytes: i64) -> String {
         format!("{}B", abs)
     }
 }
-

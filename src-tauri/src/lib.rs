@@ -1,16 +1,16 @@
-mod db;
-mod types;
 mod commands;
-mod handbrake;
 mod converter;
+mod db;
+mod handbrake;
+mod types;
 
 use converter::{ConverterState, MenuBarUpdate};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tauri::{Listener, Manager};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Listener, Manager};
 
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
@@ -27,6 +27,7 @@ pub fn run() {
     let converter_state = Arc::new(ConverterState::new());
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {

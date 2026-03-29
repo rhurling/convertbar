@@ -69,14 +69,26 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
 }
 
 const ALLOWED_KEYS: &[&str] = &[
-    "preset", "cleanup_mode", "launch_at_login", "handbrake_path",
-    "menubar_show_percent", "menubar_show_eta", "menubar_show_queue",
-    "menubar_show_filename", "menubar_show_fps",
-    "notifications_per_file", "notifications_errors_only", "notifications_queue_done",
+    "preset",
+    "cleanup_mode",
+    "launch_at_login",
+    "handbrake_path",
+    "menubar_show_percent",
+    "menubar_show_eta",
+    "menubar_show_queue",
+    "menubar_show_filename",
+    "menubar_show_fps",
+    "notifications_per_file",
+    "notifications_errors_only",
+    "notifications_queue_done",
 ];
 
 #[tauri::command]
-pub fn update_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
+pub fn update_setting(
+    state: State<'_, AppState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
     if !ALLOWED_KEYS.contains(&key.as_str()) {
         return Err(format!("Invalid setting key: {}", key));
     }
@@ -90,7 +102,10 @@ pub fn update_setting(state: State<'_, AppState>, key: String, value: String) ->
 }
 
 #[tauri::command]
-pub fn get_preset_suffix(state: State<'_, AppState>, preset: String) -> Result<Option<String>, String> {
+pub fn get_preset_suffix(
+    state: State<'_, AppState>,
+    preset: String,
+) -> Result<Option<String>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let result = conn.query_row(
         "SELECT suffix FROM preset_suffixes WHERE preset_name = ?1",
@@ -106,7 +121,11 @@ pub fn get_preset_suffix(state: State<'_, AppState>, preset: String) -> Result<O
 }
 
 #[tauri::command]
-pub fn set_preset_suffix(state: State<'_, AppState>, preset: String, suffix: String) -> Result<(), String> {
+pub fn set_preset_suffix(
+    state: State<'_, AppState>,
+    preset: String,
+    suffix: String,
+) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO preset_suffixes (preset_name, suffix) VALUES (?1, ?2) ON CONFLICT(preset_name) DO UPDATE SET suffix = ?2",

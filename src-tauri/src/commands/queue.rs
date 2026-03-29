@@ -77,10 +77,7 @@ fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
     handbrake::detect_handbrake_path().ok_or_else(|| "HandBrakeCLI not found".to_string())
 }
 
-fn add_files_inner(
-    state: &AppState,
-    paths: &[String],
-) -> Result<Vec<JobInfo>, String> {
+fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, String> {
     // First, read preset and suffix template from DB
     let (preset, suffix_template, hb_path) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -308,8 +305,11 @@ pub fn clear_completed(state: State<'_, AppState>, mode: String) -> Result<(), S
         }
         _ => {
             // "all" - clear everything in history
-            conn.execute("DELETE FROM jobs WHERE status IN ('done', 'skipped', 'error')", [])
-                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "DELETE FROM jobs WHERE status IN ('done', 'skipped', 'error')",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -372,7 +372,8 @@ pub fn get_history(
             order_clause
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let result = stmt.query_map(params![search_param, limit, offset], |row| row_to_job(row))
+        let result = stmt
+            .query_map(params![search_param, limit, offset], |row| row_to_job(row))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
@@ -388,7 +389,8 @@ pub fn get_history(
             order_clause
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let result = stmt.query_map(params![limit, offset], |row| row_to_job(row))
+        let result = stmt
+            .query_map(params![limit, offset], |row| row_to_job(row))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
@@ -399,7 +401,10 @@ pub fn get_history(
 }
 
 #[tauri::command]
-pub fn get_history_summary(state: State<'_, AppState>, search: Option<String>) -> Result<HistorySummary, String> {
+pub fn get_history_summary(
+    state: State<'_, AppState>,
+    search: Option<String>,
+) -> Result<HistorySummary, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
 
     let search_param = search

@@ -2,8 +2,7 @@ use rusqlite::{Connection, Result};
 use std::path::PathBuf;
 
 pub fn get_db_path() -> PathBuf {
-    let app_support = dirs::data_dir()
-        .expect("Could not find Application Support directory");
+    let app_support = dirs::data_dir().expect("Could not find Application Support directory");
     let db_dir = app_support.join("com.convertbar.app");
     std::fs::create_dir_all(&db_dir).expect("Could not create app data directory");
     db_dir.join("convertbar.db")

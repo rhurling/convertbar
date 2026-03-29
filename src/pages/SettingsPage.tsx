@@ -1,6 +1,8 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
@@ -55,6 +57,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   } = useSettings();
 
   const inputRef = useRef<HTMLInputElement>(null);
+  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
 
   const handleChipClick = useCallback(
     (variable: string) => {
@@ -262,6 +265,36 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           >
             Detect
           </button>
+        </div>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label">Updates</label>
+        <div className="setting-row">
+          <button
+            className="btn btn-small"
+            onClick={async () => {
+              setUpdateStatus("Checking...");
+              try {
+                const update = await check();
+                if (update) {
+                  setUpdateStatus(`Updating to v${update.version}...`);
+                  await update.downloadAndInstall();
+                  await relaunch();
+                } else {
+                  setUpdateStatus("You're up to date");
+                  setTimeout(() => setUpdateStatus(null), 3000);
+                }
+              } catch (e) {
+                setUpdateStatus(`Error: ${e}`);
+                setTimeout(() => setUpdateStatus(null), 5000);
+              }
+            }}
+            disabled={updateStatus === "Checking..." || updateStatus?.startsWith("Updating")}
+          >
+            Check for updates
+          </button>
+          {updateStatus && <span className="update-status">{updateStatus}</span>}
         </div>
       </div>
 
