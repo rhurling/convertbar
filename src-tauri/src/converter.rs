@@ -39,6 +39,8 @@ pub struct MenuBarUpdate {
     pub status: String,
     pub percent: Option<f64>,
     pub file_name: Option<String>,
+    pub eta_seconds: Option<u64>,
+    pub queue_count: Option<usize>,
 }
 
 fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
@@ -162,10 +164,22 @@ fn process_queue(
             .unwrap_or("unknown")
             .to_string();
 
+        // Count remaining queued jobs for tray info
+        let queue_count: usize = {
+            let db = db.lock().unwrap();
+            db.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
+                [],
+                |row| row.get::<_, usize>(0),
+            ).unwrap_or(0)
+        };
+
         let _ = app.emit("menu-bar-update", MenuBarUpdate {
             status: "encoding".to_string(),
             percent: Some(0.0),
             file_name: Some(file_name.clone()),
+            eta_seconds: None,
+            queue_count: Some(queue_count),
         });
 
         // Spawn HandBrakeCLI
@@ -223,6 +237,8 @@ fn process_queue(
                                 status: "encoding".to_string(),
                                 percent: Some(percent),
                                 file_name: Some(file_name_clone.clone()),
+                                eta_seconds: Some(eta),
+                                queue_count: None,
                             });
                         }
                     }
@@ -263,7 +279,7 @@ fn process_queue(
                         "delete" => { let _ = std::fs::remove_file(&job.output_path); }
                         _ => { let _ = trash::delete(&job.output_path); }
                     }
-                    ("original".to_string(), 0i64)
+                    ("original".to_string(), original_size - conv_size)
                 } else {
                     ("original".to_string(), 0i64)
                 };
@@ -327,6 +343,8 @@ fn process_queue(
         status: "idle".to_string(),
         percent: None,
         file_name: None,
+        eta_seconds: None,
+        queue_count: None,
     });
 
     *converter.is_running.lock().unwrap() = false;

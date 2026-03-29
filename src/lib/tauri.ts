@@ -47,6 +47,11 @@ export interface HistoryPage {
   total: number;
 }
 
+export interface ClassifiedPaths {
+  files: string[];
+  folders: FolderScanResult[];
+}
+
 export const commands = {
   addFiles: (paths: string[]) => invoke<JobInfo[]>("add_files", { paths }),
   scanFolder: (path: string) =>
@@ -74,4 +79,6 @@ export const commands = {
     invoke<void>("set_preset_suffix", { preset, suffix }),
   listHandbrakePresets: () => invoke<string[]>("list_handbrake_presets"),
   detectHandbrake: () => invoke<string | null>("detect_handbrake"),
+  classifyPaths: (paths: string[]) =>
+    invoke<ClassifiedPaths>("classify_paths", { paths }),
 };

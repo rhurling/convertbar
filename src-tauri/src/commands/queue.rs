@@ -2,7 +2,7 @@ use rusqlite::params;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
-use crate::types::{FolderScanResult, HistoryPage, HistorySummary, JobInfo};
+use crate::types::{ClassifiedPaths, FolderScanResult, HistoryPage, HistorySummary, JobInfo};
 use crate::AppState;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -96,10 +96,6 @@ fn add_files_inner(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mp4");
         let parent = path.parent().unwrap_or(Path::new("."));
 
         // Skip if source file already has the suffix
@@ -107,7 +103,7 @@ fn add_files_inner(
             continue;
         }
 
-        let output_filename = format!("{}{}.{}", stem, suffix, ext);
+        let output_filename = format!("{}{}.mp4", stem, suffix);
         let output_path = parent.join(&output_filename);
 
         // Skip if output file already exists
@@ -239,13 +235,17 @@ pub fn remove_job(state: State<'_, AppState>, id: String) -> Result<(), String> 
 #[tauri::command]
 pub fn reorder_queue(state: State<'_, AppState>, job_ids: Vec<String>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute("BEGIN", []).map_err(|e| e.to_string())?;
     for (i, id) in job_ids.iter().enumerate() {
-        conn.execute(
+        if let Err(e) = conn.execute(
             "UPDATE jobs SET queue_order = ?1 WHERE id = ?2",
             params![i as i32, id],
-        )
-        .map_err(|e| e.to_string())?;
+        ) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(e.to_string());
+        }
     }
+    conn.execute("COMMIT", []).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -312,4 +312,29 @@ pub fn get_history_summary(state: State<'_, AppState>) -> Result<HistorySummary,
         total_saved_bytes,
         total_files,
     })
+}
+
+#[tauri::command]
+pub fn classify_paths(paths: Vec<String>) -> Result<ClassifiedPaths, String> {
+    let mut files = Vec::new();
+    let mut folders = Vec::new();
+    for path_str in paths {
+        let path = Path::new(&path_str);
+        if path.is_dir() {
+            let video_files = scan_video_files(path);
+            let folder_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            folders.push(FolderScanResult {
+                file_count: video_files.len(),
+                folder_name,
+                folder_path: path_str,
+            });
+        } else if path.is_file() {
+            files.push(path_str);
+        }
+    }
+    Ok(ClassifiedPaths { files, folders })
 }

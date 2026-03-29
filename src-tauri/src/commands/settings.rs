@@ -44,8 +44,13 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
     })
 }
 
+const ALLOWED_KEYS: &[&str] = &["preset", "cleanup_mode", "launch_at_login", "handbrake_path"];
+
 #[tauri::command]
 pub fn update_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
+    if !ALLOWED_KEYS.contains(&key.as_str()) {
+        return Err(format!("Invalid setting key: {}", key));
+    }
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",

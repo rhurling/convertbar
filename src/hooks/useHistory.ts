@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   commands,
   type JobInfo,
@@ -48,6 +49,19 @@ export function useHistory() {
 
   useEffect(() => {
     refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    const unlistenCompleted = listen("job-completed", () => {
+      refresh();
+    });
+    const unlistenError = listen("job-error", () => {
+      refresh();
+    });
+    return () => {
+      unlistenCompleted.then((fn) => fn());
+      unlistenError.then((fn) => fn());
+    };
   }, [refresh]);
 
   const hasMore = history.length < total;

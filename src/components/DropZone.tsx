@@ -14,30 +14,19 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
     async (paths: string[]) => {
       setStatus("Adding files...");
       try {
-        const files: string[] = [];
-        const folders: string[] = [];
+        const classified = await commands.classifyPaths(paths);
 
-        for (const p of paths) {
-          // Simple heuristic: paths with an extension are files
-          const lastSegment = p.split("/").pop() || "";
-          if (lastSegment.includes(".")) {
-            files.push(p);
-          } else {
-            folders.push(p);
-          }
+        if (classified.files.length > 0) {
+          await commands.addFiles(classified.files);
         }
 
-        if (files.length > 0) {
-          await commands.addFiles(files);
-        }
-
-        for (const folder of folders) {
-          const scan = await commands.scanFolder(folder);
+        for (const folder of classified.folders) {
+          if (folder.file_count === 0) continue;
           const ok = window.confirm(
-            `Add ${scan.file_count} video file(s) from "${scan.folder_name}"?`,
+            `Add ${folder.file_count} video file(s) from "${folder.folder_name}"?`,
           );
           if (ok) {
-            await commands.confirmFolderAdd(folder);
+            await commands.confirmFolderAdd(folder.folder_path);
           }
         }
 

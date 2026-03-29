@@ -44,6 +44,7 @@ pub fn run() {
             commands::queue::clear_completed,
             commands::queue::get_history,
             commands::queue::get_history_summary,
+            commands::queue::classify_paths,
             commands::converter::start_queue,
             commands::converter::pause_conversion,
             commands::converter::resume_conversion,
@@ -88,9 +89,25 @@ pub fn run() {
                                 if let Some(percent) = update.percent {
                                     let _ = tray.set_title(Some(&format!("◇ {:.0}%", percent)));
                                 }
+                                // Build detailed tooltip
+                                let mut tooltip = String::from("ConvertBar");
                                 if let Some(ref name) = update.file_name {
-                                    let _ = tray.set_tooltip(Some(&format!("ConvertBar — Encoding: {}", name)));
+                                    tooltip.push_str(&format!(" — Converting {}", name));
                                 }
+                                if let Some(percent) = update.percent {
+                                    tooltip.push_str(&format!(" — {:.0}%", percent));
+                                }
+                                if let Some(eta) = update.eta_seconds {
+                                    let mins = eta / 60;
+                                    let secs = eta % 60;
+                                    tooltip.push_str(&format!(" — ETA {}:{:02}", mins, secs));
+                                }
+                                if let Some(count) = update.queue_count {
+                                    if count > 0 {
+                                        tooltip.push_str(&format!(" — {} queued", count));
+                                    }
+                                }
+                                let _ = tray.set_tooltip(Some(&tooltip));
                             }
                             "paused" => {
                                 let _ = tray.set_title(Some("◇ ⏸"));

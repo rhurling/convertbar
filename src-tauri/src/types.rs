@@ -43,3 +43,9 @@ pub struct FolderScanResult {
     pub folder_name: String,
     pub folder_path: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifiedPaths {
+    pub files: Vec<String>,
+    pub folders: Vec<FolderScanResult>,
+}
