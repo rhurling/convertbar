@@ -11,25 +11,25 @@ pub struct PresetMetadata {
 }
 
 pub fn detect_handbrake_path() -> Option<String> {
-    // Try `which HandBrakeCLI`
-    if let Ok(output) = Command::new("which").arg("HandBrakeCLI").output() {
+    // Use `where` on Windows, `which` on Unix
+    let cmd = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+
+    if let Ok(output) = Command::new(cmd).arg("HandBrakeCLI").output() {
         if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // `where` on Windows may return multiple lines; take the first
+            let path = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if !path.is_empty() {
                 return Some(path);
             }
-        }
-    }
-
-    // Try known paths
-    let known_paths = [
-        "/usr/local/bin/HandBrakeCLI",
-        "/opt/homebrew/bin/HandBrakeCLI",
-    ];
-
-    for path in &known_paths {
-        if std::path::Path::new(path).exists() {
-            return Some(path.to_string());
         }
     }
 

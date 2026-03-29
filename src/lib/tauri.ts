@@ -67,6 +67,10 @@ export interface HandbrakeStatus {
   version: string;
 }
 
+export interface PlatformCapabilities {
+  can_pause_process: boolean;
+}
+
 export interface PresetMetadata {
   codec: string;
   resolution: string;
@@ -110,6 +114,8 @@ export const commands = {
     invoke<PresetMetadata>("generate_preset_suffix", { preset }),
   pauseAfterCurrent: () => invoke<void>("pause_after_current"),
   cancelPauseAfterCurrent: () => invoke<void>("cancel_pause_after_current"),
+  getPlatformCapabilities: () =>
+    invoke<PlatformCapabilities>("get_platform_capabilities"),
   validateHandbrake: () => invoke<HandbrakeStatus>("validate_handbrake"),
   quitApp: () => invoke<void>("quit_app"),
   hideWindow: () => getCurrentWebviewWindow().hide(),

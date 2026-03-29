@@ -27,6 +27,7 @@ pub fn run() {
     let converter_state = Arc::new(ConverterState::new());
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
@@ -62,6 +63,7 @@ pub fn run() {
             commands::converter::pause_after_current,
             commands::converter::cancel_pause_after_current,
             commands::converter::quit_app,
+            commands::converter::get_platform_capabilities,
             commands::handbrake::validate_handbrake,
         ])
         .setup(|app| {

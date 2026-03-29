@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { JobInfo, ConversionProgress } from "../lib/tauri";
 import { commands } from "../lib/tauri";
 import { fileName, formatEta } from "../lib/format";
@@ -10,6 +10,7 @@ interface ActiveJobProps {
 
 export default function ActiveJob({ job, progress }: ActiveJobProps) {
   const [pauseAfter, setPauseAfter] = useState(false);
+  const [canPauseProcess, setCanPauseProcess] = useState(true);
   const isPaused = job.status === "paused";
   const percent =
     progress && progress.job_id === job.id ? progress.percent : 0;
@@ -17,6 +18,12 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
     progress && progress.job_id === job.id ? progress.eta_seconds : null;
   const fps =
     progress && progress.job_id === job.id ? progress.fps : null;
+
+  useEffect(() => {
+    commands.getPlatformCapabilities().then((caps) => {
+      setCanPauseProcess(caps.can_pause_process);
+    });
+  }, []);
 
   const togglePauseAfter = async () => {
     if (pauseAfter) {
@@ -53,28 +60,42 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
       </div>
 
       <div className="active-job-actions">
-        {isPaused ? (
-          <button
-            className="btn btn-small"
-            onClick={() => commands.resumeConversion()}
-          >
-            Resume
-          </button>
+        {canPauseProcess ? (
+          // macOS: real process pause/resume via SIGSTOP/SIGCONT
+          <>
+            {isPaused ? (
+              <button
+                className="btn btn-small"
+                onClick={() => commands.resumeConversion()}
+              >
+                Resume
+              </button>
+            ) : (
+              <button
+                className="btn btn-small"
+                onClick={() => commands.pauseConversion()}
+              >
+                Pause
+              </button>
+            )}
+            <button
+              className={`btn btn-small${pauseAfter ? " btn-active" : ""}`}
+              onClick={togglePauseAfter}
+              title={pauseAfter ? "Cancel pause after this job" : "Pause queue after this job finishes"}
+            >
+              {pauseAfter ? "Will pause" : "Pause after this"}
+            </button>
+          </>
         ) : (
+          // Other platforms: queue-level pause only
           <button
-            className="btn btn-small"
-            onClick={() => commands.pauseConversion()}
+            className={`btn btn-small${pauseAfter ? " btn-active" : ""}`}
+            onClick={togglePauseAfter}
+            title={pauseAfter ? "Cancel pause after this job" : "Pause queue after this job finishes"}
           >
-            Pause
+            {pauseAfter ? "Will pause" : "Pause after this"}
           </button>
         )}
-        <button
-          className={`btn btn-small${pauseAfter ? " btn-active" : ""}`}
-          onClick={togglePauseAfter}
-          title={pauseAfter ? "Cancel pause after this job" : "Pause queue after this job finishes"}
-        >
-          {pauseAfter ? "Will pause" : "Pause after this"}
-        </button>
         <button
           className="btn btn-small btn-danger"
           onClick={() => commands.cancelConversion()}

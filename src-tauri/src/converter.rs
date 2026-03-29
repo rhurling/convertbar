@@ -1,7 +1,7 @@
 use regex::Regex;
 use rusqlite::{params, Connection};
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
@@ -10,6 +10,7 @@ use tauri_plugin_notification::NotificationExt;
 
 pub struct ConverterState {
     pub current_pid: Mutex<Option<u32>>,
+    pub current_child: Mutex<Option<Child>>,
     pub current_job_id: Mutex<Option<String>>,
     pub is_paused: Mutex<bool>,
     pub is_running: Mutex<bool>,
@@ -20,11 +21,17 @@ impl ConverterState {
     pub fn new() -> Self {
         Self {
             current_pid: Mutex::new(None),
+            current_child: Mutex::new(None),
             current_job_id: Mutex::new(None),
             is_paused: Mutex::new(false),
             is_running: Mutex::new(false),
             pause_after_current: Mutex::new(false),
         }
+    }
+
+    /// Returns true if the current platform supports real process pause/resume (SIGSTOP/SIGCONT).
+    pub fn can_pause_process() -> bool {
+        cfg!(target_os = "macos")
     }
 }
 
@@ -273,6 +280,9 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             });
         }
 
+        // Store child handle for cross-platform cancel support
+        *converter.current_child.lock().unwrap() = Some(child);
+
         let job_id = job.id.clone();
         let app_clone = app.clone();
         let file_name_clone = file_name.clone();
@@ -328,13 +338,25 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             None
         };
 
-        let exit_status = child.wait();
+        let exit_status = {
+            let mut child_guard = converter.current_child.lock().unwrap();
+            if let Some(ref mut child) = *child_guard {
+                child.wait()
+            } else {
+                // Child was already taken (e.g. by cancel), treat as failure
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Process handle missing",
+                ))
+            }
+        };
 
         if let Some(handle) = progress_thread {
             let _ = handle.join();
         }
 
         *converter.current_pid.lock().unwrap() = None;
+        *converter.current_child.lock().unwrap() = None;
         *converter.current_job_id.lock().unwrap() = None;
 
         match exit_status {

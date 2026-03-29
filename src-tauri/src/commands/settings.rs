@@ -1,11 +1,12 @@
 use rusqlite::params;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_autostart::ManagerExt;
 
 use crate::types::Settings;
 use crate::AppState;
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
+pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settings, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
 
     let mut stmt = conn
@@ -52,6 +53,12 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         }
     }
 
+    // Read actual autostart state from the plugin (source of truth)
+    let launch_at_login = app
+        .autolaunch()
+        .is_enabled()
+        .unwrap_or(launch_at_login);
+
     Ok(Settings {
         preset,
         cleanup_mode,
@@ -85,6 +92,7 @@ const ALLOWED_KEYS: &[&str] = &[
 
 #[tauri::command]
 pub fn update_setting(
+    app: AppHandle,
     state: State<'_, AppState>,
     key: String,
     value: String,
@@ -98,6 +106,17 @@ pub fn update_setting(
         params![key, value],
     )
     .map_err(|e| e.to_string())?;
+
+    // Sync autostart state with the plugin
+    if key == "launch_at_login" {
+        let autostart = app.autolaunch();
+        if value == "true" {
+            let _ = autostart.enable();
+        } else {
+            let _ = autostart.disable();
+        }
+    }
+
     Ok(())
 }
 

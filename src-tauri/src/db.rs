@@ -8,8 +8,21 @@ pub fn get_db_path() -> PathBuf {
     db_dir.join("convertbar.db")
 }
 
+fn default_preset() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "H.265 Apple VideoToolbox 1080p"
+    } else if cfg!(target_os = "windows") {
+        "H.265 NVENC 1080p"
+    } else {
+        "H.265 MKV 1080p"
+    }
+}
+
 pub fn init_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch("
+    let preset = default_preset();
+
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS jobs (
             id              TEXT PRIMARY KEY,
             source_path     TEXT NOT NULL,
@@ -33,18 +46,35 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             preset_name TEXT PRIMARY KEY,
             suffix      TEXT NOT NULL
         );
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('preset', 'H.265 Apple VideoToolbox 1080p');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('cleanup_mode', 'trash');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('launch_at_login', 'false');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('handbrake_path', '');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_percent', 'true');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_eta', 'true');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_queue', 'false');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_filename', 'false');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_fps', 'false');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_per_file', 'true');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_errors_only', 'false');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_queue_done', 'true');
-        INSERT OR IGNORE INTO preset_suffixes (preset_name, suffix) VALUES ('H.265 Apple VideoToolbox 1080p', '.{resolution}-{codec}');
-    ")
+    ",
+    )?;
+
+    let defaults: &[(&str, &str)] = &[
+        ("preset", preset),
+        ("cleanup_mode", "trash"),
+        ("launch_at_login", "false"),
+        ("handbrake_path", ""),
+        ("menubar_show_percent", "true"),
+        ("menubar_show_eta", "true"),
+        ("menubar_show_queue", "false"),
+        ("menubar_show_filename", "false"),
+        ("menubar_show_fps", "false"),
+        ("notifications_per_file", "true"),
+        ("notifications_errors_only", "false"),
+        ("notifications_queue_done", "true"),
+    ];
+
+    for (key, value) in defaults {
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO preset_suffixes (preset_name, suffix) VALUES (?1, ?2)",
+        rusqlite::params![preset, ".{resolution}-{codec}"],
+    )?;
+
+    Ok(())
 }
