@@ -1,6 +1,6 @@
 [package]
 name = "convertbar"
-version = "0.8.1"
+version = "0.8.2"
 description = "Menu bar app for batch video conversion using HandBrakeCLI"
 authors = ["Rouven Hurling"]
 edition = "2021"
