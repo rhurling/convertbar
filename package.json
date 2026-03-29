@@ -5,6 +5,10 @@
   "description": "macOS menu bar app for batch video conversion using HandBrakeCLI",
   "author": "Rouven Hurling",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rhurling/convertbar"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

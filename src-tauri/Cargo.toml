@@ -5,7 +5,7 @@ description = "macOS menu bar app for batch video conversion using HandBrakeCLI"
 authors = ["Rouven Hurling"]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/rouvenhurling/mac-menubar-convert"
+repository = "https://github.com/rhurling/convertbar"
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
