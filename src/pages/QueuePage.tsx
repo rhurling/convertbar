@@ -68,7 +68,10 @@ export default function QueuePage({ hbStatus }: QueuePageProps) {
       )}
 
       {!activeJob && pendingJobs.length === 0 && (
-        <div className="empty-state">No items in queue</div>
+        <div className="empty-state">
+          <span className="empty-state-icon">&#128194;</span>
+          <span>Drag video files or folders here to get started</span>
+        </div>
       )}
     </div>
   );

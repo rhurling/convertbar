@@ -67,91 +67,123 @@ pub fn run() {
             commands::handbrake::validate_handbrake,
         ])
         .setup(|app| {
+            // Shared error flag for tray icon state
+            let has_error: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+
             // Task 7: System Tray
             let show_item = MenuItem::with_id(app, "show", "Show ConvertBar", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit ConvertBar", true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(app)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &sep, &quit_item])?;
 
-            let tray = TrayIconBuilder::new()
+            let tray = TrayIconBuilder::with_id("main")
                 .tooltip("ConvertBar — No active conversions")
                 .title("")
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png")).unwrap())
                 .icon_as_template(true)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| {
-                    match event.id.as_ref() {
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        "quit" => { app.exit(0); }
-                        _ => {}
-                    }
-                })
-                .on_tray_icon_event(|tray_icon, event| {
-                    match event {
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        } => {
-                            let app = tray_icon.app_handle();
-                            if let Some(window) = app.get_webview_window("main") {
-                                if window.is_visible().unwrap_or(false) {
-                                    // Save position before hiding
-                                    if let Ok(pos) = window.outer_position() {
-                                        let state = app.state::<AppState>();
-                                        *state.saved_window_pos.lock().unwrap() = Some((pos.x, pos.y));
-                                    }
-                                    let _ = window.hide();
-                                } else {
-                                    // Restore saved position
-                                    let state = app.state::<AppState>();
-                                    if let Some((x, y)) = *state.saved_window_pos.lock().unwrap() {
-                                        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
-                                    }
-
-                                    // Confine to screen bounds
-                                    if let Ok(Some(monitor)) = window.current_monitor() {
-                                        if let (Ok(win_pos), Ok(win_size)) = (window.outer_position(), window.outer_size()) {
-                                            let mon_pos = monitor.position();
-                                            let mon_size = monitor.size();
-
-                                            let mut x = win_pos.x;
-                                            let mut y = win_pos.y;
-                                            let w = win_size.width as i32;
-                                            let _h = win_size.height as i32;
-                                            let sw = mon_size.width as i32;
-                                            let sh = mon_size.height as i32;
-                                            let sx = mon_pos.x;
-                                            let sy = mon_pos.y;
-
-                                            // At least 1/4 of window must be on screen
-                                            let min_x = sx - (w * 3 / 4);
-                                            let max_x = sx + sw - (w / 4);
-                                            // Tab bar (top ~40px) must always be accessible
-                                            let min_y = sy;
-                                            let max_y = sy + sh - 40;
-
-                                            x = x.clamp(min_x, max_x);
-                                            y = y.clamp(min_y, max_y);
-
-                                            if x != win_pos.x || y != win_pos.y {
-                                                let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
-                                            }
-                                        }
-                                    }
-
+                .on_menu_event({
+                    let has_error = has_error.clone();
+                    move |app, event| {
+                        match event.id.as_ref() {
+                            "show" => {
+                                if let Some(window) = app.get_webview_window("main") {
                                     let _ = window.show();
                                     let _ = window.set_focus();
                                 }
+                                // Clear error indicator when user opens the app
+                                let mut err = has_error.lock().unwrap();
+                                if *err {
+                                    *err = false;
+                                    let conv = app.state::<Arc<ConverterState>>();
+                                    let is_running = *conv.is_running.lock().unwrap();
+                                    if !is_running {
+                                        if let Some(tray) = app.tray_by_id("main") {
+                                            let _ = tray.set_title(Some(""));
+                                            let _ = tray.set_tooltip(Some("ConvertBar — No active conversions"));
+                                        }
+                                    }
+                                }
                             }
+                            "quit" => { app.exit(0); }
+                            _ => {}
                         }
-                        _ => {}
+                    }
+                })
+                .on_tray_icon_event({
+                    let has_error = has_error.clone();
+                    move |tray_icon, event| {
+                        match event {
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            } => {
+                                let app = tray_icon.app_handle();
+                                if let Some(window) = app.get_webview_window("main") {
+                                    if window.is_visible().unwrap_or(false) {
+                                        // Save position before hiding
+                                        if let Ok(pos) = window.outer_position() {
+                                            let state = app.state::<AppState>();
+                                            *state.saved_window_pos.lock().unwrap() = Some((pos.x, pos.y));
+                                        }
+                                        let _ = window.hide();
+                                    } else {
+                                        // Restore saved position
+                                        let state = app.state::<AppState>();
+                                        if let Some((x, y)) = *state.saved_window_pos.lock().unwrap() {
+                                            let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
+                                        }
+
+                                        // Confine to screen bounds
+                                        if let Ok(Some(monitor)) = window.current_monitor() {
+                                            if let (Ok(win_pos), Ok(win_size)) = (window.outer_position(), window.outer_size()) {
+                                                let mon_pos = monitor.position();
+                                                let mon_size = monitor.size();
+
+                                                let mut x = win_pos.x;
+                                                let mut y = win_pos.y;
+                                                let w = win_size.width as i32;
+                                                let _h = win_size.height as i32;
+                                                let sw = mon_size.width as i32;
+                                                let sh = mon_size.height as i32;
+                                                let sx = mon_pos.x;
+                                                let sy = mon_pos.y;
+
+                                                let min_x = sx - (w * 3 / 4);
+                                                let max_x = sx + sw - (w / 4);
+                                                let min_y = sy;
+                                                let max_y = sy + sh - 40;
+
+                                                x = x.clamp(min_x, max_x);
+                                                y = y.clamp(min_y, max_y);
+
+                                                if x != win_pos.x || y != win_pos.y {
+                                                    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
+                                                }
+                                            }
+                                        }
+
+                                        let _ = window.show();
+                                        let _ = window.set_focus();
+
+                                        // Clear error indicator when user opens the app
+                                        let mut err = has_error.lock().unwrap();
+                                        if *err {
+                                            *err = false;
+                                            let conv = app.state::<Arc<ConverterState>>();
+                                            let is_running = *conv.is_running.lock().unwrap();
+                                            if !is_running {
+                                                let _ = tray_icon.set_title(Some(""));
+                                                let _ = tray_icon.set_tooltip(Some("ConvertBar — No active conversions"));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 })
                 .build(app)?;
@@ -160,11 +192,13 @@ pub fn run() {
             let tray_id = tray.id().clone();
             let app_handle = app.handle().clone();
             let db_for_tray = app.state::<AppState>().db.clone();
+            let error_flag = has_error.clone();
             app.listen("menu-bar-update", move |event| {
                 if let Ok(update) = serde_json::from_str::<MenuBarUpdate>(event.payload()) {
                     if let Some(tray) = app_handle.tray_by_id(&tray_id) {
                         match update.status.as_str() {
                             "encoding" => {
+                                *error_flag.lock().unwrap() = false;
                                 let mut parts: Vec<String> = Vec::new();
 
                                 let (show_percent, show_eta, show_queue, show_filename, show_fps) = {
@@ -262,6 +296,11 @@ pub fn run() {
                             "paused" => {
                                 let _ = tray.set_title(Some("⏸"));
                                 let _ = tray.set_tooltip(Some("ConvertBar — Paused"));
+                            }
+                            "error" => {
+                                *error_flag.lock().unwrap() = true;
+                                let _ = tray.set_title(Some("!"));
+                                let _ = tray.set_tooltip(Some("ConvertBar — Error"));
                             }
                             _ => {
                                 let _ = tray.set_title(Some(""));

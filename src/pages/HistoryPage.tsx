@@ -78,7 +78,10 @@ export default function HistoryPage() {
       )}
 
       {history.length === 0 && !loading && (
-        <div className="empty-state">No conversion history yet</div>
+        <div className="empty-state">
+          <span className="empty-state-icon">&#128203;</span>
+          <span>Completed conversions will appear here</span>
+        </div>
       )}
     </div>
   );

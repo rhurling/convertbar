@@ -21,6 +21,16 @@ function App() {
     refreshHbStatus();
   }, []);
 
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        commands.hideWindow();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, []);
+
   return (
     <div className="app">
       <TabBar activeTab={activeTab} onTabChange={setActiveTab} />

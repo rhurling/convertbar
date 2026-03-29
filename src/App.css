@@ -228,6 +228,10 @@ body {
   color: var(--red);
 }
 
+.btn-icon:active {
+  transform: scale(0.9);
+}
+
 /* History Item */
 .history-item {
   padding: 8px 12px;
@@ -512,19 +516,32 @@ select.setting-input {
   background: var(--bg-hover);
 }
 
+.btn:active {
+  transform: scale(0.96);
+  transition: transform 0.05s ease;
+}
+
 .btn:disabled {
   opacity: 0.5;
-  cursor: default;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 
 /* Empty State */
 .empty-state {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 8px;
   padding: 40px 16px;
   color: var(--text-dim);
   font-size: 13px;
+}
+
+.empty-state-icon {
+  font-size: 24px;
+  opacity: 0.5;
 }
 
 /* Queue Page */
@@ -670,6 +687,10 @@ select.setting-input {
 
 .btn-quit:hover {
   background: rgba(239, 83, 80, 0.25);
+}
+
+.btn-quit:active {
+  transform: scale(0.98);
 }
 
 .update-status {

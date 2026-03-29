@@ -154,6 +154,7 @@ fn get_cleanup_mode(db: &Connection) -> String {
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
 fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &ConverterState) {
+    let mut had_errors = false;
     loop {
         let job;
         let handbrake_path;
@@ -489,6 +490,7 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                 }
             }
             Ok(_) | Err(_) => {
+                had_errors = true;
                 let _ = std::fs::remove_file(&job.output_path);
 
                 let current_status: Option<String> = db
@@ -567,10 +569,11 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
         }
     }
 
+    let final_status = if had_errors { "error" } else { "idle" };
     let _ = app.emit(
         "menu-bar-update",
         MenuBarUpdate {
-            status: "idle".to_string(),
+            status: final_status.to_string(),
             percent: None,
             file_name: None,
             eta_seconds: None,
