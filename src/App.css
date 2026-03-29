@@ -698,6 +698,12 @@ select.setting-input {
   color: var(--text-secondary);
 }
 
+.version-label {
+  font-weight: 400;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
 /* Clear history dropdown */
 .clear-dropdown {
   position: relative;

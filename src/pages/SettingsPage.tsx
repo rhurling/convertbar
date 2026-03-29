@@ -1,8 +1,9 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
@@ -58,6 +59,9 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
 
   const inputRef = useRef<HTMLInputElement>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string>("");
+
+  useEffect(() => { getVersion().then(setAppVersion); }, []);
 
   const handleChipClick = useCallback(
     (variable: string) => {
@@ -269,7 +273,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       </div>
 
       <div className="setting-group">
-        <label className="setting-label">Updates</label>
+        <label className="setting-label">Updates {appVersion && <span className="version-label">v{appVersion}</span>}</label>
         <div className="setting-row">
           <button
             className="btn btn-small"
