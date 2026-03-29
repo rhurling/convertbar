@@ -23,6 +23,11 @@ pub struct Settings {
     pub cleanup_mode: String,
     pub launch_at_login: bool,
     pub handbrake_path: String,
+    pub menubar_show_percent: bool,
+    pub menubar_show_eta: bool,
+    pub menubar_show_queue: bool,
+    pub menubar_show_filename: bool,
+    pub menubar_show_fps: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

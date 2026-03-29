@@ -36,6 +36,11 @@ export interface AppSettings {
   cleanup_mode: string;
   launch_at_login: boolean;
   handbrake_path: string;
+  menubar_show_percent: boolean;
+  menubar_show_eta: boolean;
+  menubar_show_queue: boolean;
+  menubar_show_filename: boolean;
+  menubar_show_fps: boolean;
 }
 
 export interface HistorySummary {

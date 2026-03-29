@@ -387,6 +387,31 @@ select.setting-input {
   accent-color: var(--accent);
 }
 
+.setting-toggles {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.toggle-label input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.setting-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin: 0 0 8px 0;
+}
+
 .setting-row {
   display: flex;
   gap: 6px;

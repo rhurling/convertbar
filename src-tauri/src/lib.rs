@@ -133,14 +133,79 @@ pub fn run() {
             // Listen for menu-bar-update events to update tray title/tooltip
             let tray_id = tray.id().clone();
             let app_handle = app.handle().clone();
+            let db_for_tray = app.state::<AppState>().db.clone();
             app.listen("menu-bar-update", move |event| {
                 if let Ok(update) = serde_json::from_str::<MenuBarUpdate>(event.payload()) {
                     if let Some(tray) = app_handle.tray_by_id(&tray_id) {
                         match update.status.as_str() {
                             "encoding" => {
-                                if let Some(percent) = update.percent {
-                                    let _ = tray.set_title(Some(&format!("{:.0}%", percent)));
+                                let mut parts: Vec<String> = Vec::new();
+
+                                let (show_percent, show_eta, show_queue, show_filename, show_fps) = {
+                                    let db = db_for_tray.lock().unwrap();
+                                    let get_bool = |key: &str, default: bool| -> bool {
+                                        db.query_row(
+                                            "SELECT value FROM settings WHERE key = ?1",
+                                            rusqlite::params![key],
+                                            |row| row.get::<_, String>(0),
+                                        )
+                                        .map(|v| v == "true")
+                                        .unwrap_or(default)
+                                    };
+                                    (
+                                        get_bool("menubar_show_percent", true),
+                                        get_bool("menubar_show_eta", true),
+                                        get_bool("menubar_show_queue", false),
+                                        get_bool("menubar_show_filename", false),
+                                        get_bool("menubar_show_fps", false),
+                                    )
+                                };
+
+                                if show_percent {
+                                    if let Some(percent) = update.percent {
+                                        parts.push(format!("{:.0}%", percent));
+                                    }
                                 }
+                                if show_eta {
+                                    if let Some(eta) = update.eta_seconds {
+                                        if eta > 0 {
+                                            let mins = eta / 60;
+                                            let secs = eta % 60;
+                                            parts.push(format!("ETA {}:{:02}", mins, secs));
+                                        }
+                                    }
+                                }
+                                if show_queue {
+                                    if let Some(count) = update.queue_count {
+                                        if count > 0 {
+                                            parts.push(format!("+{}", count));
+                                        }
+                                    }
+                                }
+                                if show_filename {
+                                    if let Some(ref name) = update.file_name {
+                                        let truncated = if name.len() > 20 {
+                                            format!("{}…", &name[..19])
+                                        } else {
+                                            name.clone()
+                                        };
+                                        parts.push(truncated);
+                                    }
+                                }
+                                if show_fps {
+                                    if let Some(fps) = update.fps {
+                                        if fps > 0.0 {
+                                            parts.push(format!("{:.0}fps", fps));
+                                        }
+                                    }
+                                }
+
+                                let title = if parts.is_empty() {
+                                    String::new()
+                                } else {
+                                    parts.join(" \u{00b7} ")
+                                };
+                                let _ = tray.set_title(Some(&title));
                                 // Build detailed tooltip
                                 let mut tooltip = String::from("ConvertBar");
                                 if let Some(ref name) = update.file_name {

@@ -63,6 +63,7 @@ pub fn pause_conversion(
                 file_name: None,
                 eta_seconds: None,
                 queue_count: None,
+                fps: None,
             });
         }
     }
@@ -124,6 +125,7 @@ pub fn resume_conversion(
                 file_name,
                 eta_seconds: None,
                 queue_count: None,
+                fps: None,
             });
         }
     }
@@ -188,6 +190,7 @@ pub fn cancel_conversion(
             file_name: None,
             eta_seconds: None,
             queue_count: None,
+            fps: None,
         });
     }
 

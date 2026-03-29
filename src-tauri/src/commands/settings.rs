@@ -16,6 +16,11 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
     let mut cleanup_mode = String::new();
     let mut launch_at_login = false;
     let mut handbrake_path = String::new();
+    let mut menubar_show_percent = true;
+    let mut menubar_show_eta = true;
+    let mut menubar_show_queue = false;
+    let mut menubar_show_filename = false;
+    let mut menubar_show_fps = false;
 
     let rows = stmt
         .query_map([], |row| {
@@ -32,6 +37,11 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
             "cleanup_mode" => cleanup_mode = value,
             "launch_at_login" => launch_at_login = value == "true",
             "handbrake_path" => handbrake_path = value,
+            "menubar_show_percent" => menubar_show_percent = value == "true",
+            "menubar_show_eta" => menubar_show_eta = value == "true",
+            "menubar_show_queue" => menubar_show_queue = value == "true",
+            "menubar_show_filename" => menubar_show_filename = value == "true",
+            "menubar_show_fps" => menubar_show_fps = value == "true",
             _ => {}
         }
     }
@@ -41,10 +51,19 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         cleanup_mode,
         launch_at_login,
         handbrake_path,
+        menubar_show_percent,
+        menubar_show_eta,
+        menubar_show_queue,
+        menubar_show_filename,
+        menubar_show_fps,
     })
 }
 
-const ALLOWED_KEYS: &[&str] = &["preset", "cleanup_mode", "launch_at_login", "handbrake_path"];
+const ALLOWED_KEYS: &[&str] = &[
+    "preset", "cleanup_mode", "launch_at_login", "handbrake_path",
+    "menubar_show_percent", "menubar_show_eta", "menubar_show_queue",
+    "menubar_show_filename", "menubar_show_fps",
+];
 
 #[tauri::command]
 pub fn update_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {

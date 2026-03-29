@@ -38,6 +38,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO settings (key, value) VALUES ('cleanup_mode', 'trash');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('launch_at_login', 'false');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('handbrake_path', '');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_percent', 'true');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_eta', 'true');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_queue', 'false');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_filename', 'false');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_fps', 'false');
         INSERT OR IGNORE INTO preset_suffixes (preset_name, suffix) VALUES ('H.265 Apple VideoToolbox 1080p', '.{resolution}-{codec}');
     ")
 }

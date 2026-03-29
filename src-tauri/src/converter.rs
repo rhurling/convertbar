@@ -43,6 +43,7 @@ pub struct MenuBarUpdate {
     pub file_name: Option<String>,
     pub eta_seconds: Option<u64>,
     pub queue_count: Option<usize>,
+    pub fps: Option<f64>,
 }
 
 fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
@@ -207,6 +208,7 @@ fn process_queue(
             file_name: Some(file_name.clone()),
             eta_seconds: None,
             queue_count: Some(queue_count),
+            fps: None,
         });
 
         // Spawn HandBrakeCLI
@@ -287,6 +289,7 @@ fn process_queue(
                                             file_name: Some(file_name_clone.clone()),
                                             eta_seconds: Some(eta),
                                             queue_count: None,
+                                            fps: Some(fps),
                                         });
                                     }
                                 }
@@ -372,6 +375,7 @@ fn process_queue(
                         file_name: None,
                         eta_seconds: None,
                         queue_count: None,
+                        fps: None,
                     });
                     break;
                 }
@@ -410,6 +414,7 @@ fn process_queue(
         file_name: None,
         eta_seconds: None,
         queue_count: None,
+        fps: None,
     });
 
     *converter.is_running.lock().unwrap() = false;

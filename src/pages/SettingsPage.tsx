@@ -1,7 +1,7 @@
 import { useCallback, useRef } from "react";
 import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
-import type { PresetMetadata } from "../lib/tauri";
+import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
 
@@ -168,6 +168,29 @@ export default function SettingsPage() {
             />
             Delete permanently
           </label>
+        </div>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label">Menu bar display</label>
+        <p className="setting-hint">Choose what to show next to the icon during encoding</p>
+        <div className="setting-toggles">
+          {[
+            { key: "menubar_show_percent", label: "Percentage" },
+            { key: "menubar_show_eta", label: "ETA" },
+            { key: "menubar_show_queue", label: "Queue count" },
+            { key: "menubar_show_filename", label: "File name" },
+            { key: "menubar_show_fps", label: "Encoding speed" },
+          ].map(({ key, label }) => (
+            <label key={key} className="toggle-label">
+              <input
+                type="checkbox"
+                checked={settings[key as keyof AppSettings] === true}
+                onChange={(e) => updateSetting(key, String(e.target.checked))}
+              />
+              {label}
+            </label>
+          ))}
         </div>
       </div>
 
