@@ -22,6 +22,10 @@ Explicit per-call permissions in `src-tauri/capabilities/default.json`. No `:def
 
 When adding a new frontend Tauri API call or plugin, add the corresponding permission to `default.json`. Backend-only APIs (notifications, opener, tray, window management from Rust) do not need ACL permissions.
 
+## Window State
+
+Window position is persisted across restarts via `tauri-plugin-window-state`. Screen confinement runs on every show (tray click) to handle monitor layout changes — ensures at least half the window is visible.
+
 ## Cross-Platform
 
 - `libc` (SIGSTOP/SIGCONT) is macOS-only — gated with `cfg!(target_os = "macos")` in Cargo.toml
