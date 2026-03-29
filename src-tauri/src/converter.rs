@@ -219,7 +219,7 @@ fn process_queue(
             .arg("-o")
             .arg(&job.output_path)
             .stderr(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn();
 
         let mut child = match child {
@@ -241,15 +241,27 @@ fn process_queue(
         let pid = child.id();
         *converter.current_pid.lock().unwrap() = Some(pid);
 
-        // Read stderr for progress on a separate thread
-        let stderr = child.stderr.take();
+        // Read stdout for progress (HandBrakeCLI sends progress to stdout when piped)
+        let progress_stream = child.stdout.take();
+
+        // Drain stderr so the process doesn't block on a full pipe buffer
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut reader = stderr;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 { break; }
+                }
+            });
+        }
+
         let job_id = job.id.clone();
         let app_clone = app.clone();
         let file_name_clone = file_name.clone();
 
-        let progress_thread = if let Some(stderr) = stderr {
+        let progress_thread = if let Some(stdout) = progress_stream {
             let handle = std::thread::spawn(move || {
-                let mut reader = stderr;
+                let mut reader = stdout;
                 let mut buf = [0u8; 1024];
                 let mut partial = String::new();
                 loop {
