@@ -1,7 +1,7 @@
 {
   "name": "convertbar",
   "private": true,
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Menu bar app for batch video conversion using HandBrakeCLI",
   "author": "Rouven Hurling",
   "license": "MIT",
