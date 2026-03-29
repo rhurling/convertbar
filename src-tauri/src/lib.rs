@@ -26,6 +26,7 @@ pub fn run() {
     let converter_state = Arc::new(ConverterState::new());
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             db: Arc::new(Mutex::new(conn)),
@@ -59,6 +60,7 @@ pub fn run() {
             commands::converter::pause_after_current,
             commands::converter::cancel_pause_after_current,
             commands::converter::quit_app,
+            commands::handbrake::validate_handbrake,
         ])
         .setup(|app| {
             // Task 7: System Tray

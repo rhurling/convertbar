@@ -21,6 +21,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
     let mut menubar_show_queue = false;
     let mut menubar_show_filename = false;
     let mut menubar_show_fps = false;
+    let mut notifications_per_file = true;
+    let mut notifications_errors_only = false;
+    let mut notifications_queue_done = true;
 
     let rows = stmt
         .query_map([], |row| {
@@ -42,6 +45,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
             "menubar_show_queue" => menubar_show_queue = value == "true",
             "menubar_show_filename" => menubar_show_filename = value == "true",
             "menubar_show_fps" => menubar_show_fps = value == "true",
+            "notifications_per_file" => notifications_per_file = value == "true",
+            "notifications_errors_only" => notifications_errors_only = value == "true",
+            "notifications_queue_done" => notifications_queue_done = value == "true",
             _ => {}
         }
     }
@@ -56,6 +62,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
         menubar_show_queue,
         menubar_show_filename,
         menubar_show_fps,
+        notifications_per_file,
+        notifications_errors_only,
+        notifications_queue_done,
     })
 }
 
@@ -63,6 +72,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "preset", "cleanup_mode", "launch_at_login", "handbrake_path",
     "menubar_show_percent", "menubar_show_eta", "menubar_show_queue",
     "menubar_show_filename", "menubar_show_fps",
+    "notifications_per_file", "notifications_errors_only", "notifications_queue_done",
 ];
 
 #[tauri::command]

@@ -3,13 +3,27 @@ import DropZone from "../components/DropZone";
 import ActiveJob from "../components/ActiveJob";
 import QueueItem from "../components/QueueItem";
 import { commands } from "../lib/tauri";
+import type { HandbrakeStatus } from "../lib/tauri";
 
-export default function QueuePage() {
+interface QueuePageProps {
+  hbStatus: HandbrakeStatus | null;
+}
+
+export default function QueuePage({ hbStatus }: QueuePageProps) {
   const { activeJob, pendingJobs, progress, refresh } =
     useQueue();
 
   return (
     <div className="queue-page">
+      {hbStatus && !hbStatus.found && (
+        <div className="hb-warning">
+          <span className="hb-warning-icon">&#9888;&#65039;</span>
+          <div>
+            <strong>HandBrakeCLI not found</strong>
+            <p>Install via: <code>brew install handbrake</code> or set the path in Settings.</p>
+          </div>
+        </div>
+      )}
       <DropZone onFilesAdded={refresh} />
 
       {activeJob && <ActiveJob job={activeJob} progress={progress} />}

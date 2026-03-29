@@ -43,6 +43,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_queue', 'false');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_filename', 'false');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('menubar_show_fps', 'false');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_per_file', 'true');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_errors_only', 'false');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_queue_done', 'true');
         INSERT OR IGNORE INTO preset_suffixes (preset_name, suffix) VALUES ('H.265 Apple VideoToolbox 1080p', '.{resolution}-{codec}');
     ")
 }

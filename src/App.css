@@ -760,3 +760,26 @@ select.setting-input {
   gap: 4px;
   flex-shrink: 0;
 }
+
+/* Toggle sub-option indent */
+.toggle-sub { margin-left: 24px; }
+
+/* HandBrake warning banner */
+.hb-warning {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 152, 0, 0.15);
+  border: 1px solid rgba(255, 152, 0, 0.3);
+  border-radius: 8px;
+  margin: 12px 12px 0;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.hb-warning code {
+  background: var(--bg-tertiary);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.hb-warning p { margin: 4px 0 0; color: var(--text-secondary); }

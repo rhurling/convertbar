@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
 use crate::types::JobInfo;
+use tauri_plugin_notification::NotificationExt;
 
 pub struct ConverterState {
     pub current_pid: Mutex<Option<u32>>,
@@ -366,6 +367,41 @@ fn process_queue(
                     "status": status_str,
                 }));
 
+                // Notification logic for successful/skipped jobs
+                {
+                    let (notify_per_file, errors_only, _notify_queue_done) = {
+                        let db = db.lock().unwrap();
+                        let get = |k: &str, default: bool| -> bool {
+                            db.query_row("SELECT value FROM settings WHERE key=?1", params![k], |r| r.get::<_,String>(0))
+                                .map(|v| v == "true")
+                                .unwrap_or(default)
+                        };
+                        (
+                            get("notifications_per_file", true),
+                            get("notifications_errors_only", false),
+                            get("notifications_queue_done", true),
+                        )
+                    };
+
+                    if notify_per_file {
+                        let is_error = status_str == "error" || status_str == "skipped";
+                        let should_notify = if errors_only { is_error } else { true };
+
+                        if should_notify {
+                            let body = match status_str {
+                                "done" => format!("{} converted — saved {}", file_name, format_bytes_short(space_saved)),
+                                "skipped" => format!("{} — kept original (converted was larger)", file_name),
+                                _ => format!("{} failed", file_name),
+                            };
+                            let _ = app.notification()
+                                .builder()
+                                .title("ConvertBar")
+                                .body(&body)
+                                .show();
+                        }
+                    }
+                }
+
                 // Check if we should pause after this job
                 if *converter.pause_after_current.lock().unwrap() {
                     *converter.pause_after_current.lock().unwrap() = false;
@@ -402,12 +438,43 @@ fn process_queue(
                         "job_id": job.id,
                         "status": "error",
                     }));
+
+                    // Error notification
+                    let notify_per_file = {
+                        let db = db.lock().unwrap();
+                        db.query_row("SELECT value FROM settings WHERE key='notifications_per_file'", params![], |r| r.get::<_,String>(0))
+                            .map(|v| v == "true")
+                            .unwrap_or(true)
+                    };
+                    if notify_per_file {
+                        let _ = app.notification()
+                            .builder()
+                            .title("ConvertBar")
+                            .body(&format!("{} failed", file_name))
+                            .show();
+                    }
                 }
             }
         }
     }
 
-    // No more jobs
+    // No more jobs — queue done notification
+    {
+        let notify_queue_done = {
+            let db = db.lock().unwrap();
+            db.query_row("SELECT value FROM settings WHERE key='notifications_queue_done'", params![], |r| r.get::<_,String>(0))
+                .map(|v| v == "true")
+                .unwrap_or(true)
+        };
+        if notify_queue_done {
+            let _ = app.notification()
+                .builder()
+                .title("ConvertBar")
+                .body("Queue complete")
+                .show();
+        }
+    }
+
     let _ = app.emit("menu-bar-update", MenuBarUpdate {
         status: "idle".to_string(),
         percent: None,
@@ -438,5 +505,18 @@ pub fn run_queue(
     std::thread::spawn(move || {
         process_queue(&app, &db, &converter);
     });
+}
+
+fn format_bytes_short(bytes: i64) -> String {
+    let abs = bytes.unsigned_abs();
+    if abs >= 1_073_741_824 {
+        format!("{:.1}GB", abs as f64 / 1_073_741_824.0)
+    } else if abs >= 1_048_576 {
+        format!("{:.0}MB", abs as f64 / 1_048_576.0)
+    } else if abs >= 1024 {
+        format!("{:.0}KB", abs as f64 / 1024.0)
+    } else {
+        format!("{}B", abs)
+    }
 }
 

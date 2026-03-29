@@ -36,7 +36,11 @@ function resolveTemplate(
   return result;
 }
 
-export default function SettingsPage() {
+interface SettingsPageProps {
+  onHbPathChanged?: () => void;
+}
+
+export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const {
     settings,
     presets,
@@ -195,6 +199,32 @@ export default function SettingsPage() {
       </div>
 
       <div className="setting-group">
+        <label className="setting-label">Notifications</label>
+        <div className="setting-toggles">
+          <label className="toggle-label">
+            <input type="checkbox"
+              checked={settings.notifications_per_file}
+              onChange={(e) => updateSetting("notifications_per_file", String(e.target.checked))} />
+            Notify per file
+          </label>
+          {settings.notifications_per_file && (
+            <label className="toggle-label toggle-sub">
+              <input type="checkbox"
+                checked={settings.notifications_errors_only}
+                onChange={(e) => updateSetting("notifications_errors_only", String(e.target.checked))} />
+              Errors only
+            </label>
+          )}
+          <label className="toggle-label">
+            <input type="checkbox"
+              checked={settings.notifications_queue_done}
+              onChange={(e) => updateSetting("notifications_queue_done", String(e.target.checked))} />
+            Notify when queue finishes
+          </label>
+        </div>
+      </div>
+
+      <div className="setting-group">
         <label className="setting-label">
           <input
             type="checkbox"
@@ -214,15 +244,17 @@ export default function SettingsPage() {
             className="setting-input flex-1"
             type="text"
             value={settings.handbrake_path}
-            onChange={(e) =>
-              updateSetting("handbrake_path", e.target.value)
-            }
+            onChange={(e) => {
+              updateSetting("handbrake_path", e.target.value);
+              onHbPathChanged?.();
+            }}
             placeholder="/usr/local/bin/HandBrakeCLI"
           />
           <button
             className="btn btn-small"
             onClick={async () => {
               const path = await detectHandbrake();
+              onHbPathChanged?.();
               if (!path) {
                 alert("HandBrakeCLI not found on this system.");
               }

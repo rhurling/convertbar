@@ -41,6 +41,9 @@ export interface AppSettings {
   menubar_show_queue: boolean;
   menubar_show_filename: boolean;
   menubar_show_fps: boolean;
+  notifications_per_file: boolean;
+  notifications_errors_only: boolean;
+  notifications_queue_done: boolean;
 }
 
 export interface HistorySummary {
@@ -56,6 +59,12 @@ export interface HistoryPage {
 export interface ClassifiedPaths {
   files: string[];
   folders: FolderScanResult[];
+}
+
+export interface HandbrakeStatus {
+  found: boolean;
+  path: string;
+  version: string;
 }
 
 export interface PresetMetadata {
@@ -100,6 +109,7 @@ export const commands = {
     invoke<PresetMetadata>("generate_preset_suffix", { preset }),
   pauseAfterCurrent: () => invoke<void>("pause_after_current"),
   cancelPauseAfterCurrent: () => invoke<void>("cancel_pause_after_current"),
+  validateHandbrake: () => invoke<HandbrakeStatus>("validate_handbrake"),
   quitApp: () => invoke<void>("quit_app"),
   hideWindow: () => getCurrentWebviewWindow().hide(),
 };

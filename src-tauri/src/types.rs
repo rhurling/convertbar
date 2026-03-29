@@ -28,6 +28,9 @@ pub struct Settings {
     pub menubar_show_queue: bool,
     pub menubar_show_filename: bool,
     pub menubar_show_fps: bool,
+    pub notifications_per_file: bool,
+    pub notifications_errors_only: bool,
+    pub notifications_queue_done: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,4 +56,11 @@ pub struct FolderScanResult {
 pub struct ClassifiedPaths {
     pub files: Vec<String>,
     pub folders: Vec<FolderScanResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandbrakeStatus {
+    pub found: bool,
+    pub path: String,
+    pub version: String,
 }
