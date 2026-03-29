@@ -1,7 +1,10 @@
 {
-  "name": "tauri-app",
+  "name": "convertbar",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
+  "description": "macOS menu bar app for batch video conversion using HandBrakeCLI",
+  "author": "Rouven Hurling",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
