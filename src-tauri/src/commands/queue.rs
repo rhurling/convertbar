@@ -1,4 +1,5 @@
 use rusqlite::params;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
@@ -79,7 +80,7 @@ fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
 
 fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, String> {
     // First, read preset and suffix template from DB
-    let (preset, suffix_template, hb_path) = {
+    let (preset, suffix_template, hb_path, skip_already_converted) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
 
         let preset: String = conn
@@ -105,7 +106,16 @@ fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, S
             None
         };
 
-        (preset, suffix_template, hb_path)
+        let skip_already_converted: bool = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'skip_already_converted'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        (preset, suffix_template, hb_path, skip_already_converted)
     }; // db lock released
 
     // Resolve template if needed
@@ -128,6 +138,24 @@ fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, S
 
     // Re-acquire db lock for inserting jobs
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    // Build set of source paths already in queue (and optionally history)
+    let existing_paths: HashSet<String> = {
+        let mut sql = String::from(
+            "SELECT source_path FROM jobs WHERE status IN ('queued', 'encoding', 'paused')",
+        );
+        if skip_already_converted {
+            sql.push_str(
+                " UNION SELECT source_path FROM jobs WHERE status IN ('done', 'skipped')",
+            );
+        }
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
     let mut queue_order = get_next_queue_order(&conn)?;
     let mut jobs = Vec::new();
 
@@ -136,6 +164,11 @@ fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, S
 
         // Validate it's a video file
         if !is_video_file(path) {
+            continue;
+        }
+
+        // Skip if file is already in queue or (optionally) history
+        if existing_paths.contains(path_str) {
             continue;
         }
 

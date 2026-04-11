@@ -31,6 +31,7 @@ pub struct Settings {
     pub notifications_per_file: bool,
     pub notifications_errors_only: bool,
     pub notifications_queue_done: bool,
+    pub skip_already_converted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

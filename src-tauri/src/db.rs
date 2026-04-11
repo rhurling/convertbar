@@ -62,6 +62,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("notifications_per_file", "true"),
         ("notifications_errors_only", "false"),
         ("notifications_queue_done", "true"),
+        ("skip_already_converted", "false"),
     ];
 
     for (key, value) in defaults {
