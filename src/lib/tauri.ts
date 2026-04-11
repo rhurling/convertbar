@@ -44,6 +44,7 @@ export interface AppSettings {
   notifications_per_file: boolean;
   notifications_errors_only: boolean;
   notifications_queue_done: boolean;
+  skip_already_converted: boolean;
 }
 
 export interface HistorySummary {

@@ -184,6 +184,22 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       </div>
 
       <div className="setting-group">
+        <label className="setting-label">
+          <input
+            type="checkbox"
+            checked={settings.skip_already_converted}
+            onChange={(e) =>
+              updateSetting("skip_already_converted", String(e.target.checked))
+            }
+          />
+          Skip already-converted files
+        </label>
+        <p className="setting-hint">
+          When adding files, skip any that were previously converted successfully
+        </p>
+      </div>
+
+      <div className="setting-group">
         <label className="setting-label">Menu bar display</label>
         <p className="setting-hint">Choose what to show next to the icon during encoding</p>
         <div className="setting-toggles">
