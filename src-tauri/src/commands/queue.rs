@@ -136,9 +136,21 @@ fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, S
         suffix_template
     };
 
-    // Re-acquire db lock for inserting jobs
+    // Re-acquire db lock and hand the resolved suffix to the DB-only core.
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    add_files_to_db(&conn, paths, &preset, &suffix, skip_already_converted)
+}
 
+/// DB-only core of `add_files_inner`: applies the skip rules and inserts queued jobs given an
+/// already-resolved output suffix. Separated from suffix resolution (which may shell out to
+/// HandBrakeCLI) so the skip-rule matrix can be tested against an in-memory database.
+fn add_files_to_db(
+    conn: &rusqlite::Connection,
+    paths: &[String],
+    preset: &str,
+    suffix: &str,
+    skip_already_converted: bool,
+) -> Result<Vec<JobInfo>, String> {
     // Build set of source paths already in queue (and optionally history)
     let existing_paths: HashSet<String> = {
         let mut sql = String::from(
@@ -156,7 +168,7 @@ fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, S
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    let mut queue_order = get_next_queue_order(&conn)?;
+    let mut queue_order = get_next_queue_order(conn)?;
     let mut jobs = Vec::new();
 
     for path_str in paths {
@@ -180,7 +192,7 @@ fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, S
         let parent = path.parent().unwrap_or(Path::new("."));
 
         // Skip if source file already has the suffix
-        if !suffix.is_empty() && stem.ends_with(&suffix) {
+        if !suffix.is_empty() && stem.ends_with(suffix) {
             continue;
         }
 
@@ -215,7 +227,7 @@ fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, S
             id,
             source_path: path_str.clone(),
             output_path: output_path.to_string_lossy().to_string(),
-            preset: preset.clone(),
+            preset: preset.to_string(),
             status: "queued".to_string(),
             original_size,
             converted_size: None,
@@ -314,6 +326,10 @@ pub fn remove_job(state: State<'_, AppState>, id: String) -> Result<(), String> 
 #[tauri::command]
 pub fn reorder_queue(state: State<'_, AppState>, job_ids: Vec<String>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    reorder_queue_inner(&conn, &job_ids)
+}
+
+fn reorder_queue_inner(conn: &rusqlite::Connection, job_ids: &[String]) -> Result<(), String> {
     conn.execute("BEGIN", []).map_err(|e| e.to_string())?;
     for (i, id) in job_ids.iter().enumerate() {
         if let Err(e) = conn.execute(
@@ -365,7 +381,16 @@ pub fn get_history(
     sort_by: Option<String>,
 ) -> Result<HistoryPage, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    get_history_inner(&conn, limit, offset, search, sort_by)
+}
 
+fn get_history_inner(
+    conn: &rusqlite::Connection,
+    limit: u32,
+    offset: u32,
+    search: Option<String>,
+    sort_by: Option<String>,
+) -> Result<HistoryPage, String> {
     let search_param = search
         .as_ref()
         .filter(|s| !s.is_empty())
@@ -439,7 +464,13 @@ pub fn get_history_summary(
     search: Option<String>,
 ) -> Result<HistorySummary, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    get_history_summary_inner(&conn, search)
+}
 
+fn get_history_summary_inner(
+    conn: &rusqlite::Connection,
+    search: Option<String>,
+) -> Result<HistorySummary, String> {
     let search_param = search
         .as_ref()
         .filter(|s| !s.is_empty())
@@ -495,7 +526,48 @@ pub fn classify_paths(paths: Vec<String>) -> Result<ClassifiedPaths, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::path::Path;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn
+    }
+
+    fn insert_queued(conn: &Connection, id: &str, source: &str, status: &str, order: i32) {
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES (?1, ?2, ?3, 'preset', ?4, ?5, '2020-01-01T00:00:00Z')",
+            params![id, source, format!("{source}.out"), status, order],
+        )
+        .unwrap();
+    }
+
+    fn insert_history(
+        conn: &Connection,
+        id: &str,
+        source: &str,
+        status: &str,
+        space_saved: i64,
+        original_size: i64,
+        completed_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, original_size, space_saved, queue_order, created_at, completed_at)
+             VALUES (?1, ?2, ?3, 'preset', ?4, ?5, ?6, 0, ?7, ?7)",
+            params![
+                id,
+                source,
+                format!("{source}.out.mp4"),
+                status,
+                original_size,
+                space_saved,
+                completed_at
+            ],
+        )
+        .unwrap();
+    }
 
     #[test]
     fn accepts_known_video_extensions_case_insensitively() {
@@ -508,5 +580,236 @@ mod tests {
     fn rejects_non_video_and_extensionless() {
         assert!(!is_video_file(Path::new("notes.txt")));
         assert!(!is_video_file(Path::new("README")));
+    }
+
+    // ---- add_files_to_db skip rules ----
+
+    #[test]
+    fn add_files_skips_paths_already_in_queue() {
+        let conn = test_conn();
+        insert_queued(&conn, "j1", "/movies/a.mp4", "queued", 1);
+
+        let added =
+            add_files_to_db(&conn, &["/movies/a.mp4".to_string()], "preset", "", false).unwrap();
+
+        assert!(added.is_empty(), "an already-queued source must be skipped");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "no duplicate row inserted");
+    }
+
+    #[test]
+    fn add_files_skips_when_output_already_exists() {
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        // With suffix "-conv", source clip.mov -> output clip-conv.mp4. Pre-create the output.
+        std::fs::write(dir.path().join("clip-conv.mp4"), b"x").unwrap();
+        let source = dir.path().join("clip.mov").to_string_lossy().to_string();
+
+        let added = add_files_to_db(&conn, &[source], "preset", "-conv", false).unwrap();
+
+        assert!(
+            added.is_empty(),
+            "must skip when the converted output already exists on disk"
+        );
+    }
+
+    #[test]
+    fn add_files_skips_source_that_already_has_suffix() {
+        let conn = test_conn();
+        // The source stem already ends with the suffix -> it's already a converted file.
+        let added = add_files_to_db(
+            &conn,
+            &["/movies/clip-conv.mov".to_string()],
+            "preset",
+            "-conv",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            added.is_empty(),
+            "must skip a source whose stem already carries the suffix"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn add_files_skip_already_converted_union_respects_flag() {
+        let conn = test_conn();
+        insert_history(&conn, "h1", "/movies/done.mkv", "done", 100, 1000, "2020-01-01T00:00:00Z");
+
+        // Flag on: a previously-converted (done) source is skipped via the history UNION.
+        let with_flag =
+            add_files_to_db(&conn, &["/movies/done.mkv".to_string()], "preset", "", true).unwrap();
+        assert!(
+            with_flag.is_empty(),
+            "skip_already_converted should skip sources already in history"
+        );
+
+        // Flag off: history is ignored, the file is queued again.
+        let without_flag =
+            add_files_to_db(&conn, &["/movies/done.mkv".to_string()], "preset", "", false).unwrap();
+        assert_eq!(
+            without_flag.len(),
+            1,
+            "without the flag, a done source is re-added"
+        );
+    }
+
+    // ---- get_next_queue_order ----
+
+    #[test]
+    fn next_queue_order_starts_at_one_then_follows_max_active() {
+        let conn = test_conn();
+        assert_eq!(
+            get_next_queue_order(&conn).unwrap(),
+            1,
+            "empty queue starts at 1"
+        );
+
+        insert_queued(&conn, "a", "/m/a.mp4", "queued", 3);
+        assert_eq!(
+            get_next_queue_order(&conn).unwrap(),
+            4,
+            "next is max active order + 1"
+        );
+
+        // A finished job with a high order must not influence the next active order.
+        insert_history(&conn, "h", "/m/h.mp4", "done", 0, 0, "2020-01-01T00:00:00Z");
+        conn.execute("UPDATE jobs SET queue_order = 100 WHERE id = 'h'", [])
+            .unwrap();
+        assert_eq!(
+            get_next_queue_order(&conn).unwrap(),
+            4,
+            "done jobs are excluded from the active max"
+        );
+    }
+
+    // ---- reorder_queue_inner ----
+
+    #[test]
+    fn reorder_queue_reassigns_orders_in_listed_sequence() {
+        let conn = test_conn();
+        insert_queued(&conn, "A", "/m/a.mp4", "queued", 0);
+        insert_queued(&conn, "B", "/m/b.mp4", "queued", 1);
+        insert_queued(&conn, "C", "/m/c.mp4", "queued", 2);
+
+        reorder_queue_inner(&conn, &["C".to_string(), "A".to_string(), "B".to_string()]).unwrap();
+
+        let order = |id: &str| -> i32 {
+            conn.query_row(
+                "SELECT queue_order FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(order("C"), 0);
+        assert_eq!(order("A"), 1);
+        assert_eq!(order("B"), 2);
+    }
+
+    // ---- get_history search / sort / pagination ----
+
+    #[test]
+    fn history_search_filters_by_path() {
+        let conn = test_conn();
+        insert_history(&conn, "1", "/m/alpha.mp4", "done", 10, 100, "2020-01-01T00:00:00Z");
+        insert_history(&conn, "2", "/m/beta.mp4", "done", 20, 200, "2020-01-02T00:00:00Z");
+
+        let page = get_history_inner(&conn, 10, 0, Some("alpha".to_string()), None).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].source_path, "/m/alpha.mp4");
+    }
+
+    #[test]
+    fn history_sorts_by_space_saved_and_source_path() {
+        let conn = test_conn();
+        insert_history(&conn, "1", "/m/c.mp4", "done", 10, 100, "2020-01-01T00:00:00Z");
+        insert_history(&conn, "2", "/m/a.mp4", "done", 100, 200, "2020-01-02T00:00:00Z");
+        insert_history(&conn, "3", "/m/b.mp4", "done", 50, 300, "2020-01-03T00:00:00Z");
+
+        let by_saved =
+            get_history_inner(&conn, 10, 0, None, Some("space_saved".to_string())).unwrap();
+        assert_eq!(
+            by_saved.jobs[0].space_saved,
+            Some(100),
+            "space_saved sorts descending"
+        );
+
+        let by_path =
+            get_history_inner(&conn, 10, 0, None, Some("source_path".to_string())).unwrap();
+        assert_eq!(
+            by_path.jobs[0].source_path, "/m/a.mp4",
+            "source_path sorts ascending"
+        );
+    }
+
+    #[test]
+    fn history_default_sort_is_newest_completed_first() {
+        let conn = test_conn();
+        insert_history(&conn, "old", "/m/old.mp4", "done", 1, 1, "2020-01-01T00:00:00Z");
+        insert_history(&conn, "new", "/m/new.mp4", "done", 1, 1, "2024-12-31T00:00:00Z");
+
+        let page = get_history_inner(&conn, 10, 0, None, None).unwrap();
+        assert_eq!(
+            page.jobs[0].id, "new",
+            "default order is completed_at DESC"
+        );
+    }
+
+    #[test]
+    fn history_paginates_with_limit_and_offset() {
+        let conn = test_conn();
+        for i in 0..3 {
+            insert_history(
+                &conn,
+                &format!("j{i}"),
+                &format!("/m/{i}.mp4"),
+                "done",
+                1,
+                1,
+                "2020-01-01T00:00:00Z",
+            );
+        }
+
+        let first = get_history_inner(&conn, 2, 0, None, None).unwrap();
+        assert_eq!(first.jobs.len(), 2);
+        assert_eq!(first.total, 3, "total reflects all rows, not the page size");
+
+        let second = get_history_inner(&conn, 2, 2, None, None).unwrap();
+        assert_eq!(second.jobs.len(), 1, "offset returns the remaining page");
+    }
+
+    // ---- get_history_summary ----
+
+    #[test]
+    fn history_summary_sums_only_done_jobs() {
+        let conn = test_conn();
+        insert_history(&conn, "1", "/m/a.mp4", "done", 100, 1000, "2020-01-01T00:00:00Z");
+        insert_history(&conn, "2", "/m/b.mp4", "done", 200, 2000, "2020-01-02T00:00:00Z");
+        // Errors live in history but never count as saved space.
+        insert_history(&conn, "3", "/m/c.mp4", "error", 999, 3000, "2020-01-03T00:00:00Z");
+
+        let summary = get_history_summary_inner(&conn, None).unwrap();
+        assert_eq!(summary.total_saved_bytes, 300);
+        assert_eq!(summary.total_files, 2);
+    }
+
+    #[test]
+    fn history_summary_respects_search() {
+        let conn = test_conn();
+        insert_history(&conn, "1", "/m/keep.mp4", "done", 100, 1000, "2020-01-01T00:00:00Z");
+        insert_history(&conn, "2", "/m/other.mp4", "done", 200, 2000, "2020-01-02T00:00:00Z");
+
+        let summary = get_history_summary_inner(&conn, Some("keep".to_string())).unwrap();
+        assert_eq!(summary.total_saved_bytes, 100);
+        assert_eq!(summary.total_files, 1);
     }
 }
