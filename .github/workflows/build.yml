@@ -81,6 +81,22 @@ jobs:
           tagName: v__VERSION__
           releaseName: "v__VERSION__"
           releaseBody: ${{ steps.release_body.outputs.body }}
-          releaseDraft: false
+          # Upload to a draft so every matrix platform can attach its assets.
+          # Immutable releases seal a release on publish, so it must stay a
+          # draft until all builds finish; publish-release finalizes it.
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  # Publishing is the event that seals an immutable release, so it runs once,
+  # after every platform has uploaded to the draft.
+  publish-release:
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # flip the drafted release to published
+    steps:
+      - name: Publish the drafted release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
