@@ -398,6 +398,11 @@ with `vi.mock`.
 
 ## Phase 4 — Process orchestration (optional) *(outline)*
 
+> **Status (2026-06-17): intentionally skipped.** Phases 0–3 are complete and merged to `main`.
+> This phase is gated on "only if orchestration keeps regressing" — no regressions observed, and the
+> integration test of `process_queue` is high-effort (live `AppHandle`, spawned processes/threads).
+> Revisit if orchestration starts regressing.
+
 Integration test of `process_queue` against a fake `HandBrakeCLI` shell script emitting canned progress lines
 and a known-size output. High effort; only if orchestration keeps regressing. Do **not** test `libc::kill`
 pause/resume or `AppHandle.emit` directly — cover the decision around them (`can_pause_process` gating, the
