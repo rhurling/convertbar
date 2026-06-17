@@ -491,3 +491,22 @@ pub fn classify_paths(paths: Vec<String>) -> Result<ClassifiedPaths, String> {
     }
     Ok(ClassifiedPaths { files, folders })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn accepts_known_video_extensions_case_insensitively() {
+        assert!(is_video_file(Path::new("movie.mp4")));
+        assert!(is_video_file(Path::new("movie.MKV")));
+        assert!(is_video_file(Path::new("/a/b/c.MoV")));
+    }
+
+    #[test]
+    fn rejects_non_video_and_extensionless() {
+        assert!(!is_video_file(Path::new("notes.txt")));
+        assert!(!is_video_file(Path::new("README")));
+    }
+}

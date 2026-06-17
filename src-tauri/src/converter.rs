@@ -617,3 +617,41 @@ fn format_bytes_short(bytes: i64) -> String {
         format!("{}B", abs)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_progress_line() {
+        let line = "Encoding: task 1 of 1, 42.50 % (123.45 fps, avg 120.00 fps, ETA 00h02m30s)";
+        let (percent, fps, avg_fps, eta) = parse_progress(line).unwrap();
+        assert_eq!(percent, 42.5);
+        assert_eq!(fps, 123.45);
+        assert_eq!(avg_fps, 120.0);
+        assert_eq!(eta, 150); // 2m30s
+    }
+
+    #[test]
+    fn falls_back_to_percent_only() {
+        let line = "Encoding: task 1 of 1, 5.00 %";
+        let (percent, fps, avg_fps, eta) = parse_progress(line).unwrap();
+        assert_eq!(percent, 5.0);
+        assert_eq!(fps, 0.0);
+        assert_eq!(avg_fps, 0.0);
+        assert_eq!(eta, 0);
+    }
+
+    #[test]
+    fn ignores_non_encoding_lines() {
+        assert!(parse_progress("Scanning title 1 of 1").is_none());
+    }
+
+    #[test]
+    fn format_bytes_short_picks_units() {
+        assert_eq!(format_bytes_short(0), "0B");
+        assert_eq!(format_bytes_short(1024), "1KB");
+        assert_eq!(format_bytes_short(1_048_576), "1MB");
+        assert_eq!(format_bytes_short(1_073_741_824), "1.0GB");
+    }
+}

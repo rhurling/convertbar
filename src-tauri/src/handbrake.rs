@@ -257,3 +257,51 @@ pub fn resolve_suffix_template(template: &str, metadata: &PresetMetadata) -> Str
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(codec: &str, resolution: &str, device: &str) -> PresetMetadata {
+        PresetMetadata {
+            codec: codec.into(),
+            resolution: resolution.into(),
+            quality: "hq".into(),
+            preset: "preset".into(),
+            device: device.into(),
+        }
+    }
+
+    #[test]
+    fn slugify_collapses_separators_and_trims() {
+        assert_eq!(
+            slugify("H.265 Apple VideoToolbox 1080p"),
+            "h-265-apple-videotoolbox-1080p"
+        );
+        assert_eq!(slugify("  Fast 1080p30  "), "fast-1080p30");
+    }
+
+    #[test]
+    fn resolves_full_template() {
+        let m = meta("h265", "1080p", "apple-videotoolbox");
+        assert_eq!(
+            resolve_suffix_template(".{resolution}-{codec}", &m),
+            ".1080p-h265"
+        );
+    }
+
+    #[test]
+    fn drops_empty_var_and_its_trailing_separator_but_keeps_leading_dot() {
+        let m = meta("h265", "", "apple-videotoolbox"); // empty resolution
+        assert_eq!(resolve_suffix_template(".{resolution}-{codec}", &m), ".h265");
+    }
+
+    #[test]
+    fn drops_empty_var_and_its_leading_separator() {
+        let m = meta("", "1080p", ""); // empty codec
+        assert_eq!(
+            resolve_suffix_template(".{resolution}-{codec}", &m),
+            ".1080p"
+        );
+    }
+}
