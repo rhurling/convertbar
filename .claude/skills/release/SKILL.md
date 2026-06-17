@@ -15,7 +15,7 @@ Cut a new release. The version lives in **three** files that must stay in sync, 
    - `src-tauri/tauri.conf.json` (`"version"`)
    - `package.json` (`"version"`)
    - `src-tauri/Cargo.toml` (`[package]` `version`)
-3. **Rebuild:** `npm run tauri build` — this bakes the version into the binary. Do NOT skip or reorder this.
+3. **Rebuild:** `npm run tauri build` — this bakes the version into the binary. Do NOT skip or reorder this. The build will end with `Error A public key has been found, but no private key ... TAURI_SIGNING_PRIVATE_KEY` — this is **expected locally** and does not mean the build failed (see Critical).
 4. **Commit:** `git commit -am "chore: bump version to X.Y.Z"`
 5. **Tag:** `git tag vX.Y.Z`
 6. **Push:** `git push origin main && git push origin vX.Y.Z` — the tag triggers the CI release (`.github/workflows/build.yml`).
@@ -25,3 +25,4 @@ Cut a new release. The version lives in **three** files that must stay in sync, 
 - **Never commit the version bump before rebuilding.** Otherwise CI builds a binary whose embedded version may not match the tag.
 - All three files must match exactly. If the build updates `Cargo.lock`, the `-am` commit will include it (it is tracked).
 - **Verify the build succeeded before committing.** If `npm run tauri build` fails, STOP — do not commit or tag.
+- **The updater-signing error at the end of the local build is expected, not a failure.** `TAURI_SIGNING_PRIVATE_KEY` is a CI-only secret, set in `.github/workflows/build.yml` from `secrets.TAURI_SIGNING_PRIVATE_KEY`; it is intentionally absent locally. The build still compiles and produces the versioned `.app`/`.dmg` before the signing step. Treat the build as successful as long as it reaches `Finished N bundles at:` and the **only** error that follows is the missing private key. Any error *before* bundling (compile errors, version mismatches, etc.) is a real failure — STOP.
