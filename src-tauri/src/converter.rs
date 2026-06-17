@@ -35,6 +35,46 @@ impl ConverterState {
     }
 }
 
+/// Which file `process_queue` keeps after a successful encode. The variant *is* the cleanup
+/// decision — it tells the call site which file (if any) to delete with an irreversible
+/// `trash`/`remove_file`. `Original` and `Neither` are distinct so the call site can keep
+/// the original while choosing whether to also delete the converted output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeptFile {
+    /// Converted output is smaller — keep it, delete the original source.
+    Converted,
+    /// Original is smaller or equal — keep it, delete the converted output.
+    Original,
+    /// No usable converted output (size 0) — keep the original, delete nothing.
+    Neither,
+}
+
+/// Pure cleanup decision for a finished encode: from the original and converted byte sizes,
+/// decide which file to keep, the space saved (signed — negative when the converted file is
+/// larger), and the resulting job status. Behavior-preserving extraction of the logic that
+/// used to be inlined in `process_queue`; the actual deletion stays at the call site.
+fn decide_cleanup(original_size: i64, converted_size: i64) -> (KeptFile, i64, &'static str) {
+    let (kept_file, space_saved) = if converted_size > 0 && converted_size < original_size {
+        (KeptFile::Converted, original_size - converted_size)
+    } else if converted_size > 0 {
+        (KeptFile::Original, original_size - converted_size)
+    } else {
+        (KeptFile::Neither, 0)
+    };
+
+    // Original and Neither both record kept_file = "original" in the DB, so the
+    // skipped/done check treats them identically — exactly as the pre-refactor code did.
+    let status = if matches!(kept_file, KeptFile::Original | KeptFile::Neither)
+        && converted_size >= original_size
+    {
+        "skipped"
+    } else {
+        "done"
+    };
+
+    (kept_file, space_saved, status)
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConversionProgress {
     pub job_id: String,
@@ -372,38 +412,35 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                 let original_size = job.original_size.unwrap_or(0);
                 let conv_size = converted_size.unwrap_or(0);
 
-                let (kept_file, space_saved) = if conv_size > 0 && conv_size < original_size {
-                    // Converted is smaller — keep converted, remove original
-                    match cleanup_mode.as_str() {
+                let (kept, space_saved, status_str) = decide_cleanup(original_size, conv_size);
+
+                // Act on the decision: delete the file we're not keeping (Neither deletes nothing).
+                match kept {
+                    KeptFile::Converted => match cleanup_mode.as_str() {
                         "delete" => {
                             let _ = std::fs::remove_file(&job.source_path);
                         }
                         _ => {
                             let _ = trash::delete(&job.source_path);
                         }
-                    }
-                    ("converted".to_string(), original_size - conv_size)
-                } else if conv_size > 0 {
-                    // Original is smaller or same — keep original, remove converted
-                    match cleanup_mode.as_str() {
+                    },
+                    KeptFile::Original => match cleanup_mode.as_str() {
                         "delete" => {
                             let _ = std::fs::remove_file(&job.output_path);
                         }
                         _ => {
                             let _ = trash::delete(&job.output_path);
                         }
-                    }
-                    ("original".to_string(), original_size - conv_size)
-                } else {
-                    ("original".to_string(), 0i64)
+                    },
+                    KeptFile::Neither => {}
+                }
+
+                let kept_file = match kept {
+                    KeptFile::Converted => "converted",
+                    KeptFile::Original | KeptFile::Neither => "original",
                 };
 
                 let now = chrono::Utc::now().to_rfc3339();
-                let status_str = if kept_file == "original" && conv_size >= original_size {
-                    "skipped"
-                } else {
-                    "done"
-                };
 
                 {
                     let db = db.lock().unwrap();
@@ -653,5 +690,30 @@ mod tests {
         assert_eq!(format_bytes_short(1024), "1KB");
         assert_eq!(format_bytes_short(1_048_576), "1MB");
         assert_eq!(format_bytes_short(1_073_741_824), "1.0GB");
+    }
+
+    #[test]
+    fn decide_cleanup_matrix() {
+        // (original_size, converted_size) -> (kept file, space_saved, status).
+        // This decision drives an irreversible delete, so every cell is pinned.
+        let cases = [
+            // Converted is smaller: keep converted, delete the original, count the win.
+            (1000i64, 600i64, KeptFile::Converted, 400i64, "done"),
+            // Converted is larger: keep original, delete the converted, flag skipped
+            // (space_saved is the negative delta, matching the pre-refactor behavior).
+            (1000, 1500, KeptFile::Original, -500, "skipped"),
+            // Converted equals original: no win, keep original, skipped.
+            (1000, 1000, KeptFile::Original, 0, "skipped"),
+            // No/zero output but the source had a size: keep original, delete nothing, done.
+            (1000, 0, KeptFile::Neither, 0, "done"),
+            // Both zero (degenerate): keep original, delete nothing, skipped.
+            (0, 0, KeptFile::Neither, 0, "skipped"),
+        ];
+        for (orig, conv, want_kept, want_saved, want_status) in cases {
+            let (kept, saved, status) = decide_cleanup(orig, conv);
+            assert_eq!(kept, want_kept, "kept for ({orig}, {conv})");
+            assert_eq!(saved, want_saved, "space_saved for ({orig}, {conv})");
+            assert_eq!(status, want_status, "status for ({orig}, {conv})");
+        }
     }
 }
