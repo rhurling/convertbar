@@ -49,6 +49,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     ",
     )?;
 
+    // Backfill: early error rows were stored without a completion timestamp, which
+    // sorted them below every successful job (NULLs last under ORDER BY completed_at DESC)
+    // and hid them from History. Use created_at as the best available timestamp.
+    conn.execute(
+        "UPDATE jobs SET completed_at = created_at WHERE status = 'error' AND completed_at IS NULL",
+        [],
+    )?;
+
     let defaults: &[(&str, &str)] = &[
         ("preset", preset),
         ("cleanup_mode", "trash"),

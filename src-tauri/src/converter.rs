@@ -169,8 +169,8 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                 Some(p) => p,
                 None => {
                     let _ = db.execute(
-                        "UPDATE jobs SET status = 'error', error_message = 'HandBrakeCLI not found' WHERE id = ?1",
-                        params![job.id],
+                        "UPDATE jobs SET status = 'error', error_message = 'HandBrakeCLI not found', completed_at = ?2 WHERE id = ?1",
+                        params![job.id, chrono::Utc::now().to_rfc3339()],
                     );
                     let _ = app.emit(
                         "job-error",
@@ -247,8 +247,12 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             Ok(c) => c,
             Err(e) => {
                 let _ = db.lock().unwrap().execute(
-                    "UPDATE jobs SET status = 'error', error_message = ?2 WHERE id = ?1",
-                    params![job.id, format!("Failed to start HandBrakeCLI: {}", e)],
+                    "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3 WHERE id = ?1",
+                    params![
+                        job.id,
+                        format!("Failed to start HandBrakeCLI: {}", e),
+                        chrono::Utc::now().to_rfc3339()
+                    ],
                 );
                 let _ = app.emit(
                     "job-error",
@@ -505,8 +509,8 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
 
                 if current_status.as_deref() != Some("error") {
                     let _ = db.lock().unwrap().execute(
-                        "UPDATE jobs SET status = 'error', error_message = 'Conversion failed' WHERE id = ?1",
-                        params![job.id],
+                        "UPDATE jobs SET status = 'error', error_message = 'Conversion failed', completed_at = ?2 WHERE id = ?1",
+                        params![job.id, chrono::Utc::now().to_rfc3339()],
                     );
                     let _ = app.emit(
                         "job-error",
