@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in */package-lock.json|package-lock.json|*/Cargo.lock|Cargo.lock) echo \"Refusing to hand-edit generated lock file: $f (regenerate via 'npm install' or 'cargo build').\" >&2; exit 2 ;; esac; exit 0"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.rs) command -v rustfmt >/dev/null 2>&1 && rustfmt --edition 2021 \"$f\" >/dev/null 2>&1 ;; esac; exit 0"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/check-version-sync.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
