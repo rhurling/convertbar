@@ -80,8 +80,13 @@ pub fn get_preset_metadata(
         )
     })?;
 
-    let preset_obj = &json["PresetList"][0];
+    Ok(classify_preset(&json["PresetList"][0], preset_name))
+}
 
+/// Pure classification of a preset's exported JSON (the `PresetList[0]` object) plus its
+/// name into the metadata used for output-filename suffixes. Split out of
+/// `get_preset_metadata` so it can be table-tested without invoking HandBrakeCLI.
+fn classify_preset(preset_obj: &serde_json::Value, preset_name: &str) -> PresetMetadata {
     let video_encoder = preset_obj["VideoEncoder"]
         .as_str()
         .unwrap_or("")
@@ -175,13 +180,13 @@ pub fn get_preset_metadata(
     }
     .to_string();
 
-    Ok(PresetMetadata {
+    PresetMetadata {
         codec,
         resolution,
         quality,
         preset: preset_slug,
         device,
-    })
+    }
 }
 
 fn slugify(name: &str) -> String {
@@ -303,5 +308,84 @@ mod tests {
             resolve_suffix_template(".{resolution}-{codec}", &m),
             ".1080p"
         );
+    }
+
+    #[test]
+    fn classify_preset_maps_encoder_to_codec() {
+        // Realistic HandBrake VideoEncoder strings -> our codec slug.
+        let cases = [
+            ("x265", "h265"),
+            ("x265_10bit", "h265"),
+            ("vt_h265", "h265"),
+            ("hevc", "h265"),
+            ("x264", "h264"),
+            ("nvenc_h264", "h264"),
+            ("svt_av1", "av1"),
+            ("vp9", "vp9"),
+            ("prores_ks", "prores"),
+            ("dnxhr", "dnxhr"),
+            ("ffv1", "ffv1"),
+            ("mpeg2", "unknown"),
+        ];
+        for (encoder, want) in cases {
+            let obj = serde_json::json!({ "VideoEncoder": encoder });
+            assert_eq!(classify_preset(&obj, "preset").codec, want, "encoder {encoder}");
+        }
+    }
+
+    #[test]
+    fn classify_preset_maps_name_to_device() {
+        let cases = [
+            ("Apple VideoToolbox H.265 1080p", "apple-videotoolbox"),
+            ("Apple 1080p30 Surround", "apple"),
+            ("Amazon Fire 1080p30 Surround", "amazon-fire"),
+            ("Android 1080p30 Surround", "android"),
+            ("Chromecast 1080p30 Surround", "chromecast"),
+            ("Playstation 1080p30 Surround", "playstation"),
+            ("Roku 1080p30 Surround", "roku"),
+            ("Xbox 1080p30 Surround", "xbox"),
+            ("H.265 NVENC 1080p", "nvenc"),
+            ("H.265 QSV 1080p", "qsv"),
+            ("H.265 VCN 1080p", "vcn"),
+            ("H.265 MF 1080p", "mf"),
+            ("Production Standard", ""),
+        ];
+        for (name, want) in cases {
+            let obj = serde_json::json!({});
+            assert_eq!(classify_preset(&obj, name).device, want, "name {name}");
+        }
+    }
+
+    #[test]
+    fn classify_preset_maps_name_prefix_to_quality() {
+        // "Super HQ" must win over "HQ" — it's checked first.
+        let cases = [
+            ("Very Fast 1080p30", "vf"),
+            ("Fast 1080p30", "f"),
+            ("Super HQ 1080p30 Surround", "shq"),
+            ("HQ 1080p30 Surround", "hq"),
+            ("Creator 2160p60 4K HEVC", "cr"),
+            ("Production Standard", "prod"),
+            ("Preservation 2160p60", "pres"),
+        ];
+        for (name, want) in cases {
+            let obj = serde_json::json!({});
+            assert_eq!(classify_preset(&obj, name).quality, want, "name {name}");
+        }
+    }
+
+    #[test]
+    fn classify_preset_quality_falls_back_to_rounded_slider() {
+        // No recognized name prefix -> q{rounded VideoQualitySlider}.
+        let obj = serde_json::json!({ "VideoQualitySlider": 22.4 });
+        assert_eq!(classify_preset(&obj, "Apple 1080p30 Surround").quality, "q22");
+    }
+
+    #[test]
+    fn classify_preset_reads_resolution_from_height() {
+        let zero = serde_json::json!({ "PictureHeight": 0 });
+        assert_eq!(classify_preset(&zero, "preset").resolution, "");
+        let hd = serde_json::json!({ "PictureHeight": 1080 });
+        assert_eq!(classify_preset(&hd, "preset").resolution, "1080p");
     }
 }
