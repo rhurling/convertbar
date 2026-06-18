@@ -130,12 +130,35 @@ commit_release() {
   git commit -S -am "chore: bump version to $target"
   echo "Committed (signed) on chore/release-$target."
 }
-# STUB — replaced in Task 4
-push_and_pr() { echo "stub: push_and_pr not implemented" >&2; exit 1; }
-# STUB — replaced in Task 4
-confirm_checkpoint() { echo "stub: confirm_checkpoint not implemented" >&2; exit 1; }
-# STUB — replaced in Task 4
-merge_and_tag() { echo "stub: merge_and_tag not implemented" >&2; exit 1; }
+push_and_pr() {
+  local target="$1" notes_file="$2" branch="chore/release-$1"
+  git push -u origin "$branch"
+  if [ -n "$notes_file" ] && [ -f "$notes_file" ]; then
+    gh pr create --base main --head "$branch" --title "Release $target" --body-file "$notes_file"
+  else
+    gh pr create --base main --head "$branch" --title "Release $target" --body "Release $target"
+  fi
+}
+confirm_checkpoint() {
+  local target="$1" answer
+  [ "$YES" = "1" ] && return 0
+  printf 'Merge PR, tag v%s and push (triggers CI release)? [y/N] ' "$target"
+  read -r answer || answer=""
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) echo "Aborted at checkpoint — PR left open for manual merge."; exit 0 ;;
+  esac
+}
+merge_and_tag() {
+  local target="$1"
+  git switch main
+  gh pr merge "chore/release-$target" --admin --squash --delete-branch
+  git pull --ff-only
+  git tag -s "v$target" -m "v$target"
+  git push origin "v$target"
+  echo "Released v$target — CI build triggered."
+  gh release view "v$target" --json url -q .url 2>/dev/null || true
+}
 
 main() {
   local version_arg="" dry=0 notes=""
