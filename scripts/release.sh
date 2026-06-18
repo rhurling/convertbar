@@ -65,8 +65,32 @@ Planned steps:
 EOF
 }
 
-# STUB — replaced in Task 2
-preflight() { echo "stub: preflight not implemented" >&2; exit 1; }
+preflight() {
+  local target="$1" cur branch
+  cur="$(current_version)"
+
+  # 1. Version must be strictly newer (checked first — deterministic).
+  if ! semver_gt "$target" "$cur"; then
+    echo "error: version $target is not newer than current $cur" >&2
+    exit 1
+  fi
+  # 2. Required tools.
+  local t
+  for t in node npm git gh; do
+    command -v "$t" >/dev/null 2>&1 || { echo "error: required tool '$t' not found" >&2; exit 1; }
+  done
+  # 3. gh authenticated.
+  gh auth status >/dev/null 2>&1 || { echo "error: gh not authenticated (run: gh auth login)" >&2; exit 1; }
+  # 4. On main.
+  branch="$(git branch --show-current)"
+  [ "$branch" = "main" ] || { echo "error: must be on main (currently on '$branch')" >&2; exit 1; }
+  # 5. Clean working tree.
+  [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean" >&2; exit 1; }
+  # 6. In sync with origin/main.
+  git fetch --quiet origin main
+  [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || \
+    { echo "error: local main is not in sync with origin/main" >&2; exit 1; }
+}
 # STUB — replaced in Task 3
 bump_manifests() { echo "stub: bump_manifests not implemented" >&2; exit 1; }
 # STUB — replaced in Task 3

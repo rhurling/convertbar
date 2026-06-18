@@ -38,6 +38,18 @@ describe("release.sh", () => {
     expect(git(["status", "--porcelain"])).toBe(before);
   });
 
+  it("aborts in preflight when the version is not newer, mutating nothing", () => {
+    const before = git(["status", "--porcelain"]);
+
+    const { status, stderr } = runScript(["0.0.1"]);
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("not newer");
+    expect(git(["status", "--porcelain"])).toBe(before);
+    expect(git(["branch", "--list", "chore/release-0.0.1"])).toBe("");
+    expect(git(["tag", "--list", "v0.0.1"])).toBe("");
+  });
+
   it("--dry-run prints the plan for the resolved version and mutates nothing", () => {
     const target = bumpMinor(currentVersion());
     const before = git(["status", "--porcelain"]);
