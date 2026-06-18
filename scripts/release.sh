@@ -108,6 +108,9 @@ bump_manifests() {
 build_app() {
   echo "Building (bakes the version into the binary)..."
   local out
+  # Exit code ignored on purpose: the local build ends with an expected (CI-only)
+  # TAURI_SIGNING_PRIVATE_KEY error after bundling. Success is detected by the
+  # "Finished N bundles" line below, not the exit code.
   out="$(npm run tauri build 2>&1)" || true
   if printf '%s' "$out" | grep -qE "Finished [0-9]+ bundles"; then
     echo "Build OK — bundles produced."
@@ -119,6 +122,10 @@ build_app() {
 }
 commit_release() {
   local target="$1"
+  if git rev-parse --verify "chore/release-$target" >/dev/null 2>&1; then
+    echo "error: branch chore/release-$target already exists — delete it or finish the previous run" >&2
+    exit 1
+  fi
   git switch -c "chore/release-$target"
   git commit -S -am "chore: bump version to $target"
   echo "Committed (signed) on chore/release-$target."
