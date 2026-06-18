@@ -26,7 +26,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 trash = "5"
 regex = "1"
-dirs = "5"
+dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-notification = "2"
 tauri-plugin-process = "2"
