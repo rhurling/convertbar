@@ -15,6 +15,7 @@ jobs:
           node-version: lts/*
       - run: npm ci
       - run: npm test
+      - run: npm run build # tsc type-check + vite build — mirrors the release build, which CI otherwise never exercises
 
   rust:
     strategy:
