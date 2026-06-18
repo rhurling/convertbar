@@ -83,13 +83,17 @@ preflight() {
   gh auth status >/dev/null 2>&1 || { echo "error: gh not authenticated (run: gh auth login)" >&2; exit 1; }
   # 4. On main.
   branch="$(git branch --show-current)"
+  [ -n "$branch" ] || { echo "error: HEAD is detached — checkout main first" >&2; exit 1; }
   [ "$branch" = "main" ] || { echo "error: must be on main (currently on '$branch')" >&2; exit 1; }
   # 5. Clean working tree.
   [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean" >&2; exit 1; }
   # 6. In sync with origin/main.
-  git fetch --quiet origin main
-  [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || \
-    { echo "error: local main is not in sync with origin/main" >&2; exit 1; }
+  git fetch --quiet origin main || { echo "error: could not fetch from origin (are you online?)" >&2; exit 1; }
+  local head origin_head
+  head="$(git rev-parse HEAD)"
+  origin_head="$(git rev-parse origin/main 2>/dev/null)" || \
+    { echo "error: could not resolve origin/main — does the remote use a different default branch?" >&2; exit 1; }
+  [ "$head" = "$origin_head" ] || { echo "error: local main is not in sync with origin/main" >&2; exit 1; }
 }
 # STUB — replaced in Task 3
 bump_manifests() { echo "stub: bump_manifests not implemented" >&2; exit 1; }
