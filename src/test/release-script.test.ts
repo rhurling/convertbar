@@ -28,6 +28,16 @@ function bumpMinor(v: string): string {
 }
 
 describe("release.sh", () => {
+  it("errors clearly when --notes has no file argument, mutating nothing", () => {
+    const before = git(["status", "--porcelain"]);
+
+    const { status, stderr } = runScript(["minor", "--notes"]);
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("--notes requires a file argument");
+    expect(git(["status", "--porcelain"])).toBe(before);
+  });
+
   it("--dry-run prints the plan for the resolved version and mutates nothing", () => {
     const target = bumpMinor(currentVersion());
     const before = git(["status", "--porcelain"]);
