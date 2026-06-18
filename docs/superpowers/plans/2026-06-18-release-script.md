@@ -179,7 +179,9 @@ main() {
     case "$1" in
       -y|--yes|--force) YES=1 ;;
       --dry-run) dry=1 ;;
-      --notes) shift; notes="${1:-}" ;;
+      --notes)
+        [ $# -ge 2 ] || { echo "error: --notes requires a file argument" >&2; usage >&2; exit 1; }
+        notes="$2"; shift ;;
       -h|--help) usage; exit 0 ;;
       -*) echo "error: unknown option '$1'" >&2; usage >&2; exit 1 ;;
       *)
