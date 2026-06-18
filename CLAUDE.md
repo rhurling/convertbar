@@ -6,7 +6,7 @@ Menu bar app for batch video conversion using HandBrakeCLI. Built with Tauri 2 +
 
 `main` is protected (changes via PR, no merge commits, signed commits), so the bump lands through a PR and the release is triggered by the tag — never by a direct push to `main`. Use the `/release` skill, which automates this:
 
-1. Edit version in `src-tauri/tauri.conf.json`, `package.json`, `src-tauri/Cargo.toml`
+1. Edit version in `src-tauri/tauri.conf.json`, `package.json`, `src-tauri/Cargo.toml`, then run `npm install --package-lock-only` to sync `package-lock.json` (the build refreshes `Cargo.lock` but never the npm lockfile)
 2. Rebuild: `npm run tauri build` (bakes the version into the binary)
 3. Branch + signed commit: `git switch -c chore/release-X.Y.Z && git commit -S -am "chore: bump version to X.Y.Z"`
 4. Open a PR (use `/release-notes` for the body) and **squash-merge** it — never push to `main` directly
