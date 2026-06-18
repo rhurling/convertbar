@@ -432,7 +432,7 @@ with:
 
 ```bash
 push_and_pr() {
-  local target="$1" notes_file="$2" branch="chore/release-$1"
+  local target="$1" notes_file="$2" branch="chore/release-$target"
   git push -u origin "$branch"
   if [ -n "$notes_file" ] && [ -f "$notes_file" ]; then
     gh pr create --base main --head "$branch" --title "Release $target" --body-file "$notes_file"
@@ -482,7 +482,7 @@ merge_and_tag() {
   local target="$1"
   git switch main
   gh pr merge "chore/release-$target" --admin --squash --delete-branch
-  git pull --ff-only
+  git pull --ff-only || { echo "error: could not fast-forward main after merge — recover with: git pull --ff-only && git tag -s v$target -m v$target && git push origin v$target" >&2; exit 1; }
   git tag -s "v$target" -m "v$target"
   git push origin "v$target"
   echo "Released v$target — CI build triggered."
