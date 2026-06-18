@@ -95,12 +95,34 @@ preflight() {
     { echo "error: could not resolve origin/main — does the remote use a different default branch?" >&2; exit 1; }
   [ "$head" = "$origin_head" ] || { echo "error: local main is not in sync with origin/main" >&2; exit 1; }
 }
-# STUB — replaced in Task 3
-bump_manifests() { echo "stub: bump_manifests not implemented" >&2; exit 1; }
-# STUB — replaced in Task 3
-build_app() { echo "stub: build_app not implemented" >&2; exit 1; }
-# STUB — replaced in Task 3
-commit_release() { echo "stub: commit_release not implemented" >&2; exit 1; }
+bump_manifests() {
+  local target="$1"
+  # package.json + package-lock.json in one step (no git tag/commit).
+  npm version "$target" --no-git-tag-version >/dev/null
+  # tauri.conf.json: first "version" key is the top-level app version.
+  perl -0pi -e 's/("version":\s*")[^"]*"/${1}'"$target"'"/' src-tauri/tauri.conf.json
+  # Cargo.toml: first line-anchored version is the [package] version.
+  perl -0pi -e 's/^version = "[^"]*"/version = "'"$target"'"/m' src-tauri/Cargo.toml
+  echo "Bumped manifests + lockfile to $target."
+}
+build_app() {
+  echo "Building (bakes the version into the binary)..."
+  local out
+  out="$(npm run tauri build 2>&1)" || true
+  if printf '%s' "$out" | grep -qE "Finished [0-9]+ bundles"; then
+    echo "Build OK — bundles produced."
+  else
+    printf '%s\n' "$out" | tail -30 >&2
+    echo "error: build did not reach bundling — aborting before any commit or push." >&2
+    exit 1
+  fi
+}
+commit_release() {
+  local target="$1"
+  git switch -c "chore/release-$target"
+  git commit -S -am "chore: bump version to $target"
+  echo "Committed (signed) on chore/release-$target."
+}
 # STUB — replaced in Task 4
 push_and_pr() { echo "stub: push_and_pr not implemented" >&2; exit 1; }
 # STUB — replaced in Task 4
