@@ -91,7 +91,7 @@ describe("useQueue", () => {
     expect(result.current.progress).toEqual(payload);
   });
 
-  it.each(["job-status-changed", "job-completed", "job-error"])(
+  it.each(["job-status-changed", "job-completed", "job-error", "queue-updated"])(
     "re-fetches the queue when a %s event fires",
     async (event) => {
       queueData = [job({ id: "1", status: "queued" })];

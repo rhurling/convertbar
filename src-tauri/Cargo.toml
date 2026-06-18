@@ -28,8 +28,11 @@ trash = "5"
 regex = "1"
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
-tauri-plugin-notification = "2"
 tauri-plugin-process = "2"
+tauri-plugin-dialog = "2"
+notify = "8"
+tauri-plugin-fs = "2"
+tauri-plugin-notification = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

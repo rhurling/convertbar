@@ -65,3 +65,13 @@ pub struct HandbrakeStatus {
     pub path: String,
     pub version: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchedDirectory {
+    pub id: String,
+    pub path: String,
+    pub recursive: bool,
+    pub stability_delay_secs: i64,
+    pub enabled: bool,
+    pub created_at: String,
+}

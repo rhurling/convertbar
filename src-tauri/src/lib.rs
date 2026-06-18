@@ -3,6 +3,7 @@ mod converter;
 mod db;
 mod handbrake;
 mod types;
+mod watcher;
 
 use converter::{ConverterState, MenuBarUpdate};
 use rusqlite::{params, Connection};
@@ -27,6 +28,8 @@ pub fn run() {
     let converter_state = Arc::new(ConverterState::new());
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::Builder::new().build())
@@ -38,6 +41,7 @@ pub fn run() {
             preset_cache: Mutex::new(HashMap::new()),
         })
         .manage(converter_state)
+        .manage(watcher::WatcherState::new())
         .invoke_handler(tauri::generate_handler![
             commands::settings::get_settings,
             commands::settings::update_setting,
@@ -66,6 +70,12 @@ pub fn run() {
             commands::converter::quit_app,
             commands::converter::get_platform_capabilities,
             commands::handbrake::validate_handbrake,
+            commands::watch::get_watched_directories,
+            commands::watch::add_watched_directory,
+            commands::watch::update_watched_directory,
+            commands::watch::set_watched_directory_enabled,
+            commands::watch::remove_watched_directory,
+            commands::watch::pick_folder,
         ])
         .setup(|app| {
             // Shared error flag for tray icon state
@@ -340,6 +350,9 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 converter::run_queue(app_handle, db_arc, conv_arc);
             }
+
+            // Arm directory watchers and ingest any files already present in enabled folders.
+            watcher::start(app.handle().clone());
 
             // Check for updates on startup
             let handle = app.handle().clone();

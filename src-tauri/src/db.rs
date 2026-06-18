@@ -46,6 +46,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             preset_name TEXT PRIMARY KEY,
             suffix      TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS watched_directories (
+            id                   TEXT PRIMARY KEY,
+            path                 TEXT NOT NULL UNIQUE,
+            recursive            INTEGER NOT NULL DEFAULT 0,
+            stability_delay_secs INTEGER NOT NULL DEFAULT 5,
+            enabled              INTEGER NOT NULL DEFAULT 1,
+            created_at           TEXT NOT NULL
+        );
     ",
     )?;
 
@@ -179,6 +187,45 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 13);
+    }
+
+    #[test]
+    fn init_db_creates_empty_watched_directories_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // The table exists and starts empty — watching is opt-in, nothing is seeded.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM watched_directories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // The schema accepts the columns the feature relies on, with the documented defaults.
+        conn.execute(
+            "INSERT INTO watched_directories (id, path, created_at) VALUES ('w1', '/movies', '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (recursive, delay, enabled): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT recursive, stability_delay_secs, enabled FROM watched_directories WHERE id = 'w1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(recursive, 0);
+        assert_eq!(delay, 5);
+        assert_eq!(enabled, 1);
+
+        // `path` is unique so the same folder can't be registered twice.
+        let dup = conn.execute(
+            "INSERT INTO watched_directories (id, path, created_at) VALUES ('w2', '/movies', '2020-01-02T00:00:00Z')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate path should violate UNIQUE constraint"
+        );
     }
 
     #[test]

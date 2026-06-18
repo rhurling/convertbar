@@ -11,14 +11,14 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts",
 ];
 
-fn is_video_file(path: &Path) -> bool {
+pub(crate) fn is_video_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
         .unwrap_or(false)
 }
 
-fn scan_video_files(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn scan_video_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -78,7 +78,7 @@ fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
     handbrake::detect_handbrake_path().ok_or_else(|| "HandBrakeCLI not found".to_string())
 }
 
-fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, String> {
+pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, String> {
     // First, read preset and suffix template from DB
     let (preset, suffix_template, hb_path, skip_already_converted) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
