@@ -15,6 +15,8 @@ Cut a new release. The version lives in **three** files that must stay in sync, 
    - `src-tauri/tauri.conf.json` (`"version"`)
    - `package.json` (`"version"`)
    - `src-tauri/Cargo.toml` (`[package]` `version`)
+
+   Then sync the npm lockfile: `npm install --package-lock-only` — this updates `package-lock.json`'s version to match `package.json`. The rebuild in step 3 updates `Cargo.lock` but never touches `package-lock.json`, so without this it silently drifts behind.
 3. **Rebuild:** `npm run tauri build` — this bakes the version into the binary. Do NOT skip or reorder this. The build will end with `Error A public key has been found, but no private key ... TAURI_SIGNING_PRIVATE_KEY` — this is **expected locally** and does not mean the build failed (see Critical).
 4. **Branch & commit (signed).** `main` is protected — changes must land via a PR, with no merge commits and verified signatures. Never commit or push to `main` directly:
    ```
@@ -40,7 +42,7 @@ Cut a new release. The version lives in **three** files that must stay in sync, 
 ## Critical
 
 - **Never commit the version bump before rebuilding.** Otherwise CI builds a binary whose embedded version may not match the tag.
-- All three files must match exactly. If the build updates `Cargo.lock`, the `-am` commit will include it (it is tracked).
+- All three files must match exactly. The `-am` commit also sweeps in `Cargo.lock` (refreshed by the build) and `package-lock.json` (refreshed by the lockfile sync in step 2) — both are tracked.
 - **The squash merge changes the commit SHA but not the tree** — the tagged commit still contains `X.Y.Z` in all three manifests, so CI rebuilds from the tag with the correct embedded version.
 - **Verify the build succeeded before committing.** If `npm run tauri build` fails, STOP — do not commit or tag.
 - **The updater-signing error at the end of the local build is expected, not a failure.** `TAURI_SIGNING_PRIVATE_KEY` is a CI-only secret, set in `.github/workflows/build.yml` from `secrets.TAURI_SIGNING_PRIVATE_KEY`; it is intentionally absent locally. The build still compiles and produces the versioned `.app`/`.dmg` before the signing step. Treat the build as successful as long as it reaches `Finished N bundles at:` and the **only** error that follows is the missing private key. Any error *before* bundling (compile errors, version mismatches, etc.) is a real failure — STOP.
