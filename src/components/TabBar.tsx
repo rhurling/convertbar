@@ -1,6 +1,6 @@
 import { commands } from "../lib/tauri";
 
-type Tab = "queue" | "history" | "settings";
+type Tab = "queue" | "history" | "watch" | "settings";
 
 interface TabBarProps {
   activeTab: Tab;
@@ -10,6 +10,7 @@ interface TabBarProps {
 const tabs: { id: Tab; label: string }[] = [
   { id: "queue", label: "Queue" },
   { id: "history", label: "History" },
+  { id: "watch", label: "Watch" },
   { id: "settings", label: "Settings" },
 ];
 

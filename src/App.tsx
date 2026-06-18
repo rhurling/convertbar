@@ -2,11 +2,12 @@ import { useState, useEffect } from "react";
 import TabBar from "./components/TabBar";
 import QueuePage from "./pages/QueuePage";
 import HistoryPage from "./pages/HistoryPage";
+import WatchedFoldersPage from "./pages/WatchedFoldersPage";
 import SettingsPage from "./pages/SettingsPage";
 import { commands, type HandbrakeStatus } from "./lib/tauri";
 import "./App.css";
 
-type Tab = "queue" | "history" | "settings";
+type Tab = "queue" | "history" | "watch" | "settings";
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("queue");
@@ -37,6 +38,7 @@ function App() {
       <div className="page">
         {activeTab === "queue" && <QueuePage hbStatus={hbStatus} />}
         {activeTab === "history" && <HistoryPage />}
+        {activeTab === "watch" && <WatchedFoldersPage />}
         {activeTab === "settings" && <SettingsPage onHbPathChanged={refreshHbStatus} />}
       </div>
     </div>

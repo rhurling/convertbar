@@ -80,6 +80,15 @@ export interface PresetMetadata {
   device: string;
 }
 
+export interface WatchedDirectory {
+  id: string;
+  path: string;
+  recursive: boolean;
+  stability_delay_secs: number;
+  enabled: boolean;
+  created_at: string;
+}
+
 export const commands = {
   addFiles: (paths: string[]) => invoke<JobInfo[]>("add_files", { paths }),
   scanFolder: (path: string) =>
@@ -120,4 +129,31 @@ export const commands = {
   validateHandbrake: () => invoke<HandbrakeStatus>("validate_handbrake"),
   quitApp: () => invoke<void>("quit_app"),
   hideWindow: () => getCurrentWebviewWindow().hide(),
+  getWatchedDirectories: () =>
+    invoke<WatchedDirectory[]>("get_watched_directories"),
+  addWatchedDirectory: (
+    path: string,
+    recursive: boolean,
+    stabilityDelaySecs: number,
+  ) =>
+    invoke<WatchedDirectory>("add_watched_directory", {
+      path,
+      recursive,
+      stabilityDelaySecs,
+    }),
+  updateWatchedDirectory: (
+    id: string,
+    recursive: boolean,
+    stabilityDelaySecs: number,
+  ) =>
+    invoke<void>("update_watched_directory", {
+      id,
+      recursive,
+      stabilityDelaySecs,
+    }),
+  setWatchedDirectoryEnabled: (id: string, enabled: boolean) =>
+    invoke<void>("set_watched_directory_enabled", { id, enabled }),
+  removeWatchedDirectory: (id: string) =>
+    invoke<void>("remove_watched_directory", { id }),
+  pickFolder: () => invoke<string | null>("pick_folder"),
 };

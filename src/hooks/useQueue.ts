@@ -33,6 +33,9 @@ export function useQueue() {
       listen("job-error", () => {
         refresh();
       }),
+      listen("queue-updated", () => {
+        refresh();
+      }),
     ];
 
     return () => {
