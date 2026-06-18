@@ -1,48 +1,33 @@
 ---
 name: release
-description: Use when cutting a new ConvertBar release or bumping its version — bumps the version across all three manifests, rebuilds so the version is baked into the binary, then commits, tags, and pushes to trigger the CI release.
+description: Use when cutting a new ConvertBar release or bumping its version — picks the version and release notes, then hands the mechanical bump/build/commit/PR/merge/tag/push to scripts/release.sh.
 disable-model-invocation: true
 ---
 
 # Release ConvertBar
 
-Cut a new release. The version lives in **three** files that must stay in sync, and the binary embeds the version at build time — so the rebuild MUST happen before the commit.
+The deterministic mechanics live in `scripts/release.sh`. This skill supplies the judgment around it and interprets the result.
 
 ## Steps
 
-1. **Determine the target version** `X.Y.Z`. Use the argument if given; otherwise read the current version from `package.json` and ask which part to bump (major/minor/patch).
-2. **Bump all three manifests** to `X.Y.Z`:
-   - `src-tauri/tauri.conf.json` (`"version"`)
-   - `package.json` (`"version"`)
-   - `src-tauri/Cargo.toml` (`[package]` `version`)
+1. **Determine the target version.** Use the argument if given. Otherwise read the current version from `package.json` and ask which part to bump (major/minor/patch).
+2. **Draft release notes.** Run the `/release-notes` skill over `<previous-tag>..HEAD` and write its markdown to a temp file, e.g. `/tmp/release-notes.md`.
+3. **Run the release script.** You will be prompted to approve it — that approval is the release gate:
+   ```
+   ./scripts/release.sh <X.Y.Z|patch|minor|major> --yes --notes /tmp/release-notes.md
+   ```
+   `--yes` runs it non-interactively. The script bumps all manifests + the lockfile, rebuilds (baking the version into the binary), commits signed on a release branch, opens a PR, admin-squash-merges it, then tags the merged commit and pushes the tag — which triggers the CI release.
+4. **Interpret the result.**
+   - Success is the script reaching `Finished N bundles`; it already ignores the trailing `TAURI_SIGNING_PRIVATE_KEY` error (a CI-only secret, absent locally). Do not flag that error.
+   - On any non-zero exit, STOP and report what failed. The script makes no commit or push until the build succeeds; if it aborts after pushing, it leaves an open PR.
+   - On success the script prints `Released vX.Y.Z — CI build triggered`. CI creates the GitHub release as a **draft** and finalizes it once the multi-platform build completes, so a release URL may not resolve immediately — point the user to the Actions run and `https://github.com/rhurling/convertbar/releases/tag/vX.Y.Z` to watch.
 
-   Then sync the npm lockfile: `npm install --package-lock-only` — this updates `package-lock.json`'s version to match `package.json`. The rebuild in step 3 updates `Cargo.lock` but never touches `package-lock.json`, so without this it silently drifts behind.
-3. **Rebuild:** `npm run tauri build` — this bakes the version into the binary. Do NOT skip or reorder this. The build will end with `Error A public key has been found, but no private key ... TAURI_SIGNING_PRIVATE_KEY` — this is **expected locally** and does not mean the build failed (see Critical).
-4. **Branch & commit (signed).** `main` is protected — changes must land via a PR, with no merge commits and verified signatures. Never commit or push to `main` directly:
-   ```
-   git switch -c chore/release-X.Y.Z
-   git commit -S -am "chore: bump version to X.Y.Z"
-   git push -u origin chore/release-X.Y.Z
-   ```
-5. **Draft release notes** for the PR body: run the `/release-notes` skill over the range `<previous-tag>..HEAD` and keep its markdown output.
-6. **Open and squash-merge the PR:**
-   ```
-   gh pr create --title "Release X.Y.Z" --body "<release notes from step 5>"
-   gh pr merge --squash --delete-branch
-   git switch main && git pull --ff-only
-   ```
-   Squash keeps history linear (no merge commit) and GitHub re-signs the landed commit (verified). The repo has merge commits disabled, so only squash/rebase are offered.
-7. **Tag & push** the merged commit — this triggers the release:
-   ```
-   git tag -s vX.Y.Z -m "vX.Y.Z"
-   git push origin vX.Y.Z
-   ```
-   The tag triggers the CI release (`.github/workflows/build.yml`). Tags aren't covered by the branch ruleset, so this push succeeds even though direct pushes to `main` are blocked.
+## Preview / manual use
 
-## Critical
+- `./scripts/release.sh <version> --dry-run` prints the plan and changes nothing.
+- Run without `--yes` to get a `[y/N]` confirmation before the merge/tag/push (for a human running it directly).
 
-- **Never commit the version bump before rebuilding.** Otherwise CI builds a binary whose embedded version may not match the tag.
-- All three files must match exactly. The `-am` commit also sweeps in `Cargo.lock` (refreshed by the build) and `package-lock.json` (refreshed by the lockfile sync in step 2) — both are tracked.
-- **The squash merge changes the commit SHA but not the tree** — the tagged commit still contains `X.Y.Z` in all three manifests, so CI rebuilds from the tag with the correct embedded version.
-- **Verify the build succeeded before committing.** If `npm run tauri build` fails, STOP — do not commit or tag.
-- **The updater-signing error at the end of the local build is expected, not a failure.** `TAURI_SIGNING_PRIVATE_KEY` is a CI-only secret, set in `.github/workflows/build.yml` from `secrets.TAURI_SIGNING_PRIVATE_KEY`; it is intentionally absent locally. The build still compiles and produces the versioned `.app`/`.dmg` before the signing step. Treat the build as successful as long as it reaches `Finished N bundles at:` and the **only** error that follows is the missing private key. Any error *before* bundling (compile errors, version mismatches, etc.) is a real failure — STOP.
+## Notes
+
+- `main` is protected (PR-only, no merge commits, signed commits). The script honours this: it lands the bump via an admin squash-merge and tags the merged commit; the **tag** push (not a branch push) triggers `.github/workflows/build.yml`.
+- The script is registered as an `ask` permission in `.claude/settings.local.json`, so every run prompts for approval before anything happens.
