@@ -383,18 +383,7 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             None
         };
 
-        let exit_status = {
-            let mut child_guard = converter.current_child.lock().unwrap();
-            if let Some(ref mut child) = *child_guard {
-                child.wait()
-            } else {
-                // Child was already taken (e.g. by cancel), treat as failure
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Process handle missing",
-                ))
-            }
-        };
+        let exit_status = wait_for_active_child(converter);
 
         if let Some(handle) = progress_thread {
             let _ = handle.join();
@@ -642,6 +631,35 @@ pub fn run_queue(app: AppHandle, db: Arc<Mutex<Connection>>, converter: Arc<Conv
     });
 }
 
+/// Waits for the active child process to exit, polling with `try_wait` so the
+/// `current_child` lock is released between checks. This lets `cancel_conversion`
+/// acquire the lock and kill the process instead of deadlocking against a lock held
+/// for the entire blocking `wait()`. Progress is reported by the separate stdout
+/// thread, so the poll interval is invisible to the user.
+fn wait_for_active_child(converter: &ConverterState) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        {
+            let mut child_guard = converter.current_child.lock().unwrap();
+            match child_guard.as_mut() {
+                Some(child) => {
+                    if let Some(status) = child.try_wait()? {
+                        return Ok(status);
+                    }
+                    // None: still running — release the lock and poll again
+                }
+                None => {
+                    // Child was already taken (e.g. by cancel), treat as failure
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Process handle missing",
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn format_bytes_short(bytes: i64) -> String {
     let abs = bytes.unsigned_abs();
     if abs >= 1_073_741_824 {
@@ -690,6 +708,61 @@ mod tests {
         assert_eq!(format_bytes_short(1024), "1KB");
         assert_eq!(format_bytes_short(1_048_576), "1MB");
         assert_eq!(format_bytes_short(1_073_741_824), "1.0GB");
+    }
+
+    // Regression test for the cancel-freeze deadlock: the queue thread must not hold
+    // the `current_child` lock across the blocking wait, or `cancel_conversion` (which
+    // needs that same lock to kill the child) blocks the main thread and freezes the UI.
+    #[cfg(unix)]
+    #[test]
+    fn cancel_can_kill_child_while_wait_in_progress() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let converter = Arc::new(ConverterState::new());
+
+        // A long-running child stands in for an active HandBrakeCLI encode. It must
+        // outlive the timeouts below so a premature exit can't mask the deadlock.
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        *converter.current_child.lock().unwrap() = Some(child);
+
+        // Thread A: the queue loop's wait.
+        let waiter_rx = {
+            let converter = converter.clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = wait_for_active_child(&converter);
+                let _ = tx.send(());
+            });
+            rx
+        };
+
+        // Let Thread A enter the wait before cancel races for the lock.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Thread B: emulate cancel_conversion acquiring the lock and killing the child.
+        let killed_rx = {
+            let converter = converter.clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                if let Some(child) = converter.current_child.lock().unwrap().as_mut() {
+                    let _ = child.kill();
+                }
+                let _ = tx.send(());
+            });
+            rx
+        };
+
+        // Cancel must acquire `current_child` and kill promptly. If the wait holds the
+        // lock across the blocking wait, this lock never frees and recv_timeout fails.
+        killed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancel could not acquire current_child lock — wait holds it across the wait");
+
+        // And the waiter must observe the killed process and return.
+        waiter_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wait did not return after the child was killed");
     }
 
     #[test]

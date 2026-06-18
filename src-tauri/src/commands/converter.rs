@@ -197,7 +197,39 @@ pub fn cancel_conversion(
     state: State<'_, AppState>,
     converter_state: State<'_, Arc<ConverterState>>,
 ) -> Result<(), String> {
-    // Kill the child process using cross-platform Child::kill()
+    let job_id_val = {
+        let job_id = converter_state
+            .current_job_id
+            .lock()
+            .map_err(|e| e.to_string())?;
+        job_id.clone()
+    };
+
+    // Mark the active job cancelled *before* killing the process. The queue loop only
+    // observes the dead process after the kill, and its error branch skips its own
+    // status write and "failed" notification when the status is already 'error' — so
+    // writing first prevents a spurious "failed" event/notification racing the cancel.
+    let (output_path, update_result) = match job_id_val {
+        Some(ref job_id) => {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            let output_path: Option<String> = db
+                .query_row(
+                    "SELECT output_path FROM jobs WHERE id = ?1",
+                    rusqlite::params![job_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            let update_result = db.execute(
+                "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user' WHERE id = ?1",
+                rusqlite::params![job_id],
+            );
+            (output_path, Some(update_result))
+        }
+        None => (None, None),
+    };
+
+    // Kill the child process using cross-platform Child::kill(). Runs even if the status
+    // write above failed, so a cancel always stops the process.
     {
         let mut child_guard = converter_state
             .current_child
@@ -221,34 +253,15 @@ pub fn cancel_conversion(
         }
     }
 
-    let job_id_val = {
-        let job_id = converter_state
-            .current_job_id
-            .lock()
-            .map_err(|e| e.to_string())?;
-        job_id.clone()
-    };
+    // Surface a status-write failure now that the process has been killed.
+    if let Some(res) = update_result {
+        res.map_err(|e| e.to_string())?;
+    }
 
     if let Some(ref job_id) = job_id_val {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-
-        let output_path: Option<String> = db
-            .query_row(
-                "SELECT output_path FROM jobs WHERE id = ?1",
-                rusqlite::params![job_id],
-                |row| row.get(0),
-            )
-            .ok();
-
         if let Some(path) = output_path {
             let _ = std::fs::remove_file(&path);
         }
-
-        db.execute(
-            "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user' WHERE id = ?1",
-            rusqlite::params![job_id],
-        )
-        .map_err(|e| e.to_string())?;
 
         let _ = app.emit(
             "job-status-changed",
