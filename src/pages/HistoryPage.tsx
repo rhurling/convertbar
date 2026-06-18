@@ -11,16 +11,18 @@ export default function HistoryPage() {
 
   return (
     <div className="history-page">
-      {summary.total_files > 0 && (
+      {history.length > 0 && (
         <div className="history-summary">
-          <div className="summary-left">
-            <span className="summary-saved">
-              Total saved: {formatBytes(summary.total_saved_bytes)}
-            </span>
-            <span className="summary-files">
-              {summary.total_files} file{summary.total_files !== 1 ? "s" : ""}
-            </span>
-          </div>
+          {summary.total_files > 0 && (
+            <div className="summary-left">
+              <span className="summary-saved">
+                Total saved: {formatBytes(summary.total_saved_bytes)}
+              </span>
+              <span className="summary-files">
+                {summary.total_files} file{summary.total_files !== 1 ? "s" : ""}
+              </span>
+            </div>
+          )}
           <div className="clear-dropdown">
             <button className="btn btn-small" onClick={() => setShowClearMenu(!showClearMenu)}>
               Clear &#9662;
