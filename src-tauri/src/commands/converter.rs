@@ -25,6 +25,7 @@ pub fn start_queue(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 #[tauri::command]
 pub fn pause_conversion(
     app: AppHandle,
@@ -100,6 +101,7 @@ pub fn pause_conversion(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 #[tauri::command]
 pub fn resume_conversion(
     app: AppHandle,
