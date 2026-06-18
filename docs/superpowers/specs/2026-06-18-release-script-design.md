@@ -52,7 +52,8 @@ scripts/release.sh <X.Y.Z | patch | minor | major> [--yes|-y|--force] [--dry-run
    `origin/main`; required tools present (`node`, `npm`, `gh`, `git`, tauri CLI);
    `gh auth status` ok; version valid and strictly newer than current.
 1. **Bump** the three manifests (`src-tauri/tauri.conf.json`, `package.json`,
-   `src-tauri/Cargo.toml`) → `npm install --package-lock-only`.
+   `src-tauri/Cargo.toml`); `npm version --no-git-tag-version` bumps
+   `package.json` and `package-lock.json` together.
 2. **Build** `npm run tauri build`. Success = output reached `Finished N
    bundles`; the trailing `TAURI_SIGNING_PRIVATE_KEY` error is expected locally
    and ignored. **Any earlier error is a hard stop** — leaves the uncommitted
