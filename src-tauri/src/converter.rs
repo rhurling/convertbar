@@ -13,8 +13,12 @@ use tauri_plugin_notification::NotificationExt;
 pub(crate) const IN_PLACE_TEMP_MARKER: &str = ".convertbar-tmp.";
 
 /// A job re-encodes a file onto itself exactly when its stored output path equals its source.
+/// Compared as `Path` (not raw strings) so this predicate matches the add-time detection in
+/// `add_files_to_db` (`output_path.as_path() == path`), which normalizes `//` and `/.` segments.
+/// A mismatch here would route an in-place job through the distinct-file path and overwrite/delete
+/// the user's source — so the two predicates MUST stay identical.
 pub(crate) fn is_in_place(source_path: &str, output_path: &str) -> bool {
-    source_path == output_path
+    std::path::Path::new(source_path) == std::path::Path::new(output_path)
 }
 
 /// Temp output path for an in-place encode: a hidden, marked sibling in the SAME directory so the
@@ -883,6 +887,18 @@ mod tests {
         assert!(is_in_place("/m/clip.mp4", "/m/clip.mp4"));
         assert!(!is_in_place("/m/clip.mkv", "/m/clip.mp4"));
         assert!(!is_in_place("/m/clip.mp4", "/m/clip-conv.mp4"));
+    }
+
+    #[test]
+    fn is_in_place_matches_add_time_path_normalization() {
+        // Regression: add-time uses `Path` equality (normalizes `//` and `/.`), but the stored
+        // output_path is the normalized join while source_path is verbatim. is_in_place MUST treat
+        // these as equal, or the converter routes an in-place job through the distinct-file delete
+        // path and destroys the source.
+        assert!(is_in_place("/movies//clip.mp4", "/movies/clip.mp4"));
+        assert!(is_in_place("/movies/./clip.mp4", "/movies/clip.mp4"));
+        // Genuinely different files must still be distinct.
+        assert!(!is_in_place("/movies/clip.mp4", "/movies/other.mp4"));
     }
 
     #[test]
