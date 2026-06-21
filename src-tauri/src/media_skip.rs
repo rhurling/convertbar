@@ -31,6 +31,23 @@ pub fn target_height_from_resolution(resolution: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Decide whether a source already meets/exceeds the target so re-encoding would not help.
+/// Skip only when NEITHER downscaling NOR a more-efficient codec would shrink the file.
+/// Unknown codec on either side forces "could help" so the file is queued, never skipped.
+pub fn should_skip_by_media(
+    source_codec: &str,
+    source_height: i64,
+    target_codec: &str,
+    target_height: i64,
+) -> bool {
+    let resolution_would_help = target_height > 0 && source_height > target_height;
+    let codec_would_help = match (efficiency_rank(source_codec), efficiency_rank(target_codec)) {
+        (Some(source_rank), Some(target_rank)) => target_rank > source_rank,
+        _ => true, // unknown on either side -> assume a conversion could help
+    };
+    !resolution_would_help && !codec_would_help
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +82,96 @@ mod tests {
         assert_eq!(target_height_from_resolution(""), 0);
         assert_eq!(target_height_from_resolution("p"), 0);
         assert_eq!(target_height_from_resolution("source"), 0);
+    }
+
+    #[test]
+    fn skip_decision_only_when_neither_dimension_helps() {
+        // (source_codec, source_h, target_codec, target_h, expect_skip, why)
+        let cases = [
+            // Neither helps -> skip. The waste case the feature exists to prevent.
+            (
+                "av1",
+                1080,
+                "h265",
+                1080,
+                true,
+                "av1 1080p -> h265 1080p is pure waste",
+            ),
+            // Codec helps (h264 -> h265 at same res is a real size win) -> convert.
+            (
+                "h264",
+                1080,
+                "h265",
+                1080,
+                false,
+                "h264 -> h265 saves space",
+            ),
+            // Intermediate source always re-encodes (ProRes ranks lowest).
+            (
+                "prores",
+                1080,
+                "h265",
+                1080,
+                false,
+                "ProRes must re-encode to a delivery codec",
+            ),
+            // Resolution helps (downscale) -> convert even if codec matches.
+            (
+                "h265",
+                2160,
+                "h265",
+                1080,
+                false,
+                "4K -> 1080p downscale shrinks the file",
+            ),
+            // No upscale benefit + same codec -> skip.
+            (
+                "h265",
+                720,
+                "h265",
+                1080,
+                true,
+                "never upscale 720p to a 1080p target",
+            ),
+            // Downgrade saves nothing -> skip (compatibility users turn the toggle off).
+            (
+                "h265",
+                1080,
+                "h264",
+                1080,
+                true,
+                "h265 -> h264 at same res saves nothing",
+            ),
+            // Uncertainty: unknown on EITHER side -> never skip.
+            (
+                "unknown",
+                1080,
+                "h265",
+                1080,
+                false,
+                "unknown source codec is never skipped",
+            ),
+            (
+                "h264",
+                1080,
+                "unknown",
+                1080,
+                false,
+                "unknown target codec is never skipped",
+            ),
+            // Target with no resolution cap (height 0): resolution can't help; decide on codec.
+            ("h265", 1080, "h265", 0, true, "no cap + same codec -> skip"),
+            (
+                "h264",
+                1080,
+                "h265",
+                0,
+                false,
+                "no cap but codec upgrade -> convert",
+            ),
+        ];
+        for (sc, sh, tc, th, expect, why) in cases {
+            assert_eq!(should_skip_by_media(sc, sh, tc, th), expect, "{why}");
+        }
     }
 }
