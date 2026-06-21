@@ -26,7 +26,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
     let mut notifications_errors_only = false;
     let mut notifications_queue_done = true;
     let mut skip_already_converted = false;
-    let mut skip_by_source_media = true;
+    let mut skip_by_source_media = false;
 
     let rows = stmt
         .query_map([], |row| {

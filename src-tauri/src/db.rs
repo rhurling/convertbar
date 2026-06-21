@@ -79,7 +79,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("notifications_errors_only", "false"),
         ("notifications_queue_done", "true"),
         ("skip_already_converted", "false"),
-        ("skip_by_source_media", "true"),
+        ("skip_by_source_media", "false"),
     ];
 
     for (key, value) in defaults {
@@ -153,8 +153,8 @@ mod tests {
         );
         assert_eq!(
             setting(&conn, "skip_by_source_media").as_deref(),
-            Some("true"),
-            "skip-by-source-media defaults ON"
+            Some("false"),
+            "skip-by-source-media defaults OFF — it shells out to HandBrake per file, so it is opt-in"
         );
         assert_eq!(
             setting(&conn, "notifications_per_file").as_deref(),
