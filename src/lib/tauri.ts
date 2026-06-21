@@ -61,6 +61,7 @@ export interface AppSettings {
   notifications_errors_only: boolean;
   notifications_queue_done: boolean;
   skip_already_converted: boolean;
+  skip_by_source_media: boolean;
 }
 
 export interface HistorySummary {

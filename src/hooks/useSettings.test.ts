@@ -25,6 +25,7 @@ function makeSettings(preset: string): AppSettings {
     notifications_errors_only: false,
     notifications_queue_done: false,
     skip_already_converted: false,
+    skip_by_source_media: true,
   };
 }
 
