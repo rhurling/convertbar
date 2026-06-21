@@ -6,6 +6,11 @@ on:
     tags:
       - "v*"
 
+# Serialize runs for the same tag, but never cancel an in-flight release build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 # Default to no permissions; each job opts into the minimum scopes it needs.
 permissions: {}
 
