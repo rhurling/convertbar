@@ -207,6 +207,24 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       </div>
 
       <div className="setting-group">
+        <label className="setting-label">
+          <input
+            type="checkbox"
+            checked={settings.skip_by_source_media}
+            onChange={(e) =>
+              updateSetting("skip_by_source_media", String(e.target.checked))
+            }
+          />
+          Skip files already at or below the target
+        </label>
+        <p className="setting-hint">
+          When adding files, skip any whose codec and resolution already meet the target
+          preset, so they aren&apos;t needlessly re-encoded. Turn this off to force a
+          conversion (e.g. for device compatibility).
+        </p>
+      </div>
+
+      <div className="setting-group">
         <label className="setting-label">Menu bar display</label>
         <p className="setting-hint">Choose what to show next to the icon during encoding</p>
         <div className="setting-toggles">
