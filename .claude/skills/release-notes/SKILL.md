@@ -1,7 +1,6 @@
 ---
 name: release-notes
 description: Use when drafting release notes or a changelog for a ConvertBar release — summarizes commits since the previous git tag, grouped by conventional-commit type, into markdown ready to paste into the GitHub release.
-disable-model-invocation: true
 ---
 
 # ConvertBar Release Notes
