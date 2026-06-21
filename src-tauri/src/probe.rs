@@ -3,6 +3,7 @@
 //! policy. Kept separate from `handbrake.rs` (preset handling) and the pure `media_skip.rs`.
 
 use crate::media_skip::SourceMedia;
+use std::process::Command;
 
 /// Map a HandBrake `--scan` `VideoCodec` string (often the libav *decoder* name) to the same
 /// codec-slug vocabulary `classify_preset` emits. Substring-based because HandBrake reports
@@ -53,6 +54,18 @@ pub fn parse_scan_media(stdout: &str) -> Option<SourceMedia> {
         codec: normalize_source_codec(raw_codec),
         height,
     })
+}
+
+/// Run `HandBrakeCLI --scan --json` on a file and return its normalized codec + height.
+/// Returns `None` if the process fails to launch or no parseable title is found — the caller
+/// treats `None` as uncertainty and queues the file rather than skipping it.
+pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
+    let output = Command::new(handbrake_path)
+        .args(["--scan", "--json", "-i", file])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_scan_media(&stdout)
 }
 
 #[cfg(test)]
@@ -117,5 +130,34 @@ JSON Title Set: {
         assert!(parse_scan_media(SCAN_FIXTURE_EMPTY).is_none());
         // No marker at all -> None.
         assert!(parse_scan_media("garbage output, no json").is_none());
+    }
+
+    // Local-only: needs ffmpeg to synthesize a clip and HandBrakeCLI to scan it.
+    // Run with: cargo test -- --ignored probe_source_reads_real_clip
+    #[test]
+    #[ignore]
+    fn probe_source_reads_real_clip() {
+        let hb = crate::handbrake::detect_handbrake_path().expect("HandBrakeCLI on PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("probe.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=0.3:size=320x240:rate=12",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        let media = probe_source(&hb, clip.to_str().unwrap()).expect("probe returns media");
+        assert_eq!(media.codec, "h264");
+        assert_eq!(media.height, 240);
     }
 }
