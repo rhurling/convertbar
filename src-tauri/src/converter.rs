@@ -329,6 +329,17 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             },
         );
 
+        let in_place = is_in_place(&job.source_path, &job.output_path);
+        let encode_target = if in_place {
+            in_place_temp_path(&job.source_path)
+        } else {
+            std::path::PathBuf::from(&job.output_path)
+        };
+        if in_place {
+            // Clear any stale temp left by a previous crash so HandBrake writes a fresh file.
+            let _ = std::fs::remove_file(&encode_target);
+        }
+
         // Spawn HandBrakeCLI
         let child = Command::new(&handbrake_path)
             .arg("-Z")
@@ -337,7 +348,7 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             .arg("-i")
             .arg(&job.source_path)
             .arg("-o")
-            .arg(&job.output_path)
+            .arg(&encode_target)
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn();
@@ -454,33 +465,50 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
 
         match exit_status {
             Ok(status) if status.success() => {
-                let converted_size = std::fs::metadata(&job.output_path)
+                let converted_size = std::fs::metadata(&encode_target)
                     .map(|m| m.len() as i64)
                     .ok();
-                let original_size = job.original_size.unwrap_or(0);
+                // For in-place, the source is unchanged during the temp encode, so re-stat it now.
+                let original_size = if in_place {
+                    std::fs::metadata(&job.source_path)
+                        .map(|m| m.len() as i64)
+                        .unwrap_or(job.original_size.unwrap_or(0))
+                } else {
+                    job.original_size.unwrap_or(0)
+                };
                 let conv_size = converted_size.unwrap_or(0);
 
                 let (kept, space_saved, status_str) = decide_cleanup(original_size, conv_size);
 
-                // Act on the decision: delete the file we're not keeping (Neither deletes nothing).
-                match kept {
-                    KeptFile::Converted => match cleanup_mode.as_str() {
-                        "delete" => {
-                            let _ = std::fs::remove_file(&job.source_path);
-                        }
-                        _ => {
-                            let _ = trash::delete(&job.source_path);
-                        }
-                    },
-                    KeptFile::Original => match cleanup_mode.as_str() {
-                        "delete" => {
-                            let _ = std::fs::remove_file(&job.output_path);
-                        }
-                        _ => {
-                            let _ = trash::delete(&job.output_path);
-                        }
-                    },
-                    KeptFile::Neither => {}
+                // Act on the decision. In-place replaces/keeps the source via the temp; the
+                // distinct-file path keeps both names and trashes/deletes the loser as before.
+                if in_place {
+                    let action = in_place_action(kept, &cleanup_mode);
+                    let _ = apply_in_place_action(
+                        action,
+                        &encode_target,
+                        std::path::Path::new(&job.source_path),
+                    );
+                } else {
+                    match kept {
+                        KeptFile::Converted => match cleanup_mode.as_str() {
+                            "delete" => {
+                                let _ = std::fs::remove_file(&job.source_path);
+                            }
+                            _ => {
+                                let _ = trash::delete(&job.source_path);
+                            }
+                        },
+                        KeptFile::Original => match cleanup_mode.as_str() {
+                            "delete" => {
+                                let _ = std::fs::remove_file(&job.output_path);
+                            }
+                            _ => {
+                                let _ = trash::delete(&job.output_path);
+                            }
+                        },
+                        KeptFile::Neither => {}
+                    }
                 }
 
                 let kept_file = match kept {
@@ -580,7 +608,8 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             }
             Ok(_) | Err(_) => {
                 had_errors = true;
-                let _ = std::fs::remove_file(&job.output_path);
+                // Remove the partial encode output (the temp for in-place jobs), never the source.
+                let _ = std::fs::remove_file(&encode_target);
 
                 let current_status: Option<String> = db
                     .lock()
