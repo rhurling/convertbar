@@ -2,6 +2,7 @@ mod commands;
 mod converter;
 mod db;
 mod handbrake;
+mod media_skip;
 mod types;
 mod watcher;
 
