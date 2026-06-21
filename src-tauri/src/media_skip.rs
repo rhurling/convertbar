@@ -22,6 +22,15 @@ pub fn efficiency_rank(codec: &str) -> Option<u8> {
     }
 }
 
+/// Parse a `classify_preset` resolution slug ("1080p", "" ...) into a numeric height.
+/// "" or anything unparseable -> 0 (no downscale benefit possible).
+pub fn target_height_from_resolution(resolution: &str) -> i64 {
+    resolution
+        .strip_suffix('p')
+        .and_then(|n| n.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +53,17 @@ mod tests {
         // Unknown is the uncertainty sentinel — None, never a number.
         assert_eq!(efficiency_rank("unknown"), None);
         assert_eq!(efficiency_rank("totally-made-up"), None);
+    }
+
+    #[test]
+    fn parses_target_height_from_resolution_slug() {
+        // classify_preset emits "{height}p" or "" (when the preset keeps source resolution).
+        assert_eq!(target_height_from_resolution("1080p"), 1080);
+        assert_eq!(target_height_from_resolution("2160p"), 2160);
+        assert_eq!(target_height_from_resolution("720p"), 720);
+        // No cap / unparseable -> 0, which the policy reads as "no resolution benefit possible".
+        assert_eq!(target_height_from_resolution(""), 0);
+        assert_eq!(target_height_from_resolution("p"), 0);
+        assert_eq!(target_height_from_resolution("source"), 0);
     }
 }
