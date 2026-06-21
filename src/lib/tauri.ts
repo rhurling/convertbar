@@ -17,6 +17,22 @@ export interface JobInfo {
   completed_at: string | null;
 }
 
+export type SkipReason =
+  | "not_video"
+  | "already_queued"
+  | "already_converted"
+  | "output_exists";
+
+export interface SkipCount {
+  reason: SkipReason;
+  count: number;
+}
+
+export interface AddResult {
+  added: JobInfo[];
+  skipped: SkipCount[];
+}
+
 export interface FolderScanResult {
   file_count: number;
   folder_name: string;
@@ -90,11 +106,11 @@ export interface WatchedDirectory {
 }
 
 export const commands = {
-  addFiles: (paths: string[]) => invoke<JobInfo[]>("add_files", { paths }),
+  addFiles: (paths: string[]) => invoke<AddResult>("add_files", { paths }),
   scanFolder: (path: string) =>
     invoke<FolderScanResult>("scan_folder", { path }),
   confirmFolderAdd: (path: string) =>
-    invoke<JobInfo[]>("confirm_folder_add", { path }),
+    invoke<AddResult>("confirm_folder_add", { path }),
   getQueue: () => invoke<JobInfo[]>("get_queue"),
   removeJob: (id: string) => invoke<void>("remove_job", { id }),
   reorderQueue: (jobIds: string[]) =>
