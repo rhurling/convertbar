@@ -25,27 +25,6 @@ during the spec.
 
 **Next step:** brainstorm → spec → implementation plan (not started).
 
-## True in-place re-encode (temp file + atomic rename)
-
-The output extension is always forced to `.mp4` (`format!("{}{}.mp4", stem,
-suffix)`, `src-tauri/src/commands/queue.rs:199`) and HandBrake writes straight to
-the final path — there is no temp+rename (`src-tauri/src/converter.rs:274`). With
-an empty suffix: non-mp4 sources convert to a distinct `.mp4`, then
-`decide_cleanup` (`src-tauri/src/converter.rs:56`) trashes/deletes the larger of
-the two; but an `.mp4` source would produce output==source, which the pre-existing
-`if output_path.exists() { continue; }` guard (`queue.rs:202`) silently drops from
-the queue — no error and no corruption, but also no user feedback.
-
-So self-overwrite is structurally impossible, yet a real in-place re-encode
-(same name + same extension) is **not** supported, and the silent skip is a UX
-rough edge.
-
-**Proposed fix:** add an explicit temp-file → atomic-rename in-place path, and/or
-surface a warning when a file is silently skipped because its output already
-exists.
-
-**Next step:** brainstorm → spec → implementation plan (not started).
-
 ## Skip queued files by source codec + resolution
 
 Skip a file when its source codec and resolution already match or exceed the
