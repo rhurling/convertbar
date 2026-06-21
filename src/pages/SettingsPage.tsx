@@ -155,6 +155,13 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
             <div className="suffix-preview">
               Preview: <span>{previewFilename}</span>
             </div>
+
+            {resolvedSuffix.trim() === "" && (
+              <div className="suffix-inplace-note">
+                Empty suffix: mp4 files are re-encoded in place, replacing the original. The fast
+                &quot;already converted&quot; skip-by-suffix is also disabled.
+              </div>
+            )}
           </>
         )}
       </div>

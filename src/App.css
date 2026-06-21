@@ -633,6 +633,13 @@ select.setting-input {
   font-size: 11px;
 }
 
+.suffix-inplace-note {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-dim, #888);
+}
+
 .suffix-loading {
   padding: 8px 0;
   font-size: 12px;
