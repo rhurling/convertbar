@@ -350,7 +350,12 @@ pub fn start(app: AppHandle) {
 
     spawn_reaper(app.clone(), pending);
     reconcile(&app);
-    scan_all_enabled(&app);
+    // The initial scan probes every existing file with a blocking `HandBrakeCLI --scan` (seconds
+    // per file when skip-by-source-media is on). `start` runs inside Tauri's `setup` on the main
+    // thread, so scanning inline freezes the UI at launch — the event loop never starts pumping.
+    // Run it off-thread; the reaper already enqueues from a background thread, so this is the same
+    // proven-safe path.
+    std::thread::spawn(move || scan_all_enabled(&app));
 }
 
 #[cfg(test)]
