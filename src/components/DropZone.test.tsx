@@ -43,9 +43,9 @@ beforeEach(() => {
       case "classify_paths":
         return Promise.resolve(classified);
       case "add_files":
-        return Promise.resolve([]);
+        return Promise.resolve({ added: [], skipped: [] });
       case "confirm_folder_add":
-        return Promise.resolve([]);
+        return Promise.resolve({ added: [], skipped: [] });
       case "start_queue":
         return Promise.resolve(undefined);
       default:
@@ -132,5 +132,31 @@ describe("DropZone", () => {
     await waitFor(() => expect(onFilesAdded).toHaveBeenCalledTimes(1));
     expect(invokeMock).not.toHaveBeenCalledWith("confirm_folder_add", { path: "/big" });
     expect(invokeMock).toHaveBeenCalledWith("start_queue");
+  });
+
+  it("shows a per-reason skip summary after an add", async () => {
+    classified = { files: ["/movies/a.mp4", "/movies/b.txt"], folders: [] };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "classify_paths":
+          return Promise.resolve(classified);
+        case "add_files":
+          return Promise.resolve({
+            added: [{ id: "1" }],
+            skipped: [{ reason: "not_video", count: 1 }],
+          });
+        case "start_queue":
+          return Promise.resolve(undefined);
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<DropZone onFilesAdded={() => {}} />);
+    fireDrop(["/movies/a.mp4", "/movies/b.txt"]);
+
+    await waitFor(() =>
+      expect(screen.getByText("Added 1 · 1 skipped (not a video)")).toBeInTheDocument(),
+    );
   });
 });
