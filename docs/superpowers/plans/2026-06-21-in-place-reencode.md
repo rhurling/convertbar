@@ -566,20 +566,7 @@ fn apply_remove_temp_keeps_source_untouched() {
 Run: `cargo test --manifest-path src-tauri/Cargo.toml in_place`
 Expected: PASS (5 new tests). Also verify the `is_video_file` exclusion test path: `cargo test --manifest-path src-tauri/Cargo.toml is_video` still passes from Task 2.
 
-- [ ] **Step 4: Add the `is_video_file` temp-marker regression test**
-
-In `src-tauri/src/commands/queue.rs` tests module:
-
-```rust
-#[test]
-fn rejects_in_place_temp_files() {
-    // A lingering in-place temp must never be picked up by a folder scan or watched folder.
-    assert!(!is_video_file(Path::new("/movies/.clip.convertbar-tmp.mp4")));
-}
-```
-
-Run: `cargo test --manifest-path src-tauri/Cargo.toml rejects_in_place_temp_files`
-Expected: PASS.
+- [ ] **Step 4: (already done in Task 2)** The `is_video_file` temp-marker regression test `rejects_in_place_temp_files` was pulled forward into Task 2 (commit `79d0eee`) since the guard it covers was added there. Nothing to do here — confirm the test exists in `queue.rs`.
 
 - [ ] **Step 5: Commit**
 
