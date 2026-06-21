@@ -86,6 +86,8 @@ pub enum SkipReason {
     AlreadyQueued,
     AlreadyConverted,
     OutputExists,
+    /// Source codec + resolution already meet/exceed the target preset (skip-by-source-media).
+    AlreadyAtTarget,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -91,7 +91,7 @@ fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
 
 pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddResult, String> {
     // First, read preset and suffix template from DB
-    let (preset, suffix_template, hb_path, skip_already_converted) = {
+    let (preset, suffix_template, hb_path, skip_already_converted, skip_by_source_media) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
 
         let preset: String = conn
@@ -110,13 +110,6 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
             )
             .unwrap_or_default();
 
-        let hb_path = if suffix_template.contains('{') {
-            // May need handbrake path for metadata fetch
-            get_handbrake_path(&conn).ok()
-        } else {
-            None
-        };
-
         let skip_already_converted: bool = conn
             .query_row(
                 "SELECT value FROM settings WHERE key = 'skip_already_converted'",
@@ -126,7 +119,24 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        (preset, suffix_template, hb_path, skip_already_converted)
+        let skip_by_source_media: bool = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'skip_by_source_media'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|v| v == "true")
+            .unwrap_or(true);
+
+        // Source-media skip also needs the target preset metadata, so fetch HandBrake when
+        // either the suffix template or the skip toggle requires it.
+        let hb_path = if suffix_template.contains('{') || skip_by_source_media {
+            get_handbrake_path(&conn).ok()
+        } else {
+            None
+        };
+
+        (preset, suffix_template, hb_path, skip_already_converted, skip_by_source_media)
     }; // db lock released
 
     // Resolve template if needed
@@ -136,7 +146,7 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
             if let Some(m) = cache.get(&preset) {
                 m.clone()
             } else {
-                let hb_path = hb_path.ok_or("HandBrakeCLI not found")?;
+                let hb_path = hb_path.clone().ok_or("HandBrakeCLI not found")?;
                 let m = handbrake::get_preset_metadata(&hb_path, &preset)?;
                 cache.insert(preset.clone(), m.clone());
                 m
@@ -147,9 +157,53 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
         suffix_template
     };
 
+    // Source-media skip: probe each video file and drop those already at/below the target.
+    // Runs outside the DB lock; on any uncertainty (no HandBrake, probe failure, unknown
+    // codec) the file is kept rather than skipped.
+    let media_skipped: HashSet<String> = if skip_by_source_media {
+        if let Some(hb) = hb_path.as_deref() {
+            let metadata = {
+                let mut cache = state.preset_cache.lock().map_err(|e| e.to_string())?;
+                if let Some(m) = cache.get(&preset) {
+                    m.clone()
+                } else {
+                    let m = handbrake::get_preset_metadata(hb, &preset)?;
+                    cache.insert(preset.clone(), m.clone());
+                    m
+                }
+            };
+            let target_codec = metadata.codec.clone();
+            let target_height =
+                crate::media_skip::target_height_from_resolution(&metadata.resolution);
+            let candidates: Vec<(String, Option<crate::media_skip::SourceMedia>)> = paths
+                .iter()
+                .filter(|p| is_video_file(Path::new(p)))
+                .map(|p| (p.clone(), crate::probe::probe_source(hb, p)))
+                .collect();
+            crate::media_skip::select_media_skips(&candidates, &target_codec, target_height)
+        } else {
+            HashSet::new()
+        }
+    } else {
+        HashSet::new()
+    };
+
+    let survivors: Vec<String> = paths
+        .iter()
+        .filter(|p| !media_skipped.contains(*p))
+        .cloned()
+        .collect();
+
     // Re-acquire db lock and hand the resolved suffix to the DB-only core.
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    add_files_to_db(&conn, paths, &preset, &suffix, skip_already_converted)
+    let mut result = add_files_to_db(&conn, &survivors, &preset, &suffix, skip_already_converted)?;
+    if !media_skipped.is_empty() {
+        result.skipped.push(SkipCount {
+            reason: SkipReason::AlreadyAtTarget,
+            count: media_skipped.len() as u32,
+        });
+    }
+    Ok(result)
 }
 
 /// DB-only core of `add_files_inner`: applies the skip rules and inserts queued jobs given an
@@ -1004,5 +1058,72 @@ mod tests {
         let summary = get_history_summary_inner(&conn, Some("keep".to_string())).unwrap();
         assert_eq!(summary.total_saved_bytes, 100);
         assert_eq!(summary.total_files, 1);
+    }
+
+    // End-to-end (local only): needs ffmpeg to synthesize clips and HandBrakeCLI to probe them.
+    // Drives the whole skip-by-source-media path through add_files_inner: an at-target source is
+    // dropped and reported as AlreadyAtTarget, a codec-upgrade source is queued. Run with:
+    //   cargo test -- --ignored add_files_inner_skips_at_target_source_end_to_end
+    #[test]
+    #[ignore]
+    fn add_files_inner_skips_at_target_source_end_to_end() {
+        let conn = test_conn();
+        let preset: String = conn
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| r.get(0))
+            .unwrap();
+        let state = crate::AppState {
+            db: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+            preset_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        // Pin the target to h265/1080p without shelling out to HandBrake for preset metadata.
+        state.preset_cache.lock().unwrap().insert(
+            preset,
+            crate::handbrake::PresetMetadata {
+                codec: "h265".into(),
+                resolution: "1080p".into(),
+                quality: "hq".into(),
+                preset: "p".into(),
+                device: String::new(),
+            },
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, vcodec: &str| {
+            let path = dir.path().join(name);
+            let ok = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=duration=0.3:size=1920x1080:rate=12",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:v",
+                    vcodec,
+                ])
+                .arg(&path)
+                .status()
+                .expect("run ffmpeg")
+                .success();
+            assert!(ok, "ffmpeg failed for {name}");
+            path.to_str().unwrap().to_string()
+        };
+        let at_target = make("a.mp4", "libx265"); // h265 1080p -> skip
+        let upgrade = make("b.mp4", "libx264"); // h264 1080p -> queue
+
+        let result = add_files_inner(&state, &[at_target, upgrade]).unwrap();
+
+        assert_eq!(result.added.len(), 1, "only the h264 source is queued");
+        assert!(result.added[0].source_path.ends_with("b.mp4"));
+        let reported = result
+            .skipped
+            .iter()
+            .find(|c| c.reason == SkipReason::AlreadyAtTarget);
+        assert_eq!(
+            reported.map(|c| c.count),
+            Some(1),
+            "the h265 source must be reported as already-at-target, not silently dropped"
+        );
     }
 }
