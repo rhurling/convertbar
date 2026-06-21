@@ -3,8 +3,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
+use crate::converter::IN_PLACE_TEMP_MARKER;
 use crate::handbrake;
-use crate::types::{ClassifiedPaths, FolderScanResult, HistoryPage, HistorySummary, JobInfo};
+use crate::types::{
+    AddResult, ClassifiedPaths, FolderScanResult, HistoryPage, HistorySummary, JobInfo, SkipCount,
+    SkipReason,
+};
 use crate::AppState;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -12,6 +16,13 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 ];
 
 pub(crate) fn is_video_file(path: &Path) -> bool {
+    // An in-flight in-place temp must never be treated as a queueable video, or a folder scan
+    // or watched folder could enqueue it mid-encode.
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.contains(IN_PLACE_TEMP_MARKER) {
+            return false;
+        }
+    }
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
@@ -78,7 +89,7 @@ fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
     handbrake::detect_handbrake_path().ok_or_else(|| "HandBrakeCLI not found".to_string())
 }
 
-pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<Vec<JobInfo>, String> {
+pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddResult, String> {
     // First, read preset and suffix template from DB
     let (preset, suffix_template, hb_path, skip_already_converted) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -150,57 +161,66 @@ fn add_files_to_db(
     preset: &str,
     suffix: &str,
     skip_already_converted: bool,
-) -> Result<Vec<JobInfo>, String> {
-    // Build set of source paths already in queue (and optionally history)
-    let existing_paths: HashSet<String> = {
-        let mut sql = String::from(
-            "SELECT source_path FROM jobs WHERE status IN ('queued', 'encoding', 'paused')",
-        );
-        if skip_already_converted {
-            sql.push_str(
-                " UNION SELECT source_path FROM jobs WHERE status IN ('done', 'skipped')",
-            );
-        }
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+) -> Result<AddResult, String> {
+    let queued_paths: HashSet<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_path FROM jobs WHERE status IN ('queued', 'encoding', 'paused')",
+            )
+            .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
+    let history_paths: HashSet<String> = if skip_already_converted {
+        let mut stmt = conn
+            .prepare("SELECT source_path FROM jobs WHERE status IN ('done', 'skipped')")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    } else {
+        HashSet::new()
+    };
 
     let mut queue_order = get_next_queue_order(conn)?;
-    let mut jobs = Vec::new();
+    let mut added = Vec::new();
+    let (mut n_not_video, mut n_queued, mut n_converted, mut n_output_exists) =
+        (0u32, 0u32, 0u32, 0u32);
 
     for path_str in paths {
         let path = Path::new(path_str);
 
-        // Validate it's a video file
         if !is_video_file(path) {
+            n_not_video += 1;
+            continue;
+        }
+        if queued_paths.contains(path_str) {
+            n_queued += 1;
+            continue;
+        }
+        if history_paths.contains(path_str) {
+            n_converted += 1;
             continue;
         }
 
-        // Skip if file is already in queue or (optionally) history
-        if existing_paths.contains(path_str) {
-            continue;
-        }
-
-        // Build output path: same directory, add suffix before extension
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
         let parent = path.parent().unwrap_or(Path::new("."));
 
-        // Skip if source file already has the suffix
         if !suffix.is_empty() && stem.ends_with(suffix) {
+            n_converted += 1;
             continue;
         }
 
-        let output_filename = format!("{}{}.mp4", stem, suffix);
-        let output_path = parent.join(&output_filename);
-
-        // Skip if output file already exists
-        if output_path.exists() {
+        let output_path = parent.join(format!("{}{}.mp4", stem, suffix));
+        let in_place = output_path.as_path() == path;
+        if !in_place && output_path.exists() {
+            n_output_exists += 1;
             continue;
         }
 
@@ -223,7 +243,7 @@ fn add_files_to_db(
         )
         .map_err(|e| e.to_string())?;
 
-        jobs.push(JobInfo {
+        added.push(JobInfo {
             id,
             source_path: path_str.clone(),
             output_path: output_path.to_string_lossy().to_string(),
@@ -242,11 +262,23 @@ fn add_files_to_db(
         queue_order += 1;
     }
 
-    Ok(jobs)
+    let mut skipped = Vec::new();
+    for (reason, count) in [
+        (SkipReason::NotVideo, n_not_video),
+        (SkipReason::AlreadyQueued, n_queued),
+        (SkipReason::AlreadyConverted, n_converted),
+        (SkipReason::OutputExists, n_output_exists),
+    ] {
+        if count > 0 {
+            skipped.push(SkipCount { reason, count });
+        }
+    }
+
+    Ok(AddResult { added, skipped })
 }
 
 #[tauri::command]
-pub fn add_files(state: State<'_, AppState>, paths: Vec<String>) -> Result<Vec<JobInfo>, String> {
+pub fn add_files(state: State<'_, AppState>, paths: Vec<String>) -> Result<AddResult, String> {
     add_files_inner(&state, &paths)
 }
 
@@ -272,10 +304,7 @@ pub fn scan_folder(path: String) -> Result<FolderScanResult, String> {
 }
 
 #[tauri::command]
-pub fn confirm_folder_add(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<Vec<JobInfo>, String> {
+pub fn confirm_folder_add(state: State<'_, AppState>, path: String) -> Result<AddResult, String> {
     let dir = Path::new(&path);
     if !dir.is_dir() {
         return Err("Path is not a directory".to_string());
@@ -589,10 +618,21 @@ mod tests {
         let conn = test_conn();
         insert_queued(&conn, "j1", "/movies/a.mp4", "queued", 1);
 
-        let added =
+        let result =
             add_files_to_db(&conn, &["/movies/a.mp4".to_string()], "preset", "", false).unwrap();
 
-        assert!(added.is_empty(), "an already-queued source must be skipped");
+        assert!(
+            result.added.is_empty(),
+            "an already-queued source must be skipped"
+        );
+        assert_eq!(
+            result.skipped,
+            vec![SkipCount {
+                reason: SkipReason::AlreadyQueued,
+                count: 1
+            }],
+            "the skip is reported as AlreadyQueued"
+        );
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
             .unwrap();
@@ -603,23 +643,28 @@ mod tests {
     fn add_files_skips_when_output_already_exists() {
         let conn = test_conn();
         let dir = tempfile::tempdir().unwrap();
-        // With suffix "-conv", source clip.mov -> output clip-conv.mp4. Pre-create the output.
         std::fs::write(dir.path().join("clip-conv.mp4"), b"x").unwrap();
         let source = dir.path().join("clip.mov").to_string_lossy().to_string();
 
-        let added = add_files_to_db(&conn, &[source], "preset", "-conv", false).unwrap();
+        let result = add_files_to_db(&conn, &[source], "preset", "-conv", false).unwrap();
 
         assert!(
-            added.is_empty(),
-            "must skip when the converted output already exists on disk"
+            result.added.is_empty(),
+            "must skip when the converted output already exists"
+        );
+        assert_eq!(
+            result.skipped,
+            vec![SkipCount {
+                reason: SkipReason::OutputExists,
+                count: 1
+            }]
         );
     }
 
     #[test]
     fn add_files_skips_source_that_already_has_suffix() {
         let conn = test_conn();
-        // The source stem already ends with the suffix -> it's already a converted file.
-        let added = add_files_to_db(
+        let result = add_files_to_db(
             &conn,
             &["/movies/clip-conv.mov".to_string()],
             "preset",
@@ -629,8 +674,15 @@ mod tests {
         .unwrap();
 
         assert!(
-            added.is_empty(),
+            result.added.is_empty(),
             "must skip a source whose stem already carries the suffix"
+        );
+        assert_eq!(
+            result.skipped,
+            vec![SkipCount {
+                reason: SkipReason::AlreadyConverted,
+                count: 1
+            }]
         );
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
@@ -641,24 +693,62 @@ mod tests {
     #[test]
     fn add_files_skip_already_converted_union_respects_flag() {
         let conn = test_conn();
-        insert_history(&conn, "h1", "/movies/done.mkv", "done", 100, 1000, "2020-01-01T00:00:00Z");
-
-        // Flag on: a previously-converted (done) source is skipped via the history UNION.
-        let with_flag =
-            add_files_to_db(&conn, &["/movies/done.mkv".to_string()], "preset", "", true).unwrap();
-        assert!(
-            with_flag.is_empty(),
-            "skip_already_converted should skip sources already in history"
+        insert_history(
+            &conn,
+            "h1",
+            "/movies/done.mkv",
+            "done",
+            100,
+            1000,
+            "2020-01-01T00:00:00Z",
         );
 
-        // Flag off: history is ignored, the file is queued again.
-        let without_flag =
-            add_files_to_db(&conn, &["/movies/done.mkv".to_string()], "preset", "", false).unwrap();
+        let with_flag =
+            add_files_to_db(&conn, &["/movies/done.mkv".to_string()], "preset", "", true).unwrap();
+        assert!(with_flag.added.is_empty());
         assert_eq!(
-            without_flag.len(),
+            with_flag.skipped,
+            vec![SkipCount {
+                reason: SkipReason::AlreadyConverted,
+                count: 1
+            }]
+        );
+
+        let without_flag = add_files_to_db(
+            &conn,
+            &["/movies/done.mkv".to_string()],
+            "preset",
+            "",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            without_flag.added.len(),
             1,
             "without the flag, a done source is re-added"
         );
+    }
+
+    #[test]
+    fn add_files_reencodes_mp4_in_place_instead_of_skipping() {
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        std::fs::write(&src, b"x").unwrap();
+        let src_str = src.to_string_lossy().to_string();
+
+        let result = add_files_to_db(&conn, &[src_str.clone()], "preset", "", false).unwrap();
+
+        assert_eq!(
+            result.added.len(),
+            1,
+            "mp4 + empty suffix must queue an in-place job"
+        );
+        assert_eq!(
+            result.added[0].output_path, src_str,
+            "an in-place job stores output_path == source_path"
+        );
+        assert!(result.skipped.is_empty(), "an in-place job is not a skip");
     }
 
     // ---- get_next_queue_order ----
@@ -719,8 +809,24 @@ mod tests {
     #[test]
     fn history_search_filters_by_path() {
         let conn = test_conn();
-        insert_history(&conn, "1", "/m/alpha.mp4", "done", 10, 100, "2020-01-01T00:00:00Z");
-        insert_history(&conn, "2", "/m/beta.mp4", "done", 20, 200, "2020-01-02T00:00:00Z");
+        insert_history(
+            &conn,
+            "1",
+            "/m/alpha.mp4",
+            "done",
+            10,
+            100,
+            "2020-01-01T00:00:00Z",
+        );
+        insert_history(
+            &conn,
+            "2",
+            "/m/beta.mp4",
+            "done",
+            20,
+            200,
+            "2020-01-02T00:00:00Z",
+        );
 
         let page = get_history_inner(&conn, 10, 0, Some("alpha".to_string()), None).unwrap();
         assert_eq!(page.total, 1);
@@ -731,9 +837,33 @@ mod tests {
     #[test]
     fn history_sorts_by_space_saved_and_source_path() {
         let conn = test_conn();
-        insert_history(&conn, "1", "/m/c.mp4", "done", 10, 100, "2020-01-01T00:00:00Z");
-        insert_history(&conn, "2", "/m/a.mp4", "done", 100, 200, "2020-01-02T00:00:00Z");
-        insert_history(&conn, "3", "/m/b.mp4", "done", 50, 300, "2020-01-03T00:00:00Z");
+        insert_history(
+            &conn,
+            "1",
+            "/m/c.mp4",
+            "done",
+            10,
+            100,
+            "2020-01-01T00:00:00Z",
+        );
+        insert_history(
+            &conn,
+            "2",
+            "/m/a.mp4",
+            "done",
+            100,
+            200,
+            "2020-01-02T00:00:00Z",
+        );
+        insert_history(
+            &conn,
+            "3",
+            "/m/b.mp4",
+            "done",
+            50,
+            300,
+            "2020-01-03T00:00:00Z",
+        );
 
         let by_saved =
             get_history_inner(&conn, 10, 0, None, Some("space_saved".to_string())).unwrap();
@@ -754,14 +884,27 @@ mod tests {
     #[test]
     fn history_default_sort_is_newest_completed_first() {
         let conn = test_conn();
-        insert_history(&conn, "old", "/m/old.mp4", "done", 1, 1, "2020-01-01T00:00:00Z");
-        insert_history(&conn, "new", "/m/new.mp4", "done", 1, 1, "2024-12-31T00:00:00Z");
+        insert_history(
+            &conn,
+            "old",
+            "/m/old.mp4",
+            "done",
+            1,
+            1,
+            "2020-01-01T00:00:00Z",
+        );
+        insert_history(
+            &conn,
+            "new",
+            "/m/new.mp4",
+            "done",
+            1,
+            1,
+            "2024-12-31T00:00:00Z",
+        );
 
         let page = get_history_inner(&conn, 10, 0, None, None).unwrap();
-        assert_eq!(
-            page.jobs[0].id, "new",
-            "default order is completed_at DESC"
-        );
+        assert_eq!(page.jobs[0].id, "new", "default order is completed_at DESC");
     }
 
     #[test]
@@ -792,10 +935,34 @@ mod tests {
     #[test]
     fn history_summary_sums_only_done_jobs() {
         let conn = test_conn();
-        insert_history(&conn, "1", "/m/a.mp4", "done", 100, 1000, "2020-01-01T00:00:00Z");
-        insert_history(&conn, "2", "/m/b.mp4", "done", 200, 2000, "2020-01-02T00:00:00Z");
+        insert_history(
+            &conn,
+            "1",
+            "/m/a.mp4",
+            "done",
+            100,
+            1000,
+            "2020-01-01T00:00:00Z",
+        );
+        insert_history(
+            &conn,
+            "2",
+            "/m/b.mp4",
+            "done",
+            200,
+            2000,
+            "2020-01-02T00:00:00Z",
+        );
         // Errors live in history but never count as saved space.
-        insert_history(&conn, "3", "/m/c.mp4", "error", 999, 3000, "2020-01-03T00:00:00Z");
+        insert_history(
+            &conn,
+            "3",
+            "/m/c.mp4",
+            "error",
+            999,
+            3000,
+            "2020-01-03T00:00:00Z",
+        );
 
         let summary = get_history_summary_inner(&conn, None).unwrap();
         assert_eq!(summary.total_saved_bytes, 300);
@@ -805,8 +972,24 @@ mod tests {
     #[test]
     fn history_summary_respects_search() {
         let conn = test_conn();
-        insert_history(&conn, "1", "/m/keep.mp4", "done", 100, 1000, "2020-01-01T00:00:00Z");
-        insert_history(&conn, "2", "/m/other.mp4", "done", 200, 2000, "2020-01-02T00:00:00Z");
+        insert_history(
+            &conn,
+            "1",
+            "/m/keep.mp4",
+            "done",
+            100,
+            1000,
+            "2020-01-01T00:00:00Z",
+        );
+        insert_history(
+            &conn,
+            "2",
+            "/m/other.mp4",
+            "done",
+            200,
+            2000,
+            "2020-01-02T00:00:00Z",
+        );
 
         let summary = get_history_summary_inner(&conn, Some("keep".to_string())).unwrap();
         assert_eq!(summary.total_saved_bytes, 100);

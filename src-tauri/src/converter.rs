@@ -8,6 +8,10 @@ use tauri::{AppHandle, Emitter};
 use crate::types::JobInfo;
 use tauri_plugin_notification::NotificationExt;
 
+/// Filename marker for an in-flight in-place encode. A recognizable, non-suffix token so
+/// `is_video_file` can exclude it — a folder scan or watched folder must never enqueue a temp.
+pub(crate) const IN_PLACE_TEMP_MARKER: &str = ".convertbar-tmp.";
+
 pub struct ConverterState {
     pub current_pid: Mutex<Option<u32>>,
     pub current_child: Mutex<Option<Child>>,

@@ -209,14 +209,14 @@ fn spawn_reaper(app: AppHandle, pending: Arc<Mutex<HashMap<PathBuf, PendingEntry
 /// already-converted or already-queued files are dropped here.
 fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     let app_state = app.state::<AppState>();
-    let jobs = match queue::add_files_inner(&app_state, &paths) {
-        Ok(jobs) => jobs,
+    let result = match queue::add_files_inner(&app_state, &paths) {
+        Ok(result) => result,
         Err(err) => {
             eprintln!("watcher: failed to enqueue {paths:?}: {err}");
             return;
         }
     };
-    if jobs.is_empty() {
+    if result.added.is_empty() {
         return;
     }
     let db = app_state.db.clone();
