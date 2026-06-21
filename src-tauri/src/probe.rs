@@ -3,7 +3,15 @@
 //! policy. Kept separate from `handbrake.rs` (preset handling) and the pure `media_skip.rs`.
 
 use crate::media_skip::SourceMedia;
-use std::process::Command;
+use std::io::Read;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+/// Hard ceiling on a single `--scan`. Scanning one file is normally a few seconds; this exists
+/// only so a pathological or stalled file (a half-written download, a wedged network mount) can't
+/// wedge the background folder scan indefinitely. On timeout the child is killed and the caller
+/// treats the resulting `None` as uncertainty — the file is queued rather than skipped.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Map a HandBrake `--scan` `VideoCodec` string (often the libav *decoder* name) to the same
 /// codec-slug vocabulary `classify_preset` emits. Substring-based because HandBrake reports
@@ -57,15 +65,44 @@ pub fn parse_scan_media(stdout: &str) -> Option<SourceMedia> {
 }
 
 /// Run `HandBrakeCLI --scan --json` on a file and return its normalized codec + height.
-/// Returns `None` if the process fails to launch or no parseable title is found — the caller
-/// treats `None` as uncertainty and queues the file rather than skipping it.
+/// Returns `None` if the process fails to launch, exceeds `PROBE_TIMEOUT`, or yields no parseable
+/// title — the caller treats `None` as uncertainty and queues the file rather than skipping it.
 pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
-    let output = Command::new(handbrake_path)
+    // The verbose scan log goes to /dev/null so only the small JSON title set reaches the piped
+    // stdout — small enough that not draining it while we poll can't fill the pipe and deadlock.
+    let mut child = Command::new(handbrake_path)
         .args(["--scan", "--json", "-i", file])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    wait_with_timeout(&mut child, PROBE_TIMEOUT)?;
+
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
     parse_scan_media(&stdout)
+}
+
+/// Wait for `child` to exit, polling so we never block indefinitely. If it outlives `timeout` it
+/// is killed and `None` is returned. Mirrors `converter::wait_for_active_child`'s poll-don't-block
+/// approach so a stalled scan can't wedge the caller.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +159,42 @@ JSON Title Set: {
         let media = parse_scan_media(SCAN_FIXTURE_HEVC).expect("title set present");
         assert_eq!(media.codec, "h265", "hevc normalizes to h265");
         assert_eq!(media.height, 720);
+    }
+
+    // A wedged HandBrake scan must not hang the caller forever: it is killed at the deadline and
+    // reported as uncertainty (None), which the skip policy treats as "queue, don't skip".
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_timeout_kills_a_process_that_overruns() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        let result = wait_with_timeout(&mut child, Duration::from_millis(200));
+        assert!(
+            result.is_none(),
+            "an overrunning scan must time out to None"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must return shortly after the deadline, not wait out the child"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_some(),
+            "the timed-out child must have been killed, not leaked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_timeout_returns_status_for_a_fast_process() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+        assert!(
+            status.map(|s| s.success()).unwrap_or(false),
+            "a process that exits before the deadline returns its status"
+        );
     }
 
     #[test]

@@ -89,6 +89,90 @@ fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
     handbrake::detect_handbrake_path().ok_or_else(|| "HandBrakeCLI not found".to_string())
 }
 
+/// The probe-free skip decision for one path: `Some(reason)` to skip it, `None` to keep it.
+/// Shared by `probe_candidates` (which paths are worth the expensive HandBrake probe) and
+/// `add_files_to_db` (authoritative accounting + insert) so the two can never disagree about what
+/// counts as a skip. Never returns `AlreadyAtTarget` — that decision requires a source probe.
+fn cheap_skip_reason(
+    path_str: &str,
+    suffix: &str,
+    queued_paths: &HashSet<String>,
+    history_paths: &HashSet<String>,
+) -> Option<SkipReason> {
+    let path = Path::new(path_str);
+    if !is_video_file(path) {
+        return Some(SkipReason::NotVideo);
+    }
+    if queued_paths.contains(path_str) {
+        return Some(SkipReason::AlreadyQueued);
+    }
+    if history_paths.contains(path_str) {
+        return Some(SkipReason::AlreadyConverted);
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    if !suffix.is_empty() && stem.ends_with(suffix) {
+        return Some(SkipReason::AlreadyConverted);
+    }
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let output_path = parent.join(format!("{}{}.mp4", stem, suffix));
+    let in_place = output_path.as_path() == path;
+    if !in_place && output_path.exists() {
+        return Some(SkipReason::OutputExists);
+    }
+    None
+}
+
+/// Reads the active-queue and (when `skip_already_converted`) history source paths the cheap skip
+/// checks test against.
+fn fetch_skip_sets(
+    conn: &rusqlite::Connection,
+    skip_already_converted: bool,
+) -> Result<(HashSet<String>, HashSet<String>), String> {
+    let queued_paths: HashSet<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_path FROM jobs WHERE status IN ('queued', 'encoding', 'paused')",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let history_paths: HashSet<String> = if skip_already_converted {
+        let mut stmt = conn
+            .prepare("SELECT source_path FROM jobs WHERE status IN ('done', 'skipped')")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    } else {
+        HashSet::new()
+    };
+    Ok((queued_paths, history_paths))
+}
+
+/// The subset of `paths` worth probing for the source-media skip: those that survive the
+/// probe-free skip checks. A re-scan of an already-queued/converted folder yields an empty set, so
+/// the source-media probe shells out to HandBrake zero times.
+fn probe_candidates(
+    conn: &rusqlite::Connection,
+    paths: &[String],
+    suffix: &str,
+    skip_already_converted: bool,
+) -> Result<Vec<String>, String> {
+    let (queued_paths, history_paths) = fetch_skip_sets(conn, skip_already_converted)?;
+    Ok(paths
+        .iter()
+        .filter(|p| cheap_skip_reason(p, suffix, &queued_paths, &history_paths).is_none())
+        .cloned()
+        .collect())
+}
+
 pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddResult, String> {
     // First, read preset and suffix template from DB
     let (preset, suffix_template, hb_path, skip_already_converted, skip_by_source_media) = {
@@ -126,7 +210,7 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
                 |row| row.get::<_, String>(0),
             )
             .map(|v| v == "true")
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         // Source-media skip also needs the target preset metadata, so fetch HandBrake when
         // either the suffix template or the skip toggle requires it.
@@ -136,7 +220,13 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
             None
         };
 
-        (preset, suffix_template, hb_path, skip_already_converted, skip_by_source_media)
+        (
+            preset,
+            suffix_template,
+            hb_path,
+            skip_already_converted,
+            skip_by_source_media,
+        )
     }; // db lock released
 
     // Resolve template if needed
@@ -157,10 +247,18 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
         suffix_template
     };
 
-    // Source-media skip: probe each video file and drop those already at/below the target.
-    // Runs outside the DB lock; on any uncertainty (no HandBrake, probe failure, unknown
-    // codec) the file is kept rather than skipped.
-    let media_skipped: HashSet<String> = if skip_by_source_media {
+    // Source-media skip: probe candidate files and drop those already at/below the target. Only
+    // files that survive the probe-free skip checks are probed, so a re-scan of an already-handled
+    // folder shells out to HandBrake zero times. Probing runs outside the DB lock; on any
+    // uncertainty (no HandBrake, probe failure/timeout, unknown codec) the file is kept.
+    let candidates_to_probe: Vec<String> = if skip_by_source_media {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        probe_candidates(&conn, paths, &suffix, skip_already_converted)?
+    } else {
+        Vec::new()
+    };
+
+    let media_skipped: HashSet<String> = if !candidates_to_probe.is_empty() {
         if let Some(hb) = hb_path.as_deref() {
             let metadata = {
                 let mut cache = state.preset_cache.lock().map_err(|e| e.to_string())?;
@@ -175,12 +273,11 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
             let target_codec = metadata.codec.clone();
             let target_height =
                 crate::media_skip::target_height_from_resolution(&metadata.resolution);
-            let candidates: Vec<(String, Option<crate::media_skip::SourceMedia>)> = paths
+            let probed: Vec<(String, Option<crate::media_skip::SourceMedia>)> = candidates_to_probe
                 .iter()
-                .filter(|p| is_video_file(Path::new(p)))
                 .map(|p| (p.clone(), crate::probe::probe_source(hb, p)))
                 .collect();
-            crate::media_skip::select_media_skips(&candidates, &target_codec, target_height)
+            crate::media_skip::select_media_skips(&probed, &target_codec, target_height)
         } else {
             HashSet::new()
         }
@@ -216,28 +313,7 @@ fn add_files_to_db(
     suffix: &str,
     skip_already_converted: bool,
 ) -> Result<AddResult, String> {
-    let queued_paths: HashSet<String> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT source_path FROM jobs WHERE status IN ('queued', 'encoding', 'paused')",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    let history_paths: HashSet<String> = if skip_already_converted {
-        let mut stmt = conn
-            .prepare("SELECT source_path FROM jobs WHERE status IN ('done', 'skipped')")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?;
-        rows.filter_map(|r| r.ok()).collect()
-    } else {
-        HashSet::new()
-    };
+    let (queued_paths, history_paths) = fetch_skip_sets(conn, skip_already_converted)?;
 
     let mut queue_order = get_next_queue_order(conn)?;
     let mut added = Vec::new();
@@ -245,38 +321,25 @@ fn add_files_to_db(
         (0u32, 0u32, 0u32, 0u32);
 
     for path_str in paths {
+        if let Some(reason) = cheap_skip_reason(path_str, suffix, &queued_paths, &history_paths) {
+            match reason {
+                SkipReason::NotVideo => n_not_video += 1,
+                SkipReason::AlreadyQueued => n_queued += 1,
+                SkipReason::AlreadyConverted => n_converted += 1,
+                SkipReason::OutputExists => n_output_exists += 1,
+                // The cheap checks never produce AlreadyAtTarget — that needs a probe.
+                SkipReason::AlreadyAtTarget => {}
+            }
+            continue;
+        }
+
         let path = Path::new(path_str);
-
-        if !is_video_file(path) {
-            n_not_video += 1;
-            continue;
-        }
-        if queued_paths.contains(path_str) {
-            n_queued += 1;
-            continue;
-        }
-        if history_paths.contains(path_str) {
-            n_converted += 1;
-            continue;
-        }
-
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
         let parent = path.parent().unwrap_or(Path::new("."));
-
-        if !suffix.is_empty() && stem.ends_with(suffix) {
-            n_converted += 1;
-            continue;
-        }
-
         let output_path = parent.join(format!("{}{}.mp4", stem, suffix));
-        let in_place = output_path.as_path() == path;
-        if !in_place && output_path.exists() {
-            n_output_exists += 1;
-            continue;
-        }
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -815,6 +878,46 @@ mod tests {
         assert!(result.skipped.is_empty(), "an in-place job is not a skip");
     }
 
+    // ---- probe_candidates (source-media probe is only worth running on these) ----
+
+    #[test]
+    fn probe_candidates_excludes_files_the_cheap_checks_would_skip() {
+        // The whole point of probing only candidates: a re-scan of an already-handled folder must
+        // not pay for a HandBrake probe on files the cheap checks already reject.
+        let conn = test_conn();
+        insert_queued(&conn, "j1", "/movies/queued.mp4", "queued", 1);
+        insert_history(
+            &conn,
+            "h1",
+            "/movies/done.mp4",
+            "done",
+            0,
+            0,
+            "2020-01-01T00:00:00Z",
+        );
+
+        let paths = vec![
+            "/movies/queued.mp4".to_string(), // already queued -> never probed
+            "/movies/done.mp4".to_string(),   // in history -> probed only when the flag is off
+            "/movies/fresh.mp4".to_string(),  // new -> always a probe candidate
+            "/movies/notes.txt".to_string(),  // not a video -> never probed
+        ];
+
+        // skip_already_converted ON: the history file is excluded alongside the queued one.
+        let with_flag = probe_candidates(&conn, &paths, "", true).unwrap();
+        assert_eq!(with_flag, vec!["/movies/fresh.mp4".to_string()]);
+
+        // Flag OFF: the history file is no longer a cheap skip, so it becomes a probe candidate.
+        let without_flag = probe_candidates(&conn, &paths, "", false).unwrap();
+        assert_eq!(
+            without_flag,
+            vec![
+                "/movies/done.mp4".to_string(),
+                "/movies/fresh.mp4".to_string()
+            ]
+        );
+    }
+
     // ---- get_next_queue_order ----
 
     #[test]
@@ -1069,7 +1172,9 @@ mod tests {
     fn add_files_inner_skips_at_target_source_end_to_end() {
         let conn = test_conn();
         let preset: String = conn
-            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| r.get(0))
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let state = crate::AppState {
             db: std::sync::Arc::new(std::sync::Mutex::new(conn)),
