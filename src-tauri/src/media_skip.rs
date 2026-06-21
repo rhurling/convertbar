@@ -33,6 +33,11 @@ pub fn target_height_from_resolution(resolution: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// A source counts as already at the target height unless it is more than this factor
+/// taller. Real encodes store nominal heights a few px off the ladder (1082/1088 for
+/// "1080p"); shaving those rows isn't worth a full re-encode.
+const RESOLUTION_SKIP_MARGIN: f64 = 1.05;
+
 /// Decide whether a source already meets/exceeds the target so re-encoding would not help.
 /// Skip only when NEITHER downscaling NOR a more-efficient codec would shrink the file.
 /// Unknown codec on either side forces "could help" so the file is queued, never skipped.
@@ -42,7 +47,8 @@ pub fn should_skip_by_media(
     target_codec: &str,
     target_height: i64,
 ) -> bool {
-    let resolution_would_help = target_height > 0 && source_height > target_height;
+    let resolution_would_help = target_height > 0
+        && (source_height as f64) > (target_height as f64) * RESOLUTION_SKIP_MARGIN;
     let codec_would_help = match (efficiency_rank(source_codec), efficiency_rank(target_codec)) {
         (Some(source_rank), Some(target_rank)) => target_rank > source_rank,
         _ => true, // unknown on either side -> assume a conversion could help
@@ -190,6 +196,50 @@ mod tests {
                 0,
                 false,
                 "no cap but codec upgrade -> convert",
+            ),
+            // Near-target heights: real encodes store nominal heights a few px off the
+            // ladder (1082/1088 for "1080p"); within the 5% margin -> already at target.
+            (
+                "av1",
+                1082,
+                "h265",
+                1080,
+                true,
+                "1082 is encoder drift, still 1080p -> skip",
+            ),
+            (
+                "h265",
+                1088,
+                "h265",
+                1080,
+                true,
+                "1088 macroblock padding is still 1080p -> skip",
+            ),
+            // Meaningfully taller than target (beyond the margin) -> downscale still helps.
+            (
+                "h265",
+                1200,
+                "h265",
+                1080,
+                false,
+                "1200 is well above 1080p -> downscale helps",
+            ),
+            // Boundary documenting the 5% margin (1080 * 1.05 = 1134).
+            (
+                "h265",
+                1134,
+                "h265",
+                1080,
+                true,
+                "exactly at the 5% margin -> still at target",
+            ),
+            (
+                "h265",
+                1135,
+                "h265",
+                1080,
+                false,
+                "just past the 5% margin -> downscale helps",
             ),
         ];
         for (sc, sh, tc, th, expect, why) in cases {
