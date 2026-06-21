@@ -39,4 +39,18 @@ describe("summarizeAdds", () => {
     };
     expect(summarizeAdds([r])).toBe("2 skipped (not a video)");
   });
+
+  it("labels and orders the already-at-target reason from skip-by-source-media", () => {
+    const r: AddResult = {
+      added: [{} as never],
+      skipped: [
+        { reason: "already_at_target", count: 2 },
+        { reason: "already_converted", count: 1 },
+      ],
+    };
+    // already_converted precedes already_at_target in the stable REASON_ORDER.
+    expect(summarizeAdds([r])).toBe(
+      "Added 1 · 1 skipped (already converted) · 2 skipped (already at target)",
+    );
+  });
 });

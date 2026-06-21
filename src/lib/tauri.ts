@@ -21,7 +21,8 @@ export type SkipReason =
   | "not_video"
   | "already_queued"
   | "already_converted"
-  | "output_exists";
+  | "output_exists"
+  | "already_at_target";
 
 export interface SkipCount {
   reason: SkipReason;
