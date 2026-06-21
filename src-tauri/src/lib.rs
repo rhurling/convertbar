@@ -3,6 +3,7 @@ mod converter;
 mod db;
 mod handbrake;
 mod media_skip;
+mod probe;
 mod types;
 mod watcher;
 
