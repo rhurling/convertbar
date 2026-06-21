@@ -71,6 +71,15 @@ fn apply_in_place_action(
     }
 }
 
+/// Whether a failed in-place cleanup must demote a "successful" encode to an error. Only a failed
+/// *rename* matters: for `KeptFile::Converted` the re-encode was meant to replace the source, so a
+/// rename failure means it did not (and in trash mode the original may already be in Trash). A failed
+/// temp removal (`Original`/`Neither`) is benign — the source is correctly kept, only an orphan temp
+/// lingers (it is marker-excluded from scans and pre-cleared on the next in-place encode).
+fn in_place_apply_is_fatal(kept: KeptFile, apply_failed: bool) -> bool {
+    apply_failed && matches!(kept, KeptFile::Converted)
+}
+
 pub struct ConverterState {
     pub current_pid: Mutex<Option<u32>>,
     pub current_child: Mutex<Option<Child>>,
@@ -486,13 +495,14 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
 
                 // Act on the decision. In-place replaces/keeps the source via the temp; the
                 // distinct-file path keeps both names and trashes/deletes the loser as before.
-                if in_place {
+                let in_place_apply_failed = if in_place {
                     let action = in_place_action(kept, &cleanup_mode);
-                    let _ = apply_in_place_action(
+                    apply_in_place_action(
                         action,
                         &encode_target,
                         std::path::Path::new(&job.source_path),
-                    );
+                    )
+                    .is_err()
                 } else {
                     match kept {
                         KeptFile::Converted => match cleanup_mode.as_str() {
@@ -513,6 +523,61 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                         },
                         KeptFile::Neither => {}
                     }
+                    false
+                };
+
+                // A failed in-place *rename* means the re-encode never replaced the source (and in
+                // trash mode the original may now be in Trash, with the temp left behind). Record an
+                // error instead of a false "done" so history never claims a success that left the
+                // file out of place. A failed temp *removal* is benign and handled as success.
+                if in_place_apply_is_fatal(kept, in_place_apply_failed) {
+                    had_errors = true;
+                    let now = chrono::Utc::now().to_rfc3339();
+                    // In trash mode the original was moved to Trash before the rename failed; in
+                    // delete mode the rename-over-source failed and the original is untouched.
+                    let err_msg = if cleanup_mode == "delete" {
+                        "In-place replacement failed; original left unchanged"
+                    } else {
+                        "In-place replacement failed; original may be in Trash"
+                    };
+                    {
+                        let db = db.lock().unwrap();
+                        let _ = db.execute(
+                            "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3 WHERE id = ?1",
+                            params![job.id, err_msg, now],
+                        );
+                    }
+                    let _ = app.emit(
+                        "job-error",
+                        serde_json::json!({ "job_id": job.id, "error": err_msg }),
+                    );
+                    let _ = app.emit(
+                        "job-status-changed",
+                        serde_json::json!({ "job_id": job.id, "status": "error" }),
+                    );
+                    let notify_per_file = {
+                        let db = db.lock().unwrap();
+                        db.query_row(
+                            "SELECT value FROM settings WHERE key='notifications_per_file'",
+                            params![],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .map(|v| v == "true")
+                        .unwrap_or(true)
+                    };
+                    if notify_per_file {
+                        let _ = app
+                            .notification()
+                            .builder()
+                            .title("ConvertBar")
+                            .body(&format!("{} failed", file_name))
+                            .show();
+                    }
+                    // Intentionally leave the temp (`.{stem}.convertbar-tmp.mp4`): it holds the
+                    // re-encoded content, and in trash mode it is the only in-place copy (the
+                    // original is in Trash), so removing it would force trash recovery. The marker
+                    // keeps it out of scans, and the next in-place encode pre-clears it.
+                    continue;
                 }
 
                 let kept_file = match kept {
@@ -964,6 +1029,39 @@ mod tests {
             std::fs::read(&source).unwrap(),
             b"original",
             "source is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn in_place_apply_is_fatal_only_for_failed_rename() {
+        // A failed rename (Converted) is fatal: the source was meant to be replaced and wasn't.
+        assert!(in_place_apply_is_fatal(KeptFile::Converted, true));
+        // A successful apply is never fatal.
+        assert!(!in_place_apply_is_fatal(KeptFile::Converted, false));
+        // A failed temp removal (Original/Neither) is benign: the source is correctly kept.
+        assert!(!in_place_apply_is_fatal(KeptFile::Original, true));
+        assert!(!in_place_apply_is_fatal(KeptFile::Neither, true));
+    }
+
+    #[test]
+    fn apply_rename_surfaces_failure_when_temp_missing() {
+        // The hardening relies on apply_in_place_action returning Err so the job can be failed
+        // rather than recorded as a false success. A missing temp makes the rename fail.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        let temp = dir.path().join(".clip.convertbar-tmp.mp4");
+        std::fs::write(&source, b"original").unwrap();
+
+        let result = apply_in_place_action(InPlaceAction::RenameTempOverSource, &temp, &source);
+
+        assert!(
+            result.is_err(),
+            "a missing temp must surface as an error, not be swallowed"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"original",
+            "the source is left intact when the rename could not happen"
         );
     }
 }
