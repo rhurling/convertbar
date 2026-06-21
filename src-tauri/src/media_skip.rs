@@ -2,6 +2,8 @@
 //! No I/O — every function here is table-testable. The HandBrake shell-out that produces a
 //! `SourceMedia` lives in `handbrake.rs`.
 
+use std::collections::HashSet;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceMedia {
     /// Normalized codec slug (same vocabulary as `handbrake::classify_preset`'s codec).
@@ -46,6 +48,26 @@ pub fn should_skip_by_media(
         _ => true, // unknown on either side -> assume a conversion could help
     };
     !resolution_would_help && !codec_would_help
+}
+
+/// From candidate `(path, probed media)` pairs, return the set of paths to skip because they
+/// already meet the target. `None` media (probe failed / not a video) is never skipped.
+pub fn select_media_skips(
+    candidates: &[(String, Option<SourceMedia>)],
+    target_codec: &str,
+    target_height: i64,
+) -> HashSet<String> {
+    candidates
+        .iter()
+        .filter_map(|(path, media)| {
+            let m = media.as_ref()?;
+            if should_skip_by_media(&m.codec, m.height, target_codec, target_height) {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -173,5 +195,37 @@ mod tests {
         for (sc, sh, tc, th, expect, why) in cases {
             assert_eq!(should_skip_by_media(sc, sh, tc, th), expect, "{why}");
         }
+    }
+
+    #[test]
+    fn selects_only_at_target_paths_with_known_media() {
+        let candidates = vec![
+            // Already at target -> selected for skip.
+            (
+                "/m/av1.mp4".to_string(),
+                Some(SourceMedia {
+                    codec: "av1".into(),
+                    height: 1080,
+                }),
+            ),
+            // Codec upgrade available -> not skipped.
+            (
+                "/m/h264.mp4".to_string(),
+                Some(SourceMedia {
+                    codec: "h264".into(),
+                    height: 1080,
+                }),
+            ),
+            // Probe failed / not introspectable -> never skipped (uncertainty).
+            ("/m/unknown.mp4".to_string(), None),
+        ];
+        let skip = select_media_skips(&candidates, "h265", 1080);
+        assert!(skip.contains("/m/av1.mp4"));
+        assert!(!skip.contains("/m/h264.mp4"));
+        assert!(
+            !skip.contains("/m/unknown.mp4"),
+            "None media must never be skipped"
+        );
+        assert_eq!(skip.len(), 1);
     }
 }
