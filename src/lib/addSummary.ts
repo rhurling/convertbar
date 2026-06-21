@@ -5,12 +5,14 @@ const SKIP_LABELS: Record<SkipReason, string> = {
   already_converted: "already converted",
   already_queued: "already queued",
   not_video: "not a video",
+  already_at_target: "already at target",
 };
 
 // Fixed order so the rendered summary is deterministic regardless of backend ordering.
 const REASON_ORDER: SkipReason[] = [
   "output_exists",
   "already_converted",
+  "already_at_target",
   "already_queued",
   "not_video",
 ];

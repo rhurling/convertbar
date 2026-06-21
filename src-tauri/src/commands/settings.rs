@@ -26,6 +26,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
     let mut notifications_errors_only = false;
     let mut notifications_queue_done = true;
     let mut skip_already_converted = false;
+    let mut skip_by_source_media = true;
 
     let rows = stmt
         .query_map([], |row| {
@@ -51,6 +52,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
             "notifications_errors_only" => notifications_errors_only = value == "true",
             "notifications_queue_done" => notifications_queue_done = value == "true",
             "skip_already_converted" => skip_already_converted = value == "true",
+            "skip_by_source_media" => skip_by_source_media = value == "true",
             _ => {}
         }
     }
@@ -72,6 +74,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
         notifications_errors_only,
         notifications_queue_done,
         skip_already_converted,
+        skip_by_source_media,
     })
 }
 
@@ -89,6 +92,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "notifications_errors_only",
     "notifications_queue_done",
     "skip_already_converted",
+    "skip_by_source_media",
 ];
 
 #[tauri::command]

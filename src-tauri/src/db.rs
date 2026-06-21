@@ -79,6 +79,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("notifications_errors_only", "false"),
         ("notifications_queue_done", "true"),
         ("skip_already_converted", "false"),
+        ("skip_by_source_media", "true"),
     ];
 
     for (key, value) in defaults {
@@ -141,7 +142,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 13);
+        assert_eq!(count, 14);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -149,6 +150,11 @@ mod tests {
         assert_eq!(
             setting(&conn, "skip_already_converted").as_deref(),
             Some("false")
+        );
+        assert_eq!(
+            setting(&conn, "skip_by_source_media").as_deref(),
+            Some("true"),
+            "skip-by-source-media defaults ON"
         );
         assert_eq!(
             setting(&conn, "notifications_per_file").as_deref(),
@@ -186,7 +192,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 13);
+        assert_eq!(count, 14);
     }
 
     #[test]
