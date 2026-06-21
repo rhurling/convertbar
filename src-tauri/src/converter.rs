@@ -12,6 +12,61 @@ use tauri_plugin_notification::NotificationExt;
 /// `is_video_file` can exclude it — a folder scan or watched folder must never enqueue a temp.
 pub(crate) const IN_PLACE_TEMP_MARKER: &str = ".convertbar-tmp.";
 
+/// A job re-encodes a file onto itself exactly when its stored output path equals its source.
+pub(crate) fn is_in_place(source_path: &str, output_path: &str) -> bool {
+    source_path == output_path
+}
+
+/// Temp output path for an in-place encode: a hidden, marked sibling in the SAME directory so the
+/// final `rename` is atomic (same filesystem). Keeps `.mp4` so HandBrake's container matches the
+/// distinct-file path.
+pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(source_path);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+    parent.join(format!(".{stem}{IN_PLACE_TEMP_MARKER}mp4"))
+}
+
+/// Filesystem action for an in-place job once the keep/discard decision is made. Pure mapping so
+/// it can be table-tested apart from the side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InPlaceAction {
+    /// Re-encode won — overwrite the source with the temp (cleanup_mode = delete).
+    RenameTempOverSource,
+    /// Re-encode won — move the source to Trash first, then put the temp in its place (trash mode).
+    TrashSourceThenRename,
+    /// Re-encode lost or produced nothing usable — drop the temp, keep the source.
+    RemoveTemp,
+}
+
+fn in_place_action(kept: KeptFile, cleanup_mode: &str) -> InPlaceAction {
+    match kept {
+        KeptFile::Converted => {
+            if cleanup_mode == "delete" {
+                InPlaceAction::RenameTempOverSource
+            } else {
+                InPlaceAction::TrashSourceThenRename
+            }
+        }
+        KeptFile::Original | KeptFile::Neither => InPlaceAction::RemoveTemp,
+    }
+}
+
+fn apply_in_place_action(
+    action: InPlaceAction,
+    temp: &std::path::Path,
+    source: &std::path::Path,
+) -> std::io::Result<()> {
+    match action {
+        InPlaceAction::RenameTempOverSource => std::fs::rename(temp, source),
+        InPlaceAction::TrashSourceThenRename => {
+            let _ = trash::delete(source);
+            std::fs::rename(temp, source)
+        }
+        InPlaceAction::RemoveTemp => std::fs::remove_file(temp),
+    }
+}
+
 pub struct ConverterState {
     pub current_pid: Mutex<Option<u32>>,
     pub current_child: Mutex<Option<Child>>,
@@ -792,5 +847,78 @@ mod tests {
             assert_eq!(saved, want_saved, "space_saved for ({orig}, {conv})");
             assert_eq!(status, want_status, "status for ({orig}, {conv})");
         }
+    }
+
+    #[test]
+    fn is_in_place_only_when_paths_match() {
+        assert!(is_in_place("/m/clip.mp4", "/m/clip.mp4"));
+        assert!(!is_in_place("/m/clip.mkv", "/m/clip.mp4"));
+        assert!(!is_in_place("/m/clip.mp4", "/m/clip-conv.mp4"));
+    }
+
+    #[test]
+    fn in_place_temp_path_is_marked_hidden_sibling() {
+        let temp = in_place_temp_path("/movies/clip.mp4");
+        assert_eq!(
+            temp,
+            std::path::Path::new("/movies/.clip.convertbar-tmp.mp4")
+        );
+        assert!(temp.to_string_lossy().contains(IN_PLACE_TEMP_MARKER));
+    }
+
+    #[test]
+    fn in_place_action_maps_decision_to_filesystem_op() {
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "delete"),
+            InPlaceAction::RenameTempOverSource
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "trash"),
+            InPlaceAction::TrashSourceThenRename
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Original, "delete"),
+            InPlaceAction::RemoveTemp
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Neither, "trash"),
+            InPlaceAction::RemoveTemp
+        );
+    }
+
+    #[test]
+    fn apply_rename_replaces_source_with_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        let temp = dir.path().join(".clip.convertbar-tmp.mp4");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::write(&temp, b"reencoded").unwrap();
+
+        apply_in_place_action(InPlaceAction::RenameTempOverSource, &temp, &source).unwrap();
+
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"reencoded",
+            "source now holds the re-encode"
+        );
+        assert!(!temp.exists(), "temp was consumed by the rename");
+    }
+
+    #[test]
+    fn apply_remove_temp_keeps_source_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        let temp = dir.path().join(".clip.convertbar-tmp.mp4");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::write(&temp, b"bigger-reencode").unwrap();
+
+        apply_in_place_action(InPlaceAction::RemoveTemp, &temp, &source).unwrap();
+
+        assert!(!temp.exists(), "temp was removed");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"original",
+            "source is left exactly as it was"
+        );
     }
 }
