@@ -611,6 +611,16 @@ mod tests {
         assert!(!is_video_file(Path::new("README")));
     }
 
+    #[test]
+    fn rejects_in_place_temp_files() {
+        // A lingering in-place temp must never be picked up by a folder scan or watched folder,
+        // even though it carries a valid .mp4 extension.
+        assert!(!is_video_file(Path::new(
+            "/movies/.clip.convertbar-tmp.mp4"
+        )));
+        assert!(!is_video_file(Path::new("clip.convertbar-tmp.mp4")));
+    }
+
     // ---- add_files_to_db skip rules ----
 
     #[test]
