@@ -24,31 +24,3 @@ input model (watched-folders + web file browser vs. upload) and auth posture
 during the spec.
 
 **Next step:** brainstorm → spec → implementation plan (not started).
-
-## Skip queued files by source codec + resolution
-
-Skip a file when its source codec and resolution already match or exceed the
-target preset (e.g. target h265 1080p, source h265 720p → skip). Rough estimate
-~1–2 days.
-
-The app does **not** probe source files today — no ffprobe, no HandBrake `--scan`.
-It only knows the *target preset's* codec/resolution via `classify_preset`
-(`src-tauri/src/handbrake.rs:89`), used for filename suffixes — so this is mostly
-new source-introspection work. Reusable: the per-file skip loop in
-`add_files_to_db` (`queue.rs:174`) next to the existing `skip_already_converted`
-toggle (`queue.rs:109`); the async/lock split (slow shelling-out belongs in
-`add_files_inner` outside the DB lock, mirroring suffix resolution at
-`queue.rs:122`); a pure, table-testable comparison fn like `decide_cleanup`. New:
-a `HandBrakeCLI --scan --json -i <file>` probe + parse, the comparison policy, and
-a settings toggle + UI checkbox.
-
-**AV1 / open product decision:** a naive same-codec rule would re-encode AV1→h265
-(likely larger, lower quality); `decide_cleanup` would then keep the original AV1
-and mark the job "skipped" — correct result, but wasted CPU, which this feature
-exists to avoid. A better rule compares codec *efficiency rank* (av1 ≈ h265 ≈ vp9
-> h264 > mpeg). But skipping equal-or-better codecs conflicts with compatibility-
-driven transcodes (e.g. an old device that can't decode AV1), so a default must be
-chosen and made a toggle.
-
-**Next step:** brainstorm → spec → implementation plan (not started). Settle the
-codec-ranking-vs-compatibility default first.
