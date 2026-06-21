@@ -12,6 +12,8 @@ interface QueueItemProps {
 }
 
 export default function QueueItem({ job, onRemoved, onDragStart, onDragOver, onDrop, isDragOver }: QueueItemProps) {
+  const isInPlace = job.source_path === job.output_path;
+
   const handleRemove = async () => {
     await commands.removeJob(job.id);
     onRemoved();
@@ -44,6 +46,11 @@ export default function QueueItem({ job, onRemoved, onDragStart, onDragOver, onD
       <span className="queue-item-name" title={job.source_path}>
         {fileName(job.source_path)}
       </span>
+      {isInPlace && (
+        <span className="badge badge-dim" title="Re-encoded in place, replacing the original">
+          In place
+        </span>
+      )}
       <span className="badge badge-dim">Queued</span>
       <button className="btn-icon" onClick={handleRemove} title="Remove">
         &times;

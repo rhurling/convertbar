@@ -211,21 +211,21 @@ pub fn cancel_conversion(
     // observes the dead process after the kill, and its error branch skips its own
     // status write and "failed" notification when the status is already 'error' — so
     // writing first prevents a spurious "failed" event/notification racing the cancel.
-    let (output_path, update_result) = match job_id_val {
+    let (paths, update_result) = match job_id_val {
         Some(ref job_id) => {
             let db = state.db.lock().map_err(|e| e.to_string())?;
-            let output_path: Option<String> = db
+            let paths: Option<(String, String)> = db
                 .query_row(
-                    "SELECT output_path FROM jobs WHERE id = ?1",
+                    "SELECT source_path, output_path FROM jobs WHERE id = ?1",
                     rusqlite::params![job_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .ok();
             let update_result = db.execute(
                 "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user' WHERE id = ?1",
                 rusqlite::params![job_id],
             );
-            (output_path, Some(update_result))
+            (paths, Some(update_result))
         }
         None => (None, None),
     };
@@ -261,8 +261,15 @@ pub fn cancel_conversion(
     }
 
     if let Some(ref job_id) = job_id_val {
-        if let Some(path) = output_path {
-            let _ = std::fs::remove_file(&path);
+        if let Some((ref source_path, ref output_path)) = paths {
+            // For an in-place job output_path == source_path, so deleting output_path would delete
+            // the user's original. Remove the temp instead; otherwise remove the partial output.
+            let target = if crate::converter::is_in_place(source_path, output_path) {
+                crate::converter::in_place_temp_path(source_path)
+            } else {
+                std::path::PathBuf::from(output_path)
+            };
+            let _ = std::fs::remove_file(&target);
         }
 
         let _ = app.emit(

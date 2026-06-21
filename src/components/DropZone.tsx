@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { commands, FolderScanResult } from "../lib/tauri";
+import { commands, FolderScanResult, AddResult } from "../lib/tauri";
+import { summarizeAdds } from "../lib/addSummary";
 
 interface DropZoneProps {
   onFilesAdded: () => void;
@@ -16,16 +17,17 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
       setStatus("Adding files...");
       try {
         const classified = await commands.classifyPaths(paths);
+        const results: AddResult[] = [];
 
         if (classified.files.length > 0) {
-          await commands.addFiles(classified.files);
+          results.push(await commands.addFiles(classified.files));
         }
 
         const toConfirm: FolderScanResult[] = [];
         for (const folder of classified.folders) {
           if (folder.file_count === 0) continue;
           if (folder.file_count <= 5) {
-            await commands.confirmFolderAdd(folder.folder_path);
+            results.push(await commands.confirmFolderAdd(folder.folder_path));
           } else {
             toConfirm.push(folder);
           }
@@ -33,11 +35,13 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
 
         if (toConfirm.length > 0) {
           setPendingFolders(toConfirm);
-          setStatus(null);
+          setStatus(summarizeAdds(results));
         } else {
           await commands.startQueue();
           onFilesAdded();
-          setStatus(null);
+          const summary = summarizeAdds(results);
+          setStatus(summary);
+          if (summary) setTimeout(() => setStatus(null), 4000);
         }
       } catch (e) {
         setStatus(`Error: ${e}`);
@@ -76,12 +80,15 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
               <span>Add {folder.file_count} files from &quot;{folder.folder_name}&quot;?</span>
               <div className="folder-confirm-actions">
                 <button className="btn btn-small" onClick={async () => {
-                  await commands.confirmFolderAdd(folder.folder_path);
+                  const res = await commands.confirmFolderAdd(folder.folder_path);
                   const remaining = pendingFolders.filter((_, j) => j !== i);
                   setPendingFolders(remaining);
                   if (remaining.length === 0) {
                     await commands.startQueue();
                     onFilesAdded();
+                    const summary = summarizeAdds([res]);
+                    setStatus(summary);
+                    if (summary) setTimeout(() => setStatus(null), 4000);
                   }
                 }}>Add</button>
                 <button className="btn btn-small btn-dim" onClick={() => {

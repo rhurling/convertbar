@@ -8,6 +8,69 @@ use tauri::{AppHandle, Emitter};
 use crate::types::JobInfo;
 use tauri_plugin_notification::NotificationExt;
 
+/// Filename marker for an in-flight in-place encode. A recognizable, non-suffix token so
+/// `is_video_file` can exclude it — a folder scan or watched folder must never enqueue a temp.
+pub(crate) const IN_PLACE_TEMP_MARKER: &str = ".convertbar-tmp.";
+
+/// A job re-encodes a file onto itself exactly when its stored output path equals its source.
+/// Compared as `Path` (not raw strings) so this predicate matches the add-time detection in
+/// `add_files_to_db` (`output_path.as_path() == path`), which normalizes `//` and `/.` segments.
+/// A mismatch here would route an in-place job through the distinct-file path and overwrite/delete
+/// the user's source — so the two predicates MUST stay identical.
+pub(crate) fn is_in_place(source_path: &str, output_path: &str) -> bool {
+    std::path::Path::new(source_path) == std::path::Path::new(output_path)
+}
+
+/// Temp output path for an in-place encode: a hidden, marked sibling in the SAME directory so the
+/// final `rename` is atomic (same filesystem). Keeps `.mp4` so HandBrake's container matches the
+/// distinct-file path.
+pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(source_path);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+    parent.join(format!(".{stem}{IN_PLACE_TEMP_MARKER}mp4"))
+}
+
+/// Filesystem action for an in-place job once the keep/discard decision is made. Pure mapping so
+/// it can be table-tested apart from the side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InPlaceAction {
+    /// Re-encode won — overwrite the source with the temp (cleanup_mode = delete).
+    RenameTempOverSource,
+    /// Re-encode won — move the source to Trash first, then put the temp in its place (trash mode).
+    TrashSourceThenRename,
+    /// Re-encode lost or produced nothing usable — drop the temp, keep the source.
+    RemoveTemp,
+}
+
+fn in_place_action(kept: KeptFile, cleanup_mode: &str) -> InPlaceAction {
+    match kept {
+        KeptFile::Converted => {
+            if cleanup_mode == "delete" {
+                InPlaceAction::RenameTempOverSource
+            } else {
+                InPlaceAction::TrashSourceThenRename
+            }
+        }
+        KeptFile::Original | KeptFile::Neither => InPlaceAction::RemoveTemp,
+    }
+}
+
+fn apply_in_place_action(
+    action: InPlaceAction,
+    temp: &std::path::Path,
+    source: &std::path::Path,
+) -> std::io::Result<()> {
+    match action {
+        InPlaceAction::RenameTempOverSource => std::fs::rename(temp, source),
+        InPlaceAction::TrashSourceThenRename => {
+            let _ = trash::delete(source);
+            std::fs::rename(temp, source)
+        }
+        InPlaceAction::RemoveTemp => std::fs::remove_file(temp),
+    }
+}
+
 pub struct ConverterState {
     pub current_pid: Mutex<Option<u32>>,
     pub current_child: Mutex<Option<Child>>,
@@ -270,6 +333,17 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             },
         );
 
+        let in_place = is_in_place(&job.source_path, &job.output_path);
+        let encode_target = if in_place {
+            in_place_temp_path(&job.source_path)
+        } else {
+            std::path::PathBuf::from(&job.output_path)
+        };
+        if in_place {
+            // Clear any stale temp left by a previous crash so HandBrake writes a fresh file.
+            let _ = std::fs::remove_file(&encode_target);
+        }
+
         // Spawn HandBrakeCLI
         let child = Command::new(&handbrake_path)
             .arg("-Z")
@@ -278,7 +352,7 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             .arg("-i")
             .arg(&job.source_path)
             .arg("-o")
-            .arg(&job.output_path)
+            .arg(&encode_target)
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn();
@@ -395,33 +469,50 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
 
         match exit_status {
             Ok(status) if status.success() => {
-                let converted_size = std::fs::metadata(&job.output_path)
+                let converted_size = std::fs::metadata(&encode_target)
                     .map(|m| m.len() as i64)
                     .ok();
-                let original_size = job.original_size.unwrap_or(0);
+                // For in-place, the source is unchanged during the temp encode, so re-stat it now.
+                let original_size = if in_place {
+                    std::fs::metadata(&job.source_path)
+                        .map(|m| m.len() as i64)
+                        .unwrap_or(job.original_size.unwrap_or(0))
+                } else {
+                    job.original_size.unwrap_or(0)
+                };
                 let conv_size = converted_size.unwrap_or(0);
 
                 let (kept, space_saved, status_str) = decide_cleanup(original_size, conv_size);
 
-                // Act on the decision: delete the file we're not keeping (Neither deletes nothing).
-                match kept {
-                    KeptFile::Converted => match cleanup_mode.as_str() {
-                        "delete" => {
-                            let _ = std::fs::remove_file(&job.source_path);
-                        }
-                        _ => {
-                            let _ = trash::delete(&job.source_path);
-                        }
-                    },
-                    KeptFile::Original => match cleanup_mode.as_str() {
-                        "delete" => {
-                            let _ = std::fs::remove_file(&job.output_path);
-                        }
-                        _ => {
-                            let _ = trash::delete(&job.output_path);
-                        }
-                    },
-                    KeptFile::Neither => {}
+                // Act on the decision. In-place replaces/keeps the source via the temp; the
+                // distinct-file path keeps both names and trashes/deletes the loser as before.
+                if in_place {
+                    let action = in_place_action(kept, &cleanup_mode);
+                    let _ = apply_in_place_action(
+                        action,
+                        &encode_target,
+                        std::path::Path::new(&job.source_path),
+                    );
+                } else {
+                    match kept {
+                        KeptFile::Converted => match cleanup_mode.as_str() {
+                            "delete" => {
+                                let _ = std::fs::remove_file(&job.source_path);
+                            }
+                            _ => {
+                                let _ = trash::delete(&job.source_path);
+                            }
+                        },
+                        KeptFile::Original => match cleanup_mode.as_str() {
+                            "delete" => {
+                                let _ = std::fs::remove_file(&job.output_path);
+                            }
+                            _ => {
+                                let _ = trash::delete(&job.output_path);
+                            }
+                        },
+                        KeptFile::Neither => {}
+                    }
                 }
 
                 let kept_file = match kept {
@@ -521,7 +612,8 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             }
             Ok(_) | Err(_) => {
                 had_errors = true;
-                let _ = std::fs::remove_file(&job.output_path);
+                // Remove the partial encode output (the temp for in-place jobs), never the source.
+                let _ = std::fs::remove_file(&encode_target);
 
                 let current_status: Option<String> = db
                     .lock()
@@ -788,5 +880,90 @@ mod tests {
             assert_eq!(saved, want_saved, "space_saved for ({orig}, {conv})");
             assert_eq!(status, want_status, "status for ({orig}, {conv})");
         }
+    }
+
+    #[test]
+    fn is_in_place_only_when_paths_match() {
+        assert!(is_in_place("/m/clip.mp4", "/m/clip.mp4"));
+        assert!(!is_in_place("/m/clip.mkv", "/m/clip.mp4"));
+        assert!(!is_in_place("/m/clip.mp4", "/m/clip-conv.mp4"));
+    }
+
+    #[test]
+    fn is_in_place_matches_add_time_path_normalization() {
+        // Regression: add-time uses `Path` equality (normalizes `//` and `/.`), but the stored
+        // output_path is the normalized join while source_path is verbatim. is_in_place MUST treat
+        // these as equal, or the converter routes an in-place job through the distinct-file delete
+        // path and destroys the source.
+        assert!(is_in_place("/movies//clip.mp4", "/movies/clip.mp4"));
+        assert!(is_in_place("/movies/./clip.mp4", "/movies/clip.mp4"));
+        // Genuinely different files must still be distinct.
+        assert!(!is_in_place("/movies/clip.mp4", "/movies/other.mp4"));
+    }
+
+    #[test]
+    fn in_place_temp_path_is_marked_hidden_sibling() {
+        let temp = in_place_temp_path("/movies/clip.mp4");
+        assert_eq!(
+            temp,
+            std::path::Path::new("/movies/.clip.convertbar-tmp.mp4")
+        );
+        assert!(temp.to_string_lossy().contains(IN_PLACE_TEMP_MARKER));
+    }
+
+    #[test]
+    fn in_place_action_maps_decision_to_filesystem_op() {
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "delete"),
+            InPlaceAction::RenameTempOverSource
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "trash"),
+            InPlaceAction::TrashSourceThenRename
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Original, "delete"),
+            InPlaceAction::RemoveTemp
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Neither, "trash"),
+            InPlaceAction::RemoveTemp
+        );
+    }
+
+    #[test]
+    fn apply_rename_replaces_source_with_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        let temp = dir.path().join(".clip.convertbar-tmp.mp4");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::write(&temp, b"reencoded").unwrap();
+
+        apply_in_place_action(InPlaceAction::RenameTempOverSource, &temp, &source).unwrap();
+
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"reencoded",
+            "source now holds the re-encode"
+        );
+        assert!(!temp.exists(), "temp was consumed by the rename");
+    }
+
+    #[test]
+    fn apply_remove_temp_keeps_source_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        let temp = dir.path().join(".clip.convertbar-tmp.mp4");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::write(&temp, b"bigger-reencode").unwrap();
+
+        apply_in_place_action(InPlaceAction::RemoveTemp, &temp, &source).unwrap();
+
+        assert!(!temp.exists(), "temp was removed");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"original",
+            "source is left exactly as it was"
+        );
     }
 }

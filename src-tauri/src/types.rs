@@ -75,3 +75,27 @@ pub struct WatchedDirectory {
     pub enabled: bool,
     pub created_at: String,
 }
+
+/// Why a dropped/scanned path was not queued. Surfaced at add time and counted per reason;
+/// never written to history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    NotVideo,
+    AlreadyQueued,
+    AlreadyConverted,
+    OutputExists,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkipCount {
+    pub reason: SkipReason,
+    pub count: u32,
+}
+
+/// Result of an add operation: the jobs actually queued, plus per-reason counts of paths skipped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddResult {
+    pub added: Vec<JobInfo>,
+    pub skipped: Vec<SkipCount>,
+}
