@@ -4,6 +4,7 @@ mod db;
 mod handbrake;
 mod media_skip;
 mod probe;
+mod probe_cache;
 mod types;
 mod watcher;
 
