@@ -54,6 +54,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             enabled              INTEGER NOT NULL DEFAULT 1,
             created_at           TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS probe_cache (
+            path      TEXT PRIMARY KEY,
+            size      INTEGER NOT NULL,
+            mtime     INTEGER NOT NULL,
+            codec     TEXT NOT NULL,
+            height    INTEGER NOT NULL,
+            probed_at TEXT NOT NULL
+        );
     ",
     )?;
 
@@ -231,6 +239,43 @@ mod tests {
         assert!(
             dup.is_err(),
             "duplicate path should violate UNIQUE constraint"
+        );
+    }
+
+    #[test]
+    fn init_db_creates_probe_cache_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // The table accepts a full cache row with the documented columns.
+        conn.execute(
+            "INSERT INTO probe_cache (path, size, mtime, codec, height, probed_at)
+             VALUES ('/m/a.mp4', 100, 5000, 'h265', 1080, '2026-06-22T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let (size, mtime, codec, height): (i64, i64, String, i64) = conn
+            .query_row(
+                "SELECT size, mtime, codec, height FROM probe_cache WHERE path = '/m/a.mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (size, mtime, codec.as_str(), height),
+            (100, 5000, "h265", 1080)
+        );
+
+        // `path` is the primary key, so a second row for the same path is rejected.
+        let dup = conn.execute(
+            "INSERT INTO probe_cache (path, size, mtime, codec, height, probed_at)
+             VALUES ('/m/a.mp4', 1, 1, 'h264', 1, '2026-06-22T00:00:00Z')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate path should violate the PRIMARY KEY"
         );
     }
 
