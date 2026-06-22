@@ -71,6 +71,23 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobInfo> {
     })
 }
 
+/// The cache key for a probe: the file's byte size + last-modified time (epoch millis).
+/// `None` when the file can't be stat'd or has no readable mtime — such a file has no
+/// stable identity and is probed every scan (handled by `resolve_media`'s forced-miss path).
+fn file_identity(path: &str) -> Option<crate::probe_cache::FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some(crate::probe_cache::FileIdentity {
+        size: meta.len() as i64,
+        mtime,
+    })
+}
+
 fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
     let configured: Option<String> = conn
         .query_row(
@@ -273,10 +290,27 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
             let target_codec = metadata.codec.clone();
             let target_height =
                 crate::media_skip::target_height_from_resolution(&metadata.resolution);
-            let probed: Vec<(String, Option<crate::media_skip::SourceMedia>)> = candidates_to_probe
-                .iter()
-                .map(|p| (p.clone(), crate::probe::probe_source(hb, p)))
-                .collect();
+            // Stamp each candidate with its filesystem identity (stat outside the DB lock),
+            // then reuse cached media for unchanged files and probe only the misses.
+            // resolve_media calls lookup (brief lock) -> probe (no lock) -> store (brief
+            // lock), so the HandBrake shell-out never runs while the DB mutex is held.
+            let with_identity: Vec<(String, Option<crate::probe_cache::FileIdentity>)> =
+                candidates_to_probe
+                    .iter()
+                    .map(|p| (p.clone(), file_identity(p)))
+                    .collect();
+            let probed = crate::probe_cache::resolve_media(
+                &with_identity,
+                |ids| {
+                    let conn = state.db.lock().expect("db mutex poisoned");
+                    crate::probe_cache::lookup_batch(&conn, ids)
+                },
+                |p| crate::probe::probe_source(hb, p),
+                |items| {
+                    let conn = state.db.lock().expect("db mutex poisoned");
+                    crate::probe_cache::store_batch(&conn, items);
+                },
+            );
             crate::media_skip::select_media_skips(&probed, &target_codec, target_height)
         } else {
             HashSet::new()
@@ -1176,6 +1210,11 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
+        conn.execute(
+            "UPDATE settings SET value = 'true' WHERE key = 'skip_by_source_media'",
+            [],
+        )
+        .unwrap();
         let state = crate::AppState {
             db: std::sync::Arc::new(std::sync::Mutex::new(conn)),
             preset_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1217,7 +1256,8 @@ mod tests {
         let at_target = make("a.mp4", "libx265"); // h265 1080p -> skip
         let upgrade = make("b.mp4", "libx264"); // h264 1080p -> queue
 
-        let result = add_files_inner(&state, &[at_target, upgrade]).unwrap();
+        let inputs = vec![at_target, upgrade];
+        let result = add_files_inner(&state, &inputs).unwrap();
 
         assert_eq!(result.added.len(), 1, "only the h264 source is queued");
         assert!(result.added[0].source_path.ends_with("b.mp4"));
@@ -1229,6 +1269,25 @@ mod tests {
             reported.map(|c| c.count),
             Some(1),
             "the h265 source must be reported as already-at-target, not silently dropped"
+        );
+
+        // Second pass over the same inputs: the at-target source's identity is unchanged, so
+        // its media is served from probe_cache (zero re-probe), and the codec-upgrade source
+        // is now already queued. The at-target source must STILL be reported skipped —
+        // proving the cached media drives the same decision as a live probe.
+        let again = add_files_inner(&state, &inputs).unwrap();
+        assert!(
+            again.added.is_empty(),
+            "nothing new to queue on a repeat add"
+        );
+        let at_target_again = again
+            .skipped
+            .iter()
+            .find(|c| c.reason == SkipReason::AlreadyAtTarget);
+        assert_eq!(
+            at_target_again.map(|c| c.count),
+            Some(1),
+            "the cached at-target source is still recognized on re-scan"
         );
     }
 }
