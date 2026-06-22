@@ -112,7 +112,11 @@ where
     for path in &forced {
         probed.push((path.clone(), probe(path)));
     }
-    store(&to_store);
+    // Acquire the write lock only when there's something to persist — a steady-state
+    // re-scan of already-cached files (all hits) stores nothing.
+    if !to_store.is_empty() {
+        store(&to_store);
+    }
 
     // Hits + freshly probed. Order is irrelevant — select_media_skips collects into a set.
     let mut out: Vec<(String, Option<SourceMedia>)> =
@@ -313,6 +317,40 @@ mod tests {
         assert!(
             stored.borrow().is_empty(),
             "a failed probe must not be cached"
+        );
+    }
+
+    #[test]
+    fn resolve_media_skips_store_when_there_is_nothing_to_cache() {
+        use std::cell::Cell;
+        // Steady state: every candidate is a cache hit, so nothing is probed or stored — the
+        // store side effect (which would lock the DB) must not be invoked at all.
+        let store_called = Cell::new(false);
+        let candidates = vec![(
+            "/m/hit.mp4".to_string(),
+            Some(FileIdentity { size: 1, mtime: 1 }),
+        )];
+        let lookup = |ids: &[(String, FileIdentity)]| {
+            (
+                ids.iter()
+                    .map(|(p, _)| (p.clone(), media("h265", 1080)))
+                    .collect(),
+                Vec::new(),
+            )
+        };
+        let probe =
+            |_: &str| -> Option<SourceMedia> { panic!("a pure cache hit must never probe") };
+        let store = |_: &[(String, FileIdentity, SourceMedia)]| store_called.set(true);
+
+        let out = resolve_media(&candidates, lookup, probe, store);
+
+        assert!(
+            !store_called.get(),
+            "no store (no DB write lock) when nothing needs caching"
+        );
+        assert_eq!(
+            out,
+            vec![("/m/hit.mp4".to_string(), Some(media("h265", 1080)))]
         );
     }
 
