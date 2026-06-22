@@ -66,6 +66,61 @@ pub fn store_batch(conn: &Connection, probed: &[(String, FileIdentity, SourceMed
     }
 }
 
+/// Memoize probes for `candidates`: reuse cached media for unchanged files, probe only the
+/// rest, persist the fresh probes, and return the `(path, Option<SourceMedia>)` list that
+/// `media_skip::select_media_skips` consumes. Generic over the three side effects so the
+/// memoization behavior is unit-testable without a database or HandBrake.
+///
+/// Each candidate carries its `FileIdentity`, or `None` when its size/mtime couldn't be
+/// read — those are forced misses: probed every time, never cached (no stable key).
+///
+/// Call order matters: `lookup` runs first (one batch), then `probe` per miss, then `store`
+/// once. The wiring relies on this so the expensive probe never holds the DB lock.
+pub fn resolve_media<L, P, S>(
+    candidates: &[(String, Option<FileIdentity>)],
+    lookup: L,
+    probe: P,
+    store: S,
+) -> Vec<(String, Option<SourceMedia>)>
+where
+    L: Fn(&[(String, FileIdentity)]) -> (Vec<(String, SourceMedia)>, Vec<(String, FileIdentity)>),
+    P: Fn(&str) -> Option<SourceMedia>,
+    S: Fn(&[(String, FileIdentity, SourceMedia)]),
+{
+    // Files with no readable identity can't be cached — set them aside to always probe.
+    let mut identified = Vec::new();
+    let mut forced = Vec::new();
+    for (path, id) in candidates {
+        match id {
+            Some(id) => identified.push((path.clone(), *id)),
+            None => forced.push(path.clone()),
+        }
+    }
+
+    let (hits, misses) = lookup(&identified);
+
+    // Probe every cache miss and every identity-less file. Cache only the successes.
+    let mut to_store = Vec::new();
+    let mut probed: Vec<(String, Option<SourceMedia>)> = Vec::new();
+    for (path, id) in &misses {
+        let media = probe(path);
+        if let Some(m) = &media {
+            to_store.push((path.clone(), *id, m.clone()));
+        }
+        probed.push((path.clone(), media));
+    }
+    for path in &forced {
+        probed.push((path.clone(), probe(path)));
+    }
+    store(&to_store);
+
+    // Hits + freshly probed. Order is irrelevant — select_media_skips collects into a set.
+    let mut out: Vec<(String, Option<SourceMedia>)> =
+        hits.into_iter().map(|(p, m)| (p, Some(m))).collect();
+    out.extend(probed);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +205,115 @@ mod tests {
         );
         assert!(hits.is_empty());
         assert_eq!(misses.len(), 1, "an unseen path is always a miss");
+    }
+
+    #[test]
+    fn resolve_media_probes_only_misses_and_never_reprobes_a_hit() {
+        use std::cell::RefCell;
+        // The whole point: a cached hit costs ZERO probes; a miss costs exactly one.
+        let probe_calls = RefCell::new(Vec::<String>::new());
+        let stored = RefCell::new(Vec::<(String, FileIdentity, SourceMedia)>::new());
+
+        let candidates = vec![
+            (
+                "/m/hit.mp4".to_string(),
+                Some(FileIdentity {
+                    size: 10,
+                    mtime: 100,
+                }),
+            ),
+            (
+                "/m/miss.mp4".to_string(),
+                Some(FileIdentity {
+                    size: 20,
+                    mtime: 200,
+                }),
+            ),
+        ];
+
+        let lookup = |ids: &[(String, FileIdentity)]| {
+            let mut hits = Vec::new();
+            let mut misses = Vec::new();
+            for (p, id) in ids {
+                if p == "/m/hit.mp4" {
+                    hits.push((p.clone(), media("h265", 1080)));
+                } else {
+                    misses.push((p.clone(), *id));
+                }
+            }
+            (hits, misses)
+        };
+        let probe = |p: &str| {
+            probe_calls.borrow_mut().push(p.to_string());
+            Some(media("h264", 1080))
+        };
+        let store = |items: &[(String, FileIdentity, SourceMedia)]| {
+            stored.borrow_mut().extend_from_slice(items);
+        };
+
+        let out = resolve_media(&candidates, lookup, probe, store);
+
+        assert_eq!(
+            probe_calls.borrow().as_slice(),
+            ["/m/miss.mp4"],
+            "only the miss is probed; the hit is never re-probed"
+        );
+        assert_eq!(stored.borrow().len(), 1, "the fresh probe is cached");
+        assert_eq!(stored.borrow()[0].0, "/m/miss.mp4");
+
+        // Both files come back carrying media for the skip policy.
+        let hit = out.iter().find(|(p, _)| p == "/m/hit.mp4").unwrap();
+        assert_eq!(hit.1, Some(media("h265", 1080)));
+        let miss = out.iter().find(|(p, _)| p == "/m/miss.mp4").unwrap();
+        assert_eq!(miss.1, Some(media("h264", 1080)));
+    }
+
+    #[test]
+    fn resolve_media_probes_identityless_files_but_never_caches_them() {
+        use std::cell::RefCell;
+        // No readable size/mtime -> no stable key: probe it, but never store it.
+        let stored = RefCell::new(Vec::<(String, FileIdentity, SourceMedia)>::new());
+        let candidates = vec![("/m/no-id.mp4".to_string(), None)];
+        let lookup = |_: &[(String, FileIdentity)]| (Vec::new(), Vec::new());
+        let probe = |_: &str| Some(media("h265", 1080));
+        let store = |items: &[(String, FileIdentity, SourceMedia)]| {
+            stored.borrow_mut().extend_from_slice(items)
+        };
+
+        let out = resolve_media(&candidates, lookup, probe, store);
+
+        assert_eq!(
+            out,
+            vec![("/m/no-id.mp4".to_string(), Some(media("h265", 1080)))]
+        );
+        assert!(
+            stored.borrow().is_empty(),
+            "an identity-less file is never cached"
+        );
+    }
+
+    #[test]
+    fn resolve_media_does_not_cache_a_failed_probe() {
+        use std::cell::RefCell;
+        // Uncertainty (None) is never stored, so it is re-evaluated next scan.
+        let stored = RefCell::new(Vec::<(String, FileIdentity, SourceMedia)>::new());
+        let candidates = vec![(
+            "/m/bad.mp4".to_string(),
+            Some(FileIdentity { size: 1, mtime: 1 }),
+        )];
+        let lookup = |ids: &[(String, FileIdentity)]| (Vec::new(), ids.to_vec());
+        let probe = |_: &str| None;
+        let store = |items: &[(String, FileIdentity, SourceMedia)]| {
+            stored.borrow_mut().extend_from_slice(items)
+        };
+
+        let out = resolve_media(&candidates, lookup, probe, store);
+
+        assert_eq!(out, vec![("/m/bad.mp4".to_string(), None)]);
+        assert!(
+            stored.borrow().is_empty(),
+            "a failed probe must not be cached"
+        );
     }
 
     #[test]
