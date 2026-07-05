@@ -30,6 +30,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             preset          TEXT NOT NULL,
             status          TEXT NOT NULL DEFAULT 'queued',
             original_size   INTEGER,
+            source_size     INTEGER,
+            source_mtime    INTEGER,
             converted_size  INTEGER,
             kept_file       TEXT,
             space_saved     INTEGER,
@@ -72,6 +74,17 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "UPDATE jobs SET completed_at = created_at WHERE status = 'error' AND completed_at IS NULL",
         [],
     )?;
+
+    // Older DBs predate the source-identity fingerprint columns. A fresh DB already has them
+    // from CREATE TABLE, so "duplicate column name" is expected and ignored — this keeps the
+    // upgrade idempotent. Any other ALTER failure is re-raised so a real error is not masked.
+    for col in ["source_size", "source_mtime"] {
+        if let Err(e) = conn.execute(&format!("ALTER TABLE jobs ADD COLUMN {col} INTEGER"), []) {
+            if !e.to_string().contains("duplicate column name") {
+                return Err(e);
+            }
+        }
+    }
 
     let defaults: &[(&str, &str)] = &[
         ("preset", preset),
