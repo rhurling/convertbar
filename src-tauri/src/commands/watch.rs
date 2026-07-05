@@ -1,5 +1,5 @@
 use rusqlite::params;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -77,7 +77,9 @@ pub fn add_watched_directory(
     }; // db lock released before reconcile re-acquires it
 
     watcher::reconcile(&app);
-    watcher::scan_existing(&app, dir, recursive);
+    // Scan off-thread: it probes every existing file with a blocking HandBrakeCLI call, which would
+    // freeze the UI on the main thread (this command is sync) for a folder full of files.
+    watcher::scan_existing_background(&app, dir.to_path_buf(), recursive);
     Ok(record)
 }
 
@@ -134,8 +136,10 @@ pub fn set_watched_directory_enabled(
 
     watcher::reconcile(&app);
     // Re-enabling a folder ingests anything that landed while it was off (or the app was closed).
+    // Scan off-thread — see `add_watched_directory`: the blocking HandBrake probe would otherwise
+    // freeze the UI (this sync command runs on the main thread) for a folder with many files.
     if enabled {
-        watcher::scan_existing(&app, Path::new(&path), recursive);
+        watcher::scan_existing_background(&app, PathBuf::from(&path), recursive);
     }
     Ok(())
 }
