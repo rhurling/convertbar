@@ -282,6 +282,15 @@ pub fn scan_existing(app: &AppHandle, dir: &Path, recursive: bool) {
     }
 }
 
+/// Background variant of `scan_existing` for Tauri command handlers, which run on the main thread.
+/// The scan probes every existing file with a blocking `HandBrakeCLI --scan`, so scanning inline
+/// freezes the UI when a folder holds many files (identical hazard to the initial scan in `start`).
+/// Spawns the scan off-thread — the same proven-safe path the startup scan and reaper already use.
+pub fn scan_existing_background(app: &AppHandle, dir: PathBuf, recursive: bool) {
+    let app = app.clone();
+    std::thread::spawn(move || scan_existing(&app, &dir, recursive));
+}
+
 /// Scans the existing contents of every enabled watched directory.
 fn scan_all_enabled(app: &AppHandle) {
     if let Ok(configs) = read_enabled_configs(app) {

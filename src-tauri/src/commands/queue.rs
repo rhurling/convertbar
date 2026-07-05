@@ -1,7 +1,7 @@
 use rusqlite::params;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::converter::IN_PLACE_TEMP_MARKER;
 use crate::handbrake;
@@ -429,8 +429,16 @@ fn add_files_to_db(
 }
 
 #[tauri::command]
-pub fn add_files(state: State<'_, AppState>, paths: Vec<String>) -> Result<AddResult, String> {
-    add_files_inner(&state, &paths)
+pub async fn add_files(app: AppHandle, paths: Vec<String>) -> Result<AddResult, String> {
+    // add_files_inner runs a blocking HandBrakeCLI probe per file (source-media skip), so a large
+    // drop would freeze the main-thread event loop. Offload to a blocking thread; the AddResult
+    // still returns to the awaiting frontend. Same hazard the watcher avoids via scan_existing_background.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        add_files_inner(&state, &paths)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -455,19 +463,24 @@ pub fn scan_folder(path: String) -> Result<FolderScanResult, String> {
 }
 
 #[tauri::command]
-pub fn confirm_folder_add(state: State<'_, AppState>, path: String) -> Result<AddResult, String> {
-    let dir = Path::new(&path);
-    if !dir.is_dir() {
+pub async fn confirm_folder_add(app: AppHandle, path: String) -> Result<AddResult, String> {
+    if !Path::new(&path).is_dir() {
         return Err("Path is not a directory".to_string());
     }
 
-    let files = scan_video_files(dir);
-    let paths: Vec<String> = files
-        .into_iter()
-        .filter_map(|p| p.to_str().map(|s| s.to_string()))
-        .collect();
-
-    add_files_inner(&state, &paths)
+    // Both the recursive scan and the per-file probe block; run them off the main thread so
+    // confirming a large folder doesn't freeze the UI (same hazard as add_files).
+    tauri::async_runtime::spawn_blocking(move || {
+        let files = scan_video_files(Path::new(&path));
+        let paths: Vec<String> = files
+            .into_iter()
+            .filter_map(|p| p.to_str().map(|s| s.to_string()))
+            .collect();
+        let state = app.state::<AppState>();
+        add_files_inner(&state, &paths)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
