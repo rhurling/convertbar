@@ -661,9 +661,15 @@ mod tests {
         );
     }
 
-    /// Builds an `exists` closure that reports the given absolute paths as present.
+    /// Builds an `exists` closure that reports the given absolute paths as present. Comparison is
+    /// separator-normalized: `has_active_marker` builds candidates with `Path::join`, which emits
+    /// `\` on Windows, but the fixtures below are written with `/`.
     fn present(paths: &'static [&'static str]) -> impl Fn(&Path) -> bool {
-        move |p: &Path| p.to_str().map(|s| paths.contains(&s)).unwrap_or(false)
+        move |p: &Path| {
+            p.to_str()
+                .map(|s| paths.contains(&s.replace('\\', "/").as_str()))
+                .unwrap_or(false)
+        }
     }
 
     #[test]
