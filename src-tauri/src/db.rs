@@ -101,6 +101,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("notifications_queue_done", "true"),
         ("skip_already_converted", "false"),
         ("skip_by_source_media", "false"),
+        ("watch_skip_marker", ".downloading"),
     ];
 
     for (key, value) in defaults {
@@ -163,7 +164,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 14);
+        assert_eq!(count, 15);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -176,6 +177,11 @@ mod tests {
             setting(&conn, "skip_by_source_media").as_deref(),
             Some("false"),
             "skip-by-source-media defaults OFF — it shells out to HandBrake per file, so it is opt-in"
+        );
+        assert_eq!(
+            setting(&conn, "watch_skip_marker").as_deref(),
+            Some(".downloading"),
+            "watched folders skip files while this marker exists; empty disables the feature"
         );
         assert_eq!(
             setting(&conn, "notifications_per_file").as_deref(),
@@ -213,7 +219,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 14);
+        assert_eq!(count, 15);
     }
 
     #[test]

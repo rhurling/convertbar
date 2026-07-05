@@ -108,6 +108,64 @@ pub(crate) fn delay_for_path(configs: &[WatchedDirConfig], path: &Path) -> Optio
     })
 }
 
+/// True when a skip-marker file named `marker` exists in `path`'s own directory or any ancestor
+/// up to (and including) the watched root that contains `path`. The walk is bounded at the watched
+/// root so a stray file with the marker name above the watched tree is never honored, and returns
+/// `false` when `path` sits inside no watched directory. `marker_exists` is injected so the walk
+/// is unit-testable without touching the filesystem.
+pub(crate) fn has_active_marker(
+    configs: &[WatchedDirConfig],
+    path: &Path,
+    marker: &str,
+    marker_exists: impl Fn(&Path) -> bool,
+) -> bool {
+    let Some(root) = configs
+        .iter()
+        .map(|config| config.path.as_path())
+        .find(|root| path.starts_with(root))
+    else {
+        return false;
+    };
+    let mut dir = path.parent();
+    while let Some(current) = dir {
+        if marker_exists(&current.join(marker)) {
+            return true;
+        }
+        if current == root {
+            break;
+        }
+        dir = current.parent();
+    }
+    false
+}
+
+/// If `path` is a skip-marker file that was just *removed* from a watched directory, returns the
+/// `(directory, recursive)` subtree to re-scan so files ignored while the marker existed get picked
+/// up. Returns `None` when `path` isn't the marker, isn't inside a watched directory, or still
+/// exists (a create/modify, not a delete). `exists` is injected for testability.
+pub(crate) fn marker_removed_dir(
+    configs: &[WatchedDirConfig],
+    path: &Path,
+    marker: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<(PathBuf, bool)> {
+    if path.file_name().and_then(|name| name.to_str()) != Some(marker) {
+        return None;
+    }
+    let parent = path.parent()?;
+    let config = configs.iter().find(|config| {
+        if config.recursive {
+            path.starts_with(&config.path)
+        } else {
+            parent == config.path
+        }
+    })?;
+    if exists(path) {
+        return None;
+    }
+    Some((parent.to_path_buf(), config.recursive))
+}
+
 /// Reads a file's size and modification time in one stat. Returns `None` for missing paths or
 /// non-files (e.g. directories), which the caller treats as "stop tracking".
 fn stat_size_mtime(path: &Path) -> Option<(u64, SystemTime)> {
@@ -128,6 +186,9 @@ pub struct WatcherState {
     pending: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>,
     /// Current per-directory configs, read by the event handler on each event.
     configs: Arc<Mutex<Vec<WatchedDirConfig>>>,
+    /// The active skip-marker filename (`None`/empty = feature off). Refreshed on reconcile and
+    /// whenever the setting changes; read by the event handler and the enqueue filter.
+    skip_marker: Arc<Mutex<Option<String>>>,
 }
 
 impl WatcherState {
@@ -137,6 +198,7 @@ impl WatcherState {
             watched: Mutex::new(Vec::new()),
             pending: Arc::new(Mutex::new(HashMap::new())),
             configs: Arc::new(Mutex::new(Vec::new())),
+            skip_marker: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -147,6 +209,8 @@ impl WatcherState {
 fn build_watcher(
     pending: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>,
     configs: Arc<Mutex<Vec<WatchedDirConfig>>>,
+    skip_marker: Arc<Mutex<Option<String>>>,
+    app: AppHandle,
 ) -> RecommendedWatcher {
     notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let event = match res {
@@ -157,8 +221,20 @@ fn build_watcher(
             Ok(configs) => configs,
             Err(_) => return,
         };
+        let marker = skip_marker.lock().ok().and_then(|guard| guard.clone());
         let now = Instant::now();
         for path in &event.paths {
+            // A removed skip marker means "this folder finished downloading" — re-scan its subtree
+            // so files we ignored while the marker existed get enqueued. This is the only reason we
+            // look at non-video paths at all.
+            if let Some(marker) = marker.as_deref() {
+                if let Some((dir, recursive)) =
+                    marker_removed_dir(&configs, path, marker, |p| p.exists())
+                {
+                    scan_existing_background(&app, dir, recursive);
+                    continue;
+                }
+            }
             let Some(delay) = delay_for_path(&configs, path) else {
                 continue;
             };
@@ -204,10 +280,36 @@ fn spawn_reaper(app: AppHandle, pending: Arc<Mutex<HashMap<PathBuf, PendingEntry
     });
 }
 
+/// Drops paths that currently sit under an active skip marker (see `has_active_marker`). A no-op
+/// when the feature is disabled. Applied at the single enqueue chokepoint so live events, startup
+/// and enable scans, and marker-removal rescans all honor markers uniformly.
+fn filter_marked(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
+    let state = app.state::<WatcherState>();
+    let marker = match state.skip_marker.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => return paths,
+    };
+    let Some(marker) = marker else {
+        return paths;
+    };
+    let configs = match state.configs.lock() {
+        Ok(configs) => configs.clone(),
+        Err(_) => return paths,
+    };
+    paths
+        .into_iter()
+        .filter(|path| !has_active_marker(&configs, Path::new(path), &marker, |p| p.exists()))
+        .collect()
+}
+
 /// Feeds stabilized paths through the same pipeline as drag-dropped files, then (auto-start)
 /// kicks the queue and notifies the UI. `add_files_inner` applies all existing skip rules, so
 /// already-converted or already-queued files are dropped here.
 fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
+    let paths = filter_marked(app, paths);
+    if paths.is_empty() {
+        return;
+    }
     let app_state = app.state::<AppState>();
     let result = match queue::add_files_inner(&app_state, &paths) {
         Ok(result) => result,
@@ -248,6 +350,39 @@ fn read_enabled_configs(app: &AppHandle) -> Result<Vec<WatchedDirConfig>, String
         })
         .map_err(|e| e.to_string())?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Validates a configured skip-marker value: it must be a single plain filename. Anything empty,
+/// or containing a path separator / `.` / `..` (which would make `dir.join(marker)` resolve to a
+/// different location and silently pass every file through), is rejected as "feature off".
+/// `Path::file_name` makes this platform-correct (`\` is a separator on Windows, a filename char
+/// on Unix).
+fn valid_marker(value: &str) -> Option<String> {
+    (Path::new(value).file_name() == Some(std::ffi::OsStr::new(value))).then(|| value.to_string())
+}
+
+/// Reads the `watch_skip_marker` setting, returning the marker only when it is a valid plain
+/// filename. An empty, missing, or malformed value disables the skip-marker feature.
+fn read_skip_marker(app: &AppHandle) -> Option<String> {
+    let app_state = app.state::<AppState>();
+    let conn = app_state.db.lock().ok()?;
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'watch_skip_marker'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    valid_marker(&value)
+}
+
+/// Refreshes the watcher's cached skip-marker name from the DB. Called on reconcile and whenever
+/// the setting changes, so the event handler and enqueue filter see the current value.
+pub fn refresh_skip_marker(app: &AppHandle) {
+    let marker = read_skip_marker(app);
+    if let Ok(mut guard) = app.state::<WatcherState>().skip_marker.lock() {
+        *guard = marker;
+    }
 }
 
 /// Collects existing video files in `dir` (recursively when `recursive`), skipping temp/partial
@@ -319,6 +454,7 @@ pub fn reconcile(app: &AppHandle) {
     if let Ok(mut configs) = state.configs.lock() {
         *configs = desired.clone();
     }
+    refresh_skip_marker(app);
 
     let mut watched = match state.watched.lock() {
         Ok(watched) => watched,
@@ -349,12 +485,16 @@ pub fn reconcile(app: &AppHandle) {
 /// Starts the watcher subsystem: builds the OS watcher, spawns the reaper, arms watches from the
 /// DB, and scans existing contents. Call once during app setup.
 pub fn start(app: AppHandle) {
-    let (pending, configs) = {
+    let (pending, configs, skip_marker) = {
         let state = app.state::<WatcherState>();
-        (state.pending.clone(), state.configs.clone())
+        (
+            state.pending.clone(),
+            state.configs.clone(),
+            state.skip_marker.clone(),
+        )
     };
 
-    let watcher = build_watcher(pending.clone(), configs);
+    let watcher = build_watcher(pending.clone(), configs, skip_marker, app.clone());
     *app.state::<WatcherState>().watcher.lock().unwrap() = Some(watcher);
 
     spawn_reaper(app.clone(), pending);
@@ -519,5 +659,187 @@ mod tests {
             delay_for_path(&configs, Path::new("/elsewhere/movie.mp4")),
             None
         );
+    }
+
+    /// Builds an `exists` closure that reports the given absolute paths as present.
+    fn present(paths: &'static [&'static str]) -> impl Fn(&Path) -> bool {
+        move |p: &Path| p.to_str().map(|s| paths.contains(&s)).unwrap_or(false)
+    }
+
+    #[test]
+    fn has_active_marker_true_when_marker_in_files_own_dir() {
+        let configs = vec![config("/watch", true, 5)];
+        assert!(has_active_marker(
+            &configs,
+            Path::new("/watch/sub/movie.mp4"),
+            ".downloading",
+            present(&["/watch/sub/.downloading"]),
+        ));
+    }
+
+    #[test]
+    fn has_active_marker_true_when_marker_in_parent_subfolder() {
+        // Recursive watch: the marker sits above the video but still inside the watched tree, so
+        // the whole subtree under it is ignored.
+        let configs = vec![config("/watch", true, 5)];
+        assert!(has_active_marker(
+            &configs,
+            Path::new("/watch/sub/deeper/movie.mp4"),
+            ".downloading",
+            present(&["/watch/sub/.downloading"]),
+        ));
+    }
+
+    #[test]
+    fn has_active_marker_true_when_marker_at_watched_root() {
+        let configs = vec![config("/watch", true, 5)];
+        assert!(has_active_marker(
+            &configs,
+            Path::new("/watch/sub/movie.mp4"),
+            ".downloading",
+            present(&["/watch/.downloading"]),
+        ));
+    }
+
+    #[test]
+    fn has_active_marker_false_without_any_marker() {
+        let configs = vec![config("/watch", true, 5)];
+        assert!(!has_active_marker(
+            &configs,
+            Path::new("/watch/sub/movie.mp4"),
+            ".downloading",
+            |_| false,
+        ));
+    }
+
+    #[test]
+    fn has_active_marker_stops_at_watched_root_and_ignores_markers_above_it() {
+        // A file named like the marker above the watched root must not gate files inside it.
+        let configs = vec![config("/watch", true, 5)];
+        assert!(!has_active_marker(
+            &configs,
+            Path::new("/watch/movie.mp4"),
+            ".downloading",
+            present(&["/.downloading"]),
+        ));
+    }
+
+    #[test]
+    fn has_active_marker_false_for_path_outside_watched_dirs() {
+        let configs = vec![config("/watch", true, 5)];
+        // Even if markers "existed" everywhere, a path in no watched dir is never gated.
+        assert!(!has_active_marker(
+            &configs,
+            Path::new("/elsewhere/movie.mp4"),
+            ".downloading",
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn marker_removed_dir_none_when_filename_is_not_the_marker() {
+        let configs = vec![config("/watch", true, 5)];
+        assert_eq!(
+            marker_removed_dir(
+                &configs,
+                Path::new("/watch/movie.mp4"),
+                ".downloading",
+                |_| false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn marker_removed_dir_returns_subtree_when_deleted_in_recursive_subfolder() {
+        let configs = vec![config("/watch", true, 5)];
+        // Marker gone inside a recursive watch's subfolder → re-scan that subfolder recursively.
+        assert_eq!(
+            marker_removed_dir(
+                &configs,
+                Path::new("/watch/sub/.downloading"),
+                ".downloading",
+                |_| false
+            ),
+            Some((PathBuf::from("/watch/sub"), true))
+        );
+    }
+
+    #[test]
+    fn marker_removed_dir_none_when_marker_still_present() {
+        let configs = vec![config("/watch", true, 5)];
+        // exists = true → a create/modify, not a delete; nothing to reprocess yet.
+        assert_eq!(
+            marker_removed_dir(
+                &configs,
+                Path::new("/watch/sub/.downloading"),
+                ".downloading",
+                |_| true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn marker_removed_dir_handles_non_recursive_root_marker() {
+        let configs = vec![config("/watch", false, 5)];
+        assert_eq!(
+            marker_removed_dir(
+                &configs,
+                Path::new("/watch/.downloading"),
+                ".downloading",
+                |_| false
+            ),
+            Some((PathBuf::from("/watch"), false))
+        );
+    }
+
+    #[test]
+    fn marker_removed_dir_none_for_non_recursive_subfolder_marker() {
+        // A non-recursive watch never observes its subfolders, so a marker there isn't ours.
+        let configs = vec![config("/watch", false, 5)];
+        assert_eq!(
+            marker_removed_dir(
+                &configs,
+                Path::new("/watch/sub/.downloading"),
+                ".downloading",
+                |_| false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn marker_removed_dir_none_outside_watched_dirs() {
+        let configs = vec![config("/watch", true, 5)];
+        assert_eq!(
+            marker_removed_dir(
+                &configs,
+                Path::new("/elsewhere/.downloading"),
+                ".downloading",
+                |_| false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn valid_marker_accepts_plain_filenames() {
+        assert_eq!(
+            valid_marker(".downloading"),
+            Some(".downloading".to_string())
+        );
+        assert_eq!(valid_marker("in-progress"), Some("in-progress".to_string()));
+    }
+
+    #[test]
+    fn valid_marker_rejects_empty_separators_and_dot_paths() {
+        // Empty disables the feature; a value with a separator would make `dir.join(marker)`
+        // resolve elsewhere and silently pass every file, so it must be rejected too.
+        assert_eq!(valid_marker(""), None);
+        assert_eq!(valid_marker("sub/.downloading"), None);
+        assert_eq!(valid_marker(".downloading/"), None);
+        assert_eq!(valid_marker(".."), None);
+        assert_eq!(valid_marker("."), None);
     }
 }
