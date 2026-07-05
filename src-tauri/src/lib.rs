@@ -246,8 +246,8 @@ pub fn run() {
                                         db.query_row(
                                             "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
                                             [],
-                                            |row| row.get::<_, usize>(0),
-                                        ).unwrap_or(0)
+                                            |row| row.get::<_, i64>(0),
+                                        ).unwrap_or(0) as usize
                                     });
                                     if count > 0 {
                                         parts.push(format!("+{}", count));

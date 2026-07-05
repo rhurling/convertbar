@@ -5,6 +5,9 @@
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "skipLibCheck": true,
+    // TS 6.0 defaults `types` to []; @types/node must be listed so the
+    // `node:*` module imports in the release-script test still resolve.
+    "types": ["node"],
 
     /* Bundler mode */
     "moduleResolution": "bundler",
