@@ -225,6 +225,22 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       </div>
 
       <div className="setting-group">
+        <label className="setting-label">Watched-folder skip marker</label>
+        <input
+          className="setting-input"
+          type="text"
+          value={settings.watch_skip_marker}
+          onChange={(e) => updateSetting("watch_skip_marker", e.target.value)}
+          placeholder=".downloading"
+        />
+        <p className="setting-hint">
+          In watched folders, ignore any file whose folder (or a parent folder) contains a
+          file with this name, and convert them once it&apos;s removed. Point it at the marker
+          your downloader creates while downloading. Leave empty to disable.
+        </p>
+      </div>
+
+      <div className="setting-group">
         <label className="setting-label">Menu bar display</label>
         <p className="setting-hint">Choose what to show next to the icon during encoding</p>
         <div className="setting-toggles">

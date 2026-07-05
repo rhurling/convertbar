@@ -27,6 +27,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
     let mut notifications_queue_done = true;
     let mut skip_already_converted = false;
     let mut skip_by_source_media = false;
+    let mut watch_skip_marker = String::new();
 
     let rows = stmt
         .query_map([], |row| {
@@ -53,6 +54,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
             "notifications_queue_done" => notifications_queue_done = value == "true",
             "skip_already_converted" => skip_already_converted = value == "true",
             "skip_by_source_media" => skip_by_source_media = value == "true",
+            "watch_skip_marker" => watch_skip_marker = value,
             _ => {}
         }
     }
@@ -75,6 +77,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
         notifications_queue_done,
         skip_already_converted,
         skip_by_source_media,
+        watch_skip_marker,
     })
 }
 
@@ -93,6 +96,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "notifications_queue_done",
     "skip_already_converted",
     "skip_by_source_media",
+    "watch_skip_marker",
 ];
 
 #[tauri::command]
@@ -120,6 +124,11 @@ pub fn update_setting(
         } else {
             let _ = autostart.disable();
         }
+    }
+
+    // Let the running watcher pick up a changed skip-marker name without a restart.
+    if key == "watch_skip_marker" {
+        crate::watcher::refresh_skip_marker(&app);
     }
 
     Ok(())

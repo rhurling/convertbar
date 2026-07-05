@@ -33,6 +33,7 @@ pub struct Settings {
     pub notifications_queue_done: bool,
     pub skip_already_converted: bool,
     pub skip_by_source_media: bool,
+    pub watch_skip_marker: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
