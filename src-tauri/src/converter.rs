@@ -339,9 +339,9 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             db.query_row(
                 "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
                 [],
-                |row| row.get::<_, usize>(0),
+                |row| row.get::<_, i64>(0),
             )
-            .unwrap_or(0)
+            .unwrap_or(0) as usize
         };
 
         let _ = app.emit(
