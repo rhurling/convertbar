@@ -74,7 +74,7 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobInfo> {
 /// The cache key for a probe: the file's byte size + last-modified time (epoch millis).
 /// `None` when the file can't be stat'd or has no readable mtime — such a file has no
 /// stable identity and is probed every scan (handled by `resolve_media`'s forced-miss path).
-fn file_identity(path: &str) -> Option<crate::probe_cache::FileIdentity> {
+pub(crate) fn file_identity(path: &str) -> Option<crate::probe_cache::FileIdentity> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -113,8 +113,10 @@ fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
 fn cheap_skip_reason(
     path_str: &str,
     suffix: &str,
+    identity: Option<(i64, i64)>,
     queued_paths: &HashSet<String>,
-    history_paths: &HashSet<String>,
+    legacy_history_paths: &HashSet<String>,
+    converted_identities: &HashSet<(i64, i64)>,
 ) -> Option<SkipReason> {
     let path = Path::new(path_str);
     if !is_video_file(path) {
@@ -123,7 +125,17 @@ fn cheap_skip_reason(
     if queued_paths.contains(path_str) {
         return Some(SkipReason::AlreadyQueued);
     }
-    if history_paths.contains(path_str) {
+    // A file whose (size, mtime) matches a completed conversion is genuinely already done,
+    // whatever it is named. This replaces the old output-filename-exists heuristic, which
+    // wrongly skipped a different video that recycled a converted file's name.
+    if let Some(id) = identity {
+        if converted_identities.contains(&id) {
+            return Some(SkipReason::AlreadyConverted);
+        }
+    }
+    // Pre-migration completed rows carry no fingerprint; fall back to the old source_path
+    // match (see `fetch_skip_sets` for how this set is scoped).
+    if legacy_history_paths.contains(path_str) {
         return Some(SkipReason::AlreadyConverted);
     }
     let stem = path
@@ -133,21 +145,50 @@ fn cheap_skip_reason(
     if !suffix.is_empty() && stem.ends_with(suffix) {
         return Some(SkipReason::AlreadyConverted);
     }
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let output_path = parent.join(format!("{}{}.mp4", stem, suffix));
-    let in_place = output_path.as_path() == path;
-    if !in_place && output_path.exists() {
-        return Some(SkipReason::OutputExists);
-    }
     None
 }
 
-/// Reads the active-queue and (when `skip_already_converted`) history source paths the cheap skip
-/// checks test against.
+/// Output path for a source, renumbering the BASE name to avoid clobbering an existing file:
+/// `movie.mp4` -> `movie.h265.mp4`, then `movie (1).h265.mp4`, `movie (2).h265.mp4`, ...
+/// In-place jobs (default output == source) are returned verbatim and never renumbered, so the
+/// converter's in-place path stays intact. `is_taken` reports whether a candidate name is already
+/// claimed (on disk, by another job row, or earlier in the same batch).
+fn choose_output_path(source_path: &str, suffix: &str, is_taken: &dyn Fn(&str) -> bool) -> String {
+    let path = Path::new(source_path);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let default = parent.join(format!("{}{}.mp4", stem, suffix));
+    // In-place guard first: an in-place source's own on-disk presence must never trigger a rename.
+    if default.as_path() == path {
+        return default.to_string_lossy().to_string();
+    }
+    let default_str = default.to_string_lossy().to_string();
+    if !is_taken(&default_str) {
+        return default_str;
+    }
+    let mut n = 1;
+    loop {
+        let candidate = parent
+            .join(format!("{} ({}){}.mp4", stem, n, suffix))
+            .to_string_lossy()
+            .to_string();
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Reads the three sets the cheap skip checks test against: active-queue source paths, the
+/// pre-migration legacy history paths (scoped by `skip_already_converted`, plus in-place rows),
+/// and the always-on `(size, mtime)` fingerprints of completed conversions.
 fn fetch_skip_sets(
     conn: &rusqlite::Connection,
     skip_already_converted: bool,
-) -> Result<(HashSet<String>, HashSet<String>), String> {
+) -> Result<(HashSet<String>, HashSet<String>, HashSet<(i64, i64)>), String> {
     let queued_paths: HashSet<String> = {
         let mut stmt = conn
             .prepare(
@@ -159,18 +200,48 @@ fn fetch_skip_sets(
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
-    let history_paths: HashSet<String> = if skip_already_converted {
+
+    // One pass over completed jobs feeds two skip signals:
+    // - `converted_identities`: (size, mtime) fingerprints for the always-on identity check.
+    // - `legacy_history_paths`: source paths of PRE-MIGRATION rows that carry no fingerprint.
+    //   In-place rows (source_path == output_path) are always included to prevent a re-encode
+    //   cascade; other legacy rows are included only when `skip_already_converted` is on, which
+    //   preserves the historical history-skip behavior for upgraded databases.
+    let mut converted_identities: HashSet<(i64, i64)> = HashSet::new();
+    let mut legacy_history_paths: HashSet<String> = HashSet::new();
+    {
         let mut stmt = conn
-            .prepare("SELECT source_path FROM jobs WHERE status IN ('done', 'skipped')")
+            .prepare(
+                "SELECT source_path, output_path, source_size, source_mtime
+                 FROM jobs WHERE status IN ('done', 'skipped')",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
             .map_err(|e| e.to_string())?;
-        rows.filter_map(|r| r.ok()).collect()
-    } else {
-        HashSet::new()
-    };
-    Ok((queued_paths, history_paths))
+        for (source_path, output_path, size, mtime) in rows.flatten() {
+            match (size, mtime) {
+                (Some(s), Some(m)) => {
+                    converted_identities.insert((s, m));
+                }
+                _ => {
+                    let in_place = Path::new(&source_path) == Path::new(&output_path);
+                    if in_place || skip_already_converted {
+                        legacy_history_paths.insert(source_path);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((queued_paths, legacy_history_paths, converted_identities))
 }
 
 /// The subset of `paths` worth probing for the source-media skip: those that survive the
@@ -182,10 +253,22 @@ fn probe_candidates(
     suffix: &str,
     skip_already_converted: bool,
 ) -> Result<Vec<String>, String> {
-    let (queued_paths, history_paths) = fetch_skip_sets(conn, skip_already_converted)?;
+    let (queued_paths, legacy_history_paths, converted_identities) =
+        fetch_skip_sets(conn, skip_already_converted)?;
     Ok(paths
         .iter()
-        .filter(|p| cheap_skip_reason(p, suffix, &queued_paths, &history_paths).is_none())
+        .filter(|p| {
+            let identity = file_identity(p).map(|i| (i.size, i.mtime));
+            cheap_skip_reason(
+                p,
+                suffix,
+                identity,
+                &queued_paths,
+                &legacy_history_paths,
+                &converted_identities,
+            )
+            .is_none()
+        })
         .cloned()
         .collect())
 }
@@ -347,15 +430,27 @@ fn add_files_to_db(
     suffix: &str,
     skip_already_converted: bool,
 ) -> Result<AddResult, String> {
-    let (queued_paths, history_paths) = fetch_skip_sets(conn, skip_already_converted)?;
+    let (queued_paths, legacy_history_paths, converted_identities) =
+        fetch_skip_sets(conn, skip_already_converted)?;
 
     let mut queue_order = get_next_queue_order(conn)?;
     let mut added = Vec::new();
+    // Output names claimed earlier in THIS batch, so two new sources never resolve to one name.
+    let mut assigned: HashSet<String> = HashSet::new();
     let (mut n_not_video, mut n_queued, mut n_converted, mut n_output_exists) =
         (0u32, 0u32, 0u32, 0u32);
 
     for path_str in paths {
-        if let Some(reason) = cheap_skip_reason(path_str, suffix, &queued_paths, &history_paths) {
+        let identity = file_identity(path_str);
+        let id_tuple = identity.map(|i| (i.size, i.mtime));
+        if let Some(reason) = cheap_skip_reason(
+            path_str,
+            suffix,
+            id_tuple,
+            &queued_paths,
+            &legacy_history_paths,
+            &converted_identities,
+        ) {
             match reason {
                 SkipReason::NotVideo => n_not_video += 1,
                 SkipReason::AlreadyQueued => n_queued += 1,
@@ -368,26 +463,46 @@ fn add_files_to_db(
         }
 
         let path = Path::new(path_str);
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output");
-        let parent = path.parent().unwrap_or(Path::new("."));
-        let output_path = parent.join(format!("{}{}.mp4", stem, suffix));
+        // Never clobber an existing output: if the default name is taken (on disk, by another job
+        // row, or earlier in this batch) the base name is renumbered. In-place jobs are returned
+        // verbatim by `choose_output_path` and never renumbered. The closure's borrow of
+        // `assigned` ends with this block, before the `assigned.insert` below.
+        let output_str = {
+            let is_taken = |name: &str| -> bool {
+                assigned.contains(name)
+                    || Path::new(name).exists()
+                    || conn
+                        .query_row(
+                            "SELECT 1 FROM jobs WHERE output_path = ?1 LIMIT 1",
+                            params![name],
+                            |_| Ok(()),
+                        )
+                        .is_ok()
+            };
+            choose_output_path(path_str, suffix, &is_taken)
+        };
+        assigned.insert(output_str.clone());
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        let original_size = std::fs::metadata(path).map(|m| m.len() as i64).ok();
+        // Preserve original_size for the space-saved display even when only mtime is unreadable.
+        let original_size = identity
+            .map(|i| i.size)
+            .or_else(|| std::fs::metadata(path).map(|m| m.len() as i64).ok());
+        let source_size = identity.map(|i| i.size);
+        let source_mtime = identity.map(|i| i.mtime);
 
         conn.execute(
-            "INSERT INTO jobs (id, source_path, output_path, preset, status, original_size, queue_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7)",
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, original_size, source_size, source_mtime, queue_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 path_str,
-                output_path.to_string_lossy().to_string(),
+                output_str,
                 preset,
                 original_size,
+                source_size,
+                source_mtime,
                 queue_order,
                 now,
             ],
@@ -397,7 +512,7 @@ fn add_files_to_db(
         added.push(JobInfo {
             id,
             source_path: path_str.clone(),
-            output_path: output_path.to_string_lossy().to_string(),
+            output_path: output_str,
             preset: preset.to_string(),
             status: "queued".to_string(),
             original_size,
@@ -762,6 +877,23 @@ mod tests {
         .unwrap();
     }
 
+    /// A completed job carrying an explicit source-identity fingerprint (post-migration row).
+    fn insert_done_with_identity(
+        conn: &Connection,
+        id: &str,
+        source: &str,
+        output: &str,
+        source_size: i64,
+        source_mtime: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, original_size, source_size, source_mtime, queue_order, created_at)
+             VALUES (?1, ?2, ?3, 'preset', 'done', ?4, ?4, ?5, 0, '2020-01-01T00:00:00Z')",
+            params![id, source, output, source_size, source_mtime],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn accepts_known_video_extensions_case_insensitively() {
         assert!(is_video_file(Path::new("movie.mp4")));
@@ -814,7 +946,10 @@ mod tests {
     }
 
     #[test]
-    fn add_files_skips_when_output_already_exists() {
+    fn add_files_renumbers_when_output_name_is_taken() {
+        // A pre-existing output with no completed-job fingerprint to prove it belongs to this
+        // source must NOT cause a skip (that was the recycled-filename bug). The source is queued
+        // to a renumbered output so the unrelated existing file is never clobbered.
         let conn = test_conn();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("clip-conv.mp4"), b"x").unwrap();
@@ -822,17 +957,17 @@ mod tests {
 
         let result = add_files_to_db(&conn, &[source], "preset", "-conv", false).unwrap();
 
-        assert!(
-            result.added.is_empty(),
-            "must skip when the converted output already exists"
-        );
         assert_eq!(
-            result.skipped,
-            vec![SkipCount {
-                reason: SkipReason::OutputExists,
-                count: 1
-            }]
+            result.added.len(),
+            1,
+            "a taken output name renumbers, not skips"
         );
+        assert!(
+            result.added[0].output_path.ends_with("clip (1)-conv.mp4"),
+            "output must be renumbered on the base name, got {}",
+            result.added[0].output_path
+        );
+        assert!(result.skipped.is_empty(), "renumbering is not a skip");
     }
 
     #[test]
@@ -923,6 +1058,305 @@ mod tests {
             "an in-place job stores output_path == source_path"
         );
         assert!(result.skipped.is_empty(), "an in-place job is not a skip");
+    }
+
+    // ---- cheap_skip_reason: identity is the authoritative "already converted" signal ----
+
+    fn ids(pairs: &[(i64, i64)]) -> HashSet<(i64, i64)> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn cheap_skip_reason_skips_on_matching_identity_regardless_of_name() {
+        // The point of the fix: a file whose (size, mtime) matches a completed conversion is
+        // already done even though its name matches nothing we recorded.
+        let converted = ids(&[(500, 42)]);
+        let reason = cheap_skip_reason(
+            "/m/whatever.mp4",
+            ".h265",
+            Some((500, 42)),
+            &HashSet::new(),
+            &HashSet::new(),
+            &converted,
+        );
+        assert_eq!(reason, Some(SkipReason::AlreadyConverted));
+    }
+
+    #[test]
+    fn cheap_skip_reason_keeps_a_different_identity_at_a_recycled_path() {
+        // A different video (different size/mtime) that recycled a converted file's name must NOT
+        // be skipped — this is the exact bug. Neither the identity set nor legacy paths match.
+        let converted = ids(&[(500, 42)]);
+        let reason = cheap_skip_reason(
+            "/m/recycled.mp4",
+            ".h265",
+            Some((999, 7)),
+            &HashSet::new(),
+            &HashSet::new(),
+            &converted,
+        );
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn cheap_skip_reason_never_matches_identity_when_stat_failed() {
+        // Unreadable identity (None) must never match — uncertainty keeps the file (it converts).
+        let converted = ids(&[(500, 42)]);
+        let reason = cheap_skip_reason(
+            "/m/gone.mp4",
+            ".h265",
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            &converted,
+        );
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn cheap_skip_reason_legacy_path_still_skips_but_never_output_exists() {
+        // Pre-migration fallback: a source_path in the legacy set skips as AlreadyConverted.
+        let legacy: HashSet<String> = ["/m/old.mp4".to_string()].into_iter().collect();
+        assert_eq!(
+            cheap_skip_reason(
+                "/m/old.mp4",
+                ".h265",
+                Some((1, 1)),
+                &HashSet::new(),
+                &legacy,
+                &HashSet::new(),
+            ),
+            Some(SkipReason::AlreadyConverted),
+        );
+        // The suffix-ends guard is untouched.
+        assert_eq!(
+            cheap_skip_reason(
+                "/m/clip.h265.mp4",
+                ".h265",
+                None,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
+            Some(SkipReason::AlreadyConverted),
+        );
+        // OutputExists is gone: a bare unknown video is kept, never skipped by a filename check.
+        assert_eq!(
+            cheap_skip_reason(
+                "/m/fresh.mp4",
+                ".h265",
+                Some((5, 5)),
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
+            None,
+        );
+    }
+
+    // ---- choose_output_path: renumber the base name, never clobber, never renumber in-place ----
+
+    #[test]
+    fn choose_output_path_renumbers_the_base_name_when_taken() {
+        let free = |_: &str| false;
+        assert_eq!(
+            choose_output_path("/m/clip.mov", ".h265", &free),
+            "/m/clip.h265.mp4",
+            "an untaken default name is used as-is"
+        );
+
+        let taken1: HashSet<String> = ["/m/clip.h265.mp4".to_string()].into_iter().collect();
+        assert_eq!(
+            choose_output_path("/m/clip.mov", ".h265", &|n| taken1.contains(n)),
+            "/m/clip (1).h265.mp4"
+        );
+
+        let taken2: HashSet<String> = ["/m/clip.h265.mp4", "/m/clip (1).h265.mp4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            choose_output_path("/m/clip.mov", ".h265", &|n| taken2.contains(n)),
+            "/m/clip (2).h265.mp4"
+        );
+    }
+
+    #[test]
+    fn choose_output_path_never_renumbers_an_in_place_job() {
+        // An in-place source's own on-disk presence must never trigger a rename, or the converter
+        // would route it through the distinct-file overwrite path.
+        let always_taken = |_: &str| true;
+        assert_eq!(
+            choose_output_path("/m/clip.mp4", "", &always_taken),
+            "/m/clip.mp4"
+        );
+    }
+
+    #[test]
+    fn choose_output_path_dedupes_within_a_batch() {
+        let mut assigned: HashSet<String> = HashSet::new();
+        let first = {
+            let is_taken = |n: &str| assigned.contains(n);
+            choose_output_path("/m/clip.mov", ".h265", &is_taken)
+        };
+        assigned.insert(first.clone());
+        let second = {
+            let is_taken = |n: &str| assigned.contains(n);
+            choose_output_path("/m/clip.mov", ".h265", &is_taken)
+        };
+        assert_eq!(first, "/m/clip.h265.mp4");
+        assert_eq!(
+            second, "/m/clip (1).h265.mp4",
+            "a batch never assigns one name twice"
+        );
+    }
+
+    // ---- fetch_skip_sets: always-on identity vs. flag-gated legacy fallback ----
+
+    #[test]
+    fn fetch_skip_sets_fingerprinted_row_is_identity_only_and_flag_independent() {
+        let conn = test_conn();
+        insert_done_with_identity(&conn, "h1", "/m/a.mp4", "/m/a.h265.mp4", 500, 42);
+
+        for flag in [false, true] {
+            let (_, legacy, identities) = fetch_skip_sets(&conn, flag).unwrap();
+            assert!(
+                identities.contains(&(500, 42)),
+                "a fingerprinted row is always in the identity set (flag={flag})"
+            );
+            assert!(
+                !legacy.contains("/m/a.mp4"),
+                "a fingerprinted non-in-place row must NOT be path-matched (recycling guard, flag={flag})"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_skip_sets_null_mtime_row_is_legacy_only_when_flag_on() {
+        let conn = test_conn();
+        // insert_history writes no fingerprint -> a pre-migration row.
+        insert_history(
+            &conn,
+            "h1",
+            "/m/b.mkv",
+            "done",
+            0,
+            1000,
+            "2020-01-01T00:00:00Z",
+        );
+
+        let (_, legacy_off, _) = fetch_skip_sets(&conn, false).unwrap();
+        assert!(
+            !legacy_off.contains("/m/b.mkv"),
+            "flag off: no legacy path skip"
+        );
+
+        let (_, legacy_on, _) = fetch_skip_sets(&conn, true).unwrap();
+        assert!(
+            legacy_on.contains("/m/b.mkv"),
+            "flag on: legacy path skip preserved"
+        );
+    }
+
+    #[test]
+    fn fetch_skip_sets_null_mtime_in_place_row_is_always_legacy() {
+        let conn = test_conn();
+        // A pre-migration in-place row (source == output by Path equality, note the `//`) must be
+        // path-skipped regardless of the flag, or re-scanning it triggers a re-encode cascade.
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('h1', '/m//c.mp4', '/m/c.mp4', 'preset', 'done', 0, '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        for flag in [false, true] {
+            let (_, legacy, _) = fetch_skip_sets(&conn, flag).unwrap();
+            assert!(
+                legacy.contains("/m//c.mp4"),
+                "a legacy in-place row is path-skipped regardless of flag (flag={flag})"
+            );
+        }
+    }
+
+    // ---- end-to-end recycling scenarios against real files ----
+
+    #[test]
+    fn add_files_skips_a_recycled_path_whose_identity_matches() {
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("movie.mkv");
+        std::fs::write(&src, b"same-content").unwrap();
+        let src_str = src.to_string_lossy().to_string();
+        let id = file_identity(&src_str).unwrap();
+        insert_done_with_identity(
+            &conn,
+            "h1",
+            &src_str,
+            "/m/movie.h265.mp4",
+            id.size,
+            id.mtime,
+        );
+
+        let result = add_files_to_db(&conn, &[src_str], "preset", ".h265", false).unwrap();
+
+        assert!(
+            result.added.is_empty(),
+            "an unchanged, already-converted file is skipped"
+        );
+        assert_eq!(
+            result.skipped,
+            vec![SkipCount {
+                reason: SkipReason::AlreadyConverted,
+                count: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn add_files_converts_and_renumbers_when_a_different_file_recycles_the_path() {
+        // The reported bug: source A is converted, its path is later reused by a DIFFERENT video B
+        // while A's output still sits on disk. B must be queued (not skipped) to a renumbered
+        // output, leaving A's output untouched.
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("movie.mkv");
+        std::fs::write(&src, b"A").unwrap();
+        let src_str = src.to_string_lossy().to_string();
+        let id_a = file_identity(&src_str).unwrap();
+
+        let old_output = dir.path().join("movie.h265.mp4");
+        std::fs::write(&old_output, b"A-converted").unwrap();
+        insert_done_with_identity(
+            &conn,
+            "h1",
+            &src_str,
+            &old_output.to_string_lossy(),
+            id_a.size,
+            id_a.mtime,
+        );
+
+        // A different video B recycles the same path.
+        std::fs::write(&src, b"B is a completely different, longer video").unwrap();
+
+        let result = add_files_to_db(&conn, &[src_str], "preset", ".h265", false).unwrap();
+
+        assert_eq!(
+            result.added.len(),
+            1,
+            "the different file must be queued, not skipped"
+        );
+        assert!(
+            result.added[0].output_path.ends_with("movie (1).h265.mp4"),
+            "queued to a renumbered output, got {}",
+            result.added[0].output_path
+        );
+        assert!(result.skipped.is_empty());
+        assert_eq!(
+            std::fs::read(&old_output).unwrap(),
+            b"A-converted",
+            "the earlier conversion's output must never be clobbered"
+        );
     }
 
     // ---- probe_candidates (source-media probe is only worth running on these) ----

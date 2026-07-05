@@ -31,6 +31,20 @@ pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
     parent.join(format!(".{stem}{IN_PLACE_TEMP_MARKER}mp4"))
 }
 
+/// Refresh a completed job's source-identity fingerprint to the file currently at `path`.
+/// Called after an in-place encode replaces the source: the recorded `(size, mtime)` must match
+/// what a folder re-scan will stat, so the encoded result is recognized as already done (no
+/// re-encode cascade) while a genuinely different file that later recycles the path still fails
+/// the identity check. Reuses `queue::file_identity` so the encoding stays identical to insert.
+fn record_source_identity(db: &Connection, job_id: &str, path: &str) {
+    if let Some(id) = crate::commands::queue::file_identity(path) {
+        let _ = db.execute(
+            "UPDATE jobs SET source_size = ?2, source_mtime = ?3 WHERE id = ?1",
+            params![job_id, id.size, id.mtime],
+        );
+    }
+}
+
 /// Filesystem action for an in-place job once the keep/discard decision is made. Pure mapping so
 /// it can be table-tested apart from the side effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +607,11 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                         "UPDATE jobs SET status = ?2, converted_size = ?3, kept_file = ?4, space_saved = ?5, completed_at = ?6 WHERE id = ?1",
                         params![job.id, status_str, converted_size, kept_file, space_saved, now],
                     );
+                    // In-place encoding replaced the file at source_path, so its insert-time
+                    // fingerprint is stale. Refresh it to the final file's identity.
+                    if in_place {
+                        record_source_identity(&db, &job.id, &job.source_path);
+                    }
                 }
 
                 let _ = app.emit(
@@ -865,6 +884,36 @@ mod tests {
         assert_eq!(format_bytes_short(1024), "1KB");
         assert_eq!(format_bytes_short(1_048_576), "1MB");
         assert_eq!(format_bytes_short(1_073_741_824), "1.0GB");
+    }
+
+    #[test]
+    fn record_source_identity_refreshes_fingerprint_to_the_current_file() {
+        // After an in-place encode replaces the source, the recorded fingerprint must match what a
+        // folder re-scan will stat (via queue::file_identity), so the encoded result is recognized.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        std::fs::write(&path, b"encoded-bytes").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j1', ?1, ?1, 'preset', 'done', 0, '2020-01-01T00:00:00Z')",
+            params![path_str],
+        )
+        .unwrap();
+
+        record_source_identity(&conn, "j1", &path_str);
+
+        let (size, mtime): (i64, i64) = conn
+            .query_row(
+                "SELECT source_size, source_mtime FROM jobs WHERE id = 'j1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let expected = crate::commands::queue::file_identity(&path_str).unwrap();
+        assert_eq!((size, mtime), (expected.size, expected.mtime));
     }
 
     // Regression test for the cancel-freeze deadlock: the queue thread must not hold
