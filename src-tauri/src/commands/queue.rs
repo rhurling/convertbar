@@ -1156,18 +1156,25 @@ mod tests {
 
     // ---- choose_output_path: renumber the base name, never clobber, never renumber in-place ----
 
+    /// Normalizes path separators so assertions written with `/` match the values
+    /// `choose_output_path` builds with the platform separator (`\` on Windows).
+    fn norm(path: &str) -> String {
+        path.replace('\\', "/")
+    }
+
     #[test]
     fn choose_output_path_renumbers_the_base_name_when_taken() {
         let free = |_: &str| false;
         assert_eq!(
-            choose_output_path("/m/clip.mov", ".h265", &free),
+            norm(&choose_output_path("/m/clip.mov", ".h265", &free)),
             "/m/clip.h265.mp4",
             "an untaken default name is used as-is"
         );
 
         let taken1: HashSet<String> = ["/m/clip.h265.mp4".to_string()].into_iter().collect();
+        let is_taken1 = |n: &str| taken1.contains(&norm(n));
         assert_eq!(
-            choose_output_path("/m/clip.mov", ".h265", &|n| taken1.contains(n)),
+            norm(&choose_output_path("/m/clip.mov", ".h265", &is_taken1)),
             "/m/clip (1).h265.mp4"
         );
 
@@ -1175,8 +1182,9 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        let is_taken2 = |n: &str| taken2.contains(&norm(n));
         assert_eq!(
-            choose_output_path("/m/clip.mov", ".h265", &|n| taken2.contains(n)),
+            norm(&choose_output_path("/m/clip.mov", ".h265", &is_taken2)),
             "/m/clip (2).h265.mp4"
         );
     }
@@ -1187,7 +1195,7 @@ mod tests {
         // would route it through the distinct-file overwrite path.
         let always_taken = |_: &str| true;
         assert_eq!(
-            choose_output_path("/m/clip.mp4", "", &always_taken),
+            norm(&choose_output_path("/m/clip.mp4", "", &always_taken)),
             "/m/clip.mp4"
         );
     }
@@ -1204,9 +1212,10 @@ mod tests {
             let is_taken = |n: &str| assigned.contains(n);
             choose_output_path("/m/clip.mov", ".h265", &is_taken)
         };
-        assert_eq!(first, "/m/clip.h265.mp4");
+        assert_eq!(norm(&first), "/m/clip.h265.mp4");
         assert_eq!(
-            second, "/m/clip (1).h265.mp4",
+            norm(&second),
+            "/m/clip (1).h265.mp4",
             "a batch never assigns one name twice"
         );
     }
