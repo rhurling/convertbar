@@ -68,8 +68,6 @@ pub fn parse_scan_media(stdout: &str) -> Option<SourceMedia> {
 /// Returns `None` if the process fails to launch, exceeds `PROBE_TIMEOUT`, or yields no parseable
 /// title — the caller treats `None` as uncertainty and queues the file rather than skipping it.
 pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
-    // The verbose scan log goes to /dev/null so only the small JSON title set reaches the piped
-    // stdout — small enough that not draining it while we poll can't fill the pipe and deadlock.
     let mut child = Command::new(handbrake_path)
         .args(["--scan", "--json", "-i", file])
         .stdout(Stdio::piped())
@@ -77,10 +75,22 @@ pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
         .spawn()
         .ok()?;
 
-    wait_with_timeout(&mut child, PROBE_TIMEOUT)?;
+    // Drain stdout concurrently with the wait: with `--json`, scan Progress blocks and
+    // multi-title/track sets can exceed the OS pipe buffer (~64KB). An undrained pipe
+    // blocks HandBrake on write forever, so it would sit until the timeout kills it —
+    // stalling the scan of every such file for the full PROBE_TIMEOUT.
+    let stdout_thread = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = out.read_to_string(&mut s);
+            s
+        })
+    });
 
-    let mut stdout = String::new();
-    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    let status = wait_with_timeout(&mut child, PROBE_TIMEOUT);
+    // The child has exited (or been killed), so the reader hit EOF: join is prompt.
+    let stdout = stdout_thread.and_then(|t| t.join().ok())?;
+    status?;
     parse_scan_media(&stdout)
 }
 
@@ -184,6 +194,34 @@ JSON Title Set: {
             child.try_wait().expect("try_wait").is_some(),
             "the timed-out child must have been killed, not leaked"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_source_survives_output_larger_than_the_pipe_buffer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A fake HandBrakeCLI floods stdout well past the ~64KB pipe buffer before
+        // emitting a parseable title set. Without a concurrent drain, the flood blocks
+        // the child on write and every such probe stalls for the full PROBE_TIMEOUT.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-hb.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nyes flood | head -c 200000\nprintf 'JSON Title Set: {\"TitleList\":[{\"Geometry\":{\"Height\":240},\"VideoCodec\":\"h264\"}]}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let media = probe_source(script.to_str().unwrap(), "ignored");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "an oversized scan output must not stall until the timeout kill"
+        );
+        let media = media.expect("the title set after the flood must still parse");
+        assert_eq!(media.codec, "h264");
+        assert_eq!(media.height, 240);
     }
 
     #[cfg(unix)]

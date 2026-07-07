@@ -277,6 +277,84 @@ fn get_cleanup_mode(db: &Connection) -> String {
     .unwrap_or_else(|_| "trash".to_string())
 }
 
+const STDERR_TAIL_BYTES: usize = 4096;
+
+/// Drain a reader to EOF keeping only the last STDERR_TAIL_BYTES bytes, so the pipe
+/// never fills while memory stays bounded no matter how much HandBrake logs.
+fn read_bounded_tail(mut reader: impl Read) -> String {
+    let mut tail: Vec<u8> = Vec::with_capacity(STDERR_TAIL_BYTES * 2);
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = reader.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&buf[..n]);
+        if tail.len() > STDERR_TAIL_BYTES {
+            tail.drain(..tail.len() - STDERR_TAIL_BYTES);
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+const ERROR_TAIL_LINES: usize = 20;
+
+/// The generic failure line plus the informative end of HandBrake's stderr, so the
+/// history entry says WHY the encode failed instead of just that it did.
+fn error_message_from_tail(tail: &str) -> String {
+    let lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return "Conversion failed".to_string();
+    }
+    let start = lines.len().saturating_sub(ERROR_TAIL_LINES);
+    format!("Conversion failed:\n{}", lines[start..].join("\n"))
+}
+
+/// Record a failed job: status + error_message in the DB, the two frontend events,
+/// and the per-file notification. Shared by every failure path in process_queue.
+fn record_job_error(
+    app: &AppHandle,
+    db: &Arc<Mutex<Connection>>,
+    job_id: &str,
+    file_name: &str,
+    err_msg: &str,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let db = db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3 WHERE id = ?1",
+            params![job_id, err_msg, now],
+        );
+    }
+    let _ = app.emit(
+        "job-error",
+        serde_json::json!({ "job_id": job_id, "error": err_msg }),
+    );
+    let _ = app.emit(
+        "job-status-changed",
+        serde_json::json!({ "job_id": job_id, "status": "error" }),
+    );
+
+    let notify_per_file = {
+        let db = db.lock().unwrap();
+        db.query_row(
+            "SELECT value FROM settings WHERE key='notifications_per_file'",
+            params![],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|v| v == "true")
+        .unwrap_or(true)
+    };
+    if notify_per_file {
+        let _ = app
+            .notification()
+            .builder()
+            .title("ConvertBar")
+            .body(&format!("{} failed", file_name))
+            .show();
+    }
+}
+
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
 fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &ConverterState) {
@@ -409,18 +487,13 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
         // Read stdout for progress (HandBrakeCLI sends progress to stdout when piped)
         let progress_stream = child.stdout.take();
 
-        // Drain stderr so the process doesn't block on a full pipe buffer
-        if let Some(stderr) = child.stderr.take() {
-            std::thread::spawn(move || {
-                let mut reader = stderr;
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = reader.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            });
-        }
+        // Drain stderr so the process doesn't block on a full pipe buffer, keeping a
+        // bounded tail — HandBrake writes its failure reason there, and a bare
+        // "Conversion failed" has proven undiagnosable in bug reports.
+        let stderr_tail_thread = child
+            .stderr
+            .take()
+            .map(|stderr| std::thread::spawn(move || read_bounded_tail(stderr)));
 
         // Store child handle for cross-platform cancel support
         *converter.current_child.lock().unwrap() = Some(child);
@@ -495,6 +568,24 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                 let converted_size = std::fs::metadata(&encode_target)
                     .map(|m| m.len() as i64)
                     .ok();
+
+                // HandBrake can exit 0 yet write nothing usable. A missing or empty
+                // output is never a success — without this guard, cleanup could trash
+                // the source in favor of a 0-byte file and history would record
+                // "done — saved 0B".
+                if converted_size.unwrap_or(0) == 0 {
+                    had_errors = true;
+                    let _ = std::fs::remove_file(&encode_target);
+                    record_job_error(
+                        app,
+                        db,
+                        &job.id,
+                        &file_name,
+                        "Conversion produced an empty output file",
+                    );
+                    continue;
+                }
+
                 // For in-place, the source is unchanged during the temp encode, so re-stat it now.
                 let original_size = if in_place {
                     std::fs::metadata(&job.source_path)
@@ -546,7 +637,6 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                 // file out of place. A failed temp *removal* is benign and handled as success.
                 if in_place_apply_is_fatal(kept, in_place_apply_failed) {
                     had_errors = true;
-                    let now = chrono::Utc::now().to_rfc3339();
                     // In trash mode the original was moved to Trash before the rename failed; in
                     // delete mode the rename-over-source failed and the original is untouched.
                     let err_msg = if cleanup_mode == "delete" {
@@ -554,39 +644,7 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                     } else {
                         "In-place replacement failed; original may be in Trash"
                     };
-                    {
-                        let db = db.lock().unwrap();
-                        let _ = db.execute(
-                            "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3 WHERE id = ?1",
-                            params![job.id, err_msg, now],
-                        );
-                    }
-                    let _ = app.emit(
-                        "job-error",
-                        serde_json::json!({ "job_id": job.id, "error": err_msg }),
-                    );
-                    let _ = app.emit(
-                        "job-status-changed",
-                        serde_json::json!({ "job_id": job.id, "status": "error" }),
-                    );
-                    let notify_per_file = {
-                        let db = db.lock().unwrap();
-                        db.query_row(
-                            "SELECT value FROM settings WHERE key='notifications_per_file'",
-                            params![],
-                            |r| r.get::<_, String>(0),
-                        )
-                        .map(|v| v == "true")
-                        .unwrap_or(true)
-                    };
-                    if notify_per_file {
-                        let _ = app
-                            .notification()
-                            .builder()
-                            .title("ConvertBar")
-                            .body(&format!("{} failed", file_name))
-                            .show();
-                    }
+                    record_job_error(app, db, &job.id, &file_name, err_msg);
                     // Intentionally leave the temp (`.{stem}.convertbar-tmp.mp4`): it holds the
                     // re-encoded content, and in trash mode it is the only in-place copy (the
                     // original is in Trash), so removing it would force trash recovery. The marker
@@ -710,44 +768,18 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                     .ok();
 
                 if current_status.as_deref() != Some("error") {
-                    let _ = db.lock().unwrap().execute(
-                        "UPDATE jobs SET status = 'error', error_message = 'Conversion failed', completed_at = ?2 WHERE id = ?1",
-                        params![job.id, chrono::Utc::now().to_rfc3339()],
+                    // The drain thread hit EOF when the child died, so this join is
+                    // prompt. Its tail is the only diagnostic HandBrake leaves behind.
+                    let tail = stderr_tail_thread
+                        .and_then(|t| t.join().ok())
+                        .unwrap_or_default();
+                    record_job_error(
+                        app,
+                        db,
+                        &job.id,
+                        &file_name,
+                        &error_message_from_tail(&tail),
                     );
-                    let _ = app.emit(
-                        "job-error",
-                        serde_json::json!({
-                            "job_id": job.id,
-                            "error": "Conversion failed"
-                        }),
-                    );
-                    let _ = app.emit(
-                        "job-status-changed",
-                        serde_json::json!({
-                            "job_id": job.id,
-                            "status": "error",
-                        }),
-                    );
-
-                    // Error notification
-                    let notify_per_file = {
-                        let db = db.lock().unwrap();
-                        db.query_row(
-                            "SELECT value FROM settings WHERE key='notifications_per_file'",
-                            params![],
-                            |r| r.get::<_, String>(0),
-                        )
-                        .map(|v| v == "true")
-                        .unwrap_or(true)
-                    };
-                    if notify_per_file {
-                        let _ = app
-                            .notification()
-                            .builder()
-                            .title("ConvertBar")
-                            .body(&format!("{} failed", file_name))
-                            .show();
-                    }
                 }
             }
         }
@@ -852,6 +884,44 @@ fn format_bytes_short(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_bounded_tail_keeps_only_the_end_of_a_flood() {
+        // HandBrake can log megabytes to stderr; only the end explains a failure, and
+        // the buffer must stay bounded so a chatty encode can't balloon memory.
+        let flood = format!("{}THE-ACTUAL-ERROR", "noise\n".repeat(10_000));
+        let tail = read_bounded_tail(std::io::Cursor::new(flood.into_bytes()));
+        assert!(tail.len() <= STDERR_TAIL_BYTES);
+        assert!(
+            tail.ends_with("THE-ACTUAL-ERROR"),
+            "the most recent output must survive the truncation"
+        );
+    }
+
+    #[test]
+    fn error_message_from_tail_falls_back_to_the_generic_message() {
+        // No captured stderr (e.g. spawn raced the failure) must not produce an
+        // empty-looking history entry.
+        assert_eq!(error_message_from_tail(""), "Conversion failed");
+        assert_eq!(error_message_from_tail("\n  \n"), "Conversion failed");
+    }
+
+    #[test]
+    fn error_message_from_tail_keeps_the_last_informative_lines() {
+        let tail = (1..=30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let msg = error_message_from_tail(&tail);
+        assert!(
+            msg.starts_with("Conversion failed:\n"),
+            "the generic prefix keeps existing UI copy meaningful"
+        );
+        assert!(
+            !msg.contains("line 10\n") && msg.contains("line 11") && msg.ends_with("line 30"),
+            "only the last {ERROR_TAIL_LINES} non-empty lines belong in the history entry"
+        );
+    }
 
     #[test]
     fn parses_full_progress_line() {

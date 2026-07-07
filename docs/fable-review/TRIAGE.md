@@ -33,11 +33,11 @@ Refs: rust-core.md:36, rust-app-shell.md:38-41, rust-queue-watch.md:47,49
 
 ### B3 — Failure visibility (backend)
 Refs: rust-core.md:49,13; rust-app-shell zero-byte finding
-- [ ] Keep a bounded stderr tail (last ~4KB/20 lines) in the drain thread
+- [x] Keep a bounded stderr tail (last ~4KB/20 lines) in the drain thread
   (converter.rs:413-423) and surface it in `error_message` instead of the
   literal "Conversion failed" (line 714/721).
-- [ ] Zero-byte output after successful exit → semantics per **D3**.
-- [ ] Drain probe stdout on a thread while polling (probe.rs:73-84) to kill
+- [x] Zero-byte output after successful exit → semantics per **D3**.
+- [x] Drain probe stdout on a thread while polling (probe.rs:73-84) to kill
   the pipe-buffer 30s-stall.
 
 ### B4 — Process & window lifecycle robustness
