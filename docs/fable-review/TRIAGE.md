@@ -13,7 +13,7 @@ Status: update the checkbox + PR link as batches land.
 ## Batches
 
 ### B1 — Linux default preset name (trivial, ship first)
-- [ ] `db.rs:17`: `"H.265 MKV 1080p"` is not a valid preset in current
+- [x] (#63) `db.rs:17`: `"H.265 MKV 1080p"` is not a valid preset in current
   HandBrake (real name `"H.265 MKV 1080p30"`) — default conversions on Linux
   fail outright. Found during verification (rust-queue-watch.md, verification
   pass). Consider a startup/validation fallback so an invalid stored preset
@@ -21,13 +21,13 @@ Status: update the checkbox + PR link as batches land.
 
 ### B2 — Remaining main-thread blockers
 Refs: rust-core.md:36, rust-app-shell.md:38-41, rust-queue-watch.md:47,49
-- [ ] Make the 4 sync commands in `commands/handbrake.rs` async +
+- [x] Make the 4 sync commands in `commands/handbrake.rs` async +
   `spawn_blocking` (detect, preset-list, generate_preset_suffix, validate —
   give validate a timeout like probe.rs).
-- [ ] Stop holding `preset_cache` mutex across the metadata shell-out in
+- [x] Stop holding `preset_cache` mutex across the metadata shell-out in
   `queue.rs:335-344/363-372` (check → unlock → fetch → relock → insert);
   extract the duplicated block into a helper. (Verified: ~0.19s hitch, Medium.)
-- [ ] Make `scan_folder`/`classify_paths` (queue.rs:560,810) async +
+- [x] Make `scan_folder`/`classify_paths` (queue.rs:560,810) async +
   `spawn_blocking` like `add_files`.
 - Verify with the cross-platform-reviewer agent; same pattern as PR #55.
 
