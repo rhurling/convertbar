@@ -19,7 +19,6 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -31,7 +30,6 @@ chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
 notify = "8"
-tauri-plugin-fs = "2"
 tauri-plugin-notification = "2"
 dunce = "1.0.5"
 
