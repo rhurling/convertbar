@@ -68,19 +68,36 @@ pub fn parse_scan_media(stdout: &str) -> Option<SourceMedia> {
 /// Returns `None` if the process fails to launch, exceeds `PROBE_TIMEOUT`, or yields no parseable
 /// title — the caller treats `None` as uncertainty and queues the file rather than skipping it.
 pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
-    // The verbose scan log goes to /dev/null so only the small JSON title set reaches the piped
-    // stdout — small enough that not draining it while we poll can't fill the pipe and deadlock.
-    let mut child = Command::new(handbrake_path)
-        .args(["--scan", "--json", "-i", file])
+    let mut cmd = Command::new(handbrake_path);
+    cmd.args(["--scan", "--json", "-i", file]);
+    scan_with(cmd)
+}
+
+/// The spawn/drain/parse core of a probe, taking the prepared command so tests can
+/// substitute a scan-shaped process without exec-ing a temp script.
+fn scan_with(mut cmd: Command) -> Option<SourceMedia> {
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
 
-    wait_with_timeout(&mut child, PROBE_TIMEOUT)?;
+    // Drain stdout concurrently with the wait: with `--json`, scan Progress blocks and
+    // multi-title/track sets can exceed the OS pipe buffer (~64KB). An undrained pipe
+    // blocks HandBrake on write forever, so it would sit until the timeout kills it —
+    // stalling the scan of every such file for the full PROBE_TIMEOUT.
+    let stdout_thread = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = out.read_to_string(&mut s);
+            s
+        })
+    });
 
-    let mut stdout = String::new();
-    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    let status = wait_with_timeout(&mut child, PROBE_TIMEOUT);
+    // The child has exited (or been killed), so the reader hit EOF: join is prompt.
+    let stdout = stdout_thread.and_then(|t| t.join().ok())?;
+    status?;
     parse_scan_media(&stdout)
 }
 
@@ -184,6 +201,31 @@ JSON Title Set: {
             child.try_wait().expect("try_wait").is_some(),
             "the timed-out child must have been killed, not leaked"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_survives_output_larger_than_the_pipe_buffer() {
+        // A scan-shaped process floods stdout well past the ~64KB pipe buffer before
+        // emitting a parseable title set. Without a concurrent drain, the flood blocks
+        // the child on write and every such probe stalls for the full PROBE_TIMEOUT.
+        // Spawns /bin/sh directly — exec-ing a written temp script is fragile in CI
+        // (noexec tmp, fork/exec ETXTBSY races).
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "yes flood | head -c 200000; printf 'JSON Title Set: {\"TitleList\":[{\"Geometry\":{\"Height\":240},\"VideoCodec\":\"h264\"}]}'",
+        ]);
+
+        let started = Instant::now();
+        let media = scan_with(cmd);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "an oversized scan output must not stall until the timeout kill"
+        );
+        let media = media.expect("the title set after the flood must still parse");
+        assert_eq!(media.codec, "h264");
+        assert_eq!(media.height, 240);
     }
 
     #[cfg(unix)]
