@@ -60,11 +60,11 @@ Refs: rust-queue-watch.md:21,31
 
 ### B6 — ACL + CSP hardening
 Refs: rust-app-shell.md:57,67-70,79; claude-automation.md:53,81 → **D1**
-- [ ] Remove `fs:default`, `notification:default`, 3× `autostart:allow-*`,
+- [x] Remove `fs:default`, `notification:default`, 3× `autostart:allow-*`,
   2× `window-state:*` grants (all verified unused, incl. dynamic invokes).
-- [ ] Remove `tauri-plugin-fs` entirely (dep + registration + grant); check
+- [x] Remove `tauri-plugin-fs` entirely (dep + registration + grant); check
   `tauri-plugin-opener` usage likewise.
-- [ ] Set a real CSP in tauri.conf.json (currently `null`) per **D1**.
+- [x] Set a real CSP in tauri.conf.json (currently `null`) per **D1**.
 - Verify with the acl-auditor agent + manual run (notifications, watched
   folders, autostart toggle, window position persistence).
 
