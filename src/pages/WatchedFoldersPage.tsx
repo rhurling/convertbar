@@ -1,11 +1,7 @@
 import { useEffect, useState } from "react";
 import { useWatchedDirectories } from "../hooks/useWatchedDirectories";
+import { fileName } from "../lib/format";
 import type { WatchedDirectory } from "../lib/tauri";
-
-function basename(path: string): string {
-  const parts = path.split(/[/\\]/).filter(Boolean);
-  return parts[parts.length - 1] || path;
-}
 
 interface WatchRowProps {
   dir: WatchedDirectory;
@@ -46,7 +42,7 @@ function WatchRow({
         title={dir.enabled ? "Watching — click to pause" : "Paused — click to watch"}
       />
       <div className="watch-info">
-        <div className="watch-name">{basename(dir.path)}</div>
+        <div className="watch-name">{fileName(dir.path)}</div>
         <div className="watch-path" title={dir.path}>
           {dir.path}
         </div>
