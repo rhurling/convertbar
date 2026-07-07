@@ -121,6 +121,30 @@ impl ConverterState {
     }
 }
 
+/// Kill the active HandBrake child (resuming it first if SIGSTOP-paused, since a
+/// stopped process can't act on SIGTERM-class signals) and reap it, so quitting the
+/// app can't orphan an encoder that would keep burning CPU for hours. The partial
+/// output is left alone: the next launch's auto-resume deletes it once no process
+/// holds it.
+pub(crate) fn kill_active_child(converter: &ConverterState) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(pid) = converter.current_pid.lock() {
+            if let Some(pid) = *pid {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGCONT);
+                }
+            }
+        }
+    }
+    if let Ok(mut guard) = converter.current_child.lock() {
+        if let Some(ref mut child) = *guard {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Which file `process_queue` keeps after a successful encode. The variant *is* the cleanup
 /// decision — it tells the call site which file (if any) to delete with an irreversible
 /// `trash`/`remove_file`. `Original` and `Neither` are distinct so the call site can keep

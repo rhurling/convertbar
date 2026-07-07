@@ -42,15 +42,15 @@ Refs: rust-core.md:49,13; rust-app-shell zero-byte finding
 
 ### B4 — Process & window lifecycle robustness
 Refs: rust-app-shell.md:6,7,8,26,27
-- [ ] Kill (SIGCONT-if-paused first) the active HandBrake child on quit —
+- [x] Kill (SIGCONT-if-paused first) the active HandBrake child on quit —
   `quit_app`, tray quit, or a `RunEvent::ExitRequested` handler (none exists).
-- [ ] Cancel: `child.wait()` after `kill()` before deleting partial output
+- [x] Cancel: `child.wait()` after `kill()` before deleting partial output
   (Windows file-handle lock; the Unix "flush after unlink" claim was refuted).
-- [ ] Tray title truncation `&name[..19]` (lib.rs:258) → char-boundary-safe
+- [x] Tray title truncation `&name[..19]` (lib.rs:258) → char-boundary-safe
   (panics on multi-byte UTF-8; requires opt-in `menubar_show_filename`).
-- [ ] Screen confinement: fall back to `primary_monitor()` when
+- [x] Screen confinement: fall back to `primary_monitor()` when
   `current_monitor()` is None/Err (lib.rs:143).
-- [ ] Updater: handle `unwrap()`/errors; notify-vs-silent per **D5**.
+- [x] Updater: handle `unwrap()`/errors; notify-vs-silent per **D5**.
 
 ### B5 — Watcher correctness
 Refs: rust-queue-watch.md:21,31
