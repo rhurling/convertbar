@@ -87,7 +87,7 @@ pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
 /// Wait for `child` to exit, polling so we never block indefinitely. If it outlives `timeout` it
 /// is killed and `None` is returned. Mirrors `converter::wait_for_active_child`'s poll-don't-block
 /// approach so a stalled scan can't wedge the caller.
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+pub(crate) fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let start = Instant::now();
     loop {
         match child.try_wait() {

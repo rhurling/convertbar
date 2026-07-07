@@ -331,17 +331,8 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
 
     // Resolve template if needed
     let suffix = if suffix_template.contains('{') {
-        let metadata = {
-            let mut cache = state.preset_cache.lock().map_err(|e| e.to_string())?;
-            if let Some(m) = cache.get(&preset) {
-                m.clone()
-            } else {
-                let hb_path = hb_path.clone().ok_or("HandBrakeCLI not found")?;
-                let m = handbrake::get_preset_metadata(&hb_path, &preset)?;
-                cache.insert(preset.clone(), m.clone());
-                m
-            }
-        };
+        let hb = hb_path.clone().ok_or("HandBrakeCLI not found")?;
+        let metadata = super::handbrake::cached_preset_metadata(state, &hb, &preset)?;
         handbrake::resolve_suffix_template(&suffix_template, &metadata)
     } else {
         suffix_template
@@ -360,16 +351,7 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
 
     let media_skipped: HashSet<String> = if !candidates_to_probe.is_empty() {
         if let Some(hb) = hb_path.as_deref() {
-            let metadata = {
-                let mut cache = state.preset_cache.lock().map_err(|e| e.to_string())?;
-                if let Some(m) = cache.get(&preset) {
-                    m.clone()
-                } else {
-                    let m = handbrake::get_preset_metadata(hb, &preset)?;
-                    cache.insert(preset.clone(), m.clone());
-                    m
-                }
-            };
+            let metadata = super::handbrake::cached_preset_metadata(state, hb, &preset)?;
             let target_codec = metadata.codec.clone();
             let target_height =
                 crate::media_skip::target_height_from_resolution(&metadata.resolution);
@@ -557,7 +539,15 @@ pub async fn add_files(app: AppHandle, paths: Vec<String>) -> Result<AddResult, 
 }
 
 #[tauri::command]
-pub fn scan_folder(path: String) -> Result<FolderScanResult, String> {
+pub async fn scan_folder(path: String) -> Result<FolderScanResult, String> {
+    // scan_video_files stats every entry of an unbounded recursive walk; a deep tree
+    // or network volume would freeze the UI if this ran on the main thread.
+    tauri::async_runtime::spawn_blocking(move || scan_folder_inner(path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn scan_folder_inner(path: String) -> Result<FolderScanResult, String> {
     let dir = Path::new(&path);
     if !dir.is_dir() {
         return Err("Path is not a directory".to_string());
@@ -807,7 +797,14 @@ fn get_history_summary_inner(
 }
 
 #[tauri::command]
-pub fn classify_paths(paths: Vec<String>) -> Result<ClassifiedPaths, String> {
+pub async fn classify_paths(paths: Vec<String>) -> Result<ClassifiedPaths, String> {
+    // Dropped folders get the same recursive walk as scan_folder — off the main thread.
+    tauri::async_runtime::spawn_blocking(move || classify_paths_inner(paths))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn classify_paths_inner(paths: Vec<String>) -> Result<ClassifiedPaths, String> {
     let mut files = Vec::new();
     let mut folders = Vec::new();
     for path_str in paths {
