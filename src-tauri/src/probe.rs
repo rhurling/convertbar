@@ -68,8 +68,15 @@ pub fn parse_scan_media(stdout: &str) -> Option<SourceMedia> {
 /// Returns `None` if the process fails to launch, exceeds `PROBE_TIMEOUT`, or yields no parseable
 /// title — the caller treats `None` as uncertainty and queues the file rather than skipping it.
 pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
-    let mut child = Command::new(handbrake_path)
-        .args(["--scan", "--json", "-i", file])
+    let mut cmd = Command::new(handbrake_path);
+    cmd.args(["--scan", "--json", "-i", file]);
+    scan_with(cmd)
+}
+
+/// The spawn/drain/parse core of a probe, taking the prepared command so tests can
+/// substitute a scan-shaped process without exec-ing a temp script.
+fn scan_with(mut cmd: Command) -> Option<SourceMedia> {
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -198,23 +205,20 @@ JSON Title Set: {
 
     #[cfg(unix)]
     #[test]
-    fn probe_source_survives_output_larger_than_the_pipe_buffer() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // A fake HandBrakeCLI floods stdout well past the ~64KB pipe buffer before
+    fn scan_survives_output_larger_than_the_pipe_buffer() {
+        // A scan-shaped process floods stdout well past the ~64KB pipe buffer before
         // emitting a parseable title set. Without a concurrent drain, the flood blocks
         // the child on write and every such probe stalls for the full PROBE_TIMEOUT.
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-hb.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nyes flood | head -c 200000\nprintf 'JSON Title Set: {\"TitleList\":[{\"Geometry\":{\"Height\":240},\"VideoCodec\":\"h264\"}]}'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Spawns /bin/sh directly — exec-ing a written temp script is fragile in CI
+        // (noexec tmp, fork/exec ETXTBSY races).
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "yes flood | head -c 200000; printf 'JSON Title Set: {\"TitleList\":[{\"Geometry\":{\"Height\":240},\"VideoCodec\":\"h264\"}]}'",
+        ]);
 
         let started = Instant::now();
-        let media = probe_source(script.to_str().unwrap(), "ignored");
+        let media = scan_with(cmd);
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "an oversized scan output must not stall until the timeout kill"
