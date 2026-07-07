@@ -298,7 +298,10 @@ mod tests {
     #[test]
     fn drops_empty_var_and_its_trailing_separator_but_keeps_leading_dot() {
         let m = meta("h265", "", "apple-videotoolbox"); // empty resolution
-        assert_eq!(resolve_suffix_template(".{resolution}-{codec}", &m), ".h265");
+        assert_eq!(
+            resolve_suffix_template(".{resolution}-{codec}", &m),
+            ".h265"
+        );
     }
 
     #[test]
@@ -329,7 +332,11 @@ mod tests {
         ];
         for (encoder, want) in cases {
             let obj = serde_json::json!({ "VideoEncoder": encoder });
-            assert_eq!(classify_preset(&obj, "preset").codec, want, "encoder {encoder}");
+            assert_eq!(
+                classify_preset(&obj, "preset").codec,
+                want,
+                "encoder {encoder}"
+            );
         }
     }
 
@@ -378,7 +385,10 @@ mod tests {
     fn classify_preset_quality_falls_back_to_rounded_slider() {
         // No recognized name prefix -> q{rounded VideoQualitySlider}.
         let obj = serde_json::json!({ "VideoQualitySlider": 22.4 });
-        assert_eq!(classify_preset(&obj, "Apple 1080p30 Surround").quality, "q22");
+        assert_eq!(
+            classify_preset(&obj, "Apple 1080p30 Surround").quality,
+            "q22"
+        );
     }
 
     #[test]
