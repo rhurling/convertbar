@@ -54,8 +54,8 @@ Refs: rust-app-shell.md:6,7,8,26,27
 
 ### B5 — Watcher correctness
 Refs: rust-queue-watch.md:21,31
-- [ ] Canonicalize watched paths before insert/UNIQUE check (watch.rs:45-60).
-- [ ] `reconcile` purges `pending` entries under removed/disabled watches
+- [x] Canonicalize watched paths before insert/UNIQUE check (watch.rs:45-60).
+- [x] `reconcile` purges `pending` entries under removed/disabled watches
   (watcher.rs:440-483); mind the mode-flip re-add case.
 
 ### B6 — ACL + CSP hardening

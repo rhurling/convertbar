@@ -80,6 +80,32 @@ pub(crate) fn diff_watches(
     (to_unwatch, to_watch)
 }
 
+/// Roots whose watch is going away entirely — NOT a recursive-mode flip, which shows
+/// up in `to_unwatch` but re-adds the same path in `to_watch` and stays active.
+pub(crate) fn removed_watch_roots(
+    to_unwatch: &[PathBuf],
+    to_watch: &[(PathBuf, bool)],
+) -> Vec<PathBuf> {
+    to_unwatch
+        .iter()
+        .filter(|p| !to_watch.iter().any(|(w, _)| w == *p))
+        .cloned()
+        .collect()
+}
+
+/// Drop pending (mid-stabilization) files under removed roots. Without this, a file
+/// still settling when the user disables or removes its watch is enqueued and
+/// converted by the reaper once it stabilizes — the disable never fully takes effect.
+pub(crate) fn purge_pending_under(
+    pending: &mut HashMap<PathBuf, PendingEntry>,
+    removed: &[PathBuf],
+) {
+    if removed.is_empty() {
+        return;
+    }
+    pending.retain(|path, _| !removed.iter().any(|root| path.starts_with(root)));
+}
+
 /// A watched directory's runtime config, used by the filesystem-event handler to decide whether
 /// (and with what delay) an incoming path should be tracked. Kept separate from the serde
 /// `WatchedDirectory` DB row so the hot path doesn't carry id/created_at/enabled.
@@ -462,6 +488,11 @@ pub fn reconcile(app: &AppHandle) {
     };
     let (to_unwatch, to_watch) = diff_watches(&watched, &desired_tuples);
 
+    let removed = removed_watch_roots(&to_unwatch, &to_watch);
+    if let Ok(mut pending) = state.pending.lock() {
+        purge_pending_under(&mut pending, &removed);
+    }
+
     if let Ok(mut guard) = state.watcher.lock() {
         if let Some(watcher) = guard.as_mut() {
             for path in &to_unwatch {
@@ -603,6 +634,43 @@ mod tests {
         let (to_unwatch, to_watch) = diff_watches(&current, &desired);
         assert!(to_unwatch.is_empty());
         assert!(to_watch.is_empty());
+    }
+
+    #[test]
+    fn removed_roots_exclude_a_recursive_mode_flip() {
+        // A mode flip is unwatch+rewatch of the SAME path: the watch stays active, so
+        // its pending files must survive; only /gone is truly going away.
+        let to_unwatch = vec![PathBuf::from("/flip"), PathBuf::from("/gone")];
+        let to_watch = vec![(PathBuf::from("/flip"), true)];
+        assert_eq!(
+            removed_watch_roots(&to_unwatch, &to_watch),
+            vec![PathBuf::from("/gone")]
+        );
+    }
+
+    #[test]
+    fn purge_drops_pending_files_only_under_removed_roots() {
+        // A file mid-stabilization when its watch is disabled must NOT be enqueued
+        // once it settles — otherwise disabling a watch doesn't fully take effect.
+        let mut pending: HashMap<PathBuf, PendingEntry> = HashMap::new();
+        let entry = PendingEntry::new(
+            1,
+            SystemTime::UNIX_EPOCH,
+            Instant::now(),
+            Duration::from_secs(1),
+        );
+        let doomed = Path::new("removed").join("sub").join("a.mp4");
+        let survivor = Path::new("kept").join("b.mp4");
+        pending.insert(doomed.clone(), entry.clone());
+        pending.insert(survivor.clone(), entry);
+
+        purge_pending_under(&mut pending, &[PathBuf::from("removed")]);
+
+        assert!(!pending.contains_key(&doomed));
+        assert!(
+            pending.contains_key(&survivor),
+            "files under still-active watches keep stabilizing"
+        );
     }
 
     fn config(path: &str, recursive: bool, delay_secs: u64) -> WatchedDirConfig {
