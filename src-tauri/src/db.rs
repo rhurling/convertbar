@@ -14,7 +14,7 @@ fn default_preset() -> &'static str {
     } else if cfg!(target_os = "windows") {
         "H.265 NVENC 1080p"
     } else {
-        "H.265 MKV 1080p"
+        "H.265 MKV 1080p30"
     }
 }
 
@@ -85,6 +85,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             }
         }
     }
+
+    // Backfill: Linux DBs seeded before 0.13.1 stored "H.265 MKV 1080p", which is not a
+    // valid preset name in current HandBrake (the built-in is "H.265 MKV 1080p30"), so
+    // every default conversion failed. INSERT OR IGNORE below won't touch existing rows,
+    // so correct the stored value and its suffix-template row here.
+    conn.execute(
+        "UPDATE settings SET value = 'H.265 MKV 1080p30' WHERE key = 'preset' AND value = 'H.265 MKV 1080p'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE OR IGNORE preset_suffixes SET preset_name = 'H.265 MKV 1080p30' WHERE preset_name = 'H.265 MKV 1080p'",
+        [],
+    )?;
 
     let defaults: &[(&str, &str)] = &[
         ("preset", preset),
@@ -220,6 +233,64 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 15);
+    }
+
+    #[test]
+    fn init_db_repairs_the_invalid_pre_0_13_1_linux_default_preset() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate a DB seeded by an older Linux build: "H.265 MKV 1080p" is not a
+        // built-in preset in current HandBrake, so every default conversion failed.
+        conn.execute(
+            "UPDATE settings SET value = 'H.265 MKV 1080p' WHERE key = 'preset'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE preset_suffixes SET preset_name = 'H.265 MKV 1080p'",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        assert_eq!(
+            setting(&conn, "preset").as_deref(),
+            Some("H.265 MKV 1080p30"),
+            "restart must repair the stored preset name or Linux default conversions keep failing"
+        );
+        let suffix: String = conn
+            .query_row(
+                "SELECT suffix FROM preset_suffixes WHERE preset_name = 'H.265 MKV 1080p30'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            suffix, ".{resolution}-{codec}",
+            "the user's suffix template must follow the renamed preset"
+        );
+    }
+
+    #[test]
+    fn init_db_repair_leaves_a_user_chosen_preset_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "UPDATE settings SET value = 'H.264 MKV 720p30' WHERE key = 'preset'",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        // The repair targets only the known-bad seeded value, never a deliberate choice.
+        assert_eq!(
+            setting(&conn, "preset").as_deref(),
+            Some("H.264 MKV 720p30")
+        );
     }
 
     #[test]
