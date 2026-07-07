@@ -15,7 +15,7 @@ executes.
   accept the risk (defensible for a local-only menubar app, but weakest link
   compounds with any future ACL drift).
 - **Recommendation:** (a).
-- **Decision:** _pending_
+- **Decision (2026-07-07):** (a) strict CSP + smoke test all pages.
 
 ## D2 — Windows PR CI (blocks B10 item 1)
 Rust tests run on Windows only on pushes to main; Windows-only failures land
@@ -25,7 +25,7 @@ rust-cache keeps it cheap.
   can't block merges, just visible); (b) same but gated on
   `paths: [src-tauri/**]` so frontend-only PRs skip it; (c) status quo.
 - **Recommendation:** (b).
-- **Decision:** _pending_
+- **Decision (2026-07-07):** (b) advisory windows-latest PR job gated on paths: [src-tauri/**].
 
 ## D3 — Zero-byte output semantics (blocks B3 item 2)
 A conversion whose process exits 0 but produced a 0-byte file is recorded
@@ -33,7 +33,7 @@ as done with a "saved 0B" notification.
 - **Options:** (a) treat as failure (status=failed, partial file removed,
   error surfaced); (b) keep done but warn in notification/history.
 - **Recommendation:** (a) — a 0-byte video is never a success.
-- **Decision:** _pending_
+- **Decision (2026-07-07):** (a) treat zero-byte output as failure.
 
 ## D4 — build.yml workflow_dispatch (blocks B9 item 3)
 Manual dispatch from main is half-broken: `publish-release` runs
@@ -44,7 +44,7 @@ Manual dispatch from main is half-broken: `publish-release` runs
   (keeps a manual "test the build" escape hatch).
 - **Recommendation:** (a) unless you actually use manual dispatch to
   smoke-test builds.
-- **Decision:** _pending_
+- **Decision (2026-07-07):** (a) remove workflow_dispatch.
 
 ## D5 — Updater UX (blocks B4 item 5)
 The updater silently downloads AND installs on every startup — no consent,
@@ -54,7 +54,7 @@ The error handling gets fixed regardless; the UX question:
   restart to apply" (plugin-notification already registered); (b) notify
   before installing and let the user defer; (c) keep fully silent.
 - **Recommendation:** (a) — lowest friction, no more invisible updates.
-- **Decision:** _pending_
+- **Decision (2026-07-07):** (a) auto-install + "restart to apply" notification.
 
 ## D6 — Real-encoder e2e tests in CI (blocks B10 item 3)
 Two valuable ffmpeg+HandBrakeCLI e2e tests are `#[ignore]`d; CI never runs
@@ -64,7 +64,7 @@ them, nothing enforces they still pass.
   (b) run them only in the release workflow as a pre-release gate;
   (c) leave manual.
 - **Recommendation:** (a) — failures surface near the change, not at release.
-- **Decision:** _pending_
+- **Decision (2026-07-07):** (a) weekly scheduled + on-main ignored-tests job.
 
 ## D7 — Stop-hook version-sync warning (blocks B12 item 2)
 `check-version-sync.sh` writes its warning to exit-0 stdout, which Stop
@@ -74,7 +74,7 @@ hooks only show in transcript mode — effectively invisible.
   (b) JSON `{"decision":"block","reason":...}` — same effect, structured;
   (c) keep as-is and document it's transcript-only.
 - **Recommendation:** (a) — the hook exists to catch drift; invisible ≠ hook.
-- **Decision:** _pending_
+- **Decision (2026-07-07):** (a) exit 2 + stderr.
 
 ## D8 — rustfmt PostToolUse hook strategy (blocks B12 item 3)
 The hook reformats entire edited files; the tree is not fmt-clean
@@ -86,4 +86,4 @@ out-of-scope diffs (documented in project memory).
   (no noisy PR, but unclean files stay unclean and edits there go
   unformatted); (c) remove the hook.
 - **Recommendation:** (a).
-- **Decision:** _pending_
+- **Decision (2026-07-07):** (a) one-time cargo fmt chore PR, keep hook.
