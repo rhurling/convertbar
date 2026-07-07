@@ -1,0 +1,89 @@
+# Fable Review: ci-release
+
+## test.yml
+
+Reviewed: /Users/rhurling/Sites/convertbar/.github/workflows/test.yml (done)
+
+- **[Medium]** test.yml:34 — Windows (and macOS) Rust tests run only on push to main, so Windows-only failures land post-merge. This has already happened once (hardcoded `/` path separators in tests reddened main after merge). Cost/benefit: Windows minutes bill 2x, but the Rust test suite is small and rust-cache keeps incremental runs cheap. Fix: add `windows-latest` to the PR matrix as an advisory (non-required) check — `frontend` + `rust (ubuntu-22.04)` remain the only gates, so a flaky/slow Windows run never blocks a merge, but the failure is visible before merge. Cheaper alternative if minutes matter: a separate `rust-windows` job gated on `paths: [src-tauri/**]` so frontend-only PRs skip it.
+- **[Low]** test.yml required checks — verified against the live ruleset (id 17085079): required contexts are exactly `frontend` and `rust (ubuntu-22.04)`, matching the PR-time job names. Structural fragility: the runner label `ubuntu-22.04` is baked into the required-check name. When the runner label is migrated (e.g. to `ubuntu-latest`/`ubuntu-24.04`), the check context renames and PRs silently lose the Rust gate until the ruleset is updated. Fix: give the matrix job an explicit stable `name:` (e.g. `rust (${{ matrix.platform }})` → a fixed `rust-linux` for the PR leg) or remember to update the ruleset in the same PR.
+- **[Nit]** test.yml:8-12 — comment says "let every push to main run its full matrix to completion", but with a shared concurrency group GitHub keeps at most one pending run per group: rapid successive pushes to main can supersede a queued (not-yet-started) run, so an intermediate commit may never get its full matrix. In-progress runs are safe (cancel-in-progress is false for push). Fix (optional): append `${{ github.sha }}` to the group for push events, or accept and reword the comment.
+- Caching is correct: `setup-node cache: npm` keys on package-lock.json; `swatinem/rust-cache` keys include job + runner OS so the three matrix platforms don't collide, workspaces path `./src-tauri -> target` is right, and PR-branch caches fall back to main's. No stale-cache risk found.
+- Supply chain: both actions plus rust-toolchain pinned by full SHA with version comments — good. Verified `dtolnay/rust-toolchain@29eef33`'s action.yml has `toolchain` input defaulting to `stable`, so the SHA pin without a `toolchain:` input is safe (the `# stable` comment is accurate).
+- **[Nit]** No `cargo clippy` (or fmt) job. Memory notes the tree isn't fmt-clean, so fmt is deliberately out; clippy would still be a cheap lint layer if desired. Not a gap in the stated scope.
+
+## build.yml
+
+Reviewed: /Users/rhurling/Sites/convertbar/.github/workflows/build.yml (done)
+
+- **[Medium]** build.yml:4,108 — the `workflow_dispatch` trigger is half-broken. On a manual dispatch from `main`, `github.ref_name` is `main`, so `publish-release` runs `gh release edit "main"` and fails; meanwhile `tauri-action` will have created/updated a draft release under `v<version-from-tauri.conf.json>` (and may create that tag). Result: a stray draft that never gets published, and a red run. Fix: either remove `workflow_dispatch`, or in `publish-release` derive the tag from the draft (`v$(jq -r .version src-tauri/tauri.conf.json)`) / skip the job when `github.ref_type != 'tag'`.
+- **[Low]** build.yml:48-49 — `PREV` is the second-highest tag by version sort, which assumes the tag being released is the highest. Releasing a backport/hotfix tag lower than the current latest produces a wrong changelog compare link. Also on `workflow_dispatch`, `git describe` picks whatever tag is nearest HEAD. Edge cases only; fix by computing PREV relative to `$GITHUB_REF_NAME` if it ever matters.
+- **[Low]** build.yml (release build) — cargo runs without `--locked`, so if Cargo.lock ever drifts from Cargo.toml the release build silently re-resolves dependencies and the shipped binary won't match the committed lockfile. Fix: `args: "${{ matrix.args }} -- --locked"` (tauri build forwards trailing args to cargo), or add a `cargo metadata --locked` sanity step.
+- **[Nit]** build.yml:108 — `${{ github.ref_name }}` interpolated directly into a `run:` shell line. Tag names are maintainer-controlled here so exploitability is nil, but the hygienic pattern is passing it via `env:`.
+- Permissions: exemplary least-privilege — top-level `permissions: {}`, each job opts into only `contents: write`. Signing secrets (`TAURI_SIGNING_PRIVATE_KEY`(+password)) are exposed only to the tauri-action step env, not job-wide. Good.
+- Draft-vs-published flow is sound: all four matrix legs upload to one draft; `publish-release` (needs: publish-tauri) flips it once, which is required because immutable releases seal on publish. Failure containment is correct: if any platform fails, the draft is never published, `releases/latest/download/latest.json` keeps serving the previous release, and no client sees a partial update. Re-running failed jobs re-uploads to the existing draft, so the workflow is re-runnable pre-publish.
+- Updater signature generation: `createUpdaterArtifacts: true` + pubkey + latest.json endpoint verified in tauri.conf.json; if the signing secret were missing, tauri-action fails the build loudly rather than shipping unsigned artifacts. Good.
+- Supply chain: all four actions (checkout, setup-node, rust-toolchain, tauri-action) pinned by full commit SHA with version comments. Good.
+- Concurrency (serialize per-tag, never cancel a release build) is correct for immutable releases.
+
+## scripts/release.sh
+
+Reviewed: /Users/rhurling/Sites/convertbar/scripts/release.sh (done)
+
+- **[Medium]** release.sh:155-162 — tag-the-merged-commit has a race: after `gh pr merge --admin --squash`, the script does `git pull --ff-only` and tags whatever `main` HEAD then is. Any commit landing on main between the merge and the pull (or a stale fetch tagging the pre-merge commit) gets tagged and released — in the stale case the tag `vX.Y.Z` points at a commit whose tauri.conf.json still holds the old version, so tauri-action creates the release under the wrong tag name and `publish-release` fails against the pushed tag. Fix: capture the exact SHA — `sha=$(gh pr view "chore/release-$target" --json mergeCommit -q .mergeCommit.oid)` — assert `git rev-parse HEAD` equals it after the pull, and tag that SHA explicitly (`git tag -s "v$target" -m "v$target" "$sha"`).
+- **[Medium]** release.sh:108-122,194-195 — a failed build leaves the working tree dirty (manifests + lockfile already bumped by bump_manifests) with no commit and no cleanup hint; the next run then dies at preflight's clean-tree check with a message that doesn't explain why. Fix: on build failure, print the recovery command (`git checkout -- package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock`) or auto-restore before exiting.
+- **[Low]** release.sh:130,161 — `git commit -S` and `git tag -s` assume a working signing setup, but preflight never checks it. A signing failure at line 130 strands the run mid-way: release branch created, tree dirty, no commit. Fix: preflight-check `git config --get user.signingkey` (or do a `git commit --dry-run`-equivalent probe) alongside the tool checks.
+- **[Low]** release.sh:133-144 — partial-state re-runnability: if `gh pr create` fails after the branch was pushed, a re-run aborts at "branch already exists" with no resume path; recovery is manual (delete local+remote branch, restart). Fail-loud is acceptable for a single-maintainer tool, but the branch-exists error message could name the exact cleanup commands.
+- **[Low]** release.sh:191 — `--dry-run` genuinely changes nothing (verified: only reads package.json), but it also skips preflight entirely, so it happily prints a plan for a version that isn't newer, from a dirty tree, or off-main. Fix: run the read-only preflight checks in dry-run mode too and annotate the plan with any that would fail.
+- **[Low]** release.sh:103-105 — the perl bumps rely on positional assumptions: "first `\"version\":` key in tauri.conf.json is top-level" and "first line-anchored `version =` in Cargo.toml is [package]". True today, silently wrong if a nested `version` key ever appears earlier in tauri.conf.json. A `jq`-based edit for the JSON file would be structural. Combined with the next point, an error here ships unreviewed.
+- **[Low]** release.sh:158 — `gh pr merge --admin` bypasses both required checks and the ruleset's review requirements, so the release commit lands on protected main with zero CI. This is by design (bump-only commit, validated by the local build), but it means the only guard on the perl edits above is the local `npm run tauri build`. Worth documenting as an accepted risk in the design doc.
+- **[Nit]** release.sh:114-121 — build success is detected by grepping `Finished [0-9]+ bundles` because the local build intentionally ends with the CI-only signing-key error. Brittle against Tauri CLI wording changes, but it fails loud (aborts pre-commit), which is the right failure mode.
+- Solid: argument validation (semver regex, unknown-option rejection, `--notes` arg check), semver_gt via `sort -V`, preflight ordering (version → tools → auth → branch → clean tree → origin sync), and Cargo.lock/package-lock.json are picked up correctly (npm version updates package-lock; the build updates Cargo.lock; `git commit -am` stages both).
+
+## .claude/hooks/check-version-sync.sh (version logic only)
+
+Reviewed: /Users/rhurling/Sites/convertbar/.claude/hooks/check-version-sync.sh (done)
+
+- **[Low]** check-version-sync.sh:12 — the warning is gated on `[ -n "$tv" ]`, so if tauri.conf.json is missing/unparseable the hook stays silent even when package.json and Cargo.toml disagree with each other. Fix: warn when any of the three is empty or when any pair differs, e.g. `if [ "$tv" != "$pv" ] || [ "$tv" != "$cv" ] || [ -z "$tv$pv$cv" ]`.
+- **[Low]** check-version-sync.sh — doesn't check the lockfiles. A hand-bump of Cargo.toml (the exact drift this hook exists to catch) leaves Cargo.lock stale; since the CI release build runs cargo without `--locked` (see build.yml finding), that drift is silently papered over at release time. Fix: also compare the `convertbar` package version in Cargo.lock and `packages[""].version` in package-lock.json.
+- **[Nit]** check-version-sync.sh:10 — `grep -m1 '^version *='` on Cargo.toml grabs the first line-anchored version; would mis-match if a `[workspace.package]` or another table ever precedes `[package]`. Fine for the current single-package manifest.
+- **[Nit]** check-version-sync.sh:6 — missing `jq` silently disables the guard (`exit 0`). Defensible for a warn-only Stop hook, but a one-line "version-sync check skipped: jq not found" would honor fail-loud.
+
+## package.json scripts + version consistency
+
+Reviewed: /Users/rhurling/Sites/convertbar/package.json (+ lockfiles, tauri.conf.json, Cargo.toml, Cargo.lock) (done)
+
+- Clean. All version fields agree at 0.13.0: package.json, package-lock.json (both `version` and `packages[""].version`), src-tauri/tauri.conf.json, src-tauri/Cargo.toml, and Cargo.lock's `convertbar` package entry.
+- Scripts match CI usage exactly: `test` = `vitest run` (used by test.yml), `build` = `tsc && vite build` (type-check exercised per-PR, mirroring the release build), `tauri` passthrough used by release.sh. No drift.
+
+## .claude/skills/release/SKILL.md (vs release.sh reality)
+
+Reviewed: /Users/rhurling/Sites/convertbar/.claude/skills/release/SKILL.md (done)
+
+- Accurate overall: flags (`--yes`, `--dry-run`, `--notes`), the no-commit-until-build-succeeds guarantee, the leaves-an-open-PR-on-late-abort behavior, the intentional ignoring of the local `TAURI_SIGNING_PRIVATE_KEY` error, and the draft-then-publish CI flow all match the script and build.yml.
+- **[Nit]** SKILL.md:19,32 — says the script "tags the merged commit"; it actually tags post-pull `main` HEAD, which is only the merged commit absent the merge→pull race documented against release.sh:155-162. If the script is fixed to tag the mergeCommit SHA, this wording becomes literally true; until then it slightly oversells.
+- **[Nit]** SKILL.md:21 — "Success is the script reaching `Finished N bundles`" describes the build gate, not overall script success (the script continues through merge/tag/push after that). Harmless but could confuse an operator into stopping early.
+
+## Summary
+
+The CI/release pipeline is in good shape overall: all actions are SHA-pinned with accurate version comments (the dtolnay SHA was verified to default to `stable`), build.yml uses textbook least-privilege permissions with secrets scoped to a single step, the draft→publish flow correctly handles immutable releases and partial-matrix failure, all six version fields are in sync at 0.13.0, and the live ruleset's required checks (`frontend`, `rust (ubuntu-22.04)`) exactly match the PR-time job names. No Critical or High findings.
+
+The three Medium findings: (1) the known Windows PR-coverage gap, which has already bitten once and is cheap to close with an advisory Windows job; (2) a merge→tag race in release.sh that can tag the wrong SHA instead of the actual squash-merge commit; (3) build.yml's `workflow_dispatch` trigger, whose publish-release step is guaranteed to fail on a branch ref while leaving a stray draft. Lower-severity items cluster around release.sh partial-state recovery (dirty tree after failed build, no signing preflight, no resume path after a failed `gh pr create`), lockfile drift being invisible to both the version-sync hook and the unlocked CI cargo build, and a required-check name that embeds a runner label.
+
+## Recommendations
+
+1. **Fix the release.sh tag race** (Medium): capture `gh pr view --json mergeCommit -q .mergeCommit.oid` after the merge, assert local HEAD matches, and tag that SHA explicitly. Also makes SKILL.md's "tags the merged commit" literally true.
+2. **Close the Windows PR gap** (Medium): add `windows-latest` to the PR matrix as a non-required advisory check (or a `paths: [src-tauri/**]`-gated job). Required checks stay `frontend` + `rust (ubuntu-22.04)`, so nothing new can block merges — failures just become visible pre-merge instead of post-merge.
+3. **Fix or drop `workflow_dispatch` in build.yml** (Medium): either remove the trigger or make `publish-release` skip/derive-the-tag when `github.ref_type != 'tag'`.
+4. **Make release.sh failures recoverable** (Low, cheap): print the manifest-restore command on build failure, preflight the signing key, and name the cleanup commands in the "branch already exists" error.
+5. **Guard lockfile drift** (Low): build with `--locked` in CI (append `-- --locked` to tauri-action args) and/or extend check-version-sync.sh to compare Cargo.lock and package-lock.json versions; also fix the hook's silent pass when tauri.conf.json is unreadable.
+6. **Decouple the required check from the runner label** (Low): give the PR-time Rust job a stable name so a future runner migration can't silently un-gate PRs; at minimum, treat any `runs-on` change in test.yml as requiring a ruleset update in the same PR.
+7. **Run preflight (read-only) under `--dry-run`** (Low): the plan should flag a non-newer version, dirty tree, or off-main state instead of printing a plan that will fail.
+
+## Verification pass (2026-07-07)
+
+- **Confirmed** — Windows/macOS Rust tests only on push to main (test.yml:34): the matrix is `fromJSON(github.event_name == 'push' && '[...full...]' || '["ubuntu-22.04"]')`, so PRs never run Windows; re-verified live ruleset 17085079 requires exactly `frontend` and `rust (ubuntu-22.04)`, so adding an advisory Windows leg cannot block merges as the fix claims.
+- **Confirmed** — `workflow_dispatch` half-broken (build.yml:4,108): on a manual dispatch from main, `github.ref_name` is `main` and publish-release runs `gh release edit "main"`, which fails (no release tagged `main`); tauri-action (build.yml:87, `tagName: v__VERSION__`, `releaseDraft: true`) drafts under the tauri.conf.json version instead, so if the manifest version is unreleased the draft is stranded, and if it's already released the immutable-release conflict reddens publish-tauri — a red run either way, exactly as claimed.
+- **Confirmed** — release.sh merge→tag race (release.sh:155-162): the script tags whatever `main` HEAD is after `git pull --ff-only` (line 159→161), never the mergeCommit SHA. Critically, `--ff-only` gives no staleness protection: if the remote serves a pre-merge ref (GitHub replication lag right after an API merge), fetched origin/main equals local HEAD, the pull succeeds trivially ("already up to date"), and the tag lands on the pre-merge commit with the old manifest version — producing exactly the tauri-action/publish-release tag mismatch described. The concurrent-commit window between lines 158 and 159 is also real (that case still releases the right version with an extra commit, which the finding correctly attributes only wrong-version to the stale case). Fix as prescribed is sound.
+- **Partial** — dirty tree after failed build (release.sh:108-122,194-195): substance holds — `set -euo pipefail` (line 4), no trap, `bump_manifests` (line 194) mutates four files before `build_app` (line 195), and the failure path (lines 118-120) exits 1 with no restore hint. Correction: a retry with the same explicit X.Y.Z dies even earlier, at preflight's strictly-newer check (lines 73-76, "version X is not newer than current X"), because package.json already holds the target; only a keyword retry (`patch`/`minor`/`major`) reaches the clean-tree check at line 89. The next-run message is confusing either way, but the check named in the finding is only sometimes the one that fires.
+
+**Tally:** 3 confirmed, 1 partial, 0 refuted (of 4).
