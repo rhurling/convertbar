@@ -252,7 +252,16 @@ pub fn cancel_conversion(
                 }
             }
             let _ = child.kill();
+            // Reap before the partial-output delete below: on Windows the dying
+            // process holds the output file handle until it is fully gone, so
+            // removing the file under an unreaped child silently fails. Kill has
+            // been delivered, so this returns promptly.
+            let _ = child.wait();
         }
+        // Clear the handle so the queue loop takes its designed cancel branch
+        // ("Child was already taken") instead of try_wait() on a reaped child,
+        // whose behavior differs by platform.
+        *child_guard = None;
     }
 
     // Surface a status-write failure now that the process has been killed.

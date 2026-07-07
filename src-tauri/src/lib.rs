@@ -22,6 +22,16 @@ pub struct AppState {
     pub preset_cache: Mutex<HashMap<String, handbrake::PresetMetadata>>,
 }
 
+/// Truncate a filename for the tray title on a char boundary — byte slicing panics
+/// mid-codepoint on multi-byte names (umlauts, CJK, emoji), crashing the tray updater.
+fn truncate_tray_title(name: &str) -> String {
+    if name.chars().count() > 20 {
+        format!("{}…", name.chars().take(19).collect::<String>())
+    } else {
+        name.to_string()
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_path = db::get_db_path();
@@ -139,8 +149,16 @@ pub fn run() {
                                     if window.is_visible().unwrap_or(false) {
                                         let _ = window.hide();
                                     } else {
-                                        // Confine to screen bounds before showing
-                                        if let Ok(Some(monitor)) = window.current_monitor() {
+                                        // Confine to screen bounds before showing. After a monitor
+                                        // is disconnected the stored position may not map to any
+                                        // monitor and current_monitor() yields nothing — exactly the
+                                        // case confinement exists for — so fall back to the primary.
+                                        let monitor = window
+                                            .current_monitor()
+                                            .ok()
+                                            .flatten()
+                                            .or_else(|| window.primary_monitor().ok().flatten());
+                                        if let Some(monitor) = monitor {
                                             if let (Ok(win_pos), Ok(win_size)) = (window.outer_position(), window.outer_size()) {
                                                 let mon_pos = monitor.position();
                                                 let mon_size = monitor.size();
@@ -255,12 +273,7 @@ pub fn run() {
                                 }
                                 if show_filename {
                                     if let Some(ref name) = update.file_name {
-                                        let truncated = if name.len() > 20 {
-                                            format!("{}…", &name[..19])
-                                        } else {
-                                            name.clone()
-                                        };
-                                        parts.push(truncated);
+                                        parts.push(truncate_tray_title(name));
                                     }
                                 }
                                 if show_fps {
@@ -357,16 +370,66 @@ pub fn run() {
             // Arm directory watchers and ingest any files already present in enabled folders.
             watcher::start(app.handle().clone());
 
-            // Check for updates on startup
+            // Check for updates on startup. Install stays automatic (decision D5),
+            // but the user is told an update landed instead of it being invisible;
+            // a check/download failure is normal offline behavior and stays quiet.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Ok(Some(update)) = handle.updater().unwrap().check().await {
-                    let _ = update.download_and_install(|_, _| {}, || {}).await;
+                let Ok(updater) = handle.updater() else {
+                    return;
+                };
+                if let Ok(Some(update)) = updater.check().await {
+                    let version = update.version.clone();
+                    if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
+                        use tauri_plugin_notification::NotificationExt;
+                        let _ = handle
+                            .notification()
+                            .builder()
+                            .title("ConvertBar")
+                            .body(format!(
+                                "Updated to {version} — restart ConvertBar to apply"
+                            ))
+                            .show();
+                    }
                 }
             });
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // Fires for every exit path — quit_app, the tray Quit item, Cmd+Q, logout.
+            // Without this, quitting mid-encode orphans HandBrakeCLI, which keeps
+            // encoding into the partial output for hours; on the next launch
+            // auto-resume would delete that file and start a second encoder against
+            // the same path while the orphan still holds it.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let conv = app.state::<Arc<ConverterState>>();
+                converter::kill_active_child(&conv);
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_title_truncation_is_char_boundary_safe() {
+        // Byte slicing (&name[..19]) panicked here: byte 19 lands mid-codepoint.
+        let umlauts = "ääääääääääääääääääääää.mp4";
+        let truncated = truncate_tray_title(umlauts);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(truncated.chars().count(), 20);
+
+        let emoji = "🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬🎬.mp4";
+        assert!(truncate_tray_title(emoji).ends_with('…'));
+
+        // Short names pass through untouched.
+        assert_eq!(truncate_tray_title("clip.mp4"), "clip.mp4");
+        // A 20-char name must NOT be truncated (the old code cut at >20 bytes).
+        let exactly_20 = "a".repeat(20);
+        assert_eq!(truncate_tray_title(&exactly_20), exactly_20);
+    }
 }
