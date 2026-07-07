@@ -34,6 +34,16 @@ pub fn get_watched_directories(
         .map_err(|e| e.to_string())
 }
 
+/// Canonical form of a watch path, so aliases of one folder (trailing slash, symlink,
+/// case variant) can't register duplicate watchers — the DB UNIQUE constraint only
+/// catches byte-identical strings. dunce avoids the `\\?\` prefix std canonicalize
+/// yields on Windows.
+fn canonical_watch_path(path: &str) -> String {
+    dunce::canonicalize(Path::new(path))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 #[tauri::command]
 pub fn add_watched_directory(
     app: AppHandle,
@@ -42,6 +52,7 @@ pub fn add_watched_directory(
     recursive: bool,
     stability_delay_secs: i64,
 ) -> Result<WatchedDirectory, String> {
+    let path = canonical_watch_path(&path);
     let dir = Path::new(&path);
     if !dir.is_dir() {
         return Err("Path is not a directory".to_string());
@@ -173,4 +184,52 @@ pub async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
         .and_then(|file_path| file_path.into_path().ok())
         .map(|path| path.to_string_lossy().to_string());
     Ok(folder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_watch_path_unifies_aliases_of_the_same_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap().to_string();
+
+        // Trailing separator and a `/./` hop are the everyday duplicate-watch vectors;
+        // both must collapse to the same string the UNIQUE constraint compares.
+        let with_trailing = format!("{}{}", base, std::path::MAIN_SEPARATOR);
+        assert_eq!(
+            canonical_watch_path(&with_trailing),
+            canonical_watch_path(&base)
+        );
+
+        let with_dot = Path::new(&base).join(".").to_string_lossy().to_string();
+        assert_eq!(canonical_watch_path(&with_dot), canonical_watch_path(&base));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_watch_path_resolves_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            canonical_watch_path(link.to_str().unwrap()),
+            canonical_watch_path(real.to_str().unwrap()),
+            "a symlinked alias must not create a second watcher over the same folder"
+        );
+    }
+
+    #[test]
+    fn canonical_watch_path_passes_nonexistent_paths_through() {
+        // add_watched_directory still owns the is_dir() rejection; canonicalization
+        // must not turn its clear error into a silent transformation.
+        assert_eq!(
+            canonical_watch_path("definitely-missing"),
+            "definitely-missing"
+        );
+    }
 }
