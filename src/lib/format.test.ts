@@ -36,6 +36,14 @@ describe("fileName", () => {
   it("returns the last path segment", () => {
     expect(fileName("/Users/me/Movies/clip.mp4")).toBe("clip.mp4");
   });
+  it("handles Windows backslash paths — the backend sends OS-native separators", () => {
+    // Regression: splitting on "/" only made every queue/history row on Windows
+    // show the full path instead of the file name.
+    expect(fileName("C:\\Users\\me\\Videos\\clip.mp4")).toBe("clip.mp4");
+  });
+  it("ignores a trailing separator", () => {
+    expect(fileName("/Users/me/Movies/")).toBe("Movies");
+  });
   it("returns the input unchanged when there is no separator", () => {
     expect(fileName("clip.mp4")).toBe("clip.mp4");
   });

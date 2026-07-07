@@ -20,5 +20,7 @@ export function formatPercent(saved: number, original: number): string {
 }
 
 export function fileName(path: string): string {
-  return path.split("/").pop() || path;
+  // The backend sends OS-native paths, so Windows arrives with backslashes.
+  const parts = path.split(/[/\\]/).filter(Boolean);
+  return parts[parts.length - 1] || path;
 }

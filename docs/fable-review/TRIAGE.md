@@ -70,7 +70,7 @@ Refs: rust-app-shell.md:57,67-70,79; claude-automation.md:53,81 → **D1**
 
 ### B7 — Windows filename display
 Refs: tests-quality.md:83; frontend.md:99
-- [ ] `fileName()` splits on `/` only; backend emits OS-native `\` paths on
+- [x] `fileName()` splits on `/` only; backend emits OS-native `\` paths on
   Windows → every queue/history/active row shows the full path. Fix split to
   `/[\\/]/`, add `C:\...` test case, delete WatchedFoldersPage's duplicate
   `basename()`. (Notifications unaffected — built backend-side.)
