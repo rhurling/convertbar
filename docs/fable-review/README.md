@@ -13,6 +13,27 @@ Full-codebase review by 7 parallel Fable subagents. Each report ends with its ow
 | [claude-automation.md](claude-automation.md) | .claude skills/hooks/agents/settings, CLAUDE.md, docs drift | 32 |
 | [ci-release.md](ci-release.md) | workflows, release.sh, version sync | 22 |
 
+## Verification pass (2026-07-07)
+
+Every Critical/High/Medium finding was adversarially re-verified by a second
+agent instructed to refute it (verdicts appended to each report under
+`## Verification pass`). Result across 55 verdicts: **49 confirmed, 5 partial,
+1 refuted.** Notable corrections:
+
+- **Refuted:** "MKV data in `.mp4`-named files on Linux" — empirically
+  disproven; HandBrakeCLI auto-detects the container from the destination
+  extension. But testing surfaced a **new confirmed bug**: the Linux default
+  preset name `"H.265 MKV 1080p"` (db.rs:17) is invalid in current HandBrake
+  (real name `"H.265 MKV 1080p30"`), so default conversions on Linux fail
+  outright.
+- **Downgraded:** the preset-cache lock convoy is real but the shell-out
+  measured ~0.19s, not seconds — a brief UI hitch, severity Medium.
+- **Narrowed:** the tray UTF-8 panic requires the opt-in
+  `menubar_show_filename` setting; the Windows `fileName()` bug does not
+  affect notifications (built backend-side, platform-correct); the Unix
+  "flush after unlink" detail on cancel was wrong (SIGKILL — no flush),
+  the Windows handle-lock core stands.
+
 ## Cross-cutting themes (corroborated by multiple agents)
 
 1. **Main-thread blocking survives at more entry points than the 4 previously fixed.**
@@ -46,16 +67,18 @@ Full-codebase review by 7 parallel Fable subagents. Each report ends with its ow
 
 ## Top recommendations (priority order)
 
-1. Async-ify the remaining main-thread blockers (`commands/handbrake.rs` × 4,
+1. Fix the Linux default preset name (`"H.265 MKV 1080p"` → `"H.265 MKV 1080p30"`,
+   db.rs:17) — default conversions on Linux fail outright (found during verification).
+2. Async-ify the remaining main-thread blockers (`commands/handbrake.rs` × 4,
    preset-cache convoy, folder scans) — same fix pattern as PR #55.
-2. Capture a bounded HandBrake stderr tail into failure messages; treat zero-byte
+3. Capture a bounded HandBrake stderr tail into failure messages; treat zero-byte
    output as failure.
-3. Strip the 9 stale ACL grants + unused fs/opener plugins; set a real CSP.
-4. Fix `fileName()` separator handling (and its test) for Windows display.
-5. Tag releases by the PR's `mergeCommit` oid instead of post-pull main HEAD;
+4. Strip the 9 stale ACL grants + unused fs/opener plugins; set a real CSP.
+5. Fix `fileName()` separator handling (and its test) for Windows display.
+6. Tag releases by the PR's `mergeCommit` oid instead of post-pull main HEAD;
    fix or remove build.yml's broken `workflow_dispatch` path.
-6. Rewrite the sqlite-migration-reviewer agent against the current db.rs;
+7. Rewrite the sqlite-migration-reviewer agent against the current db.rs;
    refresh RECOMMENDATIONS.md/SPEC.md.
-7. Add an advisory windows-latest PR CI job; de-`#[cfg(unix)]` the cancel tests.
-8. Debounce/commit-on-blur the three SettingsPage text inputs (reuse the WatchRow
+8. Add an advisory windows-latest PR CI job; de-`#[cfg(unix)]` the cancel tests.
+9. Debounce/commit-on-blur the three SettingsPage text inputs (reuse the WatchRow
    draft pattern) to stop per-keystroke IPC races.
