@@ -133,8 +133,11 @@ Refs: tests-quality.md:8,36,45,46,56
   `take_pause_after_current` (the pause gate + one-shot reset, now a single atomic
   take) and `final_run_status` (had_errors → error/idle). The success-path status
   transition was already pure (`decide_cleanup`); the queued→encoding→done/error
-  DB transitions are integration-level, exercised by the enforced `e2e-ignored`
-  job (B10).
+  DB transitions are integration-level. ~~exercised by the enforced `e2e-ignored`
+  job (B10)~~ — round 2 found that claim false (neither `--ignored` test ran a
+  conversion); since R2 they are covered by mock-runtime `process_queue` tests
+  (spawn failure, zero-byte output) plus an `#[ignore]` real-encode test that the
+  `e2e-ignored` job now actually runs.
 - [x] Reaper single-tick: extracted `reap_pending_once` (stat fn injected) from
   the reaper's sleep loop; tests prove a settled file enqueues exactly once and is
   dropped, a growing file stays pending, and a vanished file is dropped.
