@@ -839,6 +839,14 @@ fn process_queue<R: tauri::Runtime>(
                 }
             }
             Ok(_) | Err(_) => {
+                // Quit path: the exit handler killed this child, the encode didn't
+                // fail. Skip ALL bookkeeping — deleting the partial, writing
+                // status='error' (auto-resume only picks up 'encoding'/'paused'),
+                // or notifying "failed" would let a scheduler race decide the
+                // job's fate. The loop head turns this continue into the return.
+                if converter.is_shutting_down() {
+                    continue;
+                }
                 had_errors = true;
                 // Remove the partial encode output (the temp for in-place jobs), never the source.
                 let _ = std::fs::remove_file(&encode_target);
@@ -1101,6 +1109,101 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             p
         }
+    }
+
+    // A stand-in for a long-running encode: writes a partial output file (last CLI
+    // arg, like HandBrakeCLI's -o), then blocks long past the test's timeouts.
+    fn slow_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb-slow.cmd");
+            // Block with a cmd-INTERNAL busy loop, not `ping`/`timeout`: a grandchild
+            // would inherit our stdout/stderr pipe handles and keep them open after
+            // the kill, blocking the queue thread's progress-drain join for ~30s
+            // (real HandBrakeCLI spawns no grandchildren, so only this fake cares).
+            std::fs::write(
+                &p,
+                "@echo off\r\n:loop\r\nif not \"%~2\"==\"\" (\r\nshift\r\ngoto loop\r\n)\r\necho partial> \"%~1\"\r\nfor /l %%i in (1,1,2000000000) do rem\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("hb-slow.sh");
+            std::fs::write(
+                &p,
+                "#!/bin/sh\nfor a; do out=\"$a\"; done\necho partial > \"$out\"\nexec sleep 30\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for: {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn quit_mid_encode_leaves_the_job_for_auto_resume() {
+        // Quitting kills the active child (ExitRequested → kill_active_child). The
+        // queue thread then observes the killed status — its error arm must NOT run:
+        // deleting the partial, writing status='error' (which auto-resume ignores),
+        // or firing a "failed" notification would make the job's fate depend on
+        // whether the 100ms poll wakes before teardown finishes. The row stays
+        // 'encoding' so the next launch resumes it.
+        let app = mock_app();
+        let db = test_db();
+        let converter = Arc::new(ConverterState::new());
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = slow_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let output = dir.path().join("out.mp4");
+        queue_job(&db, "j1", "/nowhere/a.mp4", output.to_str().unwrap(), 1000);
+
+        let error_events = record_events(&app, "job-error");
+
+        run_queue(app.handle().clone(), db.clone(), converter.clone());
+        // The partial must exist BEFORE the kill, or the exists() assertion below
+        // would pass vacuously against a file the script never got to write.
+        wait_until(
+            "the fake encode to be running with a partial on disk",
+            || {
+                job_row(&db, "j1").0 == "encoding"
+                    && converter.current_child.lock().unwrap().is_some()
+                    && output.exists()
+            },
+        );
+
+        kill_active_child(&converter);
+        wait_until("the queue thread to exit", || {
+            !*converter.is_running.lock().unwrap()
+        });
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "encoding",
+            "quit must leave the job for auto-resume, not record it as failed (msg: {msg:?})"
+        );
+        assert!(
+            output.exists(),
+            "the partial output belongs to next-launch auto-resume cleanup, not the quit path"
+        );
+        assert!(
+            error_events.lock().unwrap().is_empty(),
+            "no failure events/notifications may fire because the user quit: {:?}",
+            error_events.lock().unwrap()
+        );
     }
 
     #[test]
