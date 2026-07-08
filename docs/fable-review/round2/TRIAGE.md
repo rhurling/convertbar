@@ -192,7 +192,7 @@ Test-first; each behavior change proven fail-capable by neutering.
 sqlite-migration-reviewer + cross-platform-reviewer clean; full Rust suite green;
 `cargo fmt --check` clean; no new clippy warnings.
 
-### R8 — misc lows (branch `fix/r8-misc-lows`, PR #TBD)
+### R8 — misc lows (branch `fix/r8-misc-lows`, PR #84)
 The last two backlog Lows plus the ci-release #5 decision. Test-first; both
 behavior changes proven fail-capable by neutering.
 - [x] **Silent updater install failure (D15).** The startup auto-updater
