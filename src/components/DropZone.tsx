@@ -80,15 +80,20 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
               <span>Add {folder.file_count} files from &quot;{folder.folder_name}&quot;?</span>
               <div className="folder-confirm-actions">
                 <button className="btn btn-small" onClick={async () => {
-                  const res = await commands.confirmFolderAdd(folder.folder_path);
-                  const remaining = pendingFolders.filter((_, j) => j !== i);
-                  setPendingFolders(remaining);
-                  if (remaining.length === 0) {
-                    await commands.startQueue();
-                    onFilesAdded();
-                    const summary = summarizeAdds([res]);
-                    setStatus(summary);
-                    if (summary) setTimeout(() => setStatus(null), 4000);
+                  try {
+                    const res = await commands.confirmFolderAdd(folder.folder_path);
+                    const remaining = pendingFolders.filter((_, j) => j !== i);
+                    setPendingFolders(remaining);
+                    if (remaining.length === 0) {
+                      await commands.startQueue();
+                      onFilesAdded();
+                      const summary = summarizeAdds([res]);
+                      setStatus(summary);
+                      if (summary) setTimeout(() => setStatus(null), 4000);
+                    }
+                  } catch (e) {
+                    setStatus(`Error: ${e}`);
+                    setTimeout(() => setStatus(null), 3000);
                   }
                 }}>Add</button>
                 <button className="btn btn-small btn-dim" onClick={() => {

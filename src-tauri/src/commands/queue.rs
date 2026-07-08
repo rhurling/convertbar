@@ -286,13 +286,7 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
             )
             .map_err(|e| e.to_string())?;
 
-        let suffix_template: String = conn
-            .query_row(
-                "SELECT suffix FROM preset_suffixes WHERE preset_name = ?1",
-                params![preset],
-                |row| row.get(0),
-            )
-            .unwrap_or_default();
+        let suffix_template = crate::commands::settings::read_suffix_template(&conn, &preset);
 
         let skip_already_converted: bool = conn
             .query_row(

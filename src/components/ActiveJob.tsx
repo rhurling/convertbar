@@ -11,6 +11,7 @@ interface ActiveJobProps {
 export default function ActiveJob({ job, progress }: ActiveJobProps) {
   const [pauseAfter, setPauseAfter] = useState(false);
   const [canPauseProcess, setCanPauseProcess] = useState(true);
+  const [actionError, setActionError] = useState<string | null>(null);
   const isPaused = job.status === "paused";
   const percent =
     progress && progress.job_id === job.id ? progress.percent : 0;
@@ -23,17 +24,32 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
     commands.getPlatformCapabilities().then((caps) => {
       setCanPauseProcess(caps.can_pause_process);
     });
+    // The armed-state lives in the backend; seed from it so tab remounts (and the updater
+    // flow arming it elsewhere) can't leave this button showing the wrong label.
+    commands.getPauseAfterCurrent().then(setPauseAfter).catch(() => {});
   }, []);
 
-  const togglePauseAfter = async () => {
-    if (pauseAfter) {
-      await commands.cancelPauseAfterCurrent();
-      setPauseAfter(false);
-    } else {
-      await commands.pauseAfterCurrent();
-      setPauseAfter(true);
+  // Controls fire-and-forget invokes; without this a rejected one (e.g. no active process)
+  // becomes an invisible unhandled rejection. Surface it inline instead.
+  const run = async (fn: () => Promise<void>) => {
+    try {
+      setActionError(null);
+      await fn();
+    } catch (e) {
+      setActionError(String(e));
     }
   };
+
+  const togglePauseAfter = () =>
+    run(async () => {
+      if (pauseAfter) {
+        await commands.cancelPauseAfterCurrent();
+        setPauseAfter(false);
+      } else {
+        await commands.pauseAfterCurrent();
+        setPauseAfter(true);
+      }
+    });
 
   return (
     <div className="active-job">
@@ -66,14 +82,14 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
             {isPaused ? (
               <button
                 className="btn btn-small"
-                onClick={() => commands.resumeConversion()}
+                onClick={() => run(() => commands.resumeConversion())}
               >
                 Resume
               </button>
             ) : (
               <button
                 className="btn btn-small"
-                onClick={() => commands.pauseConversion()}
+                onClick={() => run(() => commands.pauseConversion())}
               >
                 Pause
               </button>
@@ -98,11 +114,13 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
         )}
         <button
           className="btn btn-small btn-danger"
-          onClick={() => commands.cancelConversion()}
+          onClick={() => run(() => commands.cancelConversion())}
         >
           Cancel
         </button>
       </div>
+
+      {actionError && <div className="active-job-error">{actionError}</div>}
     </div>
   );
 }

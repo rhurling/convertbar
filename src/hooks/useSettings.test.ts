@@ -60,7 +60,9 @@ beforeEach(() => {
           ? Promise.reject(new Error("no cli"))
           : Promise.resolve(presetList);
       case "get_preset_suffix":
-        return Promise.resolve(suffixes[args!.preset!] ?? null);
+        // Backend supplies the default template when a preset has no stored row,
+        // so the frontend never has to write one from a read path.
+        return Promise.resolve(suffixes[args!.preset!] ?? DEFAULT_SUFFIX);
       case "set_preset_suffix":
         suffixes[args!.preset!] = args!.suffix!;
         return Promise.resolve(undefined);
@@ -89,16 +91,66 @@ describe("useSettings", () => {
     expect(result.current.presetsError).toBeNull();
   });
 
-  it("writes the default suffix template when the preset has none stored", async () => {
-    suffixes = {}; // no stored suffix for any preset
+  it("shows the backend-provided default suffix without writing from the read path", async () => {
+    suffixes = {}; // no stored suffix for any preset; backend returns the default
 
     const { result } = renderHook(() => useSettings());
 
     await waitFor(() => expect(result.current.presetSuffix).toBe(DEFAULT_SUFFIX));
-    expect(invokeMock).toHaveBeenCalledWith("set_preset_suffix", {
-      preset: "Fast 1080p30",
-      suffix: DEFAULT_SUFFIX,
+    // The default now lives in the backend; a read must never persist it (StrictMode
+    // would double-write, and it belongs in Rust, not a frontend read path).
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "set_preset_suffix",
+      expect.anything(),
+    );
+  });
+
+  it("updates a setting optimistically without a full get_settings refetch", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const settingsReadsBefore = invokeMock.mock.calls.filter(
+      (c) => c[0] === "get_settings",
+    ).length;
+
+    await act(async () => {
+      await result.current.updateSetting("handbrake_path", "/opt/HandBrakeCLI");
     });
+
+    expect(result.current.settings?.handbrake_path).toBe("/opt/HandBrakeCLI");
+    const settingsReadsAfter = invokeMock.mock.calls.filter(
+      (c) => c[0] === "get_settings",
+    ).length;
+    expect(settingsReadsAfter).toBe(settingsReadsBefore);
+  });
+
+  it("coerces boolean settings to real booleans in the optimistic merge", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.updateSetting("skip_already_converted", "true");
+    });
+
+    // A stringly "true" must land as a real boolean so `checked={setting === true}` works.
+    expect(result.current.settings?.skip_already_converted).toBe(true);
+  });
+
+  it("surfaces an error and restores the value when a write fails", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    invokeMock.mockImplementationOnce(((cmd: string) =>
+      cmd === "update_setting"
+        ? Promise.reject(new Error("db locked"))
+        : Promise.reject(new Error(`unexpected: ${cmd}`))) as typeof invoke);
+
+    await act(async () => {
+      await result.current.updateSetting("handbrake_path", "/bad/path");
+    });
+
+    expect(result.current.error).not.toBeNull();
+    // Optimistic value was not persisted, so state must fall back to the stored truth.
+    expect(result.current.settings?.handbrake_path).toBe("");
   });
 
   it("surfaces an error and empties the preset list when listing fails", async () => {

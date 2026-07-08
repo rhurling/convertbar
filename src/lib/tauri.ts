@@ -131,9 +131,11 @@ export const commands = {
   updateSetting: (key: string, value: string) =>
     invoke<void>("update_setting", { key, value }),
   getPresetSuffix: (preset: string) =>
-    invoke<string | null>("get_preset_suffix", { preset }),
+    invoke<string>("get_preset_suffix", { preset }),
   setPresetSuffix: (preset: string, suffix: string) =>
     invoke<void>("set_preset_suffix", { preset, suffix }),
+  resolveSuffixTemplate: (template: string, metadata: PresetMetadata) =>
+    invoke<string>("resolve_suffix_template", { template, metadata }),
   listHandbrakePresets: () => invoke<string[]>("list_handbrake_presets"),
   detectHandbrake: () => invoke<string | null>("detect_handbrake"),
   classifyPaths: (paths: string[]) =>
@@ -143,6 +145,7 @@ export const commands = {
     invoke<PresetMetadata>("generate_preset_suffix", { preset }),
   pauseAfterCurrent: () => invoke<void>("pause_after_current"),
   cancelPauseAfterCurrent: () => invoke<void>("cancel_pause_after_current"),
+  getPauseAfterCurrent: () => invoke<boolean>("get_pause_after_current"),
   getPlatformCapabilities: () =>
     invoke<PlatformCapabilities>("get_platform_capabilities"),
   validateHandbrake: () => invoke<HandbrakeStatus>("validate_handbrake"),

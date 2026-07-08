@@ -119,6 +119,12 @@ impl ConverterState {
     pub fn can_pause_process() -> bool {
         cfg!(target_os = "macos")
     }
+
+    /// Whether the queue is armed to pause after the current job. The source of truth for
+    /// the "Pause after this" button, which reads it on mount rather than mirroring locally.
+    pub fn is_pause_after_current(&self) -> bool {
+        self.pause_after_current.lock().map(|g| *g).unwrap_or(false)
+    }
 }
 
 /// Kill the active HandBrake child (resuming it first if SIGSTOP-paused, since a
@@ -908,6 +914,16 @@ fn format_bytes_short(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_pause_after_current_reflects_the_backend_flag() {
+        // ActiveJob seeds its button state from this on mount instead of a local mirror
+        // that desyncs across tab remounts / the updater flow arming the flag elsewhere.
+        let state = ConverterState::new();
+        assert!(!state.is_pause_after_current());
+        *state.pause_after_current.lock().unwrap() = true;
+        assert!(state.is_pause_after_current());
+    }
 
     #[test]
     fn read_bounded_tail_keeps_only_the_end_of_a_flood() {

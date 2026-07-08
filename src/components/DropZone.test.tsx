@@ -134,6 +134,36 @@ describe("DropZone", () => {
     expect(invokeMock).toHaveBeenCalledWith("start_queue");
   });
 
+  it("surfaces an error when confirming a folder add fails", async () => {
+    classified = {
+      files: [],
+      folders: [{ file_count: 12, folder_name: "BigFolder", folder_path: "/big" }],
+    };
+    const user = userEvent.setup();
+    render(<DropZone onFilesAdded={() => {}} />);
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    fireDrop(["/big"]);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Add" })).toBeInTheDocument(),
+    );
+
+    // The confirm now fails; the click must not vanish silently.
+    invokeMock.mockImplementation(((cmd: string) => {
+      if (cmd === "confirm_folder_add")
+        return Promise.reject(new Error("scan failed"));
+      if (cmd === "classify_paths") return Promise.resolve(classified);
+      if (cmd === "start_queue") return Promise.resolve(undefined);
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    }) as typeof invoke);
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/Error:.*scan failed/)).toBeInTheDocument(),
+    );
+  });
+
   it("shows a per-reason skip summary after an add", async () => {
     classified = { files: ["/movies/a.mp4", "/movies/b.txt"], folders: [] };
     invokeMock.mockImplementation(((cmd: string) => {

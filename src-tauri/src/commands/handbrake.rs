@@ -131,6 +131,14 @@ pub async fn validate_handbrake(app: AppHandle) -> Result<HandbrakeStatus, Strin
     .map_err(|e| e.to_string())?
 }
 
+/// Resolve an output-suffix template against preset metadata. The settings preview
+/// invokes this instead of reimplementing the substitution in JS (the JS copy diverged,
+/// e.g. producing `..h265` where this yields `.h265`).
+#[tauri::command]
+pub fn resolve_suffix_template(template: String, metadata: PresetMetadata) -> String {
+    hb::resolve_suffix_template(&template, &metadata)
+}
+
 /// `HandBrakeCLI --version` with a hard deadline — a binary on a hung network mount
 /// must not stall the validation thread indefinitely. `--version` output is tiny, so
 /// reading stderr after exit cannot hit the pipe-buffer limit.
@@ -203,5 +211,21 @@ mod tests {
 
         // A failed fetch must not poison the cache mutex or insert junk.
         assert!(state.preset_cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_suffix_template_command_matches_the_backend_resolver() {
+        // The frontend preview delegates to this command instead of a JS copy that
+        // diverged (JS produced "..h265" for an empty resolution; the resolver gives ".h265").
+        let m = metadata("h265");
+        let resolved = resolve_suffix_template(".{resolution}.{codec}".to_string(), m);
+        assert_eq!(resolved, ".1080p.h265");
+
+        let mut empty_res = metadata("h265");
+        empty_res.resolution = String::new();
+        assert_eq!(
+            resolve_suffix_template(".{resolution}.{codec}".to_string(), empty_res),
+            ".h265"
+        );
     }
 }
