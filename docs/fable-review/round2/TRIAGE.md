@@ -72,22 +72,24 @@ touches their file, or stay documented here.
   all**: Claude's edit was blocked by the permission classifier (hook
   self-modification), the user applied it by hand, and it shipped in #77 —
   verified against all four fixture cases (in-sync/mismatch × flag on/off).
-- **ci-release #5** (trap-based restore covering `bump_manifests` itself):
-  bigger refactor, unlikely failure — accepted residue.
+- ~~**ci-release #5** (trap-based restore covering `bump_manifests` itself)~~
+  **kept as-is by decision D16** (see R8 below): the marginal gain over the
+  existing build-failure restore is only an unlikely post-build commit/signing
+  failure, the outcome is recoverable via the next run's preflight, and the
+  script can't be driven past `preflight` in the CI harness — so a trap can't
+  meet the failing-test-first bar without a test-only bypass hook.
 - ~~**frontend 5 Lows** (in-flight response races, `updatePresetSuffix` blur-retry
   asymmetry, DropZone stale-snapshot filter)~~ **fixed in R5** (see below).
-- **rust-queue-watch 4 Lows** (no canonicalization backfill for pre-fix watch
+- ~~**rust-queue-watch 4 Lows** (no canonicalization backfill for pre-fix watch
   rows, nested-watch purge overreach, uncancellable in-flight scans, preset
-  repair matching user presets by name): each needs a design decision, none is
-  user-visible damage today.
+  repair matching user presets by name)~~ **fixed in R7** (D11–D14, see below).
 - ~~rust-app-shell Low: quit-vs-queue race~~ **fixed in R4** (see below) — a
   targeted round-3 pass over the R1/R2 diff upgraded it to Medium because the
   R1 latch codified the racy path instead of closing it.
-- **rust-app-shell Low: silent updater install failure** and the rust-core
-  carried-over round-1 Lows: backlog.
-- **round-3 Low (new):** `cancel_conversion` clears `current_child` but leaves
-  `current_pid` set for up to ~100ms; a quit in that window SIGCONTs a
-  possibly-recycled PID (macOS only, benign signal). Backlog.
+- ~~**rust-app-shell Low: silent updater install failure**~~ **fixed in R8**
+  (D15, see below); the rust-core carried-over round-1 Lows were **fixed in R6**.
+- ~~**round-3 Low (new):** `cancel_conversion` clears `current_child` but leaves
+  `current_pid` set for up to ~100ms~~ **fixed in R6** (see below).
 
 ### R4 — Quit preserves the in-flight job (round-3 targeted pass)
 - [x] The round-3 reviewer (single Fable agent over `git diff daf4f8e..main`
@@ -189,6 +191,26 @@ Test-first; each behavior change proven fail-capable by neutering.
 
 sqlite-migration-reviewer + cross-platform-reviewer clean; full Rust suite green;
 `cargo fmt --check` clean; no new clippy warnings.
+
+### R8 — misc lows (branch `fix/r8-misc-lows`, PR #84)
+The last two backlog Lows plus the ci-release #5 decision. Test-first; both
+behavior changes proven fail-capable by neutering.
+- [x] **Silent updater install failure (D15).** The startup auto-updater
+  notified only on a successful install; a failed `download_and_install` was
+  fully silent, stranding the user on the old version with no signal. Now both
+  outcomes notify (extracted `update_install_notification(version, installed)`,
+  unit-tested) and failures also `eprintln`. An offline *check* stays quiet by
+  design (separate, correct). Consistent with D5's "no invisible updates".
+- [x] **Missing probe height → wrong skip verdict.** `parse_scan_media` maps an
+  absent `Geometry.Height` to `0`; `should_skip_by_media` read `0` as "no
+  downscale benefit" and could skip a file whose true resolution is unknown.
+  Added a `source_height <= 0 → never skip` uncertainty guard, mirroring the
+  existing unknown-codec policy. Pure `media_skip` change; new table test.
+- [x] **ci-release #5 — kept as-is (D16).** No trap added; rationale recorded in
+  DECISIONS.md (untestable past `preflight` in CI + marginal, recoverable gap).
+
+No platform-specific code introduced (a notification-body string + a pure i64
+guard); full Rust suite green (148), `cargo fmt --check` clean, no new clippy.
 
 ## Outcome (2026-07-08)
 

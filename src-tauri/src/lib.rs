@@ -32,6 +32,17 @@ fn truncate_tray_title(name: &str) -> String {
     }
 }
 
+/// Body for the startup-updater notification. Both outcomes notify (D5/D15): a silent install
+/// failure would leave the user invisibly stuck on an old version, so failure is surfaced too —
+/// an offline *check* (no update found) stays quiet at the call site and never reaches here.
+fn update_install_notification(version: &str, installed: bool) -> String {
+    if installed {
+        format!("Updated to {version} — restart ConvertBar to apply")
+    } else {
+        format!("Update to {version} failed to install — still on the current version")
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_path = db::get_db_path();
@@ -380,17 +391,19 @@ pub fn run() {
                 };
                 if let Ok(Some(update)) = updater.check().await {
                     let version = update.version.clone();
-                    if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
-                        use tauri_plugin_notification::NotificationExt;
-                        let _ = handle
-                            .notification()
-                            .builder()
-                            .title("ConvertBar")
-                            .body(format!(
-                                "Updated to {version} — restart ConvertBar to apply"
-                            ))
-                            .show();
+                    let result = update.download_and_install(|_, _| {}, || {}).await;
+                    if let Err(e) = &result {
+                        // An update was found and the install began but failed — unlike an
+                        // offline check, this silently strands the user on the old version.
+                        eprintln!("updater: install of {version} failed: {e}");
                     }
+                    use tauri_plugin_notification::NotificationExt;
+                    let _ = handle
+                        .notification()
+                        .builder()
+                        .title("ConvertBar")
+                        .body(update_install_notification(&version, result.is_ok()))
+                        .show();
                 }
             });
 
@@ -431,5 +444,21 @@ mod tests {
         // A 20-char name must NOT be truncated (the old code cut at >20 bytes).
         let exactly_20 = "a".repeat(20);
         assert_eq!(truncate_tray_title(&exactly_20), exactly_20);
+    }
+
+    #[test]
+    fn update_install_notification_surfaces_both_outcomes() {
+        let ok = update_install_notification("1.2.3", true);
+        assert!(ok.contains("Updated to 1.2.3"));
+
+        // A failed install must NOT be silent (D15): the body names the failure and the
+        // version so the user knows they're stranded on the old one.
+        let failed = update_install_notification("1.2.3", false);
+        assert!(failed.contains("1.2.3"));
+        assert!(
+            failed.to_lowercase().contains("failed"),
+            "install failure must be surfaced, got: {failed}"
+        );
+        assert_ne!(ok, failed, "success and failure must read differently");
     }
 }
