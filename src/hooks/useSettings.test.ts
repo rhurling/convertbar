@@ -227,4 +227,104 @@ describe("useSettings", () => {
       value: "/opt/homebrew/bin/HandBrakeCLI",
     });
   });
+
+  it("restores only the failed key on write failure, leaving a concurrent edit intact", async () => {
+    // N2: the failure path must not re-fetch the whole settings object — an out-of-order
+    // get_settings can resolve mid-flight and clobber a *different* key's optimistic edit.
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    // A concurrent optimistic edit the backend's get_settings does not (yet) reflect.
+    await act(async () => {
+      await result.current.updateSetting("skip_already_converted", "true");
+    });
+    expect(result.current.settings?.skip_already_converted).toBe(true);
+
+    const readsBefore = invokeMock.mock.calls.filter((c) => c[0] === "get_settings").length;
+
+    // The next write fails.
+    invokeMock.mockImplementationOnce(((cmd: string) =>
+      cmd === "update_setting"
+        ? Promise.reject(new Error("db locked"))
+        : Promise.reject(new Error(`unexpected: ${cmd}`))) as typeof invoke);
+
+    await act(async () => {
+      await result.current.updateSetting("handbrake_path", "/bad/path");
+    });
+
+    expect(result.current.error).not.toBeNull();
+    // The failed key reverts to its stored truth...
+    expect(result.current.settings?.handbrake_path).toBe("");
+    // ...without a whole-object refetch (which would reset skip_already_converted to its
+    // stored false) and without touching get_settings at all.
+    expect(result.current.settings?.skip_already_converted).toBe(true);
+    const readsAfter = invokeMock.mock.calls.filter((c) => c[0] === "get_settings").length;
+    expect(readsAfter).toBe(readsBefore);
+  });
+
+  it("restores the previous suffix when a suffix save fails, so a blur-retry can fire", async () => {
+    // N3: updatePresetSuffix must mirror updateSetting and roll back on failure, or the
+    // SettingsPage `suffixDraft !== presetSuffix` commit guard treats the unsaved value as
+    // committed and a re-blur becomes a silent no-op.
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.presetSuffix).toBe(".fast"));
+
+    invokeMock.mockImplementationOnce(((cmd: string) =>
+      cmd === "set_preset_suffix"
+        ? Promise.reject(new Error("db locked"))
+        : Promise.reject(new Error(`unexpected: ${cmd}`))) as typeof invoke);
+
+    await act(async () => {
+      await result.current.updatePresetSuffix(".broken");
+    });
+
+    expect(result.current.error).not.toBeNull();
+    expect(result.current.presetSuffix).toBe(".fast");
+  });
+
+  it("ignores stale suffix/metadata when rapid preset switches resolve out of order", async () => {
+    // N4: two quick preset changes (A then B) can interleave so A's suffix/metadata resolve
+    // last, leaving state for A while settings.preset is B — the same race useQueue guards.
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    // Make the preset-scoped suffix read controllable; metadata resolves immediately so the
+    // test is agnostic to whether the loads run sequentially or in parallel.
+    const suffixResolvers: Array<{ preset: string; resolve: (v: string) => void }> = [];
+    invokeMock.mockImplementation(((cmd: string, args?: Args) => {
+      switch (cmd) {
+        case "update_setting":
+          return Promise.resolve(undefined);
+        case "get_preset_suffix":
+          return new Promise<string>((resolve) =>
+            suffixResolvers.push({ preset: args!.preset!, resolve }),
+          );
+        case "generate_preset_suffix":
+          return Promise.resolve(makeMeta(args!.preset!));
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    act(() => {
+      void result.current.updateSetting("preset", "A");
+    });
+    await waitFor(() => expect(suffixResolvers.some((r) => r.preset === "A")).toBe(true));
+    act(() => {
+      void result.current.updateSetting("preset", "B");
+    });
+    await waitFor(() => expect(suffixResolvers.some((r) => r.preset === "B")).toBe(true));
+
+    // Newer request (B) resolves first, older (A) resolves late.
+    await act(async () => {
+      suffixResolvers.find((r) => r.preset === "B")!.resolve(".bbb");
+    });
+    await act(async () => {
+      suffixResolvers.find((r) => r.preset === "A")!.resolve(".aaa");
+    });
+
+    expect(result.current.settings?.preset).toBe("B");
+    expect(result.current.presetSuffix).toBe(".bbb");
+    expect(result.current.presetMetadata?.preset).toBe("B");
+  });
 });

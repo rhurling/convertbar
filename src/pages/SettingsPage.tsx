@@ -67,13 +67,24 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       setResolvedSuffix(suffixDraft);
       return;
     }
+    // Generation guard: an already-fired resolve must not overwrite a newer draft's preview
+    // (or setState after unmount) when it resolves late. The cleanup flips `active` off before
+    // the next effect run, so a superseded invoke's continuation is dropped.
+    let active = true;
     const timer = setTimeout(() => {
       commands
         .resolveSuffixTemplate(suffixDraft, presetMetadata)
-        .then(setResolvedSuffix)
-        .catch(() => setResolvedSuffix(suffixDraft));
+        .then((resolved) => {
+          if (active) setResolvedSuffix(resolved);
+        })
+        .catch(() => {
+          if (active) setResolvedSuffix(suffixDraft);
+        });
     }, SUFFIX_PREVIEW_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
   }, [suffixDraft, presetMetadata]);
 
   const commitHbPath = async () => {

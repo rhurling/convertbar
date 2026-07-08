@@ -22,7 +22,7 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 import DropZone from "./DropZone";
-import type { ClassifiedPaths } from "../lib/tauri";
+import type { ClassifiedPaths, AddResult } from "../lib/tauri";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -162,6 +162,62 @@ describe("DropZone", () => {
     await waitFor(() =>
       expect(screen.getByText(/Error:.*scan failed/)).toBeInTheDocument(),
     );
+  });
+
+  it("does not resurrect a confirmed folder when two Adds resolve out of order", async () => {
+    // N5: each confirm handler filtered from its render-time pendingFolders snapshot, so with
+    // two pending folders the second resolution restored the first (already-removed) row and
+    // the "last one → startQueue" check never fired. Removals must be by folder_path against
+    // the latest list, not an index against a stale snapshot.
+    classified = {
+      files: [],
+      folders: [
+        { file_count: 12, folder_name: "A", folder_path: "/a" },
+        { file_count: 12, folder_name: "B", folder_path: "/b" },
+      ],
+    };
+    const onFilesAdded = vi.fn();
+    const confirmResolvers: Array<{ path: string; resolve: (v: AddResult) => void }> = [];
+    invokeMock.mockImplementation(((cmd: string, args?: { path?: string }) => {
+      switch (cmd) {
+        case "classify_paths":
+          return Promise.resolve(classified);
+        case "confirm_folder_add":
+          return new Promise<AddResult>((resolve) =>
+            confirmResolvers.push({ path: args!.path!, resolve }),
+          );
+        case "start_queue":
+          return Promise.resolve(undefined);
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    const user = userEvent.setup();
+    render(<DropZone onFilesAdded={onFilesAdded} />);
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    fireDrop(["/a", "/b"]);
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: "Add" })).toHaveLength(2),
+    );
+
+    const addButtons = screen.getAllByRole("button", { name: "Add" });
+    await user.click(addButtons[0]); // A
+    await user.click(addButtons[1]); // B
+    await waitFor(() => expect(confirmResolvers).toHaveLength(2));
+
+    // Confirm A first, then B late; B's resolution must clear the list, not restore A.
+    await act(async () => {
+      confirmResolvers.find((r) => r.path === "/a")!.resolve({ added: [], skipped: [] });
+    });
+    await act(async () => {
+      confirmResolvers.find((r) => r.path === "/b")!.resolve({ added: [], skipped: [] });
+    });
+
+    await waitFor(() => expect(onFilesAdded).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/files from/)).not.toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith("start_queue");
   });
 
   it("shows a per-reason skip summary after an add", async () => {

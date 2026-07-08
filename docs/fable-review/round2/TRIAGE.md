@@ -74,9 +74,8 @@ touches their file, or stay documented here.
   verified against all four fixture cases (in-sync/mismatch × flag on/off).
 - **ci-release #5** (trap-based restore covering `bump_manifests` itself):
   bigger refactor, unlikely failure — accepted residue.
-- **frontend 5 Lows** (in-flight response races, `updatePresetSuffix` blur-retry
-  asymmetry, DropZone stale-snapshot filter): ride along with the next frontend
-  batch, per round-2 README.
+- ~~**frontend 5 Lows** (in-flight response races, `updatePresetSuffix` blur-retry
+  asymmetry, DropZone stale-snapshot filter)~~ **fixed in R5** (see below).
 - **rust-queue-watch 4 Lows** (no canonicalization backfill for pre-fix watch
   rows, nested-watch purge overreach, uncancellable in-flight scans, preset
   repair matching user presets by name): each needs a design decision, none is
@@ -103,6 +102,35 @@ touches their file, or stay documented here.
   (spawn→store happens-before, double-reap semantics, N2 lock scopes,
   zero-byte join EOF guarantee, generic command registration, dev-dep feature
   isolation, Windows `--lib` coverage).
+
+### R5 — Frontend race guards (branch `fix/frontend-race-guards`)
+The five round-2 frontend Lows, all unguarded in-flight-response races in the
+family the B7/B8 fixes targeted. TDD: a failing test first for each, every one
+proven fail-capable (the stale/late response wins on the pre-fix code).
+- [x] N1 (Low, frontend): suffix-preview resolve now carries a generation guard
+  (an `active` flag flipped in the effect cleanup), so a late resolve of a
+  superseded draft can't overwrite the preview or setState post-unmount.
+  Test in SettingsPage.test.tsx (older resolve lands after a newer edit).
+- [x] N2 (Low, frontend): `updateSetting`'s failure path restores only the
+  failed key — pre-edit value captured eagerly from the render closure (a
+  lazy capture inside the state updater hadn't run by the time the catch needed
+  it) — instead of a whole-object `get_settings` refetch that could resolve out
+  of order and clobber a concurrent optimistic edit to a different key.
+- [x] N3 (Low, frontend): `updatePresetSuffix` now mirrors `updateSetting` and
+  rolls back to the pre-edit suffix on failure, so SettingsPage's
+  `suffixDraft !== presetSuffix` commit guard still sees a diff and a re-blur
+  retries instead of silently no-op'ing.
+- [x] N4 (Low, frontend): preset-scoped suffix+metadata loads unified into a
+  `loadPresetData` helper stamped with a monotonic `latestPresetLoad` counter
+  (the useQueue pattern); out-of-order resolution of two rapid preset switches
+  no longer leaves stale suffix/metadata under the newer preset.
+- [x] N5 (Low, frontend): DropZone confirm/skip removals are keyed by
+  `folder_path` against a synchronously-updated `pendingRef`, not an index into
+  the render-time snapshot, so a slow-resolving confirm can't resurrect an
+  already-removed folder or wedge the "last one → startQueue" check.
+
+acl-auditor: ACL-neutral (no new `core:`/`plugin:` surface, `default.json`
+unchanged). Full frontend suite green (78 tests), `npm run build` (tsc) clean.
 
 ## Outcome (2026-07-08)
 
