@@ -103,7 +103,7 @@ touches their file, or stay documented here.
   zero-byte join EOF guarantee, generic command registration, dev-dep feature
   isolation, Windows `--lib` coverage).
 
-### R5 — Frontend race guards (branch `fix/frontend-race-guards`)
+### R5 — Frontend race guards (branch `fix/frontend-race-guards`, PR #81)
 The five round-2 frontend Lows, all unguarded in-flight-response races in the
 family the B7/B8 fixes targeted. TDD: a failing test first for each, every one
 proven fail-capable (the stale/late response wins on the pre-fix code).
