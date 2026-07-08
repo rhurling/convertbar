@@ -132,7 +132,7 @@ proven fail-capable (the stale/late response wins on the pre-fix code).
 acl-auditor: ACL-neutral (no new `core:`/`plugin:` surface, `default.json`
 unchanged). Full frontend suite green (78 tests), `npm run build` (tsc) clean.
 
-### R6 — rust-core mechanical lows (branch `fix/rust-core-lows`)
+### R6 — rust-core mechanical lows (branch `fix/rust-core-lows`, PR #82)
 The carried-over round-1 Lows in rust-core plus the round-3 `current_pid` Low.
 Test-first; each behavior change proven fail-capable by neutering the fix.
 - [x] `get_preset_metadata` UTF-8-unsafe slice + no exit-status check
