@@ -132,6 +132,36 @@ proven fail-capable (the stale/late response wins on the pre-fix code).
 acl-auditor: ACL-neutral (no new `core:`/`plugin:` surface, `default.json`
 unchanged). Full frontend suite green (78 tests), `npm run build` (tsc) clean.
 
+### R6 — rust-core mechanical lows (branch `fix/rust-core-lows`)
+The carried-over round-1 Lows in rust-core plus the round-3 `current_pid` Low.
+Test-first; each behavior change proven fail-capable by neutering the fix.
+- [x] `get_preset_metadata` UTF-8-unsafe slice + no exit-status check
+  (handbrake.rs): extracted a pure `interpret_preset_export` — a non-zero exit
+  now surfaces HandBrake's stderr diagnostic instead of a misleading JSON-parse
+  error, and the 200-byte diagnostic slice goes through `truncate_str`, which
+  backs up to a char boundary so a multibyte codepoint at byte 200 can't panic.
+- [x] `list_presets` silently `Ok(vec![])` on CLI failure (handbrake.rs):
+  extracted `interpret_preset_list` — a non-zero exit with nothing parseable
+  returns `Err` (so the UI shows "couldn't load presets", not an empty
+  dropdown); a non-zero exit that still printed presets keeps them.
+- [x] `wait_with_timeout` `Err(_)` leaked the child unreaped (probe.rs:120):
+  both give-up paths (timeout and `try_wait` error) now route through a shared
+  `kill_and_reap`, tested to actually terminate + reap.
+- [x] round-3 Low: `cancel_conversion` cleared `current_child` but left
+  `current_pid` set (~one poll interval) — a racing quit could SIGCONT a reaped,
+  possibly-recycled PID on macOS. It now clears `current_pid` too (asserted in
+  the cancel test).
+- [x] `is_running` wedge: `process_queue` now resets `is_running` via an RAII
+  `RunningGuard` (fires on an unwinding panic, not just normal return), and
+  `run_queue` acquires the lock poison-tolerantly — a crash can no longer leave
+  the flag stuck true and permanently block queue starts.
+- **Dropped, decisions recorded:** progress-event throttle → [D9](../DECISIONS.md#d9);
+  probe_cache eviction → [D10](../DECISIONS.md#d10). Neither is a correctness
+  issue; both are policy/perf items outside a mechanical Low batch.
+
+cross-platform-reviewer clean; full Rust suite green; `cargo fmt --check` clean;
+no new clippy warnings.
+
 ## Outcome (2026-07-08)
 
 All batches merged: reports+triage **#75**, R1 **#76**, R3 **#77** (grew two

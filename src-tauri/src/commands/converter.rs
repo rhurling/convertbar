@@ -264,6 +264,14 @@ pub fn cancel_conversion<R: tauri::Runtime>(
         *child_guard = None;
     }
 
+    // Clear the recorded PID too. Leaving it set while current_child is None lets a
+    // concurrent quit (kill_active_child) SIGCONT a now-reaped, possibly-recycled PID on
+    // macOS until the queue loop clears it ~one poll interval later.
+    *converter_state
+        .current_pid
+        .lock()
+        .map_err(|e| e.to_string())? = None;
+
     // Surface a status-write failure now that the process has been killed.
     if let Some(res) = update_result {
         res.map_err(|e| e.to_string())?;
@@ -437,6 +445,11 @@ mod tests {
         assert!(
             converter.current_child.lock().unwrap().is_none(),
             "the reaped handle must be cleared so the queue loop takes its cancel branch"
+        );
+        assert!(
+            converter.current_pid.lock().unwrap().is_none(),
+            "the recorded PID must be cleared too, so a racing quit can't SIGCONT a reaped, \
+             possibly-recycled PID before the queue loop clears it"
         );
     }
 }

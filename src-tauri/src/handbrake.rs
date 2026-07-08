@@ -43,7 +43,41 @@ pub fn list_presets(handbrake_path: &str) -> Result<Vec<String>, String> {
         .map_err(|e| format!("Failed to run HandBrakeCLI: {}", e))?;
 
     // HandBrakeCLI outputs the preset list to stderr.
-    Ok(parse_preset_list(&String::from_utf8_lossy(&output.stderr)))
+    interpret_preset_list(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// Interpret a `--preset-list` run's outcome. HandBrakeCLI prints presets to stderr and
+/// normally exits 0; a non-zero exit with *nothing parseable* means the CLI itself failed
+/// (missing shared lib, wrong binary), so surface that as an error instead of an empty
+/// `Ok(vec![])` — which the UI can't distinguish from "this build has no presets" and would
+/// render as a silently empty preset dropdown. If presets did parse, a non-zero exit is
+/// ignored (better to show them than hide a working list). Split out so it can be unit-tested
+/// without invoking HandBrakeCLI.
+fn interpret_preset_list(success: bool, stderr: &str) -> Result<Vec<String>, String> {
+    let presets = parse_preset_list(stderr);
+    if presets.is_empty() && !success {
+        return Err(format!(
+            "HandBrakeCLI --preset-list failed: {}",
+            truncate_str(stderr.trim(), 200)
+        ));
+    }
+    Ok(presets)
+}
+
+/// Truncate `s` to at most `max_bytes`, backing up to the previous char boundary so slicing a
+/// multibyte codepoint can't panic. Used only to bound diagnostic strings for error messages.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Extract preset names from `HandBrakeCLI --preset-list` output. Presets are the lines indented
@@ -76,13 +110,37 @@ pub fn get_preset_metadata(
         .output()
         .map_err(|e| format!("Failed to run HandBrakeCLI: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    interpret_preset_export(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+        preset_name,
+    )
+}
 
-    let json: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+/// Interpret a `--preset-export` run's outcome: a non-zero exit is surfaced as an error with
+/// HandBrake's own stderr diagnostic (instead of a misleading "failed to parse JSON" on empty
+/// stdout), and the diagnostic slice of stdout is truncated on a char boundary so a multibyte
+/// codepoint straddling byte 200 can't panic the error path. Split out so it can be unit-tested
+/// without invoking HandBrakeCLI.
+fn interpret_preset_export(
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+    preset_name: &str,
+) -> Result<PresetMetadata, String> {
+    if !success {
+        return Err(format!(
+            "HandBrakeCLI --preset-export failed: {}",
+            truncate_str(stderr.trim(), 200)
+        ));
+    }
+
+    let json: serde_json::Value = serde_json::from_str(stdout).map_err(|e| {
         format!(
             "Failed to parse preset JSON: {}. Output: {}",
             e,
-            &stdout[..stdout.len().min(200)]
+            truncate_str(stdout, 200)
         )
     })?;
 
@@ -314,6 +372,78 @@ Matroska/
     #[test]
     fn parse_preset_list_empty_output_yields_no_presets() {
         assert!(parse_preset_list("").is_empty());
+    }
+
+    #[test]
+    fn interpret_preset_list_errors_when_cli_fails_with_no_presets() {
+        // A non-zero exit with no parseable presets is the CLI itself failing (missing lib,
+        // bad binary). Returning Ok(vec![]) here makes the UI show an empty dropdown instead
+        // of "couldn't load presets"; the stderr diagnostic must be surfaced.
+        let err = interpret_preset_list(false, "error while loading shared libraries: libx.so")
+            .unwrap_err();
+        assert!(
+            err.contains("error while loading shared libraries"),
+            "the CLI diagnostic must be surfaced, got: {err}"
+        );
+    }
+
+    #[test]
+    fn interpret_preset_list_returns_presets_even_on_nonzero_exit() {
+        // If HandBrake still printed a usable list, a non-zero exit must not hide it.
+        let stderr = "General/\n    Fast 1080p30\n";
+        assert_eq!(
+            interpret_preset_list(false, stderr).unwrap(),
+            vec!["Fast 1080p30"]
+        );
+    }
+
+    #[test]
+    fn interpret_preset_list_ok_empty_on_clean_exit() {
+        assert_eq!(
+            interpret_preset_list(true, "").unwrap(),
+            Vec::<String>::new(),
+            "a clean exit with no presets is a legitimate empty list, not an error"
+        );
+    }
+
+    #[test]
+    fn truncate_str_never_splits_a_multibyte_codepoint() {
+        // 'é' is two bytes; place one so byte 200 lands mid-codepoint. `&s[..200]` would panic.
+        let s = "a".repeat(199) + "é" + "trailing";
+        assert!(
+            !s.is_char_boundary(200),
+            "test premise: byte 200 splits a codepoint"
+        );
+        let t = truncate_str(&s, 200);
+        assert!(t.len() <= 200);
+        assert_eq!(t, "a".repeat(199), "backs up to the char boundary at 199");
+    }
+
+    #[test]
+    fn interpret_preset_export_errors_on_nonzero_exit_with_stderr() {
+        let err = interpret_preset_export(false, "", "No such preset: Bogus", "Bogus").unwrap_err();
+        assert!(
+            err.contains("No such preset"),
+            "the CLI stderr diagnostic must be surfaced, got: {err}"
+        );
+    }
+
+    #[test]
+    fn interpret_preset_export_does_not_panic_on_multibyte_at_the_slice_boundary() {
+        // Invalid JSON whose byte 200 splits a codepoint: the old `&stdout[..200]` panicked
+        // building the parse-error message. It must now degrade to a bounded, valid message.
+        let stdout = "x".repeat(199) + &"é".repeat(50); // 299 bytes, not JSON
+        let err = interpret_preset_export(true, &stdout, "", "P").unwrap_err();
+        assert!(err.contains("Failed to parse preset JSON"));
+    }
+
+    #[test]
+    fn interpret_preset_export_classifies_valid_json() {
+        let stdout = r#"{"PresetList":[{"VideoEncoder":"x265","PictureHeight":1080}]}"#;
+        let m = interpret_preset_export(true, stdout, "", "HQ 1080p30").unwrap();
+        assert_eq!(m.codec, "h265");
+        assert_eq!(m.resolution, "1080p");
+        assert_eq!(m.quality, "hq");
     }
 
     #[test]

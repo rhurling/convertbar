@@ -428,6 +428,18 @@ fn final_run_status(had_errors: bool) -> &'static str {
     }
 }
 
+/// Resets `is_running` to false when the queue thread exits — including on an unwinding panic,
+/// so a crash in `process_queue` can't wedge the queue by leaving the flag stuck true (which
+/// makes every future `run_queue` early-return, permanently). Poison-tolerant so a poisoned
+/// `is_running` still gets cleared.
+struct RunningGuard<'a>(&'a ConverterState);
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.is_running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+}
+
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
 fn process_queue<R: tauri::Runtime>(
@@ -435,13 +447,14 @@ fn process_queue<R: tauri::Runtime>(
     db: &Arc<Mutex<Connection>>,
     converter: &ConverterState,
 ) {
+    // Clears is_running on every exit path (normal, early return, or panic).
+    let _running = RunningGuard(converter);
     let mut had_errors = false;
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
         // job — teardown would otherwise race a fresh HandBrakeCLI spawn and orphan it.
         // Return (not break) so no "Queue complete" notification fires mid-quit.
         if converter.is_shutting_down() {
-            *converter.is_running.lock().unwrap() = false;
             return;
         }
         let job;
@@ -914,7 +927,7 @@ fn process_queue<R: tauri::Runtime>(
         },
     );
 
-    *converter.is_running.lock().unwrap() = false;
+    // is_running is reset by RunningGuard on return (and on an unwinding panic).
 }
 
 /// Starts queue processing in a new background thread.
@@ -925,7 +938,12 @@ pub fn run_queue<R: tauri::Runtime>(
     converter: Arc<ConverterState>,
 ) {
     {
-        let mut running = converter.is_running.lock().unwrap();
+        // Poison-tolerant: if a prior queue thread panicked while briefly holding this lock,
+        // recover the flag rather than propagating the poison and permanently wedging starts.
+        let mut running = converter
+            .is_running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if *running {
             return;
         }
@@ -1421,6 +1439,34 @@ mod tests {
         assert!(!state.is_shutting_down());
         kill_active_child(&state);
         assert!(state.is_shutting_down());
+    }
+
+    #[test]
+    fn running_guard_resets_is_running_even_on_a_panic() {
+        // A panic in process_queue must not wedge the queue by leaving is_running stuck true
+        // (every future run_queue would early-return). The RAII guard clears it on unwind.
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let converter = ConverterState::new();
+        *converter.is_running.lock().unwrap() = true;
+
+        // Suppress the expected panic's default stderr print so test output stays pristine.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _running = RunningGuard(&converter);
+            assert!(
+                *converter.is_running.lock().unwrap(),
+                "is_running stays true while the guard is alive"
+            );
+            panic!("simulated process_queue crash");
+        }));
+        std::panic::set_hook(prev_hook);
+
+        assert!(result.is_err(), "the guarded closure did panic");
+        assert!(
+            !*converter.is_running.lock().unwrap(),
+            "RunningGuard reset is_running while unwinding, so run_queue can start again"
+        );
     }
 
     #[test]
