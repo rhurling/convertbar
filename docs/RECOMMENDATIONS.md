@@ -153,7 +153,7 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 | US2: Error state icon in menu bar | Missing | No `!` indicator on error |
 | Notifications on completion | **Done** (v0.5.0) | — |
 | Global hotkey for popover | Missing | Not implemented |
-| Launch at login | Setting only | No actual macOS login item registration (SMAppService / tauri-plugin-autostart) |
+| Launch at login | **Done** | `tauri-plugin-autostart` registered and wired to the setting (`src-tauri/src/lib.rs`) |
 
 ---
 
@@ -161,5 +161,4 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 
 - Debug log file (`debug_progress.log`) may still exist in app data dir from testing — can be manually deleted
 - CSS has some hardcoded colors instead of using CSS variables consistently
-- No tests (unit or integration) exist for either Rust or TypeScript code
 - Tray context menu is static (Show + Quit) — dynamic Pause/Resume items deferred due to complexity

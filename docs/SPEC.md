@@ -1,5 +1,11 @@
 # ConvertBar — macOS Menu Bar Video Converter
 
+> **Status (2026-07):** Historical design spec from the macOS-only era. ConvertBar is
+> now **cross-platform** (macOS / Windows / Linux — see `CLAUDE.md` and
+> `.github/workflows/build.yml`). Sections describing macOS-only scope and hardcoded
+> HandBrakeCLI fallback paths are **superseded**; `CLAUDE.md` and the implementation are
+> the source of truth. Individual stale items are annotated inline below.
+
 ## Overview
 
 **Problem:** Converting video files with HandBrakeCLI via a bash function works but lacks queueing, progress visibility, history tracking, and a user-friendly interface.
@@ -304,7 +310,7 @@ Skip logic:
 - **Startup time:** <1s to menu bar icon visible
 - **Progress updates:** ~1/second to frontend, menu bar text updated every 2-3 seconds to avoid flicker
 - **History retention:** unlimited, paginated queries
-- **Platform:** macOS only (Apple Silicon + Intel)
+- **Platform:** ~~macOS only (Apple Silicon + Intel)~~ **[Superseded — now macOS / Windows / Linux; see `CLAUDE.md` Cross-Platform.]**
 - **HandBrakeCLI dependency:** must be pre-installed, app shows helpful error if not found
 
 ## Open Questions
@@ -320,7 +326,7 @@ Skip logic:
 - Custom HandBrake encoding parameters beyond preset selection
 - Video preview or playback
 - Cloud sync of history
-- Windows/Linux support
+- ~~Windows/Linux support~~ **[Superseded — Windows and Linux are supported and built in CI.]**
 - Batch renaming beyond the suffix pattern
 - Scheduled/timed conversions
 
@@ -334,11 +340,12 @@ Skip logic:
 - **Preset-linked suffixes:** suffix is stored per-preset in the database, so switching presets automatically updates the output filename pattern
 
 ### HandBrakeCLI Path Detection
-Search order:
-1. User-configured path in settings
-2. `which HandBrakeCLI`
-3. `/usr/local/bin/HandBrakeCLI`
-4. `/opt/homebrew/bin/HandBrakeCLI`
+**[Superseded — no hardcoded fallback paths.]** The implementation
+(`src-tauri/src/handbrake.rs`) resolves HandBrakeCLI PATH-only, per `CLAUDE.md`:
+1. User-configured path in settings (used only if it points at an existing file)
+2. `which HandBrakeCLI` on Unix / `where HandBrakeCLI` on Windows
+
+No `/usr/local/bin` or `/opt/homebrew/bin` fallbacks are used.
 
 ### Trash Implementation
 Use macOS `NSFileManager.trashItem` via Rust's `objc` crate or `trash` crate for proper Finder trash behavior (items appear in Trash with "Put Back" support).

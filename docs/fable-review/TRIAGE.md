@@ -141,13 +141,25 @@ Refs: tests-quality.md:8,36,45,46,56
 
 ### B12 — Automation & docs refresh
 Refs: claude-automation.md:13→**D8**, 22→**D7**, 72,73,89,90,108,109
-- [ ] Rewrite sqlite-migration-reviewer agent: describe the existing
-  idempotent-ALTER+backfill pattern (db.rs:73-87), derive tables from db.rs.
-- [ ] Stop-hook version-sync warning output mode per **D7**.
-- [ ] rustfmt PostToolUse hook strategy per **D8**.
-- [ ] SPEC.md: mark macOS-only scope + hardcoded-paths sections superseded.
-- [ ] RECOMMENDATIONS.md: move autostart to implemented; delete "no tests".
-- [ ] CLAUDE.md/acl-auditor/add-tauri-plugin: consistent after B6 lands.
+- [x] Rewrote the sqlite-migration-reviewer agent: replaced the false "no migration
+  mechanism" core-trap with the established idempotent pattern (`CREATE TABLE IF NOT
+  EXISTS` + idempotent `ADD COLUMN` with duplicate-column ignored + re-run-safe
+  backfill), and told it to derive the table list from `db.rs` (now 5 tables) instead
+  of hardcoding three.
+- [x] Stop-hook version-sync now exits 2 with the message on stderr per **D7** — the
+  drift is fed back to Claude instead of vanishing into transcript-only stdout.
+  Verified: matched manifests exit 0 (silent), mismatched exit 2 with stderr only.
+- [x] rustfmt hook per **D8** (option a): the tree became fmt-clean organically as the
+  hook reformatted each file edited across B2–B11 (`cargo fmt --check` now exits 0), so
+  no separate fmt chore diff is needed and the hook is kept as-is.
+- [x] SPEC.md: added a status banner and marked the macOS-only Platform/Out-of-Scope
+  lines and the hardcoded HandBrakeCLI fallback paths superseded (now PATH-only via
+  `which`/`where`).
+- [x] RECOMMENDATIONS.md: moved Launch-at-login to Done (`tauri-plugin-autostart`);
+  deleted the stale "no tests exist" bullet.
+- [x] CLAUDE.md / acl-auditor / add-tauri-plugin: purged the dead `opener` plugin
+  (removed in B6) and noted window-state persistence is backend-only and app-defined
+  `#[tauri::command]`s are ACL-exempt.
 
 ## Recommended sequence
 
