@@ -153,3 +153,31 @@ a user's custom preset that happens to carry the old name.
   from the seeded bad default at init (before HandBrake's list is queryable);
   self-limiting (built-in exists, conversions work).
 - **Decision (2026-07-08):** (a) leave as-is; act only on a real support report.
+
+## D15 — updater install-failure notification (R8)
+The startup auto-updater notifies on a successful install (D5) but a *failed*
+`download_and_install` is fully silent — a persistently failing install leaves
+the user invisibly stuck on an old version. (An offline *check* staying quiet is
+correct and separate.)
+- **Options:** (a) notify on install failure too (consistent with D5's "no
+  invisible updates"), plus log; (b) log only; (c) keep silent.
+- **Recommendation:** (a) — the D5 precedent is that update state shouldn't be
+  invisible; a stuck-on-old-version failure is exactly what the user needs told.
+- **Decision (2026-07-08):** (a) notify on install failure + `eprintln` log.
+
+## D16 — ci-release #5 trap-based manifest restore (R8)
+`bump_manifests` dirties the tree; only `build_app` restores it on failure. A
+failure in `commit_release` (e.g. a signing error) after a successful build
+leaves the bumped manifests dirty.
+- **Options:** (a) add an EXIT-trap restore covering the whole bump→commit
+  window (also de-duplicates build_app's inline restore); (b) keep as-is.
+- **Recommendation:** (b) for this batch. The marginal gain over the existing
+  build-failure restore is only the unlikely post-build commit/signing failure,
+  and the dirty-tree outcome is recoverable (the next run's preflight flags a
+  non-clean tree with a clear message). Critically, `release.sh` can't be driven
+  past `preflight` (must be on main, clean, in sync with origin) in the CI test
+  harness — which runs on a PR/detached checkout — so a trap addition can't meet
+  this batch's failing-test-first bar without a test-only bypass hook in the
+  production script. Not worth that trade for an optional, unlikely-failure edge.
+- **Decision (2026-07-08):** (b) keep as-is; revisit only with a testability
+  refactor (extract the bump→commit pipeline so cleanup is unit-testable).

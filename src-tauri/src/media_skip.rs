@@ -47,6 +47,12 @@ pub fn should_skip_by_media(
     target_codec: &str,
     target_height: i64,
 ) -> bool {
+    // A real video always reports a positive height; `source_height <= 0` means the probe
+    // couldn't read Geometry.Height (parse_scan_media maps it to 0). That's uncertainty — we
+    // can't rule out a downscale benefit, so never skip, mirroring the unknown-codec policy.
+    if source_height <= 0 {
+        return false;
+    }
     let resolution_would_help = target_height > 0
         && (source_height as f64) > (target_height as f64) * RESOLUTION_SKIP_MARGIN;
     let codec_would_help = match (efficiency_rank(source_codec), efficiency_rank(target_codec)) {
@@ -245,6 +251,21 @@ mod tests {
         for (sc, sh, tc, th, expect, why) in cases {
             assert_eq!(should_skip_by_media(sc, sh, tc, th), expect, "{why}");
         }
+    }
+
+    #[test]
+    fn unknown_source_height_is_uncertainty_never_skipped() {
+        // Probe couldn't read Geometry.Height -> 0. Without the guard this reads as "no
+        // downscale benefit" and, with a matching/less-efficient target codec, would wrongly
+        // skip a file whose true resolution we don't know. Uncertainty must never skip.
+        assert!(
+            !should_skip_by_media("h265", 0, "h265", 1080),
+            "unknown source height must not be skipped even when the codec wouldn't help"
+        );
+        assert!(
+            !should_skip_by_media("h265", 0, "h264", 1080),
+            "unknown source height is never skipped regardless of the target"
+        );
     }
 
     #[test]
