@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# npm ci / cargo test run untrusted lockfile code — keep the token read-only.
+permissions:
+  contents: read
+
 # Cancel superseded PR runs when a new commit is pushed; let every push to main
 # run its full matrix to completion.
 concurrency:

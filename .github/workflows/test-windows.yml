@@ -6,10 +6,17 @@ name: test-windows
 # check — the ruleset gates on `frontend` + `rust (ubuntu-22.04)` only — so a slow or flaky
 # Windows run never blocks a merge. Gated on src-tauri/** so frontend-only PRs skip it
 # (Windows minutes bill 2x); a separate workflow keeps that path filter off the frontend job.
+# Never make rust-windows a required check: the paths filter means it reports no status at
+# all on frontend-only PRs, which would wait forever on "Expected".
 on:
   pull_request:
     paths:
       - "src-tauri/**"
+      - ".github/workflows/test-windows.yml"
+
+# cargo test runs untrusted lockfile code — keep the token read-only.
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

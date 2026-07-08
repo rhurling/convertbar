@@ -120,7 +120,8 @@ build_app() {
     # bump_manifests already dirtied the tree; restore it so the next run's clean-tree
     # preflight fails for the right reason (or not at all), not with an unrelated message.
     echo "Restoring bumped manifests to leave a clean tree..." >&2
-    git checkout -- package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock 2>/dev/null || true
+    git checkout -- package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock 2>/dev/null ||
+      echo "warning: restore FAILED — clean up manually with: git checkout -- package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock" >&2
     exit 1
   fi
 }
@@ -169,8 +170,11 @@ merge_and_tag() {
   # tag the OLD commit, whose manifests still hold the previous version — tauri-action then
   # builds under the wrong tag and publish-release fails), and a concurrent commit could land
   # on main between the merge and the pull.
-  sha="$(gh pr view "$pr" --json mergeCommit -q .mergeCommit.oid)"
-  [ -n "$sha" ] || { echo "error: could not resolve the squash-merge commit for PR #$pr" >&2; exit 1; }
+  # The PR IS merged past this point — every failure branch must hand the operator
+  # the recovery recipe, or the run strands merged-but-untagged.
+  sha="$(gh pr view "$pr" --json mergeCommit -q .mergeCommit.oid)" ||
+    { echo "error: could not query the squash-merge commit for PR #$pr. The merge landed; recover with: gh pr view $pr --json mergeCommit  then  git tag -s v$target -m v$target <sha> && git push origin v$target" >&2; exit 1; }
+  [ -n "$sha" ] || { echo "error: PR #$pr returned an empty mergeCommit. The merge landed; recover with: gh pr view $pr --json mergeCommit  then  git tag -s v$target -m v$target <sha> && git push origin v$target" >&2; exit 1; }
   git pull --ff-only || { echo "error: could not fast-forward main after merge — once main is at $sha, recover with: git tag -s v$target -m v$target $sha && git push origin v$target" >&2; exit 1; }
   head="$(git rev-parse HEAD)"
   if [ "$head" != "$sha" ]; then
