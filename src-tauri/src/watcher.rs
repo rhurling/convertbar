@@ -80,30 +80,18 @@ pub(crate) fn diff_watches(
     (to_unwatch, to_watch)
 }
 
-/// Roots whose watch is going away entirely — NOT a recursive-mode flip, which shows
-/// up in `to_unwatch` but re-adds the same path in `to_watch` and stays active.
-pub(crate) fn removed_watch_roots(
-    to_unwatch: &[PathBuf],
-    to_watch: &[(PathBuf, bool)],
-) -> Vec<PathBuf> {
-    to_unwatch
-        .iter()
-        .filter(|p| !to_watch.iter().any(|(w, _)| w == *p))
-        .cloned()
-        .collect()
-}
-
-/// Drop pending (mid-stabilization) files under removed roots. Without this, a file
-/// still settling when the user disables or removes its watch is enqueued and
-/// converted by the reaper once it stabilizes — the disable never fully takes effect.
-pub(crate) fn purge_pending_under(
+/// Drop pending (mid-stabilization) files that no desired config still covers. A file still
+/// settling when the user disables/removes its watch must not be enqueued by the reaper once it
+/// stabilizes. Testing "still covered by a desired config" (rather than "under a removed root")
+/// avoids over-purging: removing an enclosing watch (`/w`) must NOT drop a file under a still-active
+/// nested watch (`/w/sub`) — no further FS event would re-add a file that already stopped changing.
+/// It also subsumes the recursive-mode-flip case: a subfolder file survives only if the new
+/// (possibly non-recursive) config still covers it.
+pub(crate) fn purge_pending_uncovered(
     pending: &mut HashMap<PathBuf, PendingEntry>,
-    removed: &[PathBuf],
+    desired: &[WatchedDirConfig],
 ) {
-    if removed.is_empty() {
-        return;
-    }
-    pending.retain(|path, _| !removed.iter().any(|root| path.starts_with(root)));
+    pending.retain(|path, _| delay_for_path(desired, path).is_some());
 }
 
 /// A watched directory's runtime config, used by the filesystem-event handler to decide whether
@@ -342,10 +330,36 @@ fn filter_marked(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Keep only paths still covered by a current watch config. Pure core of `filter_watched`,
+/// split out so the coverage rule is unit-testable without a live `WatcherState`.
+fn covered_paths(configs: &[WatchedDirConfig], paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|p| delay_for_path(configs, Path::new(p)).is_some())
+        .collect()
+}
+
+/// Drop paths no longer under any current watch. Closes the window where a background scan
+/// (`scan_existing_background`) that started before the user removed/disabled the watch still
+/// enqueues the folder's files — the detached scan thread bypasses `pending`, so the reconcile
+/// purge can't reach it. Also hardens the reaper against the same-tick remove/stabilize race.
+fn filter_watched(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
+    let state = app.state::<WatcherState>();
+    let configs = match state.configs.lock() {
+        Ok(configs) => configs.clone(),
+        Err(_) => return paths,
+    };
+    covered_paths(&configs, paths)
+}
+
 /// Feeds stabilized paths through the same pipeline as drag-dropped files, then (auto-start)
 /// kicks the queue and notifies the UI. `add_files_inner` applies all existing skip rules, so
 /// already-converted or already-queued files are dropped here.
 fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
+    let paths = filter_watched(app, paths);
+    if paths.is_empty() {
+        return;
+    }
     let paths = filter_marked(app, paths);
     if paths.is_empty() {
         return;
@@ -502,9 +516,8 @@ pub fn reconcile(app: &AppHandle) {
     };
     let (to_unwatch, to_watch) = diff_watches(&watched, &desired_tuples);
 
-    let removed = removed_watch_roots(&to_unwatch, &to_watch);
     if let Ok(mut pending) = state.pending.lock() {
-        purge_pending_under(&mut pending, &removed);
+        purge_pending_uncovered(&mut pending, &desired);
     }
 
     if let Ok(mut guard) = state.watcher.lock() {
@@ -716,41 +729,67 @@ mod tests {
         assert!(to_watch.is_empty());
     }
 
-    #[test]
-    fn removed_roots_exclude_a_recursive_mode_flip() {
-        // A mode flip is unwatch+rewatch of the SAME path: the watch stays active, so
-        // its pending files must survive; only /gone is truly going away.
-        let to_unwatch = vec![PathBuf::from("/flip"), PathBuf::from("/gone")];
-        let to_watch = vec![(PathBuf::from("/flip"), true)];
-        assert_eq!(
-            removed_watch_roots(&to_unwatch, &to_watch),
-            vec![PathBuf::from("/gone")]
-        );
-    }
-
-    #[test]
-    fn purge_drops_pending_files_only_under_removed_roots() {
-        // A file mid-stabilization when its watch is disabled must NOT be enqueued
-        // once it settles — otherwise disabling a watch doesn't fully take effect.
-        let mut pending: HashMap<PathBuf, PendingEntry> = HashMap::new();
-        let entry = PendingEntry::new(
+    fn pending_entry() -> PendingEntry {
+        PendingEntry::new(
             1,
             SystemTime::UNIX_EPOCH,
             Instant::now(),
             Duration::from_secs(1),
+        )
+    }
+
+    #[test]
+    fn purge_pending_uncovered_drops_files_no_desired_config_covers() {
+        // A file mid-stabilization when its watch is removed must NOT be enqueued once it
+        // settles — otherwise removing a watch doesn't fully take effect.
+        let mut pending: HashMap<PathBuf, PendingEntry> = HashMap::new();
+        let doomed = PathBuf::from("/removed/a.mp4");
+        let survivor = PathBuf::from("/kept/b.mp4");
+        pending.insert(doomed.clone(), pending_entry());
+        pending.insert(survivor.clone(), pending_entry());
+
+        // Only /kept remains a desired watch.
+        purge_pending_uncovered(&mut pending, &[config("/kept", false, 1)]);
+
+        assert!(
+            !pending.contains_key(&doomed),
+            "a file under no desired watch is dropped"
         );
-        let doomed = Path::new("removed").join("sub").join("a.mp4");
-        let survivor = Path::new("kept").join("b.mp4");
-        pending.insert(doomed.clone(), entry.clone());
-        pending.insert(survivor.clone(), entry);
-
-        purge_pending_under(&mut pending, &[PathBuf::from("removed")]);
-
-        assert!(!pending.contains_key(&doomed));
         assert!(
             pending.contains_key(&survivor),
-            "files under still-active watches keep stabilizing"
+            "a file under a still-desired watch keeps stabilizing"
         );
+    }
+
+    #[test]
+    fn purge_pending_uncovered_retains_files_under_a_still_active_nested_watch() {
+        // The overreach fix: removing the enclosing /w watch must NOT drop a file under a
+        // still-active nested /w/sub watch. If it already finished writing, no further FS event
+        // would re-add it, so it would be silently lost until a rescan. The old "under a removed
+        // root" purge dropped it because /w/sub/c.mp4 starts_with /w.
+        let mut pending: HashMap<PathBuf, PendingEntry> = HashMap::new();
+        let nested = PathBuf::from("/w/sub/c.mp4");
+        pending.insert(nested.clone(), pending_entry());
+
+        // /w was removed; only the nested /w/sub watch remains.
+        purge_pending_uncovered(&mut pending, &[config("/w/sub", true, 1)]);
+
+        assert!(
+            pending.contains_key(&nested),
+            "a file under the still-active nested watch survives removal of the enclosing watch"
+        );
+    }
+
+    #[test]
+    fn covered_paths_keeps_only_files_under_a_current_watch() {
+        // enqueue_and_start uses this so a background scan whose watch was removed mid-scan
+        // enqueues nothing from that folder (the detached scan thread bypasses `pending`).
+        let configs = vec![config("/watch", true, 5)];
+        let kept = covered_paths(
+            &configs,
+            vec!["/watch/keep.mp4".to_string(), "/gone/drop.mp4".to_string()],
+        );
+        assert_eq!(kept, vec!["/watch/keep.mp4".to_string()]);
     }
 
     fn config(path: &str, recursive: bool, delay_secs: u64) -> WatchedDirConfig {

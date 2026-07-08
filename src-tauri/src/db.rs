@@ -1,5 +1,53 @@
-use rusqlite::{Connection, Result};
-use std::path::PathBuf;
+use rusqlite::{params, Connection, Result};
+use std::path::{Path, PathBuf};
+
+/// Canonical form of a watch path. Mirrors `commands::watch::canonical_watch_path`: dunce avoids
+/// the Windows `\\?\` prefix, and a path that can't be resolved (e.g. a folder no longer on disk)
+/// is returned unchanged so the backfill leaves it alone rather than mangling it.
+fn canonical_watch_path(path: &str) -> String {
+    dunce::canonicalize(Path::new(path))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// One-time migration for watched_directories rows written before `canonical_watch_path` ran on
+/// insert: rewrite each path to its canonical form so re-adding the same folder (which now stores
+/// the canonical path) can't slip past the UNIQUE(path) check and create a second watcher over one
+/// folder. Idempotent — already-canonical paths are skipped. A row whose canonical form collides
+/// with another row is an alias duplicate and is deleted rather than violating UNIQUE(path).
+/// Ordered by created_at so that when 3+ rows alias one folder the *earliest* row is the one
+/// canonicalized (and kept) and the later aliases are the ones dropped — a deterministic survivor
+/// instead of relying on SQLite's unspecified scan order.
+fn backfill_canonical_watch_paths(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, path FROM watched_directories ORDER BY created_at")?;
+        let mapped =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        mapped.collect::<Result<Vec<_>>>()?
+    };
+
+    for (id, path) in rows {
+        let canonical = canonical_watch_path(&path);
+        if canonical == path {
+            continue;
+        }
+        let collides: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM watched_directories WHERE path = ?1 AND id != ?2",
+            params![canonical, id],
+            |r| r.get(0),
+        )?;
+        if collides > 0 {
+            conn.execute("DELETE FROM watched_directories WHERE id = ?1", params![id])?;
+        } else {
+            conn.execute(
+                "UPDATE watched_directories SET path = ?1 WHERE id = ?2",
+                params![canonical, id],
+            )?;
+        }
+    }
+    Ok(())
+}
 
 pub fn get_db_path() -> PathBuf {
     let app_support = dirs::data_dir().expect("Could not find Application Support directory");
@@ -98,6 +146,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "UPDATE OR IGNORE preset_suffixes SET preset_name = 'H.265 MKV 1080p30' WHERE preset_name = 'H.265 MKV 1080p'",
         [],
     )?;
+
+    backfill_canonical_watch_paths(conn)?;
 
     let defaults: &[(&str, &str)] = &[
         ("preset", preset),
@@ -329,6 +379,122 @@ mod tests {
         assert!(
             dup.is_err(),
             "duplicate path should violate UNIQUE constraint"
+        );
+    }
+
+    #[test]
+    fn backfill_rewrites_a_noncanonical_watch_path_to_canonical() {
+        // A row written before canonical_watch_path ran on insert kept a verbatim alias; the
+        // backfill must rewrite it so re-adding the same folder (now stored canonical) collides
+        // on UNIQUE(path) instead of creating a second watcher.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = canonical_watch_path(dir.path().to_str().unwrap());
+        let alias = format!(
+            "{}{}",
+            dir.path().to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        );
+        assert_ne!(
+            alias, canonical,
+            "test premise: the alias is not already canonical"
+        );
+
+        conn.execute(
+            "INSERT INTO watched_directories (id, path, created_at) VALUES ('w1', ?1, '2020-01-01T00:00:00Z')",
+            params![alias],
+        )
+        .unwrap();
+
+        backfill_canonical_watch_paths(&conn).unwrap();
+
+        let stored: String = conn
+            .query_row(
+                "SELECT path FROM watched_directories WHERE id = 'w1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, canonical);
+    }
+
+    #[test]
+    fn backfill_drops_an_alias_row_that_collides_with_an_existing_canonical_row() {
+        // Two pre-fix rows aliasing one folder would violate UNIQUE(path) once canonicalized, so
+        // the alias is dropped — exactly one watcher over the folder, not two.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = canonical_watch_path(dir.path().to_str().unwrap());
+        let alias = format!(
+            "{}{}",
+            dir.path().to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        );
+
+        conn.execute(
+            "INSERT INTO watched_directories (id, path, created_at) VALUES ('keep', ?1, '2020-01-01T00:00:00Z')",
+            params![canonical],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watched_directories (id, path, created_at) VALUES ('alias', ?1, '2020-01-02T00:00:00Z')",
+            params![alias],
+        )
+        .unwrap();
+
+        backfill_canonical_watch_paths(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM watched_directories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "the aliased duplicate is removed");
+        let remaining: String = conn
+            .query_row("SELECT id FROM watched_directories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, "keep", "the canonical row is the survivor");
+    }
+
+    #[test]
+    fn backfill_keeps_the_earliest_of_three_aliasing_rows() {
+        // 3+ rows aliasing one folder (all non-canonical) must resolve to exactly one survivor,
+        // deterministically the earliest-created one. Rows are inserted latest-first so a scan
+        // without ORDER BY created_at (SQLite's rowid order) would keep the latest and fail this.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().to_string();
+        let sep = std::path::MAIN_SEPARATOR;
+        // Three distinct non-canonical aliases of the same folder (extra trailing separators).
+        let aliases = [
+            format!("{base}{sep}{sep}{sep}"),
+            format!("{base}{sep}{sep}"),
+            format!("{base}{sep}"),
+        ];
+        // Insert latest created_at first (id w0), earliest last (id w2).
+        for (i, alias) in aliases.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO watched_directories (id, path, created_at) VALUES (?1, ?2, ?3)",
+                params![format!("w{i}"), alias, format!("2020-01-0{}", 3 - i)],
+            )
+            .unwrap();
+        }
+
+        backfill_canonical_watch_paths(&conn).unwrap();
+
+        let survivors: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM watched_directories").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.collect::<Result<Vec<_>>>().unwrap()
+        };
+        assert_eq!(
+            survivors,
+            vec!["w2".to_string()],
+            "the earliest-created alias (2020-01-01) survives; later aliases are dropped"
         );
     }
 

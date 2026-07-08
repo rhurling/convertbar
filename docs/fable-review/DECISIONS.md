@@ -112,3 +112,44 @@ progress line, unthrottled.
   migration + tuning), not a mechanical fix, and there is no unbounded-memory or
   correctness problem to solve. Not this batch.
 - **Decision (2026-07-08):** (b) dropped from R6; no leak, policy feature.
+
+## D11 — canonicalization backfill for pre-fix watch rows (R7.1)
+`canonical_watch_path` runs only on new inserts; watched_directories rows
+written before the B5 fix keep verbatim paths, so re-adding the same folder
+post-update can create a duplicate watcher.
+- **Options:** (a) one-time init-time backfill rewriting each row to its
+  canonical path, dropping a row that collides with an existing canonical one;
+  (b) leave as-is (Low realism — pickers usually emit resolved paths).
+- **Recommendation:** (a).
+- **Decision (2026-07-08):** (a) one-time backfill migration in init-time Rust,
+  UNIQUE-collision-safe.
+
+## D12 — nested-watch purge overreach (R7.2)
+Removing an enclosing root purges pending entries under a still-active nested
+watch, silently dropping mid-stabilization files until a rescan.
+- **Options:** (a) purge by desired-config coverage — retain any pending entry
+  still matched by a desired config (`delay_for_path(&desired, path)`), instead
+  of dropping everything under a removed root; (b) leave as-is (nested watches
+  unusual).
+- **Recommendation:** (a) — arguably simpler and fixes the overreach exactly.
+- **Decision (2026-07-08):** (a) purge by "no desired config still covers it".
+
+## D13 — uncancellable in-flight background scans (R7.3)
+`scan_existing_background` enqueues via `enqueue_and_start`, bypassing `pending`,
+so a watch removed mid-scan still gets its files enqueued.
+- **Options:** (a) re-check current-config membership at the `enqueue_and_start`
+  chokepoint (~5 lines; probe work still runs but nothing from a removed watch
+  is enqueued; doubles as defense-in-depth); (b) generation counter that aborts
+  the scan thread early (saves the probing too, more plumbing); (c) leave as-is.
+- **Recommendation:** (a).
+- **Decision (2026-07-08):** (a) config re-check at the enqueue chokepoint.
+
+## D14 — by-name preset repair breadth (R7.4)
+The init repair `UPDATE settings ... WHERE value='H.265 MKV 1080p'` also rewrites
+a user's custom preset that happens to carry the old name.
+- **Options:** (a) leave as-is; (b) gate/limit the repair (migration flag, or
+  skip on Linux).
+- **Recommendation:** (a) — a same-named custom preset can't be reliably told
+  from the seeded bad default at init (before HandBrake's list is queryable);
+  self-limiting (built-in exists, conversions work).
+- **Decision (2026-07-08):** (a) leave as-is; act only on a real support report.
