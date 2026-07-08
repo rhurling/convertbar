@@ -111,15 +111,25 @@ pub(crate) fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<
             Ok(Some(status)) => return Some(status),
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap(child);
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(_) => return None,
+            // `try_wait` errored (a rare OS-level failure). Don't leak the child: kill and
+            // reap it before giving up, exactly as on the timeout path.
+            Err(_) => {
+                kill_and_reap(child);
+                return None;
+            }
         }
     }
+}
+
+/// Terminate `child` and reap it so we never leak a zombie/orphan on a give-up path.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -226,6 +236,23 @@ JSON Title Set: {
         let media = media.expect("the title set after the flood must still parse");
         assert_eq!(media.codec, "h264");
         assert_eq!(media.height, 240);
+    }
+
+    // The give-up paths (timeout and try_wait error) both route through kill_and_reap; this
+    // pins that it actually terminates AND reaps, so neither path leaks a child. A no-op
+    // kill_and_reap leaves the sleep running and try_wait returns Ok(None) → fails.
+    #[cfg(unix)]
+    #[test]
+    fn kill_and_reap_terminates_and_reaps_a_running_child() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        kill_and_reap(&mut child);
+        assert!(
+            child.try_wait().expect("try_wait").is_some(),
+            "the child must be killed and reaped, not left running/zombied"
+        );
     }
 
     #[cfg(unix)]

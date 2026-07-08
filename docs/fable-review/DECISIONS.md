@@ -87,3 +87,28 @@ out-of-scope diffs (documented in project memory).
   unformatted); (c) remove the hook.
 - **Recommendation:** (a).
 - **Decision (2026-07-07):** (a) one-time cargo fmt chore PR, keep hook.
+
+## D9 — progress-event throttle (R6 "consider")
+`process_queue`'s progress thread (converter.rs:586-635) emits a
+`conversion-progress` + `menu-bar-update` pair for every parseable HandBrake
+progress line, unthrottled.
+- **Options:** (a) throttle emits (min interval or percent-delta gate);
+  (b) drop it — leave as-is.
+- **Recommendation:** (b) for R6. HandBrake's progress cadence is periodic
+  (roughly per-second), not per-frame, so the "flood" is modest; a correct
+  throttle touches the hot loop and needs an injectable clock to unit-test
+  cleanly (it uses wall-clock `Instant`), which is out of scope for a mechanical
+  Low batch. Revisit only if profiling shows the IPC rate actually matters.
+- **Decision (2026-07-08):** (b) dropped from R6; not a correctness issue.
+
+## D10 — probe_cache eviction (R6 "consider")
+`probe_cache` (probe_cache.rs) has no eviction; rows accumulate over time.
+- **Options:** (a) add eviction (age-based prune or row-count LRU cap);
+  (b) drop it — leave as-is.
+- **Recommendation:** (b). It is a persistent SQLite table `INSERT OR REPLACE`d
+  per path (one row per unique file, not per probe), each row a handful of
+  bytes; growth is bounded by the user's unique-file count and stale rows for
+  deleted files are harmless. Eviction is a retention *policy* (with its own
+  migration + tuning), not a mechanical fix, and there is no unbounded-memory or
+  correctness problem to solve. Not this batch.
+- **Decision (2026-07-08):** (b) dropped from R6; no leak, policy feature.
