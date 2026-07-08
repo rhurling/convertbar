@@ -1117,9 +1117,13 @@ mod tests {
         #[cfg(windows)]
         {
             let p = dir.join("hb-slow.cmd");
+            // Block with a cmd-INTERNAL busy loop, not `ping`/`timeout`: a grandchild
+            // would inherit our stdout/stderr pipe handles and keep them open after
+            // the kill, blocking the queue thread's progress-drain join for ~30s
+            // (real HandBrakeCLI spawns no grandchildren, so only this fake cares).
             std::fs::write(
                 &p,
-                "@echo off\r\n:loop\r\nif not \"%~2\"==\"\" (\r\nshift\r\ngoto loop\r\n)\r\necho partial> \"%~1\"\r\nping -n 31 127.0.0.1 > nul\r\n",
+                "@echo off\r\n:loop\r\nif not \"%~2\"==\"\" (\r\nshift\r\ngoto loop\r\n)\r\necho partial> \"%~1\"\r\nfor /l %%i in (1,1,2000000000) do rem\r\n",
             )
             .unwrap();
             p
