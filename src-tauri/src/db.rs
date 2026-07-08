@@ -403,4 +403,69 @@ mod tests {
         assert_eq!(completed("e2").as_deref(), Some("2020-03-01T00:00:00Z"));
         assert_eq!(completed("q1"), None);
     }
+
+    #[test]
+    fn init_db_upgrades_an_older_jobs_table_missing_the_fingerprint_columns() {
+        // A DB created before the source-identity fingerprint feature has a `jobs` table without
+        // source_size/source_mtime. `CREATE TABLE IF NOT EXISTS` leaves the existing table alone,
+        // so the idempotent ALTER migration is the only thing that adds the columns to an old DB —
+        // an upgrade path no fresh-DB test exercises (a fresh CREATE already includes them).
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Hand-build the pre-fingerprint schema and a job row from that era.
+        conn.execute_batch(
+            "CREATE TABLE jobs (
+                id              TEXT PRIMARY KEY,
+                source_path     TEXT NOT NULL,
+                output_path     TEXT NOT NULL,
+                preset          TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'queued',
+                original_size   INTEGER,
+                converted_size  INTEGER,
+                kept_file       TEXT,
+                space_saved     INTEGER,
+                error_message   TEXT,
+                queue_order     INTEGER NOT NULL,
+                created_at      TEXT NOT NULL,
+                completed_at    TEXT
+            );",
+        )
+        .unwrap();
+        insert_job(&conn, "old", "done", "2020-01-01T00:00:00Z", None);
+
+        // Upgrade the existing DB in place.
+        init_db(&conn).unwrap();
+
+        // The migration added both columns; the pre-existing row survives with NULL fingerprints
+        // (the SELECT itself would error if the columns were never added).
+        let fingerprint = |id: &str| -> (Option<i64>, Option<i64>) {
+            conn.query_row(
+                "SELECT source_size, source_mtime FROM jobs WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            fingerprint("old"),
+            (None, None),
+            "an old row survives the upgrade with empty fingerprint columns"
+        );
+
+        // The upgraded table is writable through the new columns: backfill the old row and insert
+        // a fresh job that carries a fingerprint.
+        conn.execute(
+            "UPDATE jobs SET source_size = 123, source_mtime = 456 WHERE id = 'old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at, source_size, source_mtime)
+             VALUES ('new', '/src/new.mov', '/out/new.mp4', 'preset', 'queued', 1, '2026-01-01T00:00:00Z', 789, 1011)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fingerprint("old"), (Some(123), Some(456)));
+        assert_eq!(fingerprint("new"), (Some(789), Some(1011)));
+    }
 }

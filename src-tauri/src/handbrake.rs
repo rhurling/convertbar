@@ -42,10 +42,17 @@ pub fn list_presets(handbrake_path: &str) -> Result<Vec<String>, String> {
         .output()
         .map_err(|e| format!("Failed to run HandBrakeCLI: {}", e))?;
 
-    // HandBrakeCLI outputs preset list to stderr
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut presets = Vec::new();
+    // HandBrakeCLI outputs the preset list to stderr.
+    Ok(parse_preset_list(&String::from_utf8_lossy(&output.stderr)))
+}
 
+/// Extract preset names from `HandBrakeCLI --preset-list` output. Presets are the lines indented
+/// exactly four spaces; category headers sit at the left margin and preset *property* lines are
+/// indented eight, so both are excluded by the indentation test. A trailing `/` (a category that
+/// happens to be indented) and blank lines are skipped. Split out of `list_presets` so the
+/// indentation rules can be table-tested without invoking HandBrakeCLI.
+fn parse_preset_list(stderr: &str) -> Vec<String> {
+    let mut presets = Vec::new();
     for line in stderr.lines() {
         if line.starts_with("    ") && !line.starts_with("        ") {
             let name = line.trim().to_string();
@@ -54,8 +61,7 @@ pub fn list_presets(handbrake_path: &str) -> Result<Vec<String>, String> {
             }
         }
     }
-
-    Ok(presets)
+    presets
 }
 
 pub fn get_preset_metadata(
@@ -275,6 +281,39 @@ mod tests {
             preset: "preset".into(),
             device: device.into(),
         }
+    }
+
+    #[test]
+    fn parse_preset_list_keeps_only_four_space_indented_preset_names() {
+        // A realistic slice of `HandBrakeCLI --preset-list`: unindented category headers,
+        // four-space preset names, an eight-space property line, a four-space category with a
+        // trailing slash, and a blank line — only the true preset names must come through.
+        let output = "\
+General/
+    Very Fast 1080p30
+    Fast 1080p30
+        VideoEncoder: x264
+Matroska/
+    H.265 MKV 1080p30
+    Nested Category/
+
+    Production Standard
+";
+        assert_eq!(
+            parse_preset_list(output),
+            vec![
+                "Very Fast 1080p30",
+                "Fast 1080p30",
+                "H.265 MKV 1080p30",
+                "Production Standard",
+            ],
+            "categories (col 0 / trailing slash), property lines (8-space), and blanks are dropped"
+        );
+    }
+
+    #[test]
+    fn parse_preset_list_empty_output_yields_no_presets() {
+        assert!(parse_preset_list("").is_empty());
     }
 
     #[test]
