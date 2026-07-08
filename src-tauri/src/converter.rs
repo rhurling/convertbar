@@ -101,6 +101,9 @@ pub struct ConverterState {
     pub is_paused: Mutex<bool>,
     pub is_running: Mutex<bool>,
     pub pause_after_current: Mutex<bool>,
+    /// One-way app-teardown latch: armed by `kill_active_child`, checked by
+    /// `process_queue` so the queue thread never spawns another encoder mid-quit.
+    pub shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl ConverterState {
@@ -112,7 +115,12 @@ impl ConverterState {
             is_paused: Mutex::new(false),
             is_running: Mutex::new(false),
             pause_after_current: Mutex::new(false),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Returns true if the current platform supports real process pause/resume (SIGSTOP/SIGCONT).
@@ -133,6 +141,13 @@ impl ConverterState {
 /// output is left alone: the next launch's auto-resume deletes it once no process
 /// holds it.
 pub(crate) fn kill_active_child(converter: &ConverterState) {
+    // Arm shutdown BEFORE touching the child: without it the queue thread's next
+    // iteration spawns a fresh encoder during teardown, and a spawn that raced this
+    // call (child not yet stored in current_child) would be missed entirely —
+    // process_queue re-checks the flag right after storing the handle.
+    converter
+        .shutdown
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     #[cfg(target_os = "macos")]
     {
         if let Ok(pid) = converter.current_pid.lock() {
@@ -328,15 +343,25 @@ fn read_bounded_tail(mut reader: impl Read) -> String {
 
 const ERROR_TAIL_LINES: usize = 20;
 
-/// The generic failure line plus the informative end of HandBrake's stderr, so the
-/// history entry says WHY the encode failed instead of just that it did.
-fn error_message_from_tail(tail: &str) -> String {
+/// A failure prefix plus the informative end of HandBrake's stderr, so the history
+/// entry says WHY the encode failed instead of just that it did.
+fn message_with_tail(prefix: &str, tail: &str) -> String {
     let lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
-        return "Conversion failed".to_string();
+        return prefix.to_string();
     }
     let start = lines.len().saturating_sub(ERROR_TAIL_LINES);
-    format!("Conversion failed:\n{}", lines[start..].join("\n"))
+    format!("{}:\n{}", prefix, lines[start..].join("\n"))
+}
+
+fn error_message_from_tail(tail: &str) -> String {
+    message_with_tail("Conversion failed", tail)
+}
+
+/// Zero-byte outputs fail with the same stderr diagnostics as a nonzero exit —
+/// HandBrake usually said why nothing was written (e.g. "No title found").
+fn empty_output_error_message(tail: &str) -> String {
+    message_with_tail("Conversion produced an empty output file", tail)
 }
 
 /// Record a failed job: status + error_message in the DB, the two frontend events,
@@ -408,6 +433,13 @@ fn final_run_status(had_errors: bool) -> &'static str {
 fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &ConverterState) {
     let mut had_errors = false;
     loop {
+        // Quit path: kill_active_child armed shutdown. Bail before picking up another
+        // job — teardown would otherwise race a fresh HandBrakeCLI spawn and orphan it.
+        // Return (not break) so no "Queue complete" notification fires mid-quit.
+        if converter.is_shutting_down() {
+            *converter.is_running.lock().unwrap() = false;
+            return;
+        }
         let job;
         let handbrake_path;
         let cleanup_mode;
@@ -546,6 +578,13 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
         // Store child handle for cross-platform cancel support
         *converter.current_child.lock().unwrap() = Some(child);
 
+        // Close the spawn→store window: if quit armed shutdown after the spawn but
+        // before the handle was stored, kill_active_child found None — reap it here.
+        // wait_for_active_child then sees the killed status and takes the error path.
+        if converter.is_shutting_down() {
+            kill_active_child(converter);
+        }
+
         let job_id = job.id.clone();
         let app_clone = app.clone();
         let file_name_clone = file_name.clone();
@@ -624,12 +663,17 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                 if converted_size.unwrap_or(0) == 0 {
                     had_errors = true;
                     let _ = std::fs::remove_file(&encode_target);
+                    // The child exited, so the drain thread is at EOF and joins
+                    // promptly; its tail says why nothing was written.
+                    let tail = stderr_tail_thread
+                        .and_then(|t| t.join().ok())
+                        .unwrap_or_default();
                     record_job_error(
                         app,
                         db,
                         &job.id,
                         &file_name,
-                        "Conversion produced an empty output file",
+                        &empty_output_error_message(&tail),
                     );
                     continue;
                 }
@@ -1006,6 +1050,31 @@ mod tests {
     }
 
     #[test]
+    fn kill_active_child_arms_shutdown_so_the_queue_spawns_no_new_jobs() {
+        // Killing the current child is not enough on quit: the queue thread's next
+        // iteration would spawn a fresh HandBrakeCLI during teardown and orphan it.
+        // The kill must arm the shutdown flag process_queue checks — even when no
+        // child is currently running (the spawn→store window).
+        let state = ConverterState::new();
+        assert!(!state.is_shutting_down());
+        kill_active_child(&state);
+        assert!(state.is_shutting_down());
+    }
+
+    #[test]
+    fn empty_output_error_message_carries_the_stderr_tail() {
+        // The zero-byte guard fires while HandBrake's stderr says WHY the output was
+        // empty (e.g. "No title found"); discarding it would undo B3's diagnostics.
+        assert_eq!(
+            empty_output_error_message(""),
+            "Conversion produced an empty output file"
+        );
+        let msg = empty_output_error_message("scan: No title found\n");
+        assert!(msg.starts_with("Conversion produced an empty output file:"));
+        assert!(msg.contains("No title found"));
+    }
+
+    #[test]
     fn parses_full_progress_line() {
         let line = "Encoding: task 1 of 1, 42.50 % (123.45 fps, avg 120.00 fps, ETA 00h02m30s)";
         let (percent, fps, avg_fps, eta) = parse_progress(line).unwrap();
@@ -1152,9 +1221,12 @@ mod tests {
             (1000, 1500, KeptFile::Original, -500, "skipped"),
             // Converted equals original: no win, keep original, skipped.
             (1000, 1000, KeptFile::Original, 0, "skipped"),
-            // No/zero output but the source had a size: keep original, delete nothing, done.
+            // Zero output is UNREACHABLE at the call site: process_queue's zero-byte
+            // guard records an error and never calls decide_cleanup (D3). These rows
+            // pin only the function's own dead-arm contract (keep original, delete
+            // nothing) — do NOT read "done" here as licence to treat 0 bytes as
+            // success upstream.
             (1000, 0, KeptFile::Neither, 0, "done"),
-            // Both zero (degenerate): keep original, delete nothing, skipped.
             (0, 0, KeptFile::Neither, 0, "skipped"),
         ];
         for (orig, conv, want_kept, want_saved, want_status) in cases {
