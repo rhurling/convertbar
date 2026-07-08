@@ -17,28 +17,7 @@ const VARIABLES: { key: keyof PresetMetadata; label: string }[] = [
   { key: "device", label: "{device}" },
 ];
 
-function resolveTemplate(
-  template: string,
-  metadata: PresetMetadata | null,
-): string {
-  if (!metadata) return template;
-
-  let result = template;
-  for (const { key } of VARIABLES) {
-    result = result.replace(
-      new RegExp(`\\{${key}\\}`, "g"),
-      metadata[key] || "",
-    );
-  }
-
-  // Clean up separators adjacent to empty values
-  result = result.replace(/[-_]{2,}/g, (m) => m[0]);
-  result = result.replace(/[-_]\./, ".");
-  result = result.replace(/\.[-_]/, ".");
-  result = result.replace(/[-_]$/, "");
-
-  return result;
-}
+const SUFFIX_PREVIEW_DEBOUNCE_MS = 250;
 
 interface SettingsPageProps {
   onHbPathChanged?: () => void;
@@ -52,6 +31,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     presetMetadata,
     metadataLoading,
     presetsError,
+    error,
     loading,
     updateSetting,
     updatePresetSuffix,
@@ -62,18 +42,69 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("");
 
+  // Local drafts so text inputs echo keystrokes instantly and commit once (on blur/Enter),
+  // instead of round-tripping an IPC write per character (which dropped/reordered characters).
+  const [hbDraft, setHbDraft] = useState(settings?.handbrake_path ?? "");
+  const [markerDraft, setMarkerDraft] = useState(settings?.watch_skip_marker ?? "");
+  const [suffixDraft, setSuffixDraft] = useState(presetSuffix);
+  const [resolvedSuffix, setResolvedSuffix] = useState("");
+
   useEffect(() => { getVersion().then(setAppVersion); }, []);
+  useEffect(() => {
+    if (settings) setHbDraft(settings.handbrake_path);
+  }, [settings?.handbrake_path]);
+  useEffect(() => {
+    if (settings) setMarkerDraft(settings.watch_skip_marker);
+  }, [settings?.watch_skip_marker]);
+  useEffect(() => {
+    setSuffixDraft(presetSuffix);
+  }, [presetSuffix]);
+
+  // Preview resolves the *draft* (so it updates as you type) via the backend resolver —
+  // never a JS reimplementation, which diverged from the real output-name algorithm.
+  useEffect(() => {
+    if (!presetMetadata) {
+      setResolvedSuffix(suffixDraft);
+      return;
+    }
+    const timer = setTimeout(() => {
+      commands
+        .resolveSuffixTemplate(suffixDraft, presetMetadata)
+        .then(setResolvedSuffix)
+        .catch(() => setResolvedSuffix(suffixDraft));
+    }, SUFFIX_PREVIEW_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [suffixDraft, presetMetadata]);
+
+  const commitHbPath = async () => {
+    if (hbDraft === settings?.handbrake_path) return;
+    // Await the write before validating, so the banner reflects the new path, not the old.
+    await updateSetting("handbrake_path", hbDraft);
+    onHbPathChanged?.();
+  };
+
+  const commitMarker = () => {
+    if (markerDraft !== settings?.watch_skip_marker) {
+      updateSetting("watch_skip_marker", markerDraft);
+    }
+  };
+
+  const commitSuffix = () => {
+    if (suffixDraft !== presetSuffix) updatePresetSuffix(suffixDraft);
+  };
 
   const handleChipClick = useCallback(
     (variable: string) => {
-      const newSuffix = presetSuffix + variable;
+      const newSuffix = suffixDraft + variable;
+      setSuffixDraft(newSuffix);
       updatePresetSuffix(newSuffix);
       inputRef.current?.focus();
     },
-    [presetSuffix, updatePresetSuffix],
+    [suffixDraft, updatePresetSuffix],
   );
 
   const handleReset = useCallback(() => {
+    setSuffixDraft(DEFAULT_SUFFIX_TEMPLATE);
     updatePresetSuffix(DEFAULT_SUFFIX_TEMPLATE);
   }, [updatePresetSuffix]);
 
@@ -81,7 +112,6 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     return <div className="settings-page loading">Loading settings...</div>;
   }
 
-  const resolvedSuffix = resolveTemplate(presetSuffix, presetMetadata);
   const previewFilename = `vacation${resolvedSuffix}.mp4`;
 
   const visibleVariables = VARIABLES.filter(
@@ -90,6 +120,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
 
   return (
     <div className="settings-page">
+      {error && <div className="setting-error">{error}</div>}
       <div className="setting-group">
         <label className="setting-label">Preset</label>
         {presetsError ? (
@@ -129,8 +160,12 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
               ref={inputRef}
               className="setting-input"
               type="text"
-              value={presetSuffix}
-              onChange={(e) => updatePresetSuffix(e.target.value)}
+              value={suffixDraft}
+              onChange={(e) => setSuffixDraft(e.target.value)}
+              onBlur={commitSuffix}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
               placeholder={DEFAULT_SUFFIX_TEMPLATE}
             />
 
@@ -229,8 +264,12 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         <input
           className="setting-input"
           type="text"
-          value={settings.watch_skip_marker}
-          onChange={(e) => updateSetting("watch_skip_marker", e.target.value)}
+          value={markerDraft}
+          onChange={(e) => setMarkerDraft(e.target.value)}
+          onBlur={commitMarker}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
           placeholder=".downloading"
         />
         <p className="setting-hint">
@@ -308,10 +347,11 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           <input
             className="setting-input flex-1"
             type="text"
-            value={settings.handbrake_path}
-            onChange={(e) => {
-              updateSetting("handbrake_path", e.target.value);
-              onHbPathChanged?.();
+            value={hbDraft}
+            onChange={(e) => setHbDraft(e.target.value)}
+            onBlur={commitHbPath}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
             }}
             placeholder="/usr/local/bin/HandBrakeCLI"
           />

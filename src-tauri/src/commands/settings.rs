@@ -5,6 +5,26 @@ use tauri_plugin_autostart::ManagerExt;
 use crate::types::Settings;
 use crate::AppState;
 
+/// The output-filename suffix template applied to a preset the user has never
+/// customized. Single source of truth for both the settings UI (`get_preset_suffix`)
+/// and the conversion output-naming path (`commands::queue`), so an unconfigured
+/// preset can never silently fall back to an empty (in-place re-encode) suffix.
+pub const DEFAULT_SUFFIX_TEMPLATE: &str = ".{resolution}-{codec}";
+
+/// The stored suffix template for `preset`, or [`DEFAULT_SUFFIX_TEMPLATE`] when the
+/// preset has no row yet. An explicitly-stored empty string is preserved (a deliberate
+/// in-place-encode choice) rather than treated as unset.
+pub fn read_suffix_template(conn: &rusqlite::Connection, preset: &str) -> String {
+    match conn.query_row(
+        "SELECT suffix FROM preset_suffixes WHERE preset_name = ?1",
+        params![preset],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(suffix) => suffix,
+        Err(_) => DEFAULT_SUFFIX_TEMPLATE.to_string(),
+    }
+}
+
 #[tauri::command]
 pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settings, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -135,22 +155,9 @@ pub fn update_setting(
 }
 
 #[tauri::command]
-pub fn get_preset_suffix(
-    state: State<'_, AppState>,
-    preset: String,
-) -> Result<Option<String>, String> {
+pub fn get_preset_suffix(state: State<'_, AppState>, preset: String) -> Result<String, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let result = conn.query_row(
-        "SELECT suffix FROM preset_suffixes WHERE preset_name = ?1",
-        params![preset],
-        |row| row.get::<_, String>(0),
-    );
-
-    match result {
-        Ok(suffix) => Ok(Some(suffix)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
+    Ok(read_suffix_template(&conn, &preset))
 }
 
 #[tauri::command]
@@ -166,4 +173,50 @@ pub fn set_preset_suffix(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn read_suffix_template_returns_default_when_no_row() {
+        let conn = test_conn();
+        // A preset the user has never configured has no preset_suffixes row; it must
+        // fall back to the default template, not to an empty (in-place) suffix.
+        assert_eq!(
+            read_suffix_template(&conn, "Never Configured Preset"),
+            DEFAULT_SUFFIX_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn read_suffix_template_preserves_an_explicit_empty_suffix() {
+        let conn = test_conn();
+        // An empty stored suffix is a deliberate in-place-encode choice, not "unset".
+        conn.execute(
+            "INSERT INTO preset_suffixes (preset_name, suffix) VALUES ('P', '')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read_suffix_template(&conn, "P"), "");
+    }
+
+    #[test]
+    fn read_suffix_template_returns_the_stored_value() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO preset_suffixes (preset_name, suffix) VALUES ('P', '.custom')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read_suffix_template(&conn, "P"), ".custom");
+    }
 }

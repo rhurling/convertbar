@@ -1,7 +1,11 @@
 import { useState, useEffect, useCallback } from "react";
 import { commands, type AppSettings, type PresetMetadata } from "../lib/tauri";
 
-const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
+// `update_setting` is stringly-typed on the wire ("true"/"false" for booleans); the
+// optimistic merge must land booleans as real booleans so `checked={value === true}` works.
+function coerceSettingValue(current: unknown, value: string): string | boolean {
+  return typeof current === "boolean" ? value === "true" : value;
+}
 
 export function useSettings() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -10,6 +14,7 @@ export function useSettings() {
   const [presetMetadata, setPresetMetadata] = useState<PresetMetadata | null>(null);
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [presetsError, setPresetsError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const loadMetadata = useCallback(async (preset: string) => {
@@ -39,14 +44,10 @@ export function useSettings() {
         setPresets([]);
       }
 
+      // The backend returns the default template when a preset has no stored suffix,
+      // so a read never has to write one back (that write side-effect belonged in Rust).
       try {
-        const suffix = await commands.getPresetSuffix(s.preset);
-        if (suffix) {
-          setPresetSuffix(suffix);
-        } else {
-          await commands.setPresetSuffix(s.preset, DEFAULT_SUFFIX_TEMPLATE);
-          setPresetSuffix(DEFAULT_SUFFIX_TEMPLATE);
-        }
+        setPresetSuffix(await commands.getPresetSuffix(s.preset));
       } catch {
         setPresetSuffix("");
       }
@@ -65,23 +66,32 @@ export function useSettings() {
 
   const updateSetting = useCallback(
     async (key: string, value: string) => {
-      await commands.updateSetting(key, value);
-      const s = await commands.getSettings();
-      setSettings(s);
+      setError(null);
+      // Optimistic: reflect the change immediately so controlled inputs and toggles don't
+      // lag an IPC round-trip (and can't be reverted by an out-of-order get_settings).
+      setSettings((prev) =>
+        prev ? { ...prev, [key]: coerceSettingValue(prev[key as keyof AppSettings], value) } : prev,
+      );
+
+      try {
+        await commands.updateSetting(key, value);
+      } catch (e) {
+        setError(`Couldn't save ${key}: ${e}`);
+        // The optimistic value wasn't persisted; restore the stored truth.
+        try {
+          setSettings(await commands.getSettings());
+        } catch {
+          /* error already surfaced */
+        }
+        return;
+      }
 
       if (key === "preset") {
         try {
-          const suffix = await commands.getPresetSuffix(value);
-          if (suffix) {
-            setPresetSuffix(suffix);
-          } else {
-            await commands.setPresetSuffix(value, DEFAULT_SUFFIX_TEMPLATE);
-            setPresetSuffix(DEFAULT_SUFFIX_TEMPLATE);
-          }
+          setPresetSuffix(await commands.getPresetSuffix(value));
         } catch {
           setPresetSuffix("");
         }
-
         await loadMetadata(value);
       }
     },
@@ -91,8 +101,13 @@ export function useSettings() {
   const updatePresetSuffix = useCallback(
     async (suffix: string) => {
       if (!settings) return;
-      await commands.setPresetSuffix(settings.preset, suffix);
-      setPresetSuffix(suffix);
+      setError(null);
+      setPresetSuffix(suffix); // optimistic; commit-on-blur means this is a discrete edit
+      try {
+        await commands.setPresetSuffix(settings.preset, suffix);
+      } catch (e) {
+        setError(`Couldn't save suffix: ${e}`);
+      }
     },
     [settings],
   );
@@ -114,6 +129,7 @@ export function useSettings() {
     presetMetadata,
     metadataLoading,
     presetsError,
+    error,
     loading,
     updateSetting,
     updatePresetSuffix,

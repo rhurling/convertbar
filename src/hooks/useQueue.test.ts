@@ -91,6 +91,37 @@ describe("useQueue", () => {
     expect(result.current.progress).toEqual(payload);
   });
 
+  it("ignores a stale getQueue response that resolves after a newer one", async () => {
+    // A single job transition fires several events, each an independent getQueue();
+    // if an older request resolves last, its stale snapshot must not clobber the newer one.
+    const pending: Array<(v: JobInfo[]) => void> = [];
+    invokeMock.mockImplementation(((cmd: string) => {
+      if (cmd === "get_queue") {
+        return new Promise<JobInfo[]>((resolve) => pending.push(resolve));
+      }
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    }) as typeof invoke);
+
+    const { result } = renderHook(() => useQueue());
+    await waitFor(() => expect(pending).toHaveLength(1)); // mount refresh
+
+    act(() => emit("queue-updated")); // second refresh
+    await waitFor(() => expect(pending).toHaveLength(2));
+
+    const fresh = [job({ id: "FRESH", status: "encoding" })];
+    const stale = [job({ id: "STALE", status: "queued" })];
+
+    // Newer request (index 1) resolves first, then the older (index 0) resolves late.
+    await act(async () => {
+      pending[1](fresh);
+    });
+    await act(async () => {
+      pending[0](stale);
+    });
+
+    expect(result.current.queue.map((j) => j.id)).toEqual(["FRESH"]);
+  });
+
   it.each(["job-status-changed", "job-completed", "job-error", "queue-updated"])(
     "re-fetches the queue when a %s event fires",
     async (event) => {

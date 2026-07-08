@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { JobInfo } from "../lib/tauri";
 import { commands } from "../lib/tauri";
 import { fileName } from "../lib/format";
@@ -13,10 +14,18 @@ interface QueueItemProps {
 
 export default function QueueItem({ job, onRemoved, onDragStart, onDragOver, onDrop, isDragOver }: QueueItemProps) {
   const isInPlace = job.source_path === job.output_path;
+  const [removing, setRemoving] = useState(false);
 
   const handleRemove = async () => {
-    await commands.removeJob(job.id);
-    onRemoved();
+    if (removing) return; // in-flight guard: a double-click must not fire remove_job twice
+    setRemoving(true);
+    try {
+      await commands.removeJob(job.id);
+      onRemoved();
+    } catch (e) {
+      console.error("Failed to remove job:", e);
+      setRemoving(false); // let the user retry a failed removal
+    }
   };
 
   return (
@@ -52,7 +61,7 @@ export default function QueueItem({ job, onRemoved, onDragStart, onDragOver, onD
         </span>
       )}
       <span className="badge badge-dim">Queued</span>
-      <button className="btn-icon" onClick={handleRemove} title="Remove">
+      <button className="btn-icon" onClick={handleRemove} disabled={removing} title="Remove">
         &times;
       </button>
     </div>

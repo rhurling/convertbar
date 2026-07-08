@@ -335,6 +335,11 @@ pub fn cancel_pause_after_current(
     Ok(())
 }
 
+#[tauri::command]
+pub fn get_pause_after_current(converter_state: State<'_, Arc<ConverterState>>) -> bool {
+    converter_state.is_pause_after_current()
+}
+
 #[derive(serde::Serialize)]
 pub struct PlatformCapabilities {
     pub can_pause_process: bool,

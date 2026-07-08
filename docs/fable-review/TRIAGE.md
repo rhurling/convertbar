@@ -77,17 +77,22 @@ Refs: tests-quality.md:83; frontend.md:99
 
 ### B8 — Frontend state & IPC hygiene
 Refs: frontend.md:31,45,46,62,72,136,137,138 (all 9 verified confirmed)
-- [ ] SettingsPage text inputs (handbrake_path, watch_skip_marker, suffix
+- [x] SettingsPage text inputs (handbrake_path, watch_skip_marker, suffix
   template): draft + commit-on-blur/Enter (WatchRow pattern) — kills the
   per-keystroke IPC race.
-- [ ] `updateSetting` optimistic merge; fix the validate-races-write ordering.
-- [ ] `useQueue` refresh: monotonic counter to drop stale `getQueue` responses.
-- [ ] Move suffix default out of `refresh()` read path into Rust.
-- [ ] Expose backend `pause_after_current` flag (event payload or query);
-  drop ActiveJob's local mirror (verifier found 2 extra desync vectors).
-- [ ] Replace SettingsPage `resolveTemplate` JS copy with a backend command
+- [x] `updateSetting` optimistic merge; fix the validate-races-write ordering.
+- [x] `useQueue` refresh: monotonic counter to drop stale `getQueue` responses.
+- [x] Move suffix default out of `refresh()` read path into Rust. Backend now
+  owns `DEFAULT_SUFFIX_TEMPLATE`: `get_preset_suffix` returns it when unset AND
+  the conversion read path (`queue.rs`) falls back to it, so removing the
+  frontend write doesn't regress unconfigured presets to in-place encoding.
+- [x] Expose backend `pause_after_current` flag via `get_pause_after_current`
+  query; ActiveJob seeds its button from it on mount (tab remount = fresh read),
+  dropping the local mirror and its 2 extra desync vectors.
+- [x] Replace SettingsPage `resolveTemplate` JS copy with a backend command
   (proven divergent: `..h265` vs `.h265`).
-- [ ] Surface rejected invokes (DropZone folder-confirm + queue mutations).
+- [x] Surface rejected invokes (DropZone folder-confirm + ActiveJob controls +
+  QueueItem remove double-click guard).
 
 ### B9 — Release pipeline hardening
 Refs: ci-release.md:18,32,33 → **D4**
