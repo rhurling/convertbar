@@ -10,10 +10,12 @@ fn main() {
     if target_os.as_deref() == Ok("windows") && target_env.as_deref() == Ok("msvc") {
         let manifest =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("windows-test-manifest.xml");
-        println!("cargo:rerun-if-changed={}", manifest.display());
-        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+        // Double-colon syntax: tauri_build emits `cargo::` directives, and cargo
+        // rejects mixing the legacy `cargo:` form into the same build-script output.
+        println!("cargo::rerun-if-changed={}", manifest.display());
+        println!("cargo::rustc-link-arg-tests=/MANIFEST:EMBED");
         println!(
-            "cargo:rustc-link-arg-tests=/MANIFESTINPUT:{}",
+            "cargo::rustc-link-arg-tests=/MANIFESTINPUT:{}",
             manifest.display()
         );
     }
