@@ -35,4 +35,8 @@ jobs:
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "./src-tauri -> target"
+          # Share test.yml's Linux cache (same workspace, same debug profile) instead of
+          # keeping a separate ~775MB ignored-tests cache. Runs on main/cron, so it writes.
+          shared-key: "rust-tests"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --manifest-path src-tauri/Cargo.toml -- --ignored

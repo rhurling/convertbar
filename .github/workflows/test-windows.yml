@@ -31,6 +31,11 @@ jobs:
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "./src-tauri -> target"
+          # Match test.yml's key so this PR-only job restores the warm Windows cache
+          # main builds, instead of cold-building. save-if: false → never writes a
+          # PR-scoped cache that would be orphaned on merge (the old ~628MB/PR leak).
+          shared-key: "rust-tests"
+          save-if: false
       # --lib + RUSTFLAGS: the mock-runtime tests need a Common-Controls v6 manifest or
       # the test exe dies at load (STATUS_ENTRYPOINT_NOT_FOUND, tauri-apps/tauri#11028).
       # --lib keeps the app binary out of this cargo invocation, which would otherwise
