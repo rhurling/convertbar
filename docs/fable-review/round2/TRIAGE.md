@@ -68,10 +68,10 @@ touches their file, or stay documented here.
 
 ## Deferred (documented, deliberately not batched)
 
-- **claude-automation #3 — `stop_hook_active` guard in check-version-sync.sh:**
-  the edit was blocked by the permission classifier (hook self-modification);
-  needs the user to apply. Patch: after the `command -v jq` line, exit 0 when
-  the Stop-hook stdin JSON has `.stop_hook_active == true`.
+- ~~claude-automation #3 — `stop_hook_active` guard~~ **landed in R3 after
+  all**: Claude's edit was blocked by the permission classifier (hook
+  self-modification), the user applied it by hand, and it shipped in #77 —
+  verified against all four fixture cases (in-sync/mismatch × flag on/off).
 - **ci-release #5** (trap-based restore covering `bump_manifests` itself):
   bigger refactor, unlikely failure — accepted residue.
 - **frontend 5 Lows** (in-flight response races, `updatePresetSuffix` blur-retry
@@ -85,8 +85,17 @@ touches their file, or stay documented here.
   'error' instead of leaving it to auto-resume; silent updater install
   failure) and the rust-core carried-over round-1 Lows: backlog.
 
-## Sequence / PR order
+## Outcome (2026-07-08)
 
-R1 → R2 are stacked (R2 builds on R1's converter changes): merge R1 first,
-then rebase R2 onto main. R3 is independent. All three branches exist locally;
-pushing is manual (git push is deny-listed for Claude).
+All batches merged: reports+triage **#75**, R1 **#76**, R3 **#77** (grew two
+ride-alongs: the user-applied Stop-hook loop guard and a CLAUDE.md note on
+whole-plugin vs JS-half-only removal), R2 **#78** (rebased onto main after R1).
+
+R2 needed two follow-up commits for Windows: the mock-runtime tests die at
+load on windows-msvc without a Common-Controls v6 manifest
+(STATUS_ENTRYPOINT_NOT_FOUND, tauri-apps/tauri#11028 — caught by the advisory
+`rust-windows` job doing exactly its B10 job). `rustc-link-arg-tests` can't
+reach lib unit tests and a blanket link-arg would double-manifest the app
+binary against tauri-build's bins-only resource, so the Windows CI jobs now
+run `cargo test --lib` with RUSTFLAGS embedding
+`src-tauri/windows-test-manifest.xml` (rationale comment in build.rs).
