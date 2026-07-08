@@ -277,6 +277,32 @@ fn build_watcher(
     .expect("failed to create filesystem watcher")
 }
 
+/// One reaper pass over the pending set: re-stat each tracked file via `stat`, drop files that
+/// vanished, and collect + remove those that have settled (unchanged for their delay). Returns the
+/// stabilized paths to enqueue. Generic over the stat function so a full tick is unit-testable
+/// without the filesystem or the reaper's 1s sleep loop.
+fn reap_pending_once(
+    pending: &mut HashMap<PathBuf, PendingEntry>,
+    now: Instant,
+    stat: impl Fn(&Path) -> Option<(u64, SystemTime)>,
+) -> Vec<String> {
+    let mut stable: Vec<String> = Vec::new();
+    pending.retain(|path, entry| match stat(path) {
+        None => false, // gone → stop tracking
+        Some((size, mtime)) => {
+            if entry.observe(size, mtime, now) {
+                if let Some(path) = path.to_str() {
+                    stable.push(path.to_string());
+                }
+                false // settled → remove from pending
+            } else {
+                true // keep waiting
+            }
+        }
+    });
+    stable
+}
+
 /// Spawns the reaper: once a second it re-stats every pending file. Files that have settled are
 /// enqueued; files that vanished are dropped. The stat re-check is the safety net for events the
 /// OS coalesced or dropped.
@@ -284,22 +310,10 @@ fn spawn_reaper(app: AppHandle, pending: Arc<Mutex<HashMap<PathBuf, PendingEntry
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         let now = Instant::now();
-        let mut stable: Vec<String> = Vec::new();
-        if let Ok(mut pending) = pending.lock() {
-            pending.retain(|path, entry| match stat_size_mtime(path) {
-                None => false, // gone → stop tracking
-                Some((size, mtime)) => {
-                    if entry.observe(size, mtime, now) {
-                        if let Some(path) = path.to_str() {
-                            stable.push(path.to_string());
-                        }
-                        false // settled → remove from pending
-                    } else {
-                        true // keep waiting
-                    }
-                }
-            });
-        }
+        let stable = match pending.lock() {
+            Ok(mut pending) => reap_pending_once(&mut pending, now, stat_size_mtime),
+            Err(_) => Vec::new(),
+        };
         if !stable.is_empty() {
             enqueue_and_start(&app, stable);
         }
@@ -599,6 +613,72 @@ mod tests {
         assert!(!entry.observe(100, mtime(20), t0 + Duration::from_secs(8)));
         // +10s: 6s since the change → stable.
         assert!(entry.observe(100, mtime(20), t0 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn reap_pending_once_enqueues_a_settled_file_exactly_once() {
+        // A file that has stopped changing for its full delay is enqueued once and dropped from
+        // pending, so a later tick can't enqueue it again and re-convert a finished file.
+        let t0 = Instant::now();
+        let key = PathBuf::from("/watch/done.mp4");
+        let mut pending = HashMap::new();
+        pending.insert(
+            key.clone(),
+            PendingEntry::new(100, mtime(10), t0, Duration::from_secs(5)),
+        );
+
+        let stable = reap_pending_once(&mut pending, t0 + Duration::from_secs(6), |_| {
+            Some((100, mtime(10)))
+        });
+        assert_eq!(stable, vec![key.to_string_lossy().to_string()]);
+        assert!(pending.is_empty(), "a settled file is removed from pending");
+
+        // A second tick has nothing left to enqueue — the file settled exactly once.
+        let again = reap_pending_once(&mut pending, t0 + Duration::from_secs(12), |_| {
+            Some((100, mtime(10)))
+        });
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn reap_pending_once_keeps_a_growing_file_pending() {
+        // A file still being written (size keeps changing) must never be enqueued mid-write; the
+        // change resets its stability timer and it stays pending even past the original delay.
+        let t0 = Instant::now();
+        let key = PathBuf::from("/watch/growing.mp4");
+        let mut pending = HashMap::new();
+        pending.insert(
+            key.clone(),
+            PendingEntry::new(100, mtime(10), t0, Duration::from_secs(5)),
+        );
+
+        let stable = reap_pending_once(&mut pending, t0 + Duration::from_secs(6), |_| {
+            Some((200, mtime(10)))
+        });
+        assert!(
+            stable.is_empty(),
+            "a file that changed this tick is not enqueued"
+        );
+        assert!(
+            pending.contains_key(&key),
+            "it keeps waiting for stability instead of being dropped"
+        );
+    }
+
+    #[test]
+    fn reap_pending_once_drops_a_vanished_file() {
+        // A file that disappeared before settling (deleted or renamed away) is dropped, not enqueued.
+        let t0 = Instant::now();
+        let key = PathBuf::from("/watch/gone.mp4");
+        let mut pending = HashMap::new();
+        pending.insert(
+            key.clone(),
+            PendingEntry::new(100, mtime(10), t0, Duration::from_secs(5)),
+        );
+
+        let stable = reap_pending_once(&mut pending, t0 + Duration::from_secs(6), |_| None);
+        assert!(stable.is_empty());
+        assert!(pending.is_empty(), "a vanished file stops being tracked");
     }
 
     #[test]

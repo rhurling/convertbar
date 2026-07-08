@@ -121,13 +121,23 @@ Refs: ci-release.md:7 → **D2**; tests-quality.md:47,65 → **D6**, 90
 
 ### B11 — Test backfill
 Refs: tests-quality.md:8,36,45,46,56
-- [ ] Old-schema migration test (hand-create pre-fingerprint jobs table,
-  run init_db, assert columns + writability).
-- [ ] Extract + fixture-test `parse_preset_list` (indentation-based parsing).
-- [ ] Extract `process_queue` per-job state machine into testable function;
-  cover status transitions, pause gate, pause_after_current reset.
-- [ ] Reaper single-tick test (growing file stays pending; stable file
-  enqueues exactly once).
+- [x] Old-schema migration test (`db.rs`): hand-creates a pre-fingerprint `jobs`
+  table (no `source_size`/`source_mtime`), runs `init_db`, asserts the idempotent
+  ALTER added both columns, the old row survives with NULL fingerprints, and the
+  upgraded table is writable through them. Verified RED by neutering the ALTER
+  loop (`no such column: source_size`) — no fresh-DB test exercised this path.
+- [x] Extracted `parse_preset_list` out of `list_presets` and fixture-tested the
+  indentation rules: 4-space preset names kept; col-0/trailing-slash categories,
+  8-space property lines, and blanks dropped.
+- [x] Extracted the two inline, untested decisions from `process_queue`:
+  `take_pause_after_current` (the pause gate + one-shot reset, now a single atomic
+  take) and `final_run_status` (had_errors → error/idle). The success-path status
+  transition was already pure (`decide_cleanup`); the queued→encoding→done/error
+  DB transitions are integration-level, exercised by the enforced `e2e-ignored`
+  job (B10).
+- [x] Reaper single-tick: extracted `reap_pending_once` (stat fn injected) from
+  the reaper's sleep loop; tests prove a settled file enqueues exactly once and is
+  dropped, a growing file stays pending, and a vanished file is dropped.
 
 ### B12 — Automation & docs refresh
 Refs: claude-automation.md:13→**D8**, 22→**D7**, 72,73,89,90,108,109

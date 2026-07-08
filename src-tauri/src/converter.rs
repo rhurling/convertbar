@@ -385,6 +385,24 @@ fn record_job_error(
     }
 }
 
+/// Consume the "pause after current job" flag: returns true when the queue should stop after the
+/// job that just finished, clearing the flag so the pause fires exactly once. A single atomic take
+/// replaces the previous read-then-clear (two separate lock acquisitions) at the call site.
+fn take_pause_after_current(converter: &ConverterState) -> bool {
+    let mut guard = converter.pause_after_current.lock().unwrap();
+    std::mem::replace(&mut *guard, false)
+}
+
+/// The menu-bar status shown once the queue drains: `error` if any job failed during the run,
+/// otherwise `idle`. Kept pure so the end-of-run transition is unit-testable.
+fn final_run_status(had_errors: bool) -> &'static str {
+    if had_errors {
+        "error"
+    } else {
+        "idle"
+    }
+}
+
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
 fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &ConverterState) {
@@ -765,9 +783,9 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                     }
                 }
 
-                // Check if we should pause after this job
-                if *converter.pause_after_current.lock().unwrap() {
-                    *converter.pause_after_current.lock().unwrap() = false;
+                // Pause after this job if the one-shot flag is armed (consumed here so the next
+                // queued job does not also pause).
+                if take_pause_after_current(converter) {
                     let _ = app.emit(
                         "menu-bar-update",
                         MenuBarUpdate {
@@ -837,7 +855,7 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
         }
     }
 
-    let final_status = if had_errors { "error" } else { "idle" };
+    let final_status = final_run_status(had_errors);
     let _ = app.emit(
         "menu-bar-update",
         MenuBarUpdate {
@@ -914,6 +932,30 @@ fn format_bytes_short(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_pause_after_current_consumes_the_flag_exactly_once() {
+        let state = ConverterState::new();
+        // Not armed: no pause, the flag stays clear.
+        assert!(!take_pause_after_current(&state));
+
+        // Armed: the queue pauses after the job that just finished, and the flag is cleared so
+        // the NEXT job does not also pause — the "Pause after this" button is a one-shot.
+        *state.pause_after_current.lock().unwrap() = true;
+        assert!(take_pause_after_current(&state));
+        assert!(
+            !take_pause_after_current(&state),
+            "pause-after-current must fire once, then re-arm to off"
+        );
+    }
+
+    #[test]
+    fn final_run_status_is_error_only_when_a_job_failed() {
+        // The end-of-queue menu-bar transition: a clean run returns to idle; any failure leaves
+        // the tray showing an error state until the next run starts.
+        assert_eq!(final_run_status(false), "idle");
+        assert_eq!(final_run_status(true), "error");
+    }
 
     #[test]
     fn is_pause_after_current_reflects_the_backend_flag() {
