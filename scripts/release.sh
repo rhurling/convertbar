@@ -117,6 +117,10 @@ build_app() {
   else
     printf '%s\n' "$out" | tail -30 >&2
     echo "error: build did not reach bundling — aborting before any commit or push." >&2
+    # bump_manifests already dirtied the tree; restore it so the next run's clean-tree
+    # preflight fails for the right reason (or not at all), not with an unrelated message.
+    echo "Restoring bumped manifests to leave a clean tree..." >&2
+    git checkout -- package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock 2>/dev/null || true
     exit 1
   fi
 }
@@ -131,7 +135,8 @@ commit_release() {
   echo "Committed (signed) on chore/release-$target."
 }
 push_and_pr() {
-  local target="$1" notes_file="$2" branch="chore/release-$target"
+  local target="$1" notes_file="$2"
+  local branch="chore/release-$target"
   if [ -n "$notes_file" ] && [ ! -f "$notes_file" ]; then
     echo "warning: --notes file '$notes_file' not found — using a default PR body" >&2
   fi
@@ -153,12 +158,28 @@ confirm_checkpoint() {
   esac
 }
 merge_and_tag() {
-  local target="$1"
+  local target="$1" pr sha head
+  local branch="chore/release-$target"
   git switch main
-  gh pr merge "chore/release-$target" --admin --squash --delete-branch
-  git pull --ff-only || { echo "error: could not fast-forward main after merge — recover with: git pull --ff-only && git tag -s v$target -m v$target && git push origin v$target" >&2; exit 1; }
-  git branch -D "chore/release-$target" 2>/dev/null || true
-  git tag -s "v$target" -m "v$target"
+  # Capture the PR number before the merge deletes the branch, so mergeCommit stays queryable.
+  pr="$(gh pr view "$branch" --json number -q .number)"
+  gh pr merge "$branch" --admin --squash --delete-branch
+  # Tag the exact squash-merge commit, never "whatever main HEAD is after the pull":
+  # replication lag can serve a pre-merge ref (then --ff-only succeeds trivially and would
+  # tag the OLD commit, whose manifests still hold the previous version — tauri-action then
+  # builds under the wrong tag and publish-release fails), and a concurrent commit could land
+  # on main between the merge and the pull.
+  sha="$(gh pr view "$pr" --json mergeCommit -q .mergeCommit.oid)"
+  [ -n "$sha" ] || { echo "error: could not resolve the squash-merge commit for PR #$pr" >&2; exit 1; }
+  git pull --ff-only || { echo "error: could not fast-forward main after merge — once main is at $sha, recover with: git tag -s v$target -m v$target $sha && git push origin v$target" >&2; exit 1; }
+  head="$(git rev-parse HEAD)"
+  if [ "$head" != "$sha" ]; then
+    echo "error: main HEAD ($head) is not the release merge commit ($sha) — a commit may have landed after the merge, or the fetch is stale. Not tagging automatically." >&2
+    echo "Once main is at $sha, recover with: git tag -s v$target -m v$target $sha && git push origin v$target" >&2
+    exit 1
+  fi
+  git branch -D "$branch" 2>/dev/null || true
+  git tag -s "v$target" -m "v$target" "$sha"
   git push origin "v$target"
   echo "Released v$target — CI build triggered."
   gh release view "v$target" --json url -q .url 2>/dev/null || true

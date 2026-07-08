@@ -1026,10 +1026,29 @@ mod tests {
         assert_eq!((size, mtime), (expected.size, expected.mtime));
     }
 
+    // A long-running child process standing in for an active HandBrakeCLI encode. Kept
+    // cross-platform (Windows has no `sleep`) so the cancel-deadlock regression below runs
+    // everywhere — cancel via `Child::kill()` is a process-control path on ALL platforms.
+    // It must outlive the test's timeouts so a premature exit can't mask the deadlock.
+    fn spawn_long_running_child() -> Child {
+        #[cfg(windows)]
+        {
+            // ~31 pings at ~1s spacing ≈ 30s; killable directly (ping.exe on PATH).
+            Command::new("ping")
+                .args(["-n", "31", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("sleep").arg("30").spawn().unwrap()
+        }
+    }
+
     // Regression test for the cancel-freeze deadlock: the queue thread must not hold
     // the `current_child` lock across the blocking wait, or `cancel_conversion` (which
     // needs that same lock to kill the child) blocks the main thread and freezes the UI.
-    #[cfg(unix)]
     #[test]
     fn cancel_can_kill_child_while_wait_in_progress() {
         use std::sync::mpsc;
@@ -1037,9 +1056,7 @@ mod tests {
 
         let converter = Arc::new(ConverterState::new());
 
-        // A long-running child stands in for an active HandBrakeCLI encode. It must
-        // outlive the timeouts below so a premature exit can't mask the deadlock.
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let child = spawn_long_running_child();
         *converter.current_child.lock().unwrap() = Some(child);
 
         // Thread A: the queue loop's wait.

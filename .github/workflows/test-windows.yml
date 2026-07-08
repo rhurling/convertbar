@@ -1,0 +1,27 @@
+name: test-windows
+
+# Advisory Windows coverage on PRs that touch the Rust backend. The main `test` workflow
+# runs Windows only on push to main, so Windows-only breakage (e.g. path-separator bugs)
+# has landed post-merge. This job surfaces it pre-merge. It is intentionally NOT a required
+# check — the ruleset gates on `frontend` + `rust (ubuntu-22.04)` only — so a slow or flaky
+# Windows run never blocks a merge. Gated on src-tauri/** so frontend-only PRs skip it
+# (Windows minutes bill 2x); a separate workflow keeps that path filter off the frontend job.
+on:
+  pull_request:
+    paths:
+      - "src-tauri/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
