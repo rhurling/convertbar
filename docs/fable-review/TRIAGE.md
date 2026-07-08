@@ -96,21 +96,28 @@ Refs: frontend.md:31,45,46,62,72,136,137,138 (all 9 verified confirmed)
 
 ### B9 — Release pipeline hardening
 Refs: ci-release.md:18,32,33 → **D4**
-- [ ] Tag the PR's `mergeCommit` oid, assert HEAD matches after pull
-  (release.sh:155-162; `--ff-only` gives zero staleness protection).
-- [ ] Failed-build recovery: restore bumped manifests or print the recovery
-  command (note: same-version retry dies at the strictly-newer preflight,
-  not clean-tree).
-- [ ] `workflow_dispatch` in build.yml: fix or remove per **D4**.
+- [x] Tag the PR's `mergeCommit` oid, assert HEAD matches after pull
+  (release.sh:155-162; `--ff-only` gives zero staleness protection). Captures
+  the PR number before merge, resolves `mergeCommit.oid`, aborts with a recovery
+  hint if HEAD ≠ the merge commit, and tags that SHA explicitly.
+- [x] Failed-build recovery: `build_app` restores the bumped manifests +
+  lockfiles on build failure, leaving a clean tree.
+- [x] `workflow_dispatch` in build.yml: removed per **D4** (builds only on `v*`
+  tag push).
 
 ### B10 — CI coverage
 Refs: ci-release.md:7 → **D2**; tests-quality.md:47,65 → **D6**, 90
-- [ ] Advisory (non-required) windows-latest PR job per **D2**.
-- [ ] De-`#[cfg(unix)]` the cancel-deadlock test (platform-neutral child).
-- [ ] Scheduled/main-only job running `cargo test -- --ignored` with
-  HandBrakeCLI+ffmpeg per **D6**.
-- [ ] IPC contract check: extract `invoke("...")`/`listen("...")` literals
-  from src/ and check against `#[tauri::command]`/`emit` literals in src-tauri.
+- [x] Advisory (non-required) windows-latest PR job per **D2** — separate
+  `test-windows.yml` workflow, `pull_request` gated on `paths: [src-tauri/**]`,
+  not in the required-checks ruleset.
+- [x] De-`#[cfg(unix)]` the cancel-deadlock test (platform-neutral child:
+  `sleep` on unix, `ping` on Windows).
+- [x] Scheduled/main-only job (`e2e-ignored.yml`) running
+  `cargo test -- --ignored` with HandBrakeCLI+ffmpeg per **D6**.
+- [x] IPC contract check: `src/test/ipc-contract.test.ts` extracts
+  `invoke("...")`/`listen("...")` literals from src/ and checks them against
+  `#[tauri::command]` fn names + `emit("...")` literals in src-tauri (runs in the
+  required `frontend` job; negative-tested to prove it catches drift).
 
 ### B11 — Test backfill
 Refs: tests-quality.md:8,36,45,46,56
