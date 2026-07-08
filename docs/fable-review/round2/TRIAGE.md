@@ -81,9 +81,28 @@ touches their file, or stay documented here.
   rows, nested-watch purge overreach, uncancellable in-flight scans, preset
   repair matching user presets by name): each needs a design decision, none is
   user-visible damage today.
-- **rust-app-shell 2 Lows** (quit-vs-queue race can mark a mid-encode job
-  'error' instead of leaving it to auto-resume; silent updater install
-  failure) and the rust-core carried-over round-1 Lows: backlog.
+- ~~rust-app-shell Low: quit-vs-queue race~~ **fixed in R4** (see below) — a
+  targeted round-3 pass over the R1/R2 diff upgraded it to Medium because the
+  R1 latch codified the racy path instead of closing it.
+- **rust-app-shell Low: silent updater install failure** and the rust-core
+  carried-over round-1 Lows: backlog.
+- **round-3 Low (new):** `cancel_conversion` clears `current_child` but leaves
+  `current_pid` set for up to ~100ms; a quit in that window SIGCONTs a
+  possibly-recycled PID (macOS only, benign signal). Backlog.
+
+### R4 — Quit preserves the in-flight job (round-3 targeted pass)
+- [x] The round-3 reviewer (single Fable agent over `git diff daf4f8e..main`
+  for converter/commands/build) found the one gap in R1's latch: after
+  `kill_active_child` reaps the child, the queue thread's error arm could
+  still win a scheduler race during teardown — deleting the partial, writing
+  `status='error'` (which next-launch auto-resume ignores), and firing a
+  "failed" notification. Fix: the error arm bails via the loop-head return
+  when `is_shutting_down()`. Test-first with a slow fake encoder killed
+  mid-encode: row stays `'encoding'`, partial stays on disk, no job-error
+  events. Everything else in the R1/R2 diff was attacked and verified sound
+  (spawn→store happens-before, double-reap semantics, N2 lock scopes,
+  zero-byte join EOF guarantee, generic command registration, dev-dep feature
+  isolation, Windows `--lib` coverage).
 
 ## Outcome (2026-07-08)
 
