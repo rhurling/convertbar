@@ -1,0 +1,70 @@
+# Round 2 — frontend (verification pass, 2026-07-08)
+
+Status: in progress — findings appended incrementally by the reviewing subagent.
+
+Scope: src/ excluding src/test (round-1 report: docs/fable-review/frontend.md; batches B7, B8). All 9 High/Medium findings re-verified against main @ daf4f8e source, not TRIAGE checkboxes. Rust command signatures cross-checked in src-tauri.
+
+## Fix verification
+
+### 1. [Medium] useQueue multi-event refresh race — FIXED
+Monotonic request counter added exactly as prescribed: `latestRequest` ref at useQueue.ts:11, id captured pre-await (useQueue.ts:14), and the response is applied only `if (mounted.current && requestId === latestRequest.current)` (useQueue.ts:17). Because the counter increments when the request is *issued*, a later-issued `getQueue` always wins regardless of resolve order — the stale-snapshot window is closed. Externally-triggered `refresh()` calls (QueuePage onRemoved etc.) go through the same guard. Regression test exists (src/hooks/useQueue.test.ts, "drops a stale getQueue response").
+
+### 2. [High] useSettings non-optimistic `updateSetting` — FIXED
+`updateSetting` now merges optimistically before the IPC (useSettings.ts:72-74) via `coerceSettingValue` (useSettings.ts:6-8, keeps booleans real booleans so `checked={... === true}` still works), and the success path no longer re-fetches `get_settings` at all — the out-of-order-response revert vector is gone. Failure path restores stored truth with a re-fetch and surfaces `error` (useSettings.ts:78-87), which SettingsPage renders (SettingsPage.tsx:123). The old await-write-then-await-refetch-then-setState chain is fully removed.
+
+### 3. [Medium] `refresh()` write side effect / suffix default in frontend — FIXED
+The read path is now read-only: useSettings.ts:49-53 just calls `getPresetSuffix` (typed `invoke<string>` now, tauri.ts:133-134 — no more `string | null`). Backend owns the default: `DEFAULT_SUFFIX_TEMPLATE` at src-tauri/src/commands/settings.rs:12, returned by `read_suffix_template` when no row exists (settings.rs:17-26), used by both `get_preset_suffix` (settings.rs:158-161) and — critically — the conversion output-naming path (commands/queue.rs:289), so removing the frontend write-back cannot regress unconfigured presets to in-place encoding. The duplicated 10-line fallback block in `updateSetting` is gone (useSettings.ts:89-96 is now a plain read). Backed by unit test `read_suffix_template_returns_default_when_no_row` (settings.rs:190-198), and the explicit-empty-string-is-preserved semantics are documented (settings.rs:14-16).
+
+### 4. [Medium] DropZone folder-confirm "Add" un-caught — FIXED
+The async onClick is wrapped in try/catch reusing the `setStatus(\`Error: ${e}\`)` path (DropZone.tsx:82-97); on rejection the pending row stays visible and the user gets the same error surface as `handlePaths`. The unhandled-rejection/dead-click failure mode is gone. (The Skip path still fire-and-forgets `startQueue()` at DropZone.tsx:103 — the round-1 Nit, untracked, still open.)
+
+### 5. [Medium] ActiveJob `pauseAfter` desync — FIXED
+Backend getter added: `get_pause_after_current` (src-tauri/src/commands/converter.rs:338-341, registered lib.rs:82), typed wrapper `getPauseAfterCurrent(): invoke<boolean>` (tauri.ts:148). ActiveJob seeds its button from it on mount (ActiveJob.tsx:29). Both round-1 desync vectors are covered: tab switches unmount pages (App.tsx:39-42), so returning to Queue remounts ActiveJob and re-reads the flag; the updater flow arming it from SettingsPage is likewise picked up on the next Queue-tab visit since only one page is mounted at a time. Residual (acceptable, matches triage scope): the flag is not pushed by event while ActiveJob stays mounted, so a backend-side clear-on-consume mid-view isn't reflected — but consume coincides with job end, which removes/replaces the ActiveJob anyway. Test coverage: ActiveJob.test.tsx seeds-from-backend case.
+
+### 6. [Medium] `fileName()` separator-naive — FIXED (B7)
+format.ts:22-26 now splits on `/[/\\]/` with `.filter(Boolean)` (also handles trailing separators, an improvement over the round-1 suggestion). WatchedFoldersPage's duplicate `basename()` is deleted; it imports and uses `fileName` (WatchedFoldersPage.tsx:3, 45). Regression tests added: `C:\Users\...\clip.mp4` and trailing-separator cases (format.test.ts:39-46).
+
+### 7. [High] SettingsPage per-keystroke IPC on three text inputs — FIXED
+All three inputs now use local drafts committed on blur/Enter: `hbDraft`/`markerDraft`/`suffixDraft` (SettingsPage.tsx:47-49), synced from hook state via primitive-dep effects (SettingsPage.tsx:53-61), with inputs at SettingsPage.tsx:159-170 (suffix), 264-274 (marker), 347-357 (hb path). Enter is implemented as `e.currentTarget.blur()` so there is exactly one commit path — no Enter+blur double-commit. Each commit is guarded by a `draft !== stored` no-op check (SettingsPage.tsx:80, 87, 93), so clicking through the page fires zero writes. Keystrokes never touch IPC; the per-keystroke race is dead. Chip-click and Reset commit immediately with correct `useCallback` deps (`[suffixDraft, updatePresetSuffix]`, SettingsPage.tsx:96-109) — no stale closures found.
+
+### 8. [Medium] `onHbPathChanged` races the settings write — FIXED
+`commitHbPath` awaits `updateSetting("handbrake_path", hbDraft)` before calling `onHbPathChanged?.()` (SettingsPage.tsx:79-84), and `updateSetting` awaits the backend `update_setting` write before returning (useSettings.ts:77), so `validate_handbrake` now reads the committed path. Failure path is also coherent: if the write fails, `updateSetting` restores stored truth internally and returns normally, so the subsequent validation validates the (still-current) old path — correct. The Detect button also re-validates after its awaited write (SettingsPage.tsx:360-362, useSettings.ts:115-123).
+
+### 9. [Medium] JS `resolveTemplate` diverges from Rust — FIXED
+The JS reimplementation is deleted from SettingsPage; the preview resolves the draft via the backend command, debounced 250ms (SettingsPage.tsx:65-77). Rust side: `#[tauri::command] resolve_suffix_template(template: String, metadata: PresetMetadata) -> String` (src-tauri/src/commands/handbrake.rs:137-140) delegates to the same `hb::resolve_suffix_template` used for real output naming (handbrake.rs:218, commands/queue.rs:330) — single algorithm, divergence impossible. Signature cross-check: frontend passes `{ template, metadata }` (tauri.ts:137-138) and `PresetMetadata` fields (codec/resolution/quality/preset/device) match the Rust struct exactly (src-tauri/src/handbrake.rs:5-11); command registered at lib.rs:64; also covered by the new src/test/ipc-contract.test.ts. A Rust test pins the command to the resolver, including the round-1 divergence case `..h265` vs `.h265` (commands/handbrake.rs:217-228).
+
+Also verified (B8 ride-alongs from round-1 Lows): QueueItem remove double-click guard + catch (QueueItem.tsx:19-29, disabled while pending, re-enabled on failure for retry); ActiveJob pause/resume/cancel wrapped in a `run()` helper surfacing `actionError` inline (ActiveJob.tsx:34-41, 123); `updatePresetSuffix` errors surfaced (useSettings.ts:105-111).
+
+**Verdict tally: 9/9 FIXED, 0 partial, 0 not fixed, 0 regressed, 0 n/a-by-decision.**
+
+## New findings
+
+Adversarial pass over `git diff eb44d4b..HEAD -- src/ ':(exclude)src/test'` plus a fresh read of the touched files. Checked specifically for: stale closures in the draft/commit pattern (none — all `useCallback` deps correct, sync effects use primitive deps), Enter+blur double-commit (none — Enter delegates to blur, commits are `draft !== stored`-guarded), counter correctness (sound), and invoke/Rust signature drift (none; ipc-contract test also guards this). What remains are edge-case races, all Low:
+
+### N1. [Low] Suffix preview: in-flight resolve has no generation guard; raw-template flash
+SettingsPage.tsx:70-76 — the debounce clears the *timer* on re-edit, but an already-fired `resolveSuffixTemplate` invoke is not cancelled or generation-checked. Scenario: type, pause 250ms (invoke A fires, backend hiccups), edit again, pause (invoke B fires, resolves fast), then A resolves late → `setResolvedSuffix` shows the resolution of the *old* draft until the next edit; a post-unmount resolve also calls setState on an unmounted component (harmless in React 18, but inconsistent with the `mounted` refs used elsewhere). Secondary cosmetic: when metadata was still null the effect set `resolvedSuffix = suffixDraft` raw (SettingsPage.tsx:66-68), so for ~250ms+IPC after metadata loads the preview reads "vacation.{resolution}-{codec}.mp4" before snapping to the resolved name. Fix-shape: reuse the useQueue counter pattern inside the effect (or an `active` flag in the cleanup).
+
+### N2. [Low] `updateSetting` failure-restore can clobber a concurrent optimistic edit
+useSettings.ts:78-86 — the failure path re-fetches `get_settings` to restore truth. If edit A fails while edit B's write is still in flight, the restoring read can resolve *before* B's write commits, overwriting B's optimistic value with its pre-write state; when B's write then succeeds there is no further re-fetch, leaving UI ≠ DB for that key until the next `refresh()`. Requires a failing write concurrent with a second edit — rare (settings writes are fast sqlite upserts), but the restore read is unguarded by any generation check. Fix-shape: only restore the failed key (`setSettings(prev => ({...prev, [key]: storedValue}))`) instead of a whole-object re-fetch.
+
+### N3. [Low] Failed suffix save: blur-retry is silently a no-op
+useSettings.ts:105-110 keeps the optimistic value in `presetSuffix` when `set_preset_suffix` rejects (unlike `updateSetting`, which restores stored truth). Consequence in the new commit pattern: `commitSuffix`'s guard `suffixDraft !== presetSuffix` (SettingsPage.tsx:93) now sees the unsaved value as "committed", so re-focusing and blurring the field does not retry the write — the user sees the error banner, but the only way to actually retry is to change the text. Fix-shape: restore `presetSuffix` to its pre-optimistic value in the catch (mirroring updateSetting), which also makes the draft-sync effect snap the input back to stored truth.
+
+### N4. [Low] Rapid preset switching: suffix/metadata responses lack a generation guard
+useSettings.ts:89-96 — on `key === "preset"`, `getPresetSuffix(value)` and `loadMetadata(value)` are fired per change with no request ordering. Two quick preset changes (A then B) can interleave so A's suffix/metadata resolve last, leaving `presetSuffix`/`presetMetadata` for A while `settings.preset` is B. The draft-sync effect then seeds `suffixDraft` with A's template, and a subsequent user commit writes A's template under preset B (`updatePresetSuffix` uses `settings.preset`, useSettings.ts:107). Same race class the useQueue fix addressed; pre-existing shape but worth the same counter treatment. Requires out-of-order resolution of two fast sqlite reads plus a user commit — hence Low.
+
+### N5. [Low] DropZone multi-folder confirm: stale-snapshot filter resurrects rows (pre-existing)
+DropZone.tsx:85-86 and 100-101 — `remaining` is computed from the render-time `pendingFolders` (`pendingFolders.filter((_, j) => j !== i)`), not a functional update. With two pending folders, clicking Add on both before the first `confirm_folder_add` resolves makes the second resolution's `setPendingFolders` restore the first (already-confirmed) row, and `remaining.length === 0` is never hit on that pass so `startQueue` is deferred until the resurrected row is dismissed again (re-clicking Add double-fires `confirm_folder_add`; backend dedupe via `already_queued` keeps it harmless data-wise). Not introduced by the B8 fix (the fix only added try/catch around this logic), but it survived it. Fix-shape: `setPendingFolders(prev => prev.filter(f => f.folder_path !== folder.folder_path))` and derive the empty check from the updater result.
+
+Not re-reported: round-1 Low/Nit items that were explicitly untracked by triage and remain as-is (App.tsx:16-22 uncaught `refreshHbStatus`, useHistory debounce/loadMore races, DropZone untracked status timers, updater-flow unlisten leak, HistoryPage clear-all semantics, index.html title/favicon). No new High/Medium/Critical issues found; no regressions in behavior covered by the fixes.
+
+## Summary
+
+All nine High/Medium round-1 frontend findings (B7 + B8) are genuinely fixed in current source, verified against the code rather than the triage checkboxes, including the Rust halves (DEFAULT_SUFFIX_TEMPLATE ownership with the queue.rs read-path fallback, `get_pause_after_current`, `resolve_suffix_template` command reusing the real resolver). The fixes are clean: the draft/commit pattern has no stale closures or double-commit paths, the monotonic counter is correctly ordered (increment at issue time, compare at resolve time), the optimistic merge coerces booleans properly and removed the revert vector entirely, and every changed invoke matches its Rust signature (now also enforced by the new ipc-contract test). Five new findings, all Low, all edge-case races in the same family the fixes targeted — unguarded in-flight responses (N1, N2, N4), an error-path asymmetry between the two optimistic updaters (N3), and one pre-existing stale-snapshot state update that survived the fix (N5).
+
+## Recommendations
+
+1. (Low) Extract the useQueue request-counter pattern into a tiny `useLatest`-style helper and apply it to the three unguarded async response sites: suffix-preview resolve (N1), preset-change suffix/metadata loads (N4), and — if ever touched again — the updateSetting failure restore (N2, or switch it to a single-key restore).
+2. (Low) Make `updatePresetSuffix` symmetric with `updateSetting` on failure: restore the pre-optimistic value so the commit guard permits a blur-retry (N3).
+3. (Low) Convert DropZone's pending-folder removals to functional updates keyed by `folder_path` (N5).
+4. None of the above blocks anything; they are polish on an otherwise solid batch.
