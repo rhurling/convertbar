@@ -162,6 +162,34 @@ Test-first; each behavior change proven fail-capable by neutering the fix.
 cross-platform-reviewer clean; full Rust suite green; `cargo fmt --check` clean;
 no new clippy warnings.
 
+### R7 — queue-watch design items (branch `fix/watch-lifecycle-lows`)
+Four rust-queue-watch Lows, each a design call taken with the user via
+AskUserQuestion and recorded in [DECISIONS.md](../DECISIONS.md) (D11–D14).
+Test-first; each behavior change proven fail-capable by neutering.
+- [x] **D11 (R7.1) — canonicalization backfill.** New init_db migration
+  `backfill_canonical_watch_paths`: rewrites each pre-fix watched_directories
+  row to its canonical (dunce) path, dropping a row that would collide with an
+  existing canonical one (UNIQUE(path)). Idempotent; non-existent paths pass
+  through unchanged. Closes the duplicate-watcher gap on re-add.
+- [x] **D12 (R7.2) — nested-watch purge overreach.** Replaced
+  `removed_watch_roots` + `purge_pending_under` (drop everything under a removed
+  root) with `purge_pending_uncovered` (retain any pending entry a *desired*
+  config still covers, via `delay_for_path`). A file under a still-active nested
+  watch survives removal of its enclosing watch; also subsumes the old mode-flip
+  special-case.
+- [x] **D13 (R7.3) — uncancellable in-flight scans.** `enqueue_and_start` now
+  runs `filter_watched` (pure core `covered_paths`) first: a background scan
+  whose watch was removed mid-scan enqueues nothing from that folder, and the
+  reaper is hardened against the same-tick remove/stabilize race. Config re-check
+  at the single chokepoint; safe because reconcile populates configs before any
+  scan runs.
+- [x] **D14 (R7.4) — by-name preset repair breadth.** Left as-is by decision:
+  a same-named custom preset can't be reliably told from the seeded bad default
+  at init; self-limiting. No code change.
+
+sqlite-migration-reviewer + cross-platform-reviewer clean; full Rust suite green;
+`cargo fmt --check` clean; no new clippy warnings.
+
 ## Outcome (2026-07-08)
 
 All batches merged: reports+triage **#75**, R1 **#76**, R3 **#77** (grew two
