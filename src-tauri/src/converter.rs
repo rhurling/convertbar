@@ -366,8 +366,8 @@ fn empty_output_error_message(tail: &str) -> String {
 
 /// Record a failed job: status + error_message in the DB, the two frontend events,
 /// and the per-file notification. Shared by every failure path in process_queue.
-fn record_job_error(
-    app: &AppHandle,
+fn record_job_error<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     db: &Arc<Mutex<Connection>>,
     job_id: &str,
     file_name: &str,
@@ -430,7 +430,11 @@ fn final_run_status(had_errors: bool) -> &'static str {
 
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
-fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &ConverterState) {
+fn process_queue<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    db: &Arc<Mutex<Connection>>,
+    converter: &ConverterState,
+) {
     let mut had_errors = false;
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
@@ -441,7 +445,7 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
             return;
         }
         let job;
-        let handbrake_path;
+        let handbrake_path_opt;
         let cleanup_mode;
         {
             let db = db.lock().unwrap();
@@ -449,30 +453,33 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                 Some(j) => j,
                 None => break,
             };
-            handbrake_path = match get_handbrake_path(&db) {
-                Some(p) => p,
-                None => {
-                    let _ = db.execute(
-                        "UPDATE jobs SET status = 'error', error_message = 'HandBrakeCLI not found', completed_at = ?2 WHERE id = ?1",
-                        params![job.id, chrono::Utc::now().to_rfc3339()],
-                    );
-                    let _ = app.emit(
-                        "job-error",
-                        serde_json::json!({
-                            "job_id": job.id,
-                            "error": "HandBrakeCLI not found"
-                        }),
-                    );
-                    continue;
-                }
-            };
+            handbrake_path_opt = get_handbrake_path(&db);
             cleanup_mode = get_cleanup_mode(&db);
 
-            let _ = db.execute(
-                "UPDATE jobs SET status = 'encoding' WHERE id = ?1",
-                params![job.id],
-            );
+            if handbrake_path_opt.is_some() {
+                let _ = db.execute(
+                    "UPDATE jobs SET status = 'encoding' WHERE id = ?1",
+                    params![job.id],
+                );
+            }
         }
+
+        let file_name = std::path::Path::new(&job.source_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Outside the db-lock scope: record_job_error takes the lock itself, and this
+        // failure must count toward had_errors and emit the same events as any other.
+        let handbrake_path = match handbrake_path_opt {
+            Some(p) => p,
+            None => {
+                had_errors = true;
+                record_job_error(app, db, &job.id, &file_name, "HandBrakeCLI not found");
+                continue;
+            }
+        };
 
         *converter.current_job_id.lock().unwrap() = Some(job.id.clone());
         *converter.is_paused.lock().unwrap() = false;
@@ -484,12 +491,6 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
                 "status": "encoding"
             }),
         );
-
-        let file_name = std::path::Path::new(&job.source_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
 
         // Count remaining queued jobs for tray info
         let queue_count: usize = {
@@ -541,20 +542,13 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
-                let _ = db.lock().unwrap().execute(
-                    "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3 WHERE id = ?1",
-                    params![
-                        job.id,
-                        format!("Failed to start HandBrakeCLI: {}", e),
-                        chrono::Utc::now().to_rfc3339()
-                    ],
-                );
-                let _ = app.emit(
-                    "job-error",
-                    serde_json::json!({
-                        "job_id": job.id,
-                        "error": format!("Failed to start HandBrakeCLI: {}", e)
-                    }),
+                had_errors = true;
+                record_job_error(
+                    app,
+                    db,
+                    &job.id,
+                    &file_name,
+                    &format!("Failed to start HandBrakeCLI: {}", e),
                 );
                 *converter.current_job_id.lock().unwrap() = None;
                 continue;
@@ -917,7 +911,11 @@ fn process_queue(app: &AppHandle, db: &Arc<Mutex<Connection>>, converter: &Conve
 
 /// Starts queue processing in a new background thread.
 /// Sets `is_running` to true atomically before spawning.
-pub fn run_queue(app: AppHandle, db: Arc<Mutex<Connection>>, converter: Arc<ConverterState>) {
+pub fn run_queue<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    db: Arc<Mutex<Connection>>,
+    converter: Arc<ConverterState>,
+) {
     {
         let mut running = converter.is_running.lock().unwrap();
         if *running {
@@ -976,6 +974,267 @@ fn format_bytes_short(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauri::Listener;
+
+    // --- process_queue integration harness (mock runtime, in-memory DB) ---
+
+    fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+    }
+
+    fn test_db() -> Arc<Mutex<Connection>> {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        // Notifications route through the notification plugin, which isn't
+        // registered on the mock app — disable them so process_queue skips it.
+        conn.execute(
+            "UPDATE settings SET value = 'false'
+             WHERE key IN ('notifications_per_file', 'notifications_queue_done')",
+            [],
+        )
+        .unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn set_setting(db: &Arc<Mutex<Connection>>, key: &str, value: &str) {
+        db.lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .unwrap();
+    }
+
+    fn queue_job(db: &Arc<Mutex<Connection>>, id: &str, source: &str, output: &str, size: i64) {
+        db.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status,
+                                   original_size, queue_order, created_at)
+                 VALUES (?1, ?2, ?3,
+                         (SELECT value FROM settings WHERE key = 'preset'),
+                         'queued', ?4, 0, '2020-01-01T00:00:00Z')",
+                params![id, source, output, size],
+            )
+            .unwrap();
+    }
+
+    fn job_row(db: &Arc<Mutex<Connection>>, id: &str) -> (String, Option<String>) {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, error_message FROM jobs WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn record_events(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        name: &str,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let sink = store.clone();
+        app.listen_any(name.to_string(), move |event| {
+            sink.lock().unwrap().push(event.payload().to_string());
+        });
+        store
+    }
+
+    #[test]
+    fn spawn_failure_surfaces_like_every_other_error() {
+        // A configured handbrake_path that exists but is not executable makes
+        // Command::spawn fail. That branch must behave like all other failures:
+        // job-status-changed fires (so the UI row updates) and the run ends with
+        // the tray in "error", not a clean "idle" that hides every job failing.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("not-a-binary.txt");
+        std::fs::write(&fake, "plain text").unwrap();
+        set_setting(&db, "handbrake_path", fake.to_str().unwrap());
+        queue_job(&db, "j1", "/nowhere/in.mp4", "/nowhere/out.mp4", 1000);
+
+        let status_events = record_events(&app, "job-status-changed");
+        let menubar_events = record_events(&app, "menu-bar-update");
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(status, "error");
+        assert!(msg.unwrap().contains("Failed to start HandBrakeCLI"));
+        assert!(
+            status_events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("\"error\"")),
+            "spawn failure must emit job-status-changed like other failure paths"
+        );
+        let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            final_update.contains("\"error\""),
+            "a run where the only job failed must end 'error', got: {final_update}"
+        );
+    }
+
+    // A stand-in for HandBrakeCLI that logs to stderr, writes no output, and exits 0 —
+    // the "successful" run that produces nothing, which D3 defines as a failure.
+    fn fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb.cmd");
+            std::fs::write(&p, "@echo boom 1>&2\r\n@exit /b 0\r\n").unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("hb.sh");
+            std::fs::write(&p, "#!/bin/sh\necho boom >&2\nexit 0\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    #[test]
+    fn zero_byte_output_fails_with_diagnostics_and_the_queue_continues() {
+        // Exit 0 with an empty/missing output must record an error carrying the
+        // stderr tail (not a bare fixed string), and must not abort the run — the
+        // next queued job still gets processed.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let out1 = dir.path().join("out1.mp4");
+        let out2 = dir.path().join("out2.mp4");
+        queue_job(&db, "j1", "/nowhere/a.mp4", out1.to_str().unwrap(), 1000);
+        queue_job(&db, "j2", "/nowhere/b.mp4", out2.to_str().unwrap(), 1000);
+
+        let menubar_events = record_events(&app, "menu-bar-update");
+
+        process_queue(app.handle(), &db, &converter);
+
+        for id in ["j1", "j2"] {
+            let (status, msg) = job_row(&db, id);
+            assert_eq!(status, "error", "{id} must fail, exit 0 notwithstanding");
+            let msg = msg.unwrap();
+            assert!(
+                msg.starts_with("Conversion produced an empty output file"),
+                "{id}: {msg}"
+            );
+            assert!(
+                msg.contains("boom"),
+                "{id} must keep the stderr diagnostic, got: {msg}"
+            );
+        }
+        assert!(
+            !out1.exists() && !out2.exists(),
+            "empty outputs are removed"
+        );
+        let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
+        assert!(final_update.contains("\"error\""));
+    }
+
+    // End-to-end (local/e2e-ignored CI only): needs ffmpeg to synthesize a clip and a
+    // real HandBrakeCLI on PATH. The only test driving process_queue's full DB state
+    // machine queued → encoding → done with a real encode. Run with:
+    //   cargo test -- --ignored process_queue_drives_a_real_encode
+    #[test]
+    #[ignore]
+    fn process_queue_drives_a_real_encode_from_queued_to_done() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+        // 'delete' keeps the cleanup assertion filesystem-local (no Trash involved).
+        set_setting(&db, "cleanup_mode", "delete");
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.mp4");
+        // Lossless H.264 so the source is large enough that the H.265 re-encode wins,
+        // making the terminal state deterministically 'done' (not 'skipped').
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=1280x720:rate=25",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-qp",
+                "0",
+            ])
+            .arg(&source)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        assert!(ok, "ffmpeg failed to synthesize the source clip");
+        let original_size = std::fs::metadata(&source).map(|m| m.len() as i64).unwrap();
+
+        let output = dir.path().join("out.mkv");
+        queue_job(
+            &db,
+            "j1",
+            source.to_str().unwrap(),
+            output.to_str().unwrap(),
+            original_size,
+        );
+
+        let status_events = record_events(&app, "job-status-changed");
+
+        process_queue(app.handle(), &db, &converter);
+
+        // The UI saw the full transition, not just the terminal state.
+        let events = status_events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|p| p.contains("\"encoding\"")),
+            "missing encoding transition: {events:?}"
+        );
+        assert!(
+            events.last().unwrap().contains("\"done\""),
+            "missing done transition: {events:?}"
+        );
+
+        let (status, completed_at, converted_size, kept_file, space_saved) = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, completed_at, converted_size, kept_file, space_saved
+                 FROM jobs WHERE id = 'j1'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(status, "done");
+        assert!(completed_at.is_some(), "done must set completed_at");
+        let converted_size = converted_size.unwrap();
+        assert!(converted_size > 0 && converted_size < original_size);
+        assert_eq!(kept_file.as_deref(), Some("converted"));
+        assert_eq!(space_saved, Some(original_size - converted_size));
+        // Cleanup ran: converted kept on disk, original deleted (mode 'delete').
+        assert!(output.exists());
+        assert!(!source.exists());
+    }
 
     #[test]
     fn take_pause_after_current_consumes_the_flag_exactly_once() {

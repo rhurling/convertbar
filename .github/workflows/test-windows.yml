@@ -31,4 +31,10 @@ jobs:
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "./src-tauri -> target"
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      # --lib + RUSTFLAGS: the mock-runtime tests need a Common-Controls v6 manifest or
+      # the test exe dies at load (STATUS_ENTRYPOINT_NOT_FOUND, tauri-apps/tauri#11028).
+      # --lib keeps the app binary out of this cargo invocation, which would otherwise
+      # get a second manifest on top of tauri-build's. All tests live in the lib.
+      - run: cargo test --lib --manifest-path src-tauri/Cargo.toml
+        env:
+          RUSTFLAGS: -Clink-arg=/MANIFEST:EMBED -Clink-arg=/MANIFESTINPUT:${{ github.workspace }}\src-tauri\windows-test-manifest.xml

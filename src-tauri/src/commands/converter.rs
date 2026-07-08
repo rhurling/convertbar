@@ -194,8 +194,8 @@ pub fn resume_conversion(
 }
 
 #[tauri::command]
-pub fn cancel_conversion(
-    app: AppHandle,
+pub fn cancel_conversion<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     converter_state: State<'_, Arc<ConverterState>>,
 ) -> Result<(), String> {
@@ -355,4 +355,88 @@ pub fn get_platform_capabilities() -> PlatformCapabilities {
 #[tauri::command]
 pub fn quit_app(app: AppHandle) {
     app.exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+    use std::sync::Mutex;
+    use tauri::Manager;
+
+    // Regression test for the cancel ordering contract: kill → reap (wait) → delete
+    // the partial output. On Windows the dying process holds the output file handle
+    // until it is reaped, so deleting before the wait silently leaves the partial
+    // behind. A reorder passes on Unix regardless — the assertion with teeth runs in
+    // the advisory windows CI job (test-windows.yml); on Unix the test still pins
+    // the DB write, the handle clearing, and that the delete happens at all.
+    #[test]
+    fn cancel_reaps_the_child_before_deleting_the_partial_output() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.mp4");
+        let output = dir.path().join("out.mp4");
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j1', ?1, ?2, 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            params![source.to_str().unwrap(), output.to_str().unwrap()],
+        )
+        .unwrap();
+        app.manage(crate::AppState {
+            db: Arc::new(Mutex::new(conn)),
+            preset_cache: Mutex::new(Default::default()),
+        });
+
+        // Stand-in for the active encode: a long-running child whose stdout IS the
+        // partial output file, so it holds the handle exactly like HandBrakeCLI.
+        let out_handle = std::fs::File::create(&output).unwrap();
+        #[cfg(windows)]
+        let child = std::process::Command::new("ping")
+            .args(["-n", "31", "127.0.0.1"])
+            .stdout(out_handle)
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(out_handle)
+            .spawn()
+            .unwrap();
+
+        let converter = Arc::new(ConverterState::new());
+        *converter.current_pid.lock().unwrap() = Some(child.id());
+        *converter.current_child.lock().unwrap() = Some(child);
+        *converter.current_job_id.lock().unwrap() = Some("j1".into());
+        app.manage(converter.clone());
+
+        cancel_conversion(app.handle().clone(), app.state(), app.state()).unwrap();
+
+        assert!(
+            !output.exists(),
+            "partial output must be gone — on Windows this fails if the delete runs before the child is reaped"
+        );
+        let state: State<'_, AppState> = app.state();
+        let (status, msg): (String, Option<String>) = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, error_message FROM jobs WHERE id = 'j1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "error");
+        assert_eq!(msg.as_deref(), Some("Cancelled by user"));
+        assert!(
+            converter.current_child.lock().unwrap().is_none(),
+            "the reaped handle must be cleared so the queue loop takes its cancel branch"
+        );
+    }
 }

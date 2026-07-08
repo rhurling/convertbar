@@ -43,4 +43,6 @@ tauri-plugin-window-state = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# Enables tauri::test (MockRuntime) for the process_queue / cancel integration tests.
+tauri = { version = "2", features = ["test"] }
 
