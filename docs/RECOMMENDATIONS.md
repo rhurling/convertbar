@@ -1,4 +1,4 @@
-# ConvertBar — Improvement Recommendations (v0.6.0)
+# ConvertBar — Improvement Recommendations (written at v0.6.0; statuses refreshed 2026-07-08)
 
 ## Current State Summary
 
@@ -108,9 +108,10 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 - "Browse" button next to the HandBrakeCLI path field
 - Opens native macOS file picker filtered to executables
 
-**How:** Use `tauri-plugin-dialog` for native file selection.
+**How:** Use `tauri-plugin-dialog` for native file selection (the plugin is already
+registered in `src-tauri/src/lib.rs` — only the button and a dialog invocation are missing).
 
-**Files:** `src-tauri/Cargo.toml` (add plugin), `src/pages/SettingsPage.tsx` (browse button)
+**Files:** `src/pages/SettingsPage.tsx` (browse button)
 
 ---
 
@@ -149,8 +150,8 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 | Spec Requirement | Status | Gap |
 |---|---|---|
 | US3: Queue drag reordering | **Done** (v0.6.0) | — |
-| US1: Skipped files notification | Missing | Silent skip, no user feedback |
-| US2: Error state icon in menu bar | Missing | No `!` indicator on error |
+| US1: Skipped files notification | **Done** | Skips reported via `SkipReason` / `summarizeAdds` feedback |
+| US2: Error state icon in menu bar | **Done** | Tray error state flag shared with menu-bar status |
 | Notifications on completion | **Done** (v0.5.0) | — |
 | Global hotkey for popover | Missing | Not implemented |
 | Launch at login | **Done** | `tauri-plugin-autostart` registered and wired to the setting (`src-tauri/src/lib.rs`) |

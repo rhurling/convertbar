@@ -13,10 +13,10 @@ ConvertBar deliberately uses per-call permissions (no `:default` bundles), so ea
 
 1. Read `src-tauri/capabilities/default.json` and list every granted permission.
 2. Find all frontend Tauri API usage across `src/` (especially `src/lib/tauri.ts`, hooks, and pages). Look for:
-   - `invoke("...")` core commands
+   - `invoke("...")` calls — but note that app-defined `#[tauri::command]` functions are ACL-exempt: only `core:`/`plugin:` APIs need a grant, so a plain app-command invoke is never MISSING
    - `@tauri-apps/api/*` imports and calls (event `emit`/`listen`/`unlisten`, `window` ops, `app` version, etc.)
-   - `@tauri-apps/plugin-*` imports and calls (updater, process, autostart, window-state)
-3. Map each call to the permission it requires (e.g. `listen` → `core:event:allow-listen`, `relaunch`/`restart` → `process:allow-restart`, `enable` → `autostart:allow-enable`, `check` → `updater:allow-check`).
+   - `@tauri-apps/plugin-*` imports and calls (currently only updater and process — autostart, window-state, dialog, and notification are Rust-side only and need no grants)
+3. Map each call to the permission it requires (e.g. `listen` → `core:event:allow-listen`, `relaunch`/`restart` → `process:allow-restart`, `check` → `updater:allow-check`).
 4. Report:
    - **Missing** — calls with no matching permission (runtime failure risk). Highest priority.
    - **Unused** — granted permissions with no corresponding frontend call (removal candidates).

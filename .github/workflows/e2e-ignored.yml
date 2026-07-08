@@ -1,10 +1,12 @@
 name: e2e-ignored
 
-# The two #[ignore]d end-to-end tests (probe.rs, commands/queue.rs) need a real
-# HandBrakeCLI + ffmpeg, so the PR/main `test` workflow never runs them and nothing
+# The #[ignore]d end-to-end tests (probe.rs, commands/queue.rs, converter.rs) need a
+# real HandBrakeCLI + ffmpeg, so the PR/main `test` workflow never runs them and nothing
 # enforces they still pass against reality. This job installs both encoders and runs
 # `cargo test -- --ignored` weekly and on every push to main, surfacing e2e breakage
 # near the change instead of at release time. It is not a required PR check.
+# Note: GitHub auto-disables cron schedules after ~60 days without repo activity (email
+# notice only). Pushes keep it alive; on a dormant repo re-enable it in the Actions tab.
 on:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
