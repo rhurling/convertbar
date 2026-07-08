@@ -10,6 +10,11 @@ set -u
 d="${CLAUDE_PROJECT_DIR:-.}"
 command -v jq >/dev/null 2>&1 || exit 0
 
+# Loop guard: when this Stop was already blocked once, let it through.
+if jq -e '.stop_hook_active == true' >/dev/null 2>&1 <<<"$(cat 2>/dev/null || true)"; then
+  exit 0
+fi
+
 tv=$(jq -r '.version // empty' "$d/src-tauri/tauri.conf.json" 2>/dev/null)
 pv=$(jq -r '.version // empty' "$d/package.json" 2>/dev/null)
 cv=$(grep -m1 -E '^version *=' "$d/src-tauri/Cargo.toml" 2>/dev/null | sed -E 's/.*"([^"]*)".*/\1/')
