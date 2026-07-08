@@ -162,7 +162,7 @@ Test-first; each behavior change proven fail-capable by neutering the fix.
 cross-platform-reviewer clean; full Rust suite green; `cargo fmt --check` clean;
 no new clippy warnings.
 
-### R7 — queue-watch design items (branch `fix/watch-lifecycle-lows`)
+### R7 — queue-watch design items (branch `fix/watch-lifecycle-lows`, PR #83)
 Four rust-queue-watch Lows, each a design call taken with the user via
 AskUserQuestion and recorded in [DECISIONS.md](../DECISIONS.md) (D11–D14).
 Test-first; each behavior change proven fail-capable by neutering.
