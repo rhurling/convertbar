@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { commands, FolderScanResult, AddResult } from "../lib/tauri";
 import { summarizeAdds } from "../lib/addSummary";
@@ -11,6 +11,15 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [pendingFolders, setPendingFolders] = useState<FolderScanResult[]>([]);
+
+  // Authoritative copy updated synchronously so concurrent confirm/skip handlers each filter
+  // from the latest list, not their render-time snapshot — otherwise a slow-resolving handler
+  // restores an already-removed folder and the "last one → startQueue" check never fires.
+  const pendingRef = useRef<FolderScanResult[]>([]);
+  const setPending = useCallback((next: FolderScanResult[]) => {
+    pendingRef.current = next;
+    setPendingFolders(next);
+  }, []);
 
   const handlePaths = useCallback(
     async (paths: string[]) => {
@@ -34,7 +43,7 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
         }
 
         if (toConfirm.length > 0) {
-          setPendingFolders(toConfirm);
+          setPending(toConfirm);
           setStatus(summarizeAdds(results));
         } else {
           await commands.startQueue();
@@ -48,7 +57,7 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
         setTimeout(() => setStatus(null), 3000);
       }
     },
-    [onFilesAdded],
+    [onFilesAdded, setPending],
   );
 
   useEffect(() => {
@@ -75,15 +84,17 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
         <span className="drop-zone-status">{status}</span>
       ) : pendingFolders.length > 0 ? (
         <div className="folder-confirm">
-          {pendingFolders.map((folder, i) => (
+          {pendingFolders.map((folder) => (
             <div key={folder.folder_path} className="folder-confirm-item">
               <span>Add {folder.file_count} files from &quot;{folder.folder_name}&quot;?</span>
               <div className="folder-confirm-actions">
                 <button className="btn btn-small" onClick={async () => {
                   try {
                     const res = await commands.confirmFolderAdd(folder.folder_path);
-                    const remaining = pendingFolders.filter((_, j) => j !== i);
-                    setPendingFolders(remaining);
+                    const remaining = pendingRef.current.filter(
+                      (f) => f.folder_path !== folder.folder_path,
+                    );
+                    setPending(remaining);
                     if (remaining.length === 0) {
                       await commands.startQueue();
                       onFilesAdded();
@@ -97,8 +108,10 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
                   }
                 }}>Add</button>
                 <button className="btn btn-small btn-dim" onClick={() => {
-                  const remaining = pendingFolders.filter((_, j) => j !== i);
-                  setPendingFolders(remaining);
+                  const remaining = pendingRef.current.filter(
+                    (f) => f.folder_path !== folder.folder_path,
+                  );
+                  setPending(remaining);
                   if (remaining.length === 0) {
                     commands.startQueue();
                     onFilesAdded();

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -142,5 +142,61 @@ describe("SettingsPage", () => {
     await waitFor(() =>
       expect(screen.getByText("vacation.RESOLVED.mp4")).toBeInTheDocument(),
     );
+  });
+
+  it("ignores a stale suffix-preview resolve that lands after a newer edit", async () => {
+    // N1: the debounce cancels the pending *timer*, but an already-fired resolve invoke is
+    // not generation-checked — a slow older resolve must not overwrite a newer draft's preview.
+    const resolvers: Array<{ template: string; resolve: (v: string) => void }> = [];
+    invokeMock.mockImplementation(((cmd: string, args?: { template?: string }) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return new Promise<string>((resolve) =>
+            resolvers.push({ template: args!.template!, resolve }),
+          );
+        case "set_preset_suffix":
+          return Promise.resolve(undefined);
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const input = await screen.findByPlaceholderText(".{resolution}-{codec}");
+
+    // Settle the initial debounced preview so its resolve can't confuse the assertions.
+    await waitFor(() =>
+      expect(resolvers.some((r) => r.template === ".{resolution}-{codec}")).toBe(true),
+    );
+    await act(async () => {
+      resolvers.find((r) => r.template === ".{resolution}-{codec}")!.resolve(".INITIAL");
+    });
+    await screen.findByText("vacation.INITIAL.mp4");
+
+    // Edit to A, let its debounced resolve fire (left pending).
+    fireEvent.change(input, { target: { value: ".AAA" } });
+    await waitFor(() => expect(resolvers.some((r) => r.template === ".AAA")).toBe(true));
+    // Edit to B, let its debounced resolve fire (left pending).
+    fireEvent.change(input, { target: { value: ".BBB" } });
+    await waitFor(() => expect(resolvers.some((r) => r.template === ".BBB")).toBe(true));
+
+    // Newer (B) resolves first, older (A) resolves late — A must not clobber the preview.
+    await act(async () => {
+      resolvers.find((r) => r.template === ".BBB")!.resolve(".RESOLVED_B");
+    });
+    await act(async () => {
+      resolvers.find((r) => r.template === ".AAA")!.resolve(".RESOLVED_A");
+    });
+
+    expect(screen.getByText("vacation.RESOLVED_B.mp4")).toBeInTheDocument();
+    expect(screen.queryByText("vacation.RESOLVED_A.mp4")).not.toBeInTheDocument();
   });
 });
