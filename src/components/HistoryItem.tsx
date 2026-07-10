@@ -47,7 +47,9 @@ export default function HistoryItem({ job }: HistoryItemProps) {
         </div>
       )}
       {isError && job.error_message && (
-        <div className="history-item-error-msg">{job.error_message}</div>
+        <div className="history-item-error-msg" title={job.error_message}>
+          {job.error_message}
+        </div>
       )}
     </div>
   );

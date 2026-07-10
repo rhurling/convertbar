@@ -343,15 +343,77 @@ fn read_bounded_tail(mut reader: impl Read) -> String {
 
 const ERROR_TAIL_LINES: usize = 20;
 
+/// Substrings that mark a line as the actual failure reason. HandBrake opens its
+/// stderr with a build banner and host-info preamble (none of which match these), so
+/// the first hit is the diagnostic rather than the noise above it.
+const DIAGNOSTIC_MARKERS: [&str; 18] = [
+    "error",
+    "failed",
+    "fatal",
+    "aborted",
+    "not found",
+    "no such file",
+    "no title",
+    "unrecognized",
+    "unsupported",
+    "invalid",
+    "corrupt",
+    "no space",
+    "read-only",
+    "permission denied",
+    "not permitted",
+    "cannot",
+    "could not",
+    "unable",
+];
+
+/// The first line that reads like a failure reason, or None if nothing stands out.
+fn diagnostic_headline<'a>(lines: &[&'a str]) -> Option<&'a str> {
+    lines.iter().copied().find(|line| {
+        let lower = line.to_lowercase();
+        DIAGNOSTIC_MARKERS.iter().any(|m| lower.contains(m))
+    })
+}
+
 /// A failure prefix plus the informative end of HandBrake's stderr, so the history
-/// entry says WHY the encode failed instead of just that it did.
+/// entry says WHY the encode failed instead of just that it did. The diagnostic line
+/// is promoted to the headline because the UI truncates the entry to a single line —
+/// leading with HandBrake's build banner would bury the reason (see the "Compile-time
+/// hardening features are enabled" false alarm).
 fn message_with_tail(prefix: &str, tail: &str) -> String {
     let lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
         return prefix.to_string();
     }
     let start = lines.len().saturating_sub(ERROR_TAIL_LINES);
-    format!("{}:\n{}", prefix, lines[start..].join("\n"))
+    let tail_block = lines[start..].join("\n");
+    match diagnostic_headline(&lines) {
+        Some(headline) => format!("{prefix}: {headline}\n{tail_block}"),
+        None => format!("{prefix}:\n{tail_block}"),
+    }
+}
+
+/// The bare failure prefixes written before the diagnostic headline was promoted. A
+/// stored message whose first line is exactly one of these predates the change and
+/// still leads with HandBrake's banner. Kept in sync with the `message_with_tail`
+/// callers below.
+const LEGACY_ERROR_PREFIXES: [&str; 2] = [
+    "Conversion failed:",
+    "Conversion produced an empty output file:",
+];
+
+/// Rewrite a previously-stored error message so its first line is the failure reason
+/// instead of HandBrake's build banner. Returns None when the message is already
+/// headlined, isn't one of our messages, or has no recognizable diagnostic — which
+/// makes the backfill that calls this idempotent (a rewritten first line no longer
+/// matches a legacy prefix).
+pub(crate) fn promote_stored_diagnostic(message: &str) -> Option<String> {
+    let (first_line, body) = message.split_once('\n')?;
+    if !LEGACY_ERROR_PREFIXES.contains(&first_line) {
+        return None;
+    }
+    let headline = diagnostic_headline(&body.lines().collect::<Vec<_>>())?;
+    Some(format!("{first_line} {headline}\n{body}"))
 }
 
 fn error_message_from_tail(tail: &str) -> String {
@@ -1426,6 +1488,131 @@ mod tests {
         assert!(
             !msg.contains("line 10\n") && msg.contains("line 11") && msg.ends_with("line 30"),
             "only the last {ERROR_TAIL_LINES} non-empty lines belong in the history entry"
+        );
+    }
+
+    #[test]
+    fn error_message_from_tail_leads_with_the_diagnostic_not_the_banner() {
+        // Real HandBrake stderr opens with a benign build banner and host-info preamble;
+        // the line that says WHY the encode failed sits several lines down. The history
+        // entry is shown truncated to a single line in the UI, so its first line must be
+        // the diagnostic — otherwise the user only ever sees "Compile-time hardening…".
+        let tail = "\
+[22:35:20] Compile-time hardening features are enabled
+[22:35:20] hb_init: starting libhb thread
+HandBrake 1.11.2 (2026060700) - Darwin arm64 - https://handbrake.fr
+10 CPUs detected
+Opening /movies/clip.mp4...
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0x0] moov atom not found
+[22:35:21] scan: unrecognized file type
+No title found.
+HandBrake has exited.";
+        let msg = error_message_from_tail(tail);
+        let headline = msg.lines().next().unwrap();
+        assert!(
+            headline.contains("moov atom not found"),
+            "the first line must surface the root-cause diagnostic, got: {headline:?}"
+        );
+        assert!(
+            !headline.to_lowercase().contains("hardening"),
+            "the benign build banner must never be the headline, got: {headline:?}"
+        );
+        // The full tail is still retained below the headline for detail.
+        assert!(msg.contains("No title found."));
+    }
+
+    #[test]
+    fn error_message_from_tail_surfaces_common_handbrake_failures() {
+        // Each of these is a real HandBrakeCLI / libav / OS failure reason that can sit
+        // below the build banner. The headline must be the reason, whatever form it takes.
+        let cases = [
+            (
+                "[libavformat] Unsupported color space",
+                "Unsupported color space",
+            ),
+            (
+                "Error opening output: Read-only file system",
+                "Read-only file system",
+            ),
+            (
+                "Failed to create /out/x.mp4: Operation not permitted",
+                "Operation not permitted",
+            ),
+            (
+                "Opening /gone.mp4: No such file or directory",
+                "No such file or directory",
+            ),
+            ("[22:00:00] sync: track failed, encode aborted", "aborted"),
+            ("mp4 muxer: fatal: could not write header", "fatal"),
+            ("[matroska] corrupt input near sample 42", "corrupt"),
+        ];
+        for (error_line, expected) in cases {
+            let tail = format!(
+                "[00:00:00] Compile-time hardening features are enabled\n\
+                 HandBrake 1.11.2 - Darwin arm64\n\
+                 10 CPUs detected\n\
+                 {error_line}\n\
+                 HandBrake has exited.",
+            );
+            let headline = error_message_from_tail(&tail)
+                .lines()
+                .next()
+                .unwrap()
+                .to_string();
+            assert!(
+                headline.contains(expected),
+                "headline should surface {expected:?}, got: {headline:?}"
+            );
+            assert!(
+                !headline.to_lowercase().contains("hardening"),
+                "the build banner must never win, got: {headline:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn promote_stored_diagnostic_rewrites_old_banner_first_messages() {
+        let old = "Conversion failed:\n\
+                   [00:00:00] Compile-time hardening features are enabled\n\
+                   [mov] moov atom not found\n\
+                   No title found.";
+        let promoted =
+            promote_stored_diagnostic(old).expect("a banner-first legacy row should be rewritten");
+        assert_eq!(
+            promoted.lines().next().unwrap(),
+            "Conversion failed: [mov] moov atom not found"
+        );
+        assert!(promoted.contains("No title found."), "detail is preserved");
+        // Idempotent: a second pass over the rewritten message is a no-op.
+        assert_eq!(promote_stored_diagnostic(&promoted), None);
+    }
+
+    #[test]
+    fn promote_stored_diagnostic_leaves_foreign_messages_untouched() {
+        // Already headlined (space after the prefix, not a bare "prefix:").
+        assert_eq!(
+            promote_stored_diagnostic(
+                "Conversion failed: moov atom not found\nmoov atom not found"
+            ),
+            None
+        );
+        // Single-line generic fallback with no tail to promote from.
+        assert_eq!(promote_stored_diagnostic("Conversion failed"), None);
+        // Legacy shape but nothing diagnostic in the body — leave it rather than promote noise.
+        assert_eq!(
+            promote_stored_diagnostic("Conversion failed:\nScanning title 1\nOpening file"),
+            None
+        );
+        // The empty-output prefix is handled too.
+        assert_eq!(
+            promote_stored_diagnostic(
+                "Conversion produced an empty output file:\nbanner\nNo space left on device"
+            )
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+            "Conversion produced an empty output file: No space left on device"
         );
     }
 
