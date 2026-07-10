@@ -123,6 +123,27 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Backfill: error rows written before the diagnostic headline was promoted lead with
+    // HandBrake's build banner ("Compile-time hardening features are enabled"), which is
+    // all the single-line history UI shows. Re-promote the real failure reason so old
+    // failures read as clearly as new ones. Idempotent — promote_stored_diagnostic returns
+    // None once a row is already headlined (or has no diagnostic to surface).
+    let legacy_errors: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, error_message FROM jobs WHERE status = 'error' AND error_message IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<Result<Vec<_>>>()?
+    };
+    for (id, message) in legacy_errors {
+        if let Some(promoted) = crate::converter::promote_stored_diagnostic(&message) {
+            conn.execute(
+                "UPDATE jobs SET error_message = ?2 WHERE id = ?1",
+                params![id, promoted],
+            )?;
+        }
+    }
+
     // Older DBs predate the source-identity fingerprint columns. A fresh DB already has them
     // from CREATE TABLE, so "duplicate column name" is expected and ignored — this keeps the
     // upgrade idempotent. Any other ALTER failure is re-raised so a real error is not masked.
@@ -568,6 +589,61 @@ mod tests {
         assert_eq!(completed("e1").as_deref(), Some("2020-01-01T00:00:00Z"));
         assert_eq!(completed("e2").as_deref(), Some("2020-03-01T00:00:00Z"));
         assert_eq!(completed("q1"), None);
+    }
+
+    #[test]
+    fn init_db_promotes_legacy_banner_first_error_messages() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let insert_error = |id: &str, msg: &str| {
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, error_message, queue_order, created_at, completed_at)
+                 VALUES (?1, '/s.mp4', '/o.mp4', 'p', 'error', ?2, 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+                params![id, msg],
+            )
+            .unwrap();
+        };
+
+        // Legacy row: HandBrake's benign banner leads, the real reason is buried below —
+        // exactly what the single-line history UI was showing before the fix.
+        insert_error(
+            "leg",
+            "Conversion failed:\n[00:00] Compile-time hardening features are enabled\n[mov] moov atom not found\nNo title found.",
+        );
+        // A row already carrying a promoted headline must be left byte-for-byte identical.
+        let good = "Conversion failed: No title found.\nNo title found.";
+        insert_error("good", good);
+
+        // Re-running init_db runs the backfill migration.
+        init_db(&conn).unwrap();
+
+        let msg = |id: &str| -> String {
+            conn.query_row(
+                "SELECT error_message FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            msg("leg").lines().next().unwrap(),
+            "Conversion failed: [mov] moov atom not found",
+            "the buried diagnostic must be promoted to the headline"
+        );
+        assert!(
+            msg("leg").contains("No title found."),
+            "detail is preserved"
+        );
+        assert_eq!(msg("good"), good, "already-headlined rows are untouched");
+
+        // Idempotent: a later startup must not double-promote.
+        init_db(&conn).unwrap();
+        assert_eq!(
+            msg("leg").lines().next().unwrap(),
+            "Conversion failed: [mov] moov atom not found"
+        );
     }
 
     #[test]
