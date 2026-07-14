@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
 
 import HistoryItem from "./HistoryItem";
 import type { JobInfo } from "../lib/tauri";
@@ -31,5 +31,21 @@ describe("HistoryItem", () => {
       "Conversion failed: moov atom not found\n[mov] moov atom not found\nNo title found.";
     render(<HistoryItem job={job({ status: "error", error_message: full })} />);
     expect(screen.getByText(/moov atom not found/).title).toBe(full);
+  });
+
+  it("forwards right-click to onContextMenu and suppresses the native menu", () => {
+    const onContextMenu = vi.fn();
+    const j = job({});
+    render(<HistoryItem job={j} onContextMenu={onContextMenu} />);
+
+    const prevented = !fireEvent.contextMenu(screen.getByText("clip.mp4"));
+
+    expect(onContextMenu).toHaveBeenCalledWith(expect.anything(), j);
+    expect(prevented).toBe(true);
+  });
+
+  it("still suppresses the native menu without an onContextMenu handler", () => {
+    render(<HistoryItem job={job({})} />);
+    expect(!fireEvent.contextMenu(screen.getByText("clip.mp4"))).toBe(true);
   });
 });

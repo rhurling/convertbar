@@ -616,6 +616,23 @@ pub fn remove_job(state: State<'_, AppState>, id: String) -> Result<(), String> 
 }
 
 #[tauri::command]
+pub fn remove_history_entry(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    remove_history_entry_inner(&conn, &id)
+}
+
+fn remove_history_entry_inner(conn: &rusqlite::Connection, id: &str) -> Result<(), String> {
+    // Terminal rows only — mirrors remove_job's queued-only guard so the History
+    // tab can never delete a job that is queued or mid-encode.
+    conn.execute(
+        "DELETE FROM jobs WHERE id = ?1 AND status IN ('done', 'error', 'skipped')",
+        params![id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn reorder_queue(state: State<'_, AppState>, job_ids: Vec<String>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     reorder_queue_inner(&conn, &job_ids)
@@ -1450,6 +1467,49 @@ mod tests {
         assert_eq!(order("C"), 0);
         assert_eq!(order("A"), 1);
         assert_eq!(order("B"), 2);
+    }
+
+    // ---- remove_history_entry_inner ----
+
+    #[test]
+    fn remove_history_entry_deletes_terminal_rows_only() {
+        let conn = test_conn();
+        insert_history(
+            &conn,
+            "done1",
+            "/m/a.mp4",
+            "done",
+            100,
+            1000,
+            "2020-01-02T00:00:00Z",
+        );
+        insert_history(
+            &conn,
+            "err1",
+            "/m/b.mp4",
+            "error",
+            0,
+            1000,
+            "2020-01-02T00:00:00Z",
+        );
+        insert_queued(&conn, "q1", "/m/c.mp4", "queued", 0);
+
+        remove_history_entry_inner(&conn, "done1").unwrap();
+        remove_history_entry_inner(&conn, "err1").unwrap();
+        // A queued job must survive a history delete for its id.
+        remove_history_entry_inner(&conn, "q1").unwrap();
+
+        let status_count = |status: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = ?1",
+                params![status],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status_count("done"), 0);
+        assert_eq!(status_count("error"), 0);
+        assert_eq!(status_count("queued"), 1, "queued row must not be deleted");
     }
 
     // ---- get_history search / sort / pagination ----
