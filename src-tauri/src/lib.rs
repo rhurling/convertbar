@@ -52,6 +52,7 @@ pub fn run() {
     let converter_state = Arc::new(ConverterState::new());
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -78,6 +79,7 @@ pub fn run() {
             commands::queue::confirm_folder_add,
             commands::queue::get_queue,
             commands::queue::remove_job,
+            commands::queue::remove_history_entry,
             commands::queue::reorder_queue,
             commands::queue::clear_completed,
             commands::queue::get_history,
@@ -100,6 +102,9 @@ pub fn run() {
             commands::watch::set_watched_directory_enabled,
             commands::watch::remove_watched_directory,
             commands::watch::pick_folder,
+            commands::files::check_paths_exist,
+            commands::files::open_path,
+            commands::files::reveal_in_dir,
         ])
         .setup(|app| {
             // Shared error flag for tray icon state

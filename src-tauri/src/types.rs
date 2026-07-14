@@ -36,6 +36,13 @@ pub struct Settings {
     pub watch_skip_marker: String,
 }
 
+/// Existence of a history entry's two paths, checked when its context menu opens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathsExist {
+    pub source_exists: bool,
+    pub output_exists: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistorySummary {
     pub total_saved_bytes: i64,

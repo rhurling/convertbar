@@ -3,9 +3,10 @@ import { fileName, formatBytes, formatPercent } from "../lib/format";
 
 interface HistoryItemProps {
   job: JobInfo;
+  onContextMenu?: (e: React.MouseEvent, job: JobInfo) => void;
 }
 
-export default function HistoryItem({ job }: HistoryItemProps) {
+export default function HistoryItem({ job, onContextMenu }: HistoryItemProps) {
   const isError = job.status === "error";
   const keptOriginal = job.kept_file === "original";
 
@@ -23,7 +24,13 @@ export default function HistoryItem({ job }: HistoryItemProps) {
   }
 
   return (
-    <div className={`history-item ${isError ? "history-item-error" : ""}`}>
+    <div
+      className={`history-item ${isError ? "history-item-error" : ""}`}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContextMenu?.(e, job);
+      }}
+    >
       <div className="history-item-top">
         <span className="history-item-name" title={job.source_path}>
           {fileName(job.source_path)}

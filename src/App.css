@@ -747,6 +747,57 @@ select.setting-input {
   background: var(--bg-hover);
 }
 
+/* Right-click context menu (history items) */
+.context-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 170px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.context-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+
+.context-menu button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.context-menu button:disabled {
+  color: var(--text-dim);
+  cursor: default;
+}
+
+.context-menu button.context-menu-danger {
+  color: var(--red);
+}
+
+.context-menu-separator {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+
+.context-menu-hint {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
 .summary-left {
   display: flex;
   flex-direction: column;

@@ -66,6 +66,11 @@ export interface AppSettings {
   watch_skip_marker: string;
 }
 
+export interface PathsExist {
+  source_exists: boolean;
+  output_exists: boolean;
+}
+
 export interface HistorySummary {
   total_saved_bytes: number;
   total_files: number;
@@ -127,6 +132,12 @@ export const commands = {
     invoke<HistoryPage>("get_history", { limit, offset, search: search || null, sortBy: sortBy || null }),
   getHistorySummary: (search?: string) =>
     invoke<HistorySummary>("get_history_summary", { search: search || null }),
+  removeHistoryEntry: (id: string) =>
+    invoke<void>("remove_history_entry", { id }),
+  checkPathsExist: (sourcePath: string, outputPath: string) =>
+    invoke<PathsExist>("check_paths_exist", { sourcePath, outputPath }),
+  openPath: (path: string) => invoke<void>("open_path", { path }),
+  revealInDir: (path: string) => invoke<void>("reveal_in_dir", { path }),
   getSettings: () => invoke<AppSettings>("get_settings"),
   updateSetting: (key: string, value: string) =>
     invoke<void>("update_setting", { key, value }),
