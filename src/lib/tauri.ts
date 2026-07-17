@@ -48,6 +48,28 @@ export interface ConversionProgress {
   avg_fps: number;
 }
 
+export interface AddStarted {
+  op_id: string;
+}
+
+export interface AddProgress {
+  op_id: string;
+  done: number;
+  total: number;
+}
+
+export interface AddFinished {
+  op_id: string;
+}
+
+// Frontend view of the current add operation. `done`/`total` are null during the
+// indeterminate scan phase (before the first per-file probe tick).
+export interface AddActivity {
+  opId: string;
+  done: number | null;
+  total: number | null;
+}
+
 export interface AppSettings {
   preset: string;
   cleanup_mode: string;
