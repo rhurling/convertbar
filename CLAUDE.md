@@ -14,6 +14,16 @@ The script bumps all three manifests (`tauri.conf.json`, `package.json`, `Cargo.
 
 Never hand-edit the version — the script keeps the manifests and lockfile in sync and rebuilds before committing.
 
+## Merging a PR (non-release)
+
+`main` is protected: signed commits, no merge commits, PR required. Claude cannot `git push` — ask the user to push with `! git push -u origin <branch>`. Then:
+
+- Open PR: `gh pr create --base main`
+- Merge after CI is green: `gh pr merge <n> --admin --squash` (the admin bypass of required checks is allowed)
+- Cleanup: `git checkout main && git pull --ff-only`, then `git branch -d <branch>`, then delete the remote branch via `gh api -X DELETE repos/rhurling/convertbar/git/refs/heads/<branch>` (Claude can't `git push :branch`)
+
+Required checks are `frontend` and `rust (ubuntu-22.04)`.
+
 ## Adding Tauri Plugins
 
 Always use `npm run tauri add {plugin}` — it handles Cargo.toml, lib.rs registration, npm dependency, and capabilities in one step. Removing a whole plugin: prefer `npm run tauri remove {plugin}` for the same reason. But when only the frontend half is unused (several plugins here are Rust-side only: autostart, dialog, notification, window-state), `npm uninstall` the `@tauri-apps/plugin-*` package alone — `tauri remove` would rip out the still-needed Rust side.
