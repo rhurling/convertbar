@@ -1,3 +1,4 @@
+mod add_progress;
 mod commands;
 mod converter;
 mod db;
