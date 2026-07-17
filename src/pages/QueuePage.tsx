@@ -5,12 +5,15 @@ import ActiveJob from "../components/ActiveJob";
 import QueueItem from "../components/QueueItem";
 import { commands } from "../lib/tauri";
 import type { HandbrakeStatus } from "../lib/tauri";
+import AddingIndicator from "../components/AddingIndicator";
+import type { AddActivity } from "../lib/tauri";
 
 interface QueuePageProps {
   hbStatus: HandbrakeStatus | null;
+  adding: AddActivity | null;
 }
 
-export default function QueuePage({ hbStatus }: QueuePageProps) {
+export default function QueuePage({ hbStatus, adding }: QueuePageProps) {
   const { activeJob, pendingJobs, progress, refresh } =
     useQueue();
   const [dragOverId, setDragOverId] = useState<string | null>(null);
@@ -40,6 +43,8 @@ export default function QueuePage({ hbStatus }: QueuePageProps) {
       )}
       <DropZone onFilesAdded={refresh} />
 
+      <AddingIndicator activity={adding} />
+
       {activeJob && <ActiveJob job={activeJob} progress={progress} />}
 
       {pendingJobs.length > 0 && (
@@ -67,7 +72,7 @@ export default function QueuePage({ hbStatus }: QueuePageProps) {
         </div>
       )}
 
-      {!activeJob && pendingJobs.length === 0 && (
+      {!adding && !activeJob && pendingJobs.length === 0 && (
         <div className="empty-state">
           <span className="empty-state-icon">&#128194;</span>
           <span>Drag video files or folders here to get started</span>

@@ -5,6 +5,7 @@ import HistoryPage from "./pages/HistoryPage";
 import WatchedFoldersPage from "./pages/WatchedFoldersPage";
 import SettingsPage from "./pages/SettingsPage";
 import { commands, type HandbrakeStatus } from "./lib/tauri";
+import { useAddProgress } from "./hooks/useAddProgress";
 import "./App.css";
 
 type Tab = "queue" | "history" | "watch" | "settings";
@@ -12,6 +13,7 @@ type Tab = "queue" | "history" | "watch" | "settings";
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("queue");
   const [hbStatus, setHbStatus] = useState<HandbrakeStatus | null>(null);
+  const { isAdding, activity } = useAddProgress();
 
   const refreshHbStatus = async () => {
     const status = await commands.validateHandbrake();
@@ -34,9 +36,9 @@ function App() {
 
   return (
     <div className="app">
-      <TabBar activeTab={activeTab} onTabChange={setActiveTab} />
+      <TabBar activeTab={activeTab} onTabChange={setActiveTab} isAdding={isAdding} />
       <div className="page">
-        {activeTab === "queue" && <QueuePage hbStatus={hbStatus} />}
+        {activeTab === "queue" && <QueuePage hbStatus={hbStatus} adding={activity} />}
         {activeTab === "history" && <HistoryPage />}
         {activeTab === "watch" && <WatchedFoldersPage />}
         {activeTab === "settings" && <SettingsPage onHbPathChanged={refreshHbStatus} />}
