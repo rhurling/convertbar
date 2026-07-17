@@ -80,10 +80,9 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
 
   return (
     <div className={`drop-zone ${isDragOver ? "drag-over" : ""}`}>
-      {status ? (
-        <span className="drop-zone-status">{status}</span>
-      ) : pendingFolders.length > 0 ? (
+      {pendingFolders.length > 0 ? (
         <div className="folder-confirm">
+          {status && <span className="drop-zone-status">{status}</span>}
           {pendingFolders.map((folder) => (
             <div key={folder.folder_path} className="folder-confirm-item">
               <span>Add {folder.file_count} files from &quot;{folder.folder_name}&quot;?</span>
@@ -121,6 +120,8 @@ export default function DropZone({ onFilesAdded }: DropZoneProps) {
             </div>
           ))}
         </div>
+      ) : status ? (
+        <span className="drop-zone-status">{status}</span>
       ) : (
         <span className="drop-zone-label">
           Drop video files or folders here
