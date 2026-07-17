@@ -38,7 +38,7 @@ function App() {
     <div className="app">
       <TabBar activeTab={activeTab} onTabChange={setActiveTab} isAdding={isAdding} />
       <div className="page">
-        {activeTab === "queue" && <QueuePage hbStatus={hbStatus} adding={activity} />}
+        {activeTab === "queue" && <QueuePage hbStatus={hbStatus} adding={activity} isAdding={isAdding} />}
         {activeTab === "history" && <HistoryPage />}
         {activeTab === "watch" && <WatchedFoldersPage />}
         {activeTab === "settings" && <SettingsPage onHbPathChanged={refreshHbStatus} />}

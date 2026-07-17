@@ -11,9 +11,10 @@ import type { AddActivity } from "../lib/tauri";
 interface QueuePageProps {
   hbStatus: HandbrakeStatus | null;
   adding: AddActivity | null;
+  isAdding: boolean;
 }
 
-export default function QueuePage({ hbStatus, adding }: QueuePageProps) {
+export default function QueuePage({ hbStatus, adding, isAdding }: QueuePageProps) {
   const { activeJob, pendingJobs, progress, refresh } =
     useQueue();
   const [dragOverId, setDragOverId] = useState<string | null>(null);
@@ -72,7 +73,7 @@ export default function QueuePage({ hbStatus, adding }: QueuePageProps) {
         </div>
       )}
 
-      {!adding && !activeJob && pendingJobs.length === 0 && (
+      {!isAdding && !activeJob && pendingJobs.length === 0 && (
         <div className="empty-state">
           <span className="empty-state-icon">&#128194;</span>
           <span>Drag video files or folders here to get started</span>
