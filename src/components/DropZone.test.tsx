@@ -114,6 +114,47 @@ describe("DropZone", () => {
     expect(screen.queryByText(/files from/)).not.toBeInTheDocument();
   });
 
+  it("still prompts for a big folder when loose files auto-add in the same drop", async () => {
+    // Regression: the auto-added summary ("Added 1") was written into `status`, and the
+    // render gated the confirm UI behind `status` being falsy — so a >5-file folder dropped
+    // alongside anything that auto-adds had its Add/Skip prompt hidden and was silently
+    // swallowed (never confirmed, never queued).
+    classified = {
+      files: ["/movies/a.mp4"],
+      folders: [{ file_count: 12, folder_name: "BigFolder", folder_path: "/big" }],
+    };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "classify_paths":
+          return Promise.resolve(classified);
+        case "add_files":
+          return Promise.resolve({ added: [{ id: "1" }], skipped: [] });
+        case "confirm_folder_add":
+          return Promise.resolve({ added: [], skipped: [] });
+        case "start_queue":
+          return Promise.resolve(undefined);
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    const onFilesAdded = vi.fn();
+    render(<DropZone onFilesAdded={onFilesAdded} />);
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    fireDrop(["/movies/a.mp4", "/big"]);
+
+    // The confirm prompt for the big folder must appear despite the "Added 1" summary.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Add" })).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/Add 12 files from/)).toBeInTheDocument();
+    // The folder is not auto-added and the queue does not start until the user confirms.
+    expect(invokeMock).not.toHaveBeenCalledWith("confirm_folder_add", { path: "/big" });
+    expect(invokeMock).not.toHaveBeenCalledWith("start_queue");
+    expect(onFilesAdded).not.toHaveBeenCalled();
+  });
+
   it("starts the queue without adding when the user skips the only pending folder", async () => {
     classified = {
       files: [],
