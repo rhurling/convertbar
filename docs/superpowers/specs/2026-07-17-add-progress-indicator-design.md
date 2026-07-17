@@ -177,9 +177,12 @@ Wiring:
 
 - **Rust (`MockRuntime`, as the other emitter tests do):** `AddOp<R>` emits `add-started` on
   `new` and `add-finished` on `Drop`, including when the guarded scope returns `Err` (drop
-  still fires). The probe reporter fires `total` times with monotonic `done` for an all-miss
-  batch, and `add_files_inner` with `progress: None` behaves exactly as before (existing
-  skip-rule tests unchanged — the pure `add_files_to_db` is not touched).
+  still fires), and `report()` emits `add-progress` carrying the op's id. `add_files_inner`
+  with `progress: None` behaves exactly as before (existing skip-rule tests unchanged — the
+  pure `add_files_to_db` is not touched). Note: the reporter's *in-context* behavior (firing
+  once per probed file with monotonic `done ≤ total`) is **not** unit-tested — reaching the
+  probe loop requires a real `HandBrakeCLI` (preset-metadata fetch), so that path is verified
+  by the end-to-end drive (see plan Task 8), not a unit test.
 - **Frontend:** `App` global listener flips `isAdding` true on `add-started` and back to
   false only after **all** open ops emit `add-finished` (overlapping-op test) and tolerates a
   stray `add-finished` for an unseen op. The Queue indicator renders `Scanning…` before first
