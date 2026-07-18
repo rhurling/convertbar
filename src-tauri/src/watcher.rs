@@ -365,12 +365,17 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
         return;
     }
     let app_state = app.state::<AppState>();
-    let result = match queue::add_files_inner(&app_state, &paths) {
-        Ok(result) => result,
-        Err(err) => {
-            eprintln!("watcher: failed to enqueue {paths:?}: {err}");
-            return;
+    let result = {
+        let op = crate::add_progress::AddOp::new(app);
+        let reporter = |done: u32, total: u32| op.report(done, total);
+        match queue::add_files_inner(&app_state, &paths, Some(&reporter as &dyn Fn(u32, u32))) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("watcher: failed to enqueue {paths:?}: {err}");
+                return;
+            }
         }
+        // `op` drops here → add-finished (also on the early return above).
     };
     if result.added.is_empty() {
         return;

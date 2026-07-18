@@ -273,7 +273,11 @@ fn probe_candidates(
         .collect())
 }
 
-pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddResult, String> {
+pub(crate) fn add_files_inner(
+    state: &AppState,
+    paths: &[String],
+    progress: Option<&dyn Fn(u32, u32)>,
+) -> Result<AddResult, String> {
     // First, read preset and suffix template from DB
     let (preset, suffix_template, hb_path, skip_already_converted, skip_by_source_media) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -358,13 +362,23 @@ pub(crate) fn add_files_inner(state: &AppState, paths: &[String]) -> Result<AddR
                     .iter()
                     .map(|p| (p.clone(), file_identity(p)))
                     .collect();
+            let total = candidates_to_probe.len() as u32;
+            let probe_count = std::cell::Cell::new(0u32);
             let probed = crate::probe_cache::resolve_media(
                 &with_identity,
                 |ids| {
                     let conn = state.db.lock().expect("db mutex poisoned");
                     crate::probe_cache::lookup_batch(&conn, ids)
                 },
-                |p| crate::probe::probe_source(hb, p),
+                |p| {
+                    let media = crate::probe::probe_source(hb, p);
+                    let done = probe_count.get() + 1;
+                    probe_count.set(done);
+                    if let Some(report) = progress {
+                        report(done, total);
+                    }
+                    media
+                },
                 |items| {
                     let conn = state.db.lock().expect("db mutex poisoned");
                     crate::probe_cache::store_batch(&conn, items);
@@ -526,7 +540,9 @@ pub async fn add_files(app: AppHandle, paths: Vec<String>) -> Result<AddResult, 
     // still returns to the awaiting frontend. Same hazard the watcher avoids via scan_existing_background.
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        add_files_inner(&state, &paths)
+        let op = crate::add_progress::AddOp::new(&app);
+        let reporter = |done: u32, total: u32| op.report(done, total);
+        add_files_inner(&state, &paths, Some(&reporter as &dyn Fn(u32, u32)))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -570,13 +586,15 @@ pub async fn confirm_folder_add(app: AppHandle, path: String) -> Result<AddResul
     // Both the recursive scan and the per-file probe block; run them off the main thread so
     // confirming a large folder doesn't freeze the UI (same hazard as add_files).
     tauri::async_runtime::spawn_blocking(move || {
+        let op = crate::add_progress::AddOp::new(&app);
         let files = scan_video_files(Path::new(&path));
         let paths: Vec<String> = files
             .into_iter()
             .filter_map(|p| p.to_str().map(|s| s.to_string()))
             .collect();
         let state = app.state::<AppState>();
-        add_files_inner(&state, &paths)
+        let reporter = |done: u32, total: u32| op.report(done, total);
+        add_files_inner(&state, &paths, Some(&reporter as &dyn Fn(u32, u32)))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1764,7 +1782,7 @@ mod tests {
         let upgrade = make("b.mp4", "libx264"); // h264 1080p -> queue
 
         let inputs = vec![at_target, upgrade];
-        let result = add_files_inner(&state, &inputs).unwrap();
+        let result = add_files_inner(&state, &inputs, None).unwrap();
 
         assert_eq!(result.added.len(), 1, "only the h264 source is queued");
         assert!(result.added[0].source_path.ends_with("b.mp4"));
@@ -1782,7 +1800,7 @@ mod tests {
         // its media is served from probe_cache (zero re-probe), and the codec-upgrade source
         // is now already queued. The at-target source must STILL be reported skipped —
         // proving the cached media drives the same decision as a live probe.
-        let again = add_files_inner(&state, &inputs).unwrap();
+        let again = add_files_inner(&state, &inputs, None).unwrap();
         assert!(
             again.added.is_empty(),
             "nothing new to queue on a repeat add"

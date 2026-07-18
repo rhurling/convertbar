@@ -978,3 +978,46 @@ select.setting-input {
   color: var(--red);
   font-size: 11px;
 }
+
+/* File-intake progress: title-bar spinner + Queue-page indicator */
+@keyframes cb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.tab-spinner {
+  align-self: center;
+  width: 12px;
+  height: 12px;
+  margin-right: 8px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: cb-spin 0.7s linear infinite;
+}
+
+.adding-indicator {
+  margin: 0 12px 8px;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius);
+}
+
+.adding-indicator-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.adding-indicator .spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: cb-spin 0.7s linear infinite;
+}

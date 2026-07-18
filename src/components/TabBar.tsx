@@ -5,6 +5,7 @@ type Tab = "queue" | "history" | "watch" | "settings";
 interface TabBarProps {
   activeTab: Tab;
   onTabChange: (tab: Tab) => void;
+  isAdding: boolean;
 }
 
 const tabs: { id: Tab; label: string }[] = [
@@ -14,7 +15,7 @@ const tabs: { id: Tab; label: string }[] = [
   { id: "settings", label: "Settings" },
 ];
 
-export default function TabBar({ activeTab, onTabChange }: TabBarProps) {
+export default function TabBar({ activeTab, onTabChange, isAdding }: TabBarProps) {
   return (
     <div className="tab-bar" data-tauri-drag-region>
       {tabs.map((tab) => (
@@ -27,6 +28,9 @@ export default function TabBar({ activeTab, onTabChange }: TabBarProps) {
         </button>
       ))}
       <div className="tab-spacer" data-tauri-drag-region />
+      {isAdding && (
+        <span className="tab-spinner" title="Adding files to the queue…" aria-label="Adding files" />
+      )}
       <button className="tab-btn close-tab-btn" onClick={() => commands.hideWindow()} title="Close">
         &times;
       </button>
