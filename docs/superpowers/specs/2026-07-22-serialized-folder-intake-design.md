@@ -281,11 +281,15 @@ the hook test.)
     their folders (neither is dropped) — locks the head-of-`confirmQueueRef` fix.
   - **Synchronous card clear:** the confirm advances on Add *before* the deferred
     `confirm_folder_add` resolves — proves the card is decoupled from the scan.
-  - **Cross-tab drop:** a "drop" fired while `activeTab !== "queue"` calls the switch callback
-    and still processes the paths; state is retained across a simulated tab switch.
-  - **Status timer:** a later task's summary is not wiped by an earlier task's 4s auto-clear.
+  - **Cross-tab drop:** a "drop" calls the switch callback (`onDrop`) and still processes the
+    paths. (State surviving a tab switch is *architectural* — the hook lives in always-mounted
+    `App`, not `QueuePage` — so it's guaranteed by construction rather than unit-tested; the
+    manual smoke covers it.)
   - Carry over: auto-add of loose files + ≤5 folders, the big-folder-with-loose-files prompt
     (`:117`), the skip-summary line.
+  - **Not unit-tested (by construction):** the status auto-clear race — the fix is a single
+    timer ref cleared-and-rearmed on every `status` set, so a stale timer cannot exist; a
+    fake-timer test would be brittle for no added assurance.
 - **Frontend (`DropZone.test.tsx` — now presentational):** given props it renders the confirm
   prompt / status / label three-way switch, and Add/Skip call the passed handlers. No invoke
   or drag mocks.
@@ -296,8 +300,11 @@ the hook test.)
 - **Rust (`add_progress.rs`, `MockRuntime`):** `add-started` **and** `add-progress` carry the
   given `label`; existing started/finished/report tests updated for the new `AddOp::new`
   signature.
-- **Rust (`commands/queue.rs`, `MockRuntime`):** `add_files` and `confirm_folder_add` emit
-  `queue-updated` on the Ok path.
+- **`queue-updated` emit — not unit-tested:** the async `#[tauri::command]` wrappers need a
+  fully-managed `AppState` + async runtime to exercise, which the codebase deliberately avoids
+  (only sync `_inner` fns are unit-tested); the emit is a one-line mirror of the untested
+  watcher emit (`watcher.rs:386`) and is verified by the frontend integration (queue refreshes
+  without `onFilesAdded`) + manual smoke.
 
 ## Files touched (estimate)
 
@@ -305,7 +312,7 @@ the hook test.)
   `ProgressPayload` (`report` emits it); tests.
 - `src-tauri/src/commands/queue.rs` — pass label at the `add_files` / `confirm_folder_add`
   `AddOp::new` sites (folder basename for confirm); emit `queue-updated` on the Ok path of each
-  add so `useQueue` refreshes reactively (removes the `onFilesAdded` wiring); tests.
+  add so `useQueue` refreshes reactively (removes the `onFilesAdded` wiring).
 - `src-tauri/src/watcher.rs` — pass a label (single-dir basename / empty) at `enqueue_and_start`.
 - `src/lib/tauri.ts` — `label` on `AddStarted`, `AddProgress`, and `AddActivity`.
 - `src/hooks/useAddProgress.ts` — set `label` on `activity` from both `add-started` and
