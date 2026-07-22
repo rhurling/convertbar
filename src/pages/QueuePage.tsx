@@ -7,14 +7,16 @@ import { commands } from "../lib/tauri";
 import type { HandbrakeStatus } from "../lib/tauri";
 import AddingIndicator from "../components/AddingIndicator";
 import type { AddActivity } from "../lib/tauri";
+import type { FileIntake } from "../hooks/useFileIntake";
 
 interface QueuePageProps {
   hbStatus: HandbrakeStatus | null;
   adding: AddActivity | null;
   isAdding: boolean;
+  intake: FileIntake;
 }
 
-export default function QueuePage({ hbStatus, adding, isAdding }: QueuePageProps) {
+export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueuePageProps) {
   const { activeJob, pendingJobs, progress, refresh } =
     useQueue();
   const [dragOverId, setDragOverId] = useState<string | null>(null);
@@ -42,7 +44,13 @@ export default function QueuePage({ hbStatus, adding, isAdding }: QueuePageProps
           </div>
         </div>
       )}
-      <DropZone onFilesAdded={refresh} />
+      <DropZone
+        pendingConfirm={intake.pendingConfirm}
+        onAdd={intake.onAdd}
+        onSkip={intake.onSkip}
+        status={intake.status}
+        isDragOver={intake.isDragOver}
+      />
 
       <AddingIndicator activity={adding} />
 
