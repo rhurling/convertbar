@@ -540,7 +540,7 @@ pub async fn add_files(app: AppHandle, paths: Vec<String>) -> Result<AddResult, 
     // still returns to the awaiting frontend. Same hazard the watcher avoids via scan_existing_background.
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let op = crate::add_progress::AddOp::new(&app);
+        let op = crate::add_progress::AddOp::new(&app, String::new());
         let reporter = |done: u32, total: u32| op.report(done, total);
         add_files_inner(&state, &paths, Some(&reporter as &dyn Fn(u32, u32)))
     })
@@ -586,7 +586,12 @@ pub async fn confirm_folder_add(app: AppHandle, path: String) -> Result<AddResul
     // Both the recursive scan and the per-file probe block; run them off the main thread so
     // confirming a large folder doesn't freeze the UI (same hazard as add_files).
     tauri::async_runtime::spawn_blocking(move || {
-        let op = crate::add_progress::AddOp::new(&app);
+        let label = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let op = crate::add_progress::AddOp::new(&app, label);
         let files = scan_video_files(Path::new(&path));
         let paths: Vec<String> = files
             .into_iter()

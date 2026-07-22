@@ -352,6 +352,26 @@ fn filter_watched(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
     covered_paths(&configs, paths)
 }
 
+/// The basename of the single directory a batch of paths shares, or empty when the batch spans
+/// multiple directories (e.g. a recursive reaper batch). Used only to name the intake scanner in
+/// the UI, so an empty fallback is harmless.
+fn batch_label(paths: &[String]) -> String {
+    let mut parents = paths.iter().map(|p| Path::new(p).parent());
+    let first = match parents.next() {
+        Some(Some(p)) => p,
+        _ => return String::new(),
+    };
+    if parents.all(|p| p == Some(first)) {
+        first
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Feeds stabilized paths through the same pipeline as drag-dropped files, then (auto-start)
 /// kicks the queue and notifies the UI. `add_files_inner` applies all existing skip rules, so
 /// already-converted or already-queued files are dropped here.
@@ -366,7 +386,7 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     }
     let app_state = app.state::<AppState>();
     let result = {
-        let op = crate::add_progress::AddOp::new(app);
+        let op = crate::add_progress::AddOp::new(app, batch_label(&paths));
         let reporter = |done: u32, total: u32| op.report(done, total);
         match queue::add_files_inner(&app_state, &paths, Some(&reporter as &dyn Fn(u32, u32))) {
             Ok(result) => result,
@@ -1039,5 +1059,20 @@ mod tests {
         assert_eq!(valid_marker(".downloading/"), None);
         assert_eq!(valid_marker(".."), None);
         assert_eq!(valid_marker("."), None);
+    }
+
+    #[test]
+    fn batch_label_names_a_single_dir_batch_and_empties_a_mixed_one() {
+        assert_eq!(
+            super::batch_label(&["/movies/SEOA/a.mp4".into(), "/movies/SEOA/b.mp4".into()]),
+            "SEOA",
+            "all-same-parent batch takes the parent's basename"
+        );
+        assert_eq!(
+            super::batch_label(&["/movies/SEOA/a.mp4".into(), "/movies/Other/b.mp4".into()]),
+            "",
+            "a multi-directory batch has no single name"
+        );
+        assert_eq!(super::batch_label(&[]), "", "empty batch → empty label");
     }
 }
