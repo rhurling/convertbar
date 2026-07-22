@@ -128,11 +128,95 @@ describe("useFileIntake", () => {
     await waitFor(() => expect(resolvers).toHaveLength(1)); // only A started
     expect(resolvers[0].path).toBe("/a");
 
+    await act(async () => {}); // flush microtasks — B must still not have started
+    expect(resolvers).toHaveLength(1);
+
     await act(async () => {
       resolvers[0].resolve({ added: [], skipped: [] });
     });
     await waitFor(() => expect(resolvers).toHaveLength(2)); // B starts only after A resolves
     expect(resolvers[1].path).toBe("/b");
+  });
+
+  it("a new drop never interrupts or loses the in-flight scan", async () => {
+    // User requirement #5: a folder scan already in flight must run to completion; a new drop
+    // during that scan is appended behind it, not dropped and not raced ahead of.
+    classified = {
+      files: [],
+      folders: [{ file_count: 12, folder_name: "A", folder_path: "/a" }],
+    };
+    const resolvers: Array<{ path: string; resolve: (v: AddResult) => void }> = [];
+    invokeMock.mockImplementation(((cmd: string, args?: { path?: string; paths?: string[] }) => {
+      switch (cmd) {
+        case "classify_paths":
+          return Promise.resolve(classified);
+        case "confirm_folder_add":
+          return new Promise<AddResult>((resolve) => resolvers.push({ path: args!.path!, resolve }));
+        case "add_files":
+          return Promise.resolve({ added: [], skipped: [] });
+        case "start_queue":
+          return Promise.resolve(undefined);
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    fireDrop(["/a"]);
+    await waitFor(() => expect(result.current.pendingConfirm?.folder_path).toBe("/a"));
+    act(() => result.current.onAdd()); // enqueues A's confirm_folder_add — now in flight, unresolved
+    await waitFor(() => expect(resolvers).toHaveLength(1));
+
+    classified = { files: ["/x.mp4"], folders: [] };
+    fireDrop(["/x.mp4"]);
+
+    await act(async () => {}); // flush the second drop's classify + enqueue
+    // The loose-file task is queued behind A's still-running scan — not run, not lost.
+    expect(invokeMock).not.toHaveBeenCalledWith("add_files", { paths: ["/x.mp4"] });
+
+    await act(async () => {
+      resolvers[0].resolve({ added: [], skipped: [] });
+    });
+    // Only after A completes does the queued task run.
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("add_files", { paths: ["/x.mp4"] }));
+  });
+
+  it("auto-adds exactly ≤5-file folders and prompts for >5 (AUTO_ADD_MAX boundary)", async () => {
+    classified = {
+      files: [],
+      folders: [
+        { file_count: 5, folder_name: "Five", folder_path: "/five" },
+        { file_count: 6, folder_name: "Six", folder_path: "/six" },
+      ],
+    };
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    fireDrop(["/five", "/six"]);
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("confirm_folder_add", { path: "/five" }));
+    expect(result.current.pendingConfirm?.folder_path).toBe("/six");
+    expect(invokeMock).not.toHaveBeenCalledWith("confirm_folder_add", { path: "/six" });
+  });
+
+  it("surfaces a classify_paths failure in the status line", async () => {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "classify_paths":
+          return Promise.reject(new Error("scan failed"));
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    fireDrop(["/whatever"]);
+
+    await waitFor(() => expect(result.current.status).toMatch(/Error:.*scan failed/));
   });
 
   it("does not drop a folder when two separate drops' classify resolve back-to-back", async () => {
