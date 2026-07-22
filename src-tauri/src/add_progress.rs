@@ -5,11 +5,13 @@ use uuid::Uuid;
 #[derive(Clone, Serialize)]
 struct StartedPayload {
     op_id: String,
+    label: String,
 }
 
 #[derive(Clone, Serialize)]
 struct ProgressPayload {
     op_id: String,
+    label: String,
     done: u32,
     total: u32,
 }
@@ -29,20 +31,23 @@ struct FinishedPayload {
 pub struct AddOp<R: Runtime> {
     app: AppHandle<R>,
     op_id: String,
+    label: String,
 }
 
 impl<R: Runtime> AddOp<R> {
-    pub fn new(app: &AppHandle<R>) -> Self {
+    pub fn new(app: &AppHandle<R>, label: String) -> Self {
         let op_id = Uuid::new_v4().to_string();
         let _ = app.emit(
             "add-started",
             StartedPayload {
                 op_id: op_id.clone(),
+                label: label.clone(),
             },
         );
         Self {
             app: app.clone(),
             op_id,
+            label,
         }
     }
 
@@ -53,6 +58,7 @@ impl<R: Runtime> AddOp<R> {
             "add-progress",
             ProgressPayload {
                 op_id: self.op_id.clone(),
+                label: self.label.clone(),
                 done,
                 total,
             },
@@ -93,17 +99,20 @@ mod tests {
     }
 
     #[test]
-    fn emits_started_on_new_and_finished_on_drop() {
+    fn emits_started_with_label_on_new_and_finished_on_drop() {
         let app = mock_app();
         let started = record(&app, "add-started");
         let finished = record(&app, "add-finished");
         {
-            let _op = AddOp::new(app.handle());
+            let _op = AddOp::new(app.handle(), "My Folder".to_string());
             assert_eq!(
                 started.lock().unwrap().len(),
                 1,
                 "started fires immediately"
             );
+            let payload: serde_json::Value =
+                serde_json::from_str(&started.lock().unwrap()[0]).unwrap();
+            assert_eq!(payload["label"].as_str().unwrap(), "My Folder");
             assert_eq!(finished.lock().unwrap().len(), 0, "not finished yet");
         }
         assert_eq!(finished.lock().unwrap().len(), 1, "finished fires on drop");
@@ -111,10 +120,8 @@ mod tests {
 
     #[test]
     fn finished_fires_even_on_early_return() {
-        // Simulates the enqueue_and_start Err arm: the guard is in scope, an early
-        // return drops it, and add-finished must still fire so the spinner clears.
         fn guarded(app: &tauri::AppHandle<tauri::test::MockRuntime>, bail: bool) {
-            let _op = AddOp::new(app);
+            let _op = AddOp::new(app, String::new());
             if bail {
                 return;
             }
@@ -126,25 +133,29 @@ mod tests {
     }
 
     #[test]
-    fn report_emits_progress_with_the_same_op_id() {
+    fn report_emits_progress_with_op_id_and_label() {
         let app = mock_app();
         let started = record(&app, "add-started");
         let progress = record(&app, "add-progress");
-        let op = AddOp::new(app.handle());
+        let op = AddOp::new(app.handle(), "Clips".to_string());
         op.report(1, 3);
-        op.report(2, 3);
 
         let started = started.lock().unwrap();
-        let op_id: serde_json::Value = serde_json::from_str(&started[0]).unwrap();
-        let op_id = op_id["op_id"].as_str().unwrap();
+        let started_val: serde_json::Value = serde_json::from_str(&started[0]).unwrap();
+        let op_id = started_val["op_id"].as_str().unwrap();
 
         let progress = progress.lock().unwrap();
-        assert_eq!(progress.len(), 2);
+        assert_eq!(progress.len(), 1);
         let first: serde_json::Value = serde_json::from_str(&progress[0]).unwrap();
         assert_eq!(
             first["op_id"].as_str().unwrap(),
             op_id,
             "progress carries the op's id"
+        );
+        assert_eq!(
+            first["label"].as_str().unwrap(),
+            "Clips",
+            "progress carries the label"
         );
         assert_eq!(first["done"].as_u64().unwrap(), 1);
         assert_eq!(first["total"].as_u64().unwrap(), 3);

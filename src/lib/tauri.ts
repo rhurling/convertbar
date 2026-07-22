@@ -50,10 +50,12 @@ export interface ConversionProgress {
 
 export interface AddStarted {
   op_id: string;
+  label: string;
 }
 
 export interface AddProgress {
   op_id: string;
+  label: string;
   done: number;
   total: number;
 }
@@ -63,9 +65,11 @@ export interface AddFinished {
 }
 
 // Frontend view of the current add operation. `done`/`total` are null during the
-// indeterminate scan phase (before the first per-file probe tick).
+// indeterminate scan phase (before the first per-file probe tick). `label` is the folder
+// name (empty for loose-file adds).
 export interface AddActivity {
   opId: string;
+  label: string;
   done: number | null;
   total: number | null;
 }

@@ -32,12 +32,12 @@ it("goes adding on start and clears on finish", () => {
   expect(result.current.isAdding).toBe(false);
   expect(result.current.activity).toBeNull();
 
-  emit("add-started", { op_id: "a" });
+  emit("add-started", { op_id: "a", label: "Folder" });
   expect(result.current.isAdding).toBe(true);
-  expect(result.current.activity).toEqual({ opId: "a", done: null, total: null });
+  expect(result.current.activity).toEqual({ opId: "a", label: "Folder", done: null, total: null });
 
-  emit("add-progress", { op_id: "a", done: 3, total: 10 });
-  expect(result.current.activity).toEqual({ opId: "a", done: 3, total: 10 });
+  emit("add-progress", { op_id: "a", label: "Folder", done: 3, total: 10 });
+  expect(result.current.activity).toEqual({ opId: "a", label: "Folder", done: 3, total: 10 });
 
   emit("add-finished", { op_id: "a" });
   expect(result.current.isAdding).toBe(false);
@@ -46,20 +46,20 @@ it("goes adding on start and clears on finish", () => {
 
 it("stays adding until every overlapping op finishes", () => {
   const { result } = renderHook(() => useAddProgress());
-  emit("add-started", { op_id: "a" });
-  emit("add-started", { op_id: "b" });
+  emit("add-started", { op_id: "a", label: "A" });
+  emit("add-started", { op_id: "b", label: "B" });
   emit("add-finished", { op_id: "a" });
   expect(result.current.isAdding).toBe(true); // b still open
   emit("add-finished", { op_id: "b" });
   expect(result.current.isAdding).toBe(false);
 });
 
-it("tolerates progress for an op whose start it missed", () => {
+it("tolerates progress for an op whose start it missed, keeping its label", () => {
   // A watcher scan can emit add-started before the webview attaches listeners.
   const { result } = renderHook(() => useAddProgress());
-  emit("add-progress", { op_id: "x", done: 1, total: 4 });
+  emit("add-progress", { op_id: "x", label: "Watched", done: 1, total: 4 });
   expect(result.current.isAdding).toBe(true);
-  expect(result.current.activity).toEqual({ opId: "x", done: 1, total: 4 });
+  expect(result.current.activity).toEqual({ opId: "x", label: "Watched", done: 1, total: 4 });
 });
 
 it("ignores a stray finish for an unseen op", () => {

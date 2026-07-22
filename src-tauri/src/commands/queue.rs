@@ -1,7 +1,7 @@
 use rusqlite::params;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::converter::IN_PLACE_TEMP_MARKER;
 use crate::handbrake;
@@ -538,14 +538,20 @@ pub async fn add_files(app: AppHandle, paths: Vec<String>) -> Result<AddResult, 
     // add_files_inner runs a blocking HandBrakeCLI probe per file (source-media skip), so a large
     // drop would freeze the main-thread event loop. Offload to a blocking thread; the AddResult
     // still returns to the awaiting frontend. Same hazard the watcher avoids via scan_existing_background.
-    tauri::async_runtime::spawn_blocking(move || {
+    let app_for_emit = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let op = crate::add_progress::AddOp::new(&app);
+        let op = crate::add_progress::AddOp::new(&app, String::new());
         let reporter = |done: u32, total: u32| op.report(done, total);
         add_files_inner(&state, &paths, Some(&reporter as &dyn Fn(u32, u32)))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        // Mirror enqueue_and_start (watcher.rs) so useQueue refreshes without a frontend callback.
+        let _ = app_for_emit.emit("queue-updated", ());
+    }
+    result
 }
 
 #[tauri::command]
@@ -585,8 +591,14 @@ pub async fn confirm_folder_add(app: AppHandle, path: String) -> Result<AddResul
 
     // Both the recursive scan and the per-file probe block; run them off the main thread so
     // confirming a large folder doesn't freeze the UI (same hazard as add_files).
-    tauri::async_runtime::spawn_blocking(move || {
-        let op = crate::add_progress::AddOp::new(&app);
+    let app_for_emit = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let label = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let op = crate::add_progress::AddOp::new(&app, label);
         let files = scan_video_files(Path::new(&path));
         let paths: Vec<String> = files
             .into_iter()
@@ -597,7 +609,11 @@ pub async fn confirm_folder_add(app: AppHandle, path: String) -> Result<AddResul
         add_files_inner(&state, &paths, Some(&reporter as &dyn Fn(u32, u32)))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        let _ = app_for_emit.emit("queue-updated", ());
+    }
+    result
 }
 
 #[tauri::command]

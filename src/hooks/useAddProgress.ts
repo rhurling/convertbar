@@ -30,12 +30,12 @@ export function useAddProgress() {
       listen<AddStarted>("add-started", ({ payload }) => {
         if (!mounted.current) return;
         add(payload.op_id);
-        setActivity({ opId: payload.op_id, done: null, total: null });
+        setActivity({ opId: payload.op_id, label: payload.label, done: null, total: null });
       }),
       listen<AddProgress>("add-progress", ({ payload }) => {
         if (!mounted.current) return;
         add(payload.op_id); // covers a start we never saw
-        setActivity({ opId: payload.op_id, done: payload.done, total: payload.total });
+        setActivity({ opId: payload.op_id, label: payload.label, done: payload.done, total: payload.total });
       }),
       listen<AddFinished>("add-finished", ({ payload }) => {
         if (!mounted.current) return;
