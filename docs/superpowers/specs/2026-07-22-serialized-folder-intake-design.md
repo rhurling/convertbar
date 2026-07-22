@@ -1,4 +1,4 @@
-# Serialized folder intake + clean drop zone — Design
+# Serialized folder intake + cross-tab drops — Design
 
 **Date:** 2026-07-22
 **Status:** Approved design, ready for implementation plan
@@ -19,22 +19,25 @@ misbehaves. Each drop invokes `DropZone.handlePaths` (`src/components/DropZone.t
    races between invocations. The single global `AddingIndicator` (`useAddProgress` keeps
    only the *most recent* op) flips between op ids, so its "Checking X of N" jumps around
    with no indication of which folder it belongs to.
-3. **The confirm prompt lives inside the drop zone.** The folder-name + Add/Skip buttons
-   render *inside* `.drop-zone` (`DropZone.tsx:82-122`), replacing the "Drop files here"
-   label, so the drop target is visually consumed by the prompt.
+3. **Confirm is coupled to the scan.** The Add handler `await`s the entire
+   `confirm_folder_add` (recursive walk + per-file probe) *before* removing the confirmed
+   row (`DropZone.tsx:90-103`), so the folder-name + Add/Skip prompt lingers inside
+   `.drop-zone` for the whole scan instead of reverting to the droppable label immediately.
 
 ## Goals
 
 - **Serialize the heavy intake work** so only one folder is scanned/probed at a time; a
   new drop **appends** to that pipeline and never interrupts, cancels, or loses the folder
   currently being scanned.
-- **Keep the drop zone clean and always droppable** — it never morphs into the folder
-  label + buttons.
-- **Move confirmation to its own card below the drop zone**, showing one folder at a time,
-  and **clear it the instant the user clicks Add/Skip** (decoupled from the scan, which
-  continues in the background).
+- **Decouple confirm from the scan.** The confirm prompt stays where it is (inside the drop
+  zone — the whole window stays droppable via the window-level `onDragDropEvent`, so its
+  placement costs no droppability), showing **one folder at a time**, and reverts to the
+  "Drop files here" label **the instant the user clicks Add/Skip** — never lingering through
+  the scan, which continues in the background scanner.
 - **Name the scanner** — the progress card shows the folder currently being scanned:
   `"<folder>" · Checking X of N`.
+- **Accept drops on any tab** — a folder dropped while on History/Watch/Settings
+  auto-switches to the Queue tab and is processed there, instead of being ignored.
 
 ## Non-goals
 
@@ -47,17 +50,16 @@ misbehaves. Each drop invokes `DropZone.handlePaths` (`src/components/DropZone.t
 - No per-folder *concurrent* scanner stack. One scanner card, one serialized pipeline
   (the explicitly rejected alternative — it reintroduces the concurrency we're removing).
 
-## Approach: a per-drop count feeding one serialized scanner, three UI regions
+## Approach: a per-drop count feeding one serialized scanner, two UI regions
 
-The Queue page's intake area becomes three stacked regions, top to bottom. None of them is
-the drop zone morphing:
+The Queue page's intake area is two stacked regions. The drop zone doubles as the confirm
+surface (kept in place to minimize churn); the whole window stays droppable throughout:
 
 ```
 ┌──────────────────────────────────────────────┐
-│ DROP ZONE — "Drop video files or folders here" │  always clean, always accepts a drop
-├──────────────────────────────────────────────┤
-│ CONFIRM CARD — "SEOA 2" · 40 files [Add][Skip] │  only while a big folder awaits confirm;
-│                                                │  cleared immediately on Add/Skip
+│ DROP ZONE — "Drop video files or folders here" │  morphs to "SEOA 2" · 40 files [Add][Skip]
+│                                                │  while a big folder awaits confirm;
+│                                                │  reverts to the label on Add/Skip click
 ├──────────────────────────────────────────────┤
 │ SCANNER — "SEOA" · Checking 12 of 87…          │  persists until THAT folder's scan ends
 └──────────────────────────────────────────────┘
@@ -92,32 +94,60 @@ replace), and nothing is dropped on the floor.
 
 ## Frontend
 
-### `DropZone.tsx` — owns intake orchestration + the confirm card
+### Intake ownership moves to App (`useFileIntake` hook)
 
-State (queue-like state held in refs so overlapping async handlers read the latest value,
-mirroring the existing `pendingRef` pattern at `DropZone.tsx:18`):
+The drop listener and the whole intake pipeline move out of `DropZone` into a new
+`useFileIntake` hook mounted in **always-mounted `App`** (the same convention as
+`useAddProgress`). Two payoffs:
+
+1. **Drops work on any tab.** `DropZone` only mounts on the Queue tab, so today its listener
+   is gone on History/Watch/Settings. A hook in `App` keeps one persistent window-level
+   `onDragDropEvent`; a "drop" auto-switches to the Queue tab (`setActiveTab("queue")`, passed
+   into the hook as a callback) and then processes the paths.
+2. **State survives tab switches.** The confirm queue and in-flight scanner state live in the
+   hook, so switching away and back mid-confirm/mid-scan no longer loses them (today a
+   `DropZone` unmount would).
+
+Hook state (queue-like state held in refs so overlapping async handlers read the latest
+value, mirroring the existing `pendingRef` pattern at `DropZone.tsx:18`):
 
 - `confirmQueueRef: FolderScanResult[]` + `pendingConfirm` state — the confirm slot.
 - `taskQueueRef: AddTask[]` + `runningRef: boolean` — the serialized scanner pipeline.
   `AddTask = { kind: "files"; paths: string[] } | { kind: "folder"; folder: FolderScanResult }`.
-- `summary` state — the transient "Added N · M skipped" line, rendered **below** the drop
-  box (never inside it), auto-cleared after 4s as today.
+- `status` state — the transient "Added N · M skipped" line, shown inside the drop zone as
+  today (`.drop-zone-status`), auto-cleared after 4s.
+- `isDragOver` state — for the Queue tab's drag-over highlight.
 
 Flow:
 
-- `onDragDropEvent` "drop" → `classify_paths(paths)` (per drop, not serialized). On result:
-  enqueue a `files` task if any loose files; for each folder, drop 0-count, enqueue a
-  `folder` task for ≤5, else push to `confirmQueueRef` and promote `pendingConfirm` if empty.
+- `onDragDropEvent` "drop" → `switchToQueue()`, then `classify_paths(paths)` (per drop, not
+  serialized). On result: enqueue a `files` task if any loose files; for each folder, drop
+  0-count, enqueue a `folder` task for ≤5, else push to `confirmQueueRef` and promote
+  `pendingConfirm` if empty. ("over"/"enter"/"leave" only toggle `isDragOver`; they never
+  switch tabs — only an actual drop does.)
 - `runNext()` drains `taskQueueRef` one task at a time: guard on `runningRef`; pop; `await`
-  the invoke (`add_files` or `confirm_folder_add`); on settle, `start_queue()`,
-  `onFilesAdded()`, set `summary`, then `runNext()` again. Because each task is awaited before
-  the next starts, at most one heavy op is in flight.
+  the invoke (`add_files` or `confirm_folder_add`); on settle, `start_queue()`, set `status`,
+  then `runNext()` again. Because each task is awaited before the next starts, at most one
+  heavy op is in flight.
 - **Add** handler: push a `folder` task, advance `pendingConfirm` from `confirmQueueRef`,
   kick `runNext()`. **Skip** handler: advance `pendingConfirm`. No `startQueue` coupling to
   the card — the queue is kicked when the scanner task completes.
 
-Render: the `.drop-zone` box contains **only** the label / drag-over state (no status, no
-buttons). The confirm card and summary line are **siblings below** the box.
+The hook returns `{ pendingConfirm, onAdd, onSkip, status, isDragOver }`; `App` threads them
+through `QueuePage` to `DropZone`. **Queue refresh needs no cross-component wiring:**
+`add_files` and `confirm_folder_add` emit `queue-updated` on completion (mirroring the
+watcher's `enqueue_and_start`, `watcher.rs:386`), which `useQueue` already listens for
+(`useQueue.ts:40`) and refreshes reactively. The current `DropZone(onFilesAdded)` →
+`useQueue.refresh` prop wiring is removed.
+
+### `DropZone.tsx` — presentational
+
+`DropZone` becomes a pure presentational component: it takes `pendingConfirm`, `onAdd`,
+`onSkip`, `status`, `isDragOver` as props and renders the `.drop-zone` box with its current
+three-way switch — confirm prompt / transient status / label. The only markup change is
+rendering a **single** `pendingConfirm` (one Add/Skip pair) instead of mapping an array; the
+Add/Skip buttons just call the prop handlers. No `onDragDropEvent`, no `invoke`, no intake
+state of its own.
 
 ### Backend event label → named scanner
 
@@ -154,6 +184,10 @@ Call sites (each already constructs an `AddOp` — the only change is passing a 
   available (parent of the batch), else `String::new()`. Names the watcher's scanner for
   free; empty is an acceptable fallback.
 
+`add_files` and `confirm_folder_add` also `emit("queue-updated", ())` after the add completes
+(mirroring `enqueue_and_start`, `watcher.rs:386`), so `useQueue` refreshes reactively and the
+frontend `onFilesAdded` callback is dropped.
+
 `add_files_inner`, `add_files_to_db`, `resolve_media`, the skip engine, and `classify_paths`
 are **untouched**.
 
@@ -172,9 +206,13 @@ are **untouched**.
 - **`skip_by_source_media` off** → no probe loop → each task is near-instant → the scanner
   flashes briefly per folder. Honest and acceptable (as in the 2026-07-17 spec).
 - **Error in a task** → `AddOp::Drop` still emits `add-finished`; `runNext` continues to the
-  next task; the error surfaces in the summary line. One bad folder doesn't stall the queue.
+  next task; the error surfaces in the `status` line. One bad folder doesn't stall the queue.
 - **Watcher op overlapping a drop op** → both carry labels; `activity` shows the most recent
   (current behavior), now named. Rare; acceptable.
+- **Drop while on another tab** → the `App`-level listener catches it, switches to the Queue
+  tab, and processes it; the confirm prompt (if any) appears on the now-active Queue tab.
+- **Switch tabs mid-confirm / mid-scan** → confirm queue and scanner state live in the
+  `App`-owned hook, so nothing is lost; returning to Queue shows the current state.
 
 ## Testing
 
@@ -188,7 +226,12 @@ are **untouched**.
   - **New:** the confirm card clears synchronously on Add (before the deferred
     `confirm_folder_add` resolves) — proves the card is decoupled from the scan.
   - Keep: auto-add of loose files + ≤5 folders, the big-folder-with-loose-files prompt, the
-    skip-summary line — updated for the below-the-box layout.
+    skip-summary line — confirm prompt stays inside the drop zone, so these assertions hold
+    with only the single-vs-array markup change. (These now render `DropZone` via the hook,
+    or drive the hook directly.)
+- **Frontend (`useFileIntake` / `App`):** a "drop" fired while `activeTab !== "queue"` calls
+  the switch callback (activeTab becomes "queue") and still processes the paths; confirm/scan
+  state is retained across a simulated tab switch.
 - **Frontend (`AddingIndicator.test.tsx` / `useAddProgress.test.ts`):** the label rides
   through `add-started` → `activity.label` → rendered as `"<label>" · Checking X of N`, with
   the empty-label fallback preserved.
@@ -199,16 +242,26 @@ are **untouched**.
 
 - `src-tauri/src/add_progress.rs` — `label` on `AddOp::new` + `StartedPayload`; tests.
 - `src-tauri/src/commands/queue.rs` — pass label at the `add_files` / `confirm_folder_add`
-  `AddOp::new` sites (folder basename for confirm).
+  `AddOp::new` sites (folder basename for confirm); emit `queue-updated` after each add so
+  `useQueue` refreshes reactively (removes the `onFilesAdded` wiring).
 - `src-tauri/src/watcher.rs` — pass a label (folder basename / empty) at `enqueue_and_start`.
 - `src/lib/tauri.ts` — `label` on `AddStarted` and `AddActivity`.
 - `src/hooks/useAddProgress.ts` — carry `label` on `activity`.
 - `src/components/AddingIndicator.tsx` — render the label prefix.
-- `src/components/DropZone.tsx` — serialized task pipeline + confirm queue; confirm card and
-  summary rendered **below** the (clean) drop box.
-- `src/App.css` — confirm-card styling as a sibling block (reuse existing tokens); drop-zone
-  stays label-only.
-- Tests alongside the above.
+- `src/hooks/useFileIntake.ts` — **new.** Window-level drop listener; per-drop `classify`;
+  confirm queue; serialized `add_files` / `confirm_folder_add` pipeline; `status`,
+  `isDragOver`, `pendingConfirm`; takes a `switchToQueue` callback.
+- `src/App.tsx` — mount `useFileIntake`, pass `switchToQueue = () => setActiveTab("queue")`,
+  thread `{ pendingConfirm, onAdd, onSkip, status, isDragOver }` to `QueuePage`.
+- `src/pages/QueuePage.tsx` — receive the intake props and pass them to `DropZone`; drop the
+  `onFilesAdded` wiring (refresh now rides the `queue-updated` event `useQueue` handles).
+- `src/components/DropZone.tsx` — becomes presentational: props-driven
+  (`pendingConfirm`/`onAdd`/`onSkip`/`status`/`isDragOver`), single `pendingConfirm` markup,
+  no listener/invoke/state of its own.
+- `src/App.css` — no layout change expected (existing `.drop-zone` / `.folder-confirm` /
+  `.adding-indicator` styles reused as-is); tweak only if the scanner label prefix needs it.
+- Tests alongside the above (`useFileIntake` gains its own test for the serialization,
+  confirm-queue, and cross-tab-drop behavior; `DropZone` tests become prop-driven).
 
 No new Tauri plugin or ACL permission: events are app-emitted and the frontend only adds
 `listen`/`invoke` of existing app commands. App commands stay ACL-exempt.
