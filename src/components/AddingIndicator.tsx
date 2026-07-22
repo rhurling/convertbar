@@ -11,12 +11,14 @@ export default function AddingIndicator({ activity }: AddingIndicatorProps) {
   const percent = determinate
     ? Math.min(100, Math.round((activity.done! / activity.total!) * 100))
     : 0;
+  const prefix = activity.label ? `${activity.label} · ` : "";
 
   return (
     <div className="adding-indicator">
       <div className="adding-indicator-label">
         <span className="spinner" aria-hidden="true" />
         <span>
+          {prefix}
           {determinate ? `Checking ${activity.done} of ${activity.total}…` : "Scanning…"}
         </span>
       </div>
