@@ -94,6 +94,7 @@ pub fn run() {
             commands::converter::pause_after_current,
             commands::converter::cancel_pause_after_current,
             commands::converter::get_pause_after_current,
+            commands::converter::get_low_disk_pause,
             commands::converter::quit_app,
             commands::converter::get_platform_capabilities,
             commands::handbrake::validate_handbrake,

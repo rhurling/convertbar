@@ -348,6 +348,13 @@ pub fn get_pause_after_current(converter_state: State<'_, Arc<ConverterState>>) 
     converter_state.is_pause_after_current()
 }
 
+#[tauri::command]
+pub fn get_low_disk_pause(
+    converter_state: State<'_, Arc<ConverterState>>,
+) -> Option<crate::converter::LowDiskPause> {
+    converter_state.low_disk_pause()
+}
+
 #[derive(serde::Serialize)]
 pub struct PlatformCapabilities {
     pub can_pause_process: bool,

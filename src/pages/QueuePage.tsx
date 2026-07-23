@@ -5,7 +5,7 @@ import DropZone from "../components/DropZone";
 import ActiveJob from "../components/ActiveJob";
 import QueueItem from "../components/QueueItem";
 import { commands } from "../lib/tauri";
-import type { HandbrakeStatus } from "../lib/tauri";
+import type { HandbrakeStatus, LowDiskPause } from "../lib/tauri";
 import { formatBytes } from "../lib/format";
 import AddingIndicator from "../components/AddingIndicator";
 import type { AddActivity } from "../lib/tauri";
@@ -18,10 +18,11 @@ interface QueuePageProps {
   intake: FileIntake;
 }
 
-interface LowDiskPayload {
-  path: string;
-  available_bytes: number;
-  required_bytes: number;
+function lowDiskMessage(p: LowDiskPause): string {
+  return (
+    `Only ${formatBytes(p.available_bytes)} free on the destination — ` +
+    `need ${formatBytes(p.required_bytes)} to start the next file. Free up space, then Resume.`
+  );
 }
 
 export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueuePageProps) {
@@ -31,16 +32,23 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
 
   // The queue stops itself before starting a file when the destination disk is low; surface why.
   useEffect(() => {
-    const un = listen<LowDiskPayload>("queue-paused-low-disk", (e) => {
-      setLowDiskMsg(
-        `Only ${formatBytes(e.payload.available_bytes)} free on the destination — ` +
-          `need ${formatBytes(e.payload.required_bytes)} to start the next file. ` +
-          `Free up space, then Resume.`,
-      );
+    const un = listen<LowDiskPause>("queue-paused-low-disk", (e) => {
+      setLowDiskMsg(lowDiskMessage(e.payload));
     });
     return () => {
       un.then((u) => u());
     };
+  }, []);
+
+  // Seed the banner from backend state so a pause that fired while this tab was unmounted
+  // (or at launch) is still explained — the live event only fires while mounted.
+  useEffect(() => {
+    commands
+      .getLowDiskPause()
+      .then((p) => {
+        if (p) setLowDiskMsg(lowDiskMessage(p));
+      })
+      .catch(() => {});
   }, []);
 
   // Clear the low-disk notice once the queue restarts (an active job appears) or the pending

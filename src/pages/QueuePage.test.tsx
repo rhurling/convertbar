@@ -21,6 +21,7 @@ vi.mock("../lib/tauri", () => ({
     startQueue: vi.fn(() => Promise.resolve()),
     clearQueue: vi.fn(() => Promise.resolve()),
     reorderQueue: vi.fn(() => Promise.resolve()),
+    getLowDiskPause: vi.fn(() => Promise.resolve(null)),
   },
 }));
 
@@ -103,4 +104,20 @@ it("shows a low-disk banner when the queue-paused-low-disk event fires", async (
     handler!({ payload: { path: "/m/out.mp4", available_bytes: 3_000_000_000, required_bytes: 5_000_000_000 } }),
   );
   expect(screen.getByText(/free on the destination/i)).toBeInTheDocument();
+});
+
+it("seeds the low-disk banner from backend state on mount, without the event firing", async () => {
+  vi.mocked(commands.getLowDiskPause).mockResolvedValueOnce({
+    path: "/m/out.mp4",
+    available_bytes: 3_000_000_000,
+    required_bytes: 5_000_000_000,
+  });
+  queueMock = {
+    activeJob: null,
+    pendingJobs: [{ id: "j1", source_path: "/m/a.mp4", status: "queued" }],
+    progress: null,
+    refresh: vi.fn(),
+  };
+  render(<QueuePage hbStatus={null} adding={null} isAdding={false} intake={intakeStub} />);
+  expect(await screen.findByText(/free on the destination/i)).toBeInTheDocument();
 });

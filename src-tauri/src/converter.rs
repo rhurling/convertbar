@@ -104,6 +104,11 @@ pub struct ConverterState {
     /// One-way app-teardown latch: armed by `kill_active_child`, checked by
     /// `process_queue` so the queue thread never spawns another encoder mid-quit.
     pub shutdown: std::sync::atomic::AtomicBool,
+    /// Reason the queue is currently paused for low disk space, if any. Set when the low-disk
+    /// gate trips, cleared at the start of every `process_queue` run so a resume (or a run that
+    /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
+    /// backend state on mount, not just the live `queue-paused-low-disk` event.
+    pub low_disk_pause: Mutex<Option<LowDiskPause>>,
 }
 
 impl ConverterState {
@@ -116,11 +121,19 @@ impl ConverterState {
             is_running: Mutex::new(false),
             pause_after_current: Mutex::new(false),
             shutdown: std::sync::atomic::AtomicBool::new(false),
+            low_disk_pause: Mutex::new(None),
         }
     }
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn low_disk_pause(&self) -> Option<LowDiskPause> {
+        self.low_disk_pause
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(None)
     }
 
     /// Returns true if the current platform supports real process pause/resume (SIGSTOP/SIGCONT).
@@ -213,6 +226,13 @@ pub struct ConversionProgress {
     pub fps: f64,
     pub avg_fps: f64,
     pub eta_seconds: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct LowDiskPause {
+    pub path: String,
+    pub available_bytes: u64,
+    pub required_bytes: u64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -579,6 +599,9 @@ fn process_queue<R: tauri::Runtime>(
 ) {
     // Clears is_running on every exit path (normal, early return, or panic).
     let _running = RunningGuard(converter);
+    // Every run/resume starts fresh: a stale reason from a prior pause must not linger once
+    // the queue is running again (and be gone entirely if this run never hits the gate).
+    *converter.low_disk_pause.lock().unwrap() = None;
     let mut had_errors = false;
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
@@ -621,14 +644,13 @@ fn process_queue<R: tauri::Runtime>(
                 let source_size = job.original_size.unwrap_or(0).max(0) as u64;
                 if !has_enough_disk(available, floor, source_size) {
                     let required = required_free_bytes(floor, source_size);
-                    let _ = app.emit(
-                        "queue-paused-low-disk",
-                        serde_json::json!({
-                            "path": job.output_path,
-                            "available_bytes": available,
-                            "required_bytes": required,
-                        }),
-                    );
+                    let pause = LowDiskPause {
+                        path: job.output_path.clone(),
+                        available_bytes: available,
+                        required_bytes: required,
+                    };
+                    *converter.low_disk_pause.lock().unwrap() = Some(pause.clone());
+                    let _ = app.emit("queue-paused-low-disk", &pause);
                     let _ = app.emit(
                         "menu-bar-update",
                         MenuBarUpdate {
@@ -1469,6 +1491,18 @@ mod tests {
 
         process_queue(app.handle(), &db, &converter);
         assert_eq!(job_row(&db, "j1").0, "queued", "gate pauses the job");
+        let pause = converter
+            .low_disk_pause()
+            .expect("the pause reason is persisted in backend state, not just emitted");
+        assert_eq!(
+            pause.path,
+            out.to_str().unwrap(),
+            "the persisted reason names the job's output path"
+        );
+        assert!(
+            pause.available_bytes < pause.required_bytes,
+            "the persisted reason reflects the shortfall"
+        );
 
         // Free space (disable the gate) and run again: the job must now reach the encode stage.
         set_setting(&db, "low_disk_min_gb", "0");
@@ -1477,6 +1511,10 @@ mod tests {
             job_row(&db, "j1").0,
             "error",
             "after resume the job runs (fake HB -> empty output)"
+        );
+        assert!(
+            converter.low_disk_pause().is_none(),
+            "a resumed run that gets past the gate must clear the stale pause reason"
         );
     }
 

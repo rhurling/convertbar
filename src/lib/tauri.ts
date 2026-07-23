@@ -123,6 +123,12 @@ export interface PlatformCapabilities {
   can_pause_process: boolean;
 }
 
+export interface LowDiskPause {
+  path: string;
+  available_bytes: number;
+  required_bytes: number;
+}
+
 export interface PresetMetadata {
   codec: string;
   resolution: string;
@@ -184,6 +190,7 @@ export const commands = {
   pauseAfterCurrent: () => invoke<void>("pause_after_current"),
   cancelPauseAfterCurrent: () => invoke<void>("cancel_pause_after_current"),
   getPauseAfterCurrent: () => invoke<boolean>("get_pause_after_current"),
+  getLowDiskPause: () => invoke<LowDiskPause | null>("get_low_disk_pause"),
   getPlatformCapabilities: () =>
     invoke<PlatformCapabilities>("get_platform_capabilities"),
   validateHandbrake: () => invoke<HandbrakeStatus>("validate_handbrake"),
