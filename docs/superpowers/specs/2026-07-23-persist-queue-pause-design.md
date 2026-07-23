@@ -46,6 +46,7 @@ Any (re)start of processing or resume of a paused job:
 2. **`commands::converter::resume_conversion`** (SIGCONT / un-freeze) — `set_queue_paused(&db, false)`.
 3. **`watcher::enqueue_and_start`** — before its `run_queue`, `set_queue_paused(&db, false)`. Covers watched-folder file arrivals (adding files → start).
 4. **`commands::queue::clear_queue`** — `set_queue_paused(&db, false)` alongside the existing `low_disk_pause` clear (an empty queue has nothing to stay paused for).
+5. **`commands::converter::cancel_conversion`** — `set_queue_paused(&db, false)`. Cancelling the current job does not stop the queue (the loop continues with the next job), so a pause remembered from an earlier macOS SIGSTOP must be dropped, or the next launch would wrongly stay paused for a queue that was actively running.
 
 ## Launch guard (`lib.rs`)
 
