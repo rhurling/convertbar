@@ -1292,6 +1292,7 @@ mod tests {
         let paused_events = record_events(&app, "queue-paused-low-disk");
         let status_events = record_events(&app, "job-status-changed");
 
+        *converter.is_running.lock().unwrap() = true;
         process_queue(app.handle(), &db, &converter);
 
         let (status, _msg) = job_row(&db, "j1");
@@ -1350,6 +1351,47 @@ mod tests {
         assert!(
             msg.unwrap().contains("empty output file"),
             "the job reached the encode stage (fake HandBrake produced no output)"
+        );
+    }
+
+    #[test]
+    fn low_disk_check_fails_open_when_destination_is_unstattable() {
+        // A configured threshold must NOT block a job whose destination free space can't be
+        // read (nonexistent parent dir -> fs4::available_space errs -> None). Fail open: the
+        // encode proceeds rather than the queue wedging on an unreadable volume.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_handbrake_script(dir.path()); // exits 0, writes nothing -> empty-output error
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "low_disk_min_gb", "5"); // gate enabled, but destination can't be stat'd
+                                                  // Output under a parent directory that does not exist -> available-space query fails -> None.
+        queue_job(
+            &db,
+            "j1",
+            "/nowhere/a.mp4",
+            "/no-such-dir-xyz/out.mp4",
+            1000,
+        );
+
+        let paused_events = record_events(&app, "queue-paused-low-disk");
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "error",
+            "fail-open: the job runs to the encode stage, not held 'queued'"
+        );
+        assert!(
+            msg.unwrap().contains("empty output file"),
+            "the disabled/unreadable-disk gate let the encode proceed"
+        );
+        assert!(
+            paused_events.lock().unwrap().is_empty(),
+            "no low-disk pause event fires when free space is unknown"
         );
     }
 
