@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "convertbar"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
