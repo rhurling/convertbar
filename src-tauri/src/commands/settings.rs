@@ -48,6 +48,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
     let mut skip_already_converted = false;
     let mut skip_by_source_media = false;
     let mut watch_skip_marker = String::new();
+    let mut low_disk_min_gb: f64 = 0.0;
 
     let rows = stmt
         .query_map([], |row| {
@@ -75,6 +76,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
             "skip_already_converted" => skip_already_converted = value == "true",
             "skip_by_source_media" => skip_by_source_media = value == "true",
             "watch_skip_marker" => watch_skip_marker = value,
+            "low_disk_min_gb" => low_disk_min_gb = value.parse().unwrap_or(0.0),
             _ => {}
         }
     }
@@ -98,6 +100,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
         skip_already_converted,
         skip_by_source_media,
         watch_skip_marker,
+        low_disk_min_gb,
     })
 }
 
@@ -117,6 +120,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "skip_already_converted",
     "skip_by_source_media",
     "watch_skip_marker",
+    "low_disk_min_gb",
 ];
 
 #[tauri::command]

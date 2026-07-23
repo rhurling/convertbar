@@ -27,6 +27,7 @@ function makeSettings(preset: string): AppSettings {
     skip_already_converted: false,
     skip_by_source_media: true,
     watch_skip_marker: ".downloading",
+    low_disk_min_gb: 0,
   };
 }
 

@@ -186,6 +186,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("skip_already_converted", "false"),
         ("skip_by_source_media", "false"),
         ("watch_skip_marker", ".downloading"),
+        ("low_disk_min_gb", "0"),
     ];
 
     for (key, value) in defaults {
@@ -248,7 +249,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 15);
+        assert_eq!(count, 16);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -266,6 +267,11 @@ mod tests {
             setting(&conn, "watch_skip_marker").as_deref(),
             Some(".downloading"),
             "watched folders skip files while this marker exists; empty disables the feature"
+        );
+        assert_eq!(
+            setting(&conn, "low_disk_min_gb").as_deref(),
+            Some("0"),
+            "low-disk auto-pause is off (0) until the user sets a GB threshold"
         );
         assert_eq!(
             setting(&conn, "notifications_per_file").as_deref(),
@@ -303,7 +309,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 15);
+        assert_eq!(count, 16);
     }
 
     #[test]

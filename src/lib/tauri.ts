@@ -90,6 +90,7 @@ export interface AppSettings {
   skip_already_converted: boolean;
   skip_by_source_media: boolean;
   watch_skip_marker: string;
+  low_disk_min_gb: number;
 }
 
 export interface PathsExist {
