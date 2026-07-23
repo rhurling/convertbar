@@ -417,6 +417,33 @@ fn get_low_disk_min_gb(db: &Connection) -> f64 {
     .unwrap_or(0.0)
 }
 
+/// Persisted "the user deliberately stopped the queue" flag, stored in the settings table.
+/// Read-with-default (no seed) so existing databases need no migration and the settings-count
+/// guard test is untouched. It is backend runtime state — NOT in ALLOWED_KEYS, NOT in the UI.
+pub(crate) fn set_queue_paused(db: &Connection, paused: bool) {
+    let _ = db.execute(
+        "INSERT INTO settings (key, value) VALUES ('queue_paused', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        params![if paused { "true" } else { "false" }],
+    );
+}
+
+pub(crate) fn is_queue_paused(db: &Connection) -> bool {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = 'queue_paused'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .map(|v| v == "true")
+    .unwrap_or(false)
+}
+
+/// Whether launch should auto-start the queue: only when jobs are queued AND the user did not
+/// leave the queue deliberately paused. Pure so the launch decision is unit-testable.
+pub(crate) fn should_auto_resume(has_queued: bool, queue_paused: bool) -> bool {
+    has_queued && !queue_paused
+}
+
 /// Outcome of trying to claim the next job by flipping it 'queued' -> 'encoding'. The claim is
 /// conditional (`AND status = 'queued'`) so a job that `clear_queue`/`remove_job` deleted during
 /// the pre-spawn window is not resurrected — spawning on a deleted row could trash the source.
@@ -2481,5 +2508,34 @@ HandBrake has exited.";
             .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "queued");
+    }
+
+    #[test]
+    fn queue_paused_round_trips_and_defaults_false() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        // Absent row -> false (no seed, existing DBs need no migration).
+        assert!(!is_queue_paused(&conn));
+        set_queue_paused(&conn, true);
+        assert!(is_queue_paused(&conn));
+        set_queue_paused(&conn, false);
+        assert!(!is_queue_paused(&conn));
+    }
+
+    #[test]
+    fn should_auto_resume_only_when_queued_and_not_paused() {
+        assert!(
+            should_auto_resume(true, false),
+            "queued + not paused -> auto-start"
+        );
+        assert!(
+            !should_auto_resume(true, true),
+            "a remembered pause blocks auto-start"
+        );
+        assert!(
+            !should_auto_resume(false, false),
+            "nothing queued -> nothing to start"
+        );
+        assert!(!should_auto_resume(false, true));
     }
 }
