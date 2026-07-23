@@ -265,6 +265,40 @@ fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
     None
 }
 
+/// Peak disk headroom multiplier applied to the next file's source size. An in-place re-encode
+/// writes its temp output alongside the still-present source on the same filesystem, so usage
+/// peaks at ~2× the source before cleanup removes one.
+const LOW_DISK_HEADROOM_FACTOR: u64 = 2;
+
+/// Bytes that must remain free on a job's destination filesystem before its encode may start:
+/// the user's configured floor plus headroom for the encode itself. Saturating so an enormous
+/// configured floor (or source size) can't wrap.
+pub(crate) fn required_free_bytes(reserve_floor: u64, source_size: u64) -> u64 {
+    reserve_floor.saturating_add(source_size.saturating_mul(LOW_DISK_HEADROOM_FACTOR))
+}
+
+/// Whether `available` free bytes clear the reserve floor plus the encode headroom.
+pub(crate) fn has_enough_disk(available: u64, reserve_floor: u64, source_size: u64) -> bool {
+    available >= required_free_bytes(reserve_floor, source_size)
+}
+
+/// GiB (1024³ bytes), as configured in settings, to bytes. `f64 as u64` saturates at `u64::MAX`
+/// and clamps negatives/zero to 0, so a garbage or huge stored value can't panic or wrap.
+pub(crate) fn gb_to_bytes(gb: f64) -> u64 {
+    if gb <= 0.0 {
+        return 0;
+    }
+    (gb * 1024.0 * 1024.0 * 1024.0) as u64
+}
+
+/// Free bytes available to this process on the filesystem holding `output_path`'s parent
+/// directory (the output file itself does not exist yet). `None` when the parent can't be
+/// resolved or the platform query fails — the caller treats that as "don't block the queue".
+fn destination_available_bytes(output_path: &str) -> Option<u64> {
+    let parent = std::path::Path::new(output_path).parent()?;
+    fs4::available_space(parent).ok()
+}
+
 fn get_next_job(db: &Connection) -> Option<JobInfo> {
     let mut stmt = db
         .prepare(
@@ -1441,6 +1475,38 @@ mod tests {
         // the tray showing an error state until the next run starts.
         assert_eq!(final_run_status(false), "idle");
         assert_eq!(final_run_status(true), "error");
+    }
+
+    #[test]
+    fn required_free_bytes_adds_double_the_source_to_the_floor() {
+        // Peak disk during an in-place encode is source + temp ≈ 2× source, on top of the floor.
+        assert_eq!(required_free_bytes(1000, 500), 1000 + 1000);
+        // Unknown/zero source size degrades to the bare floor.
+        assert_eq!(required_free_bytes(1000, 0), 1000);
+    }
+
+    #[test]
+    fn required_free_bytes_saturates_instead_of_wrapping() {
+        assert_eq!(required_free_bytes(u64::MAX, 10), u64::MAX);
+        assert_eq!(required_free_bytes(10, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn has_enough_disk_is_true_only_at_or_above_the_requirement() {
+        // floor 1000 + 2*500 = 2000 required.
+        assert!(has_enough_disk(2000, 1000, 500));
+        assert!(has_enough_disk(2001, 1000, 500));
+        assert!(!has_enough_disk(1999, 1000, 500));
+    }
+
+    #[test]
+    fn gb_to_bytes_converts_and_clamps() {
+        assert_eq!(gb_to_bytes(1.0), 1024 * 1024 * 1024);
+        // Disabled / nonsense values clamp to 0 (never panic, never wrap).
+        assert_eq!(gb_to_bytes(0.0), 0);
+        assert_eq!(gb_to_bytes(-5.0), 0);
+        // Absurd values saturate rather than panicking (used by the Task 4 integration test).
+        assert_eq!(gb_to_bytes(f64::MAX), u64::MAX);
     }
 
     #[test]
