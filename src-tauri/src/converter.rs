@@ -1461,6 +1461,11 @@ mod tests {
         );
     }
 
+    // Unix-only: this exercises fail-open when statvfs ERRORS for a missing path. On Windows,
+    // GetDiskFreeSpaceEx resolves a missing subdir to the volume root and returns Some, so the
+    // job would (correctly) be gated by the absurd threshold instead. The universal fail-open
+    // path (a None parent) is covered by `destination_available_bytes_resolves_or_fails_open`.
+    #[cfg(unix)]
     #[test]
     fn low_disk_check_fails_open_when_destination_is_unstattable() {
         // A configured threshold must NOT block a job whose destination free space can't be
@@ -1885,13 +1890,19 @@ mod tests {
             destination_available_bytes(out.to_str().unwrap()).is_some(),
             "an output inside a real directory has a stat-able free-space figure"
         );
-        // A nonexistent parent can't be stat'd -> None (fail open, don't wedge the queue).
-        assert_eq!(
-            destination_available_bytes("/no-such-dir-xyz/out.mp4"),
-            None
-        );
-        // A bare filename's parent is "" (not None), and statting "" fails -> None (fail open).
-        assert_eq!(destination_available_bytes("out.mp4"), None);
+        // The fail-open-to-None cases below rely on POSIX statvfs erroring for an unreadable
+        // location; Windows' GetDiskFreeSpaceEx resolves a missing subdir to the volume root and
+        // returns Some, so these are Unix-only.
+        #[cfg(unix)]
+        {
+            // A nonexistent parent can't be stat'd -> None (fail open, don't wedge the queue).
+            assert_eq!(
+                destination_available_bytes("/no-such-dir-xyz/out.mp4"),
+                None
+            );
+            // A bare filename's parent is "" (not None), and statting "" fails -> None.
+            assert_eq!(destination_available_bytes("out.mp4"), None);
+        }
     }
 
     #[test]
