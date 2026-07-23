@@ -10,7 +10,7 @@ mod types;
 mod watcher;
 
 use converter::{ConverterState, MenuBarUpdate};
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -353,23 +353,9 @@ pub fn run() {
             {
                 let db = app_state.db.lock().unwrap();
 
-                // Find interrupted jobs and reset to queued
-                let mut stmt = db.prepare(
-                    "SELECT id, output_path FROM jobs WHERE status IN ('encoding', 'paused')"
-                ).unwrap();
-                let interrupted: Vec<(String, String)> = stmt
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                    .unwrap()
-                    .flatten()
-                    .collect();
-
-                for (id, output_path) in &interrupted {
-                    let _ = std::fs::remove_file(output_path);
-                    let _ = db.execute(
-                        "UPDATE jobs SET status = 'queued' WHERE id = ?1",
-                        params![id],
-                    );
-                }
+                // Reset interrupted jobs to queued, deleting only their partial output (never the
+                // source — critical for in-place jobs where output_path == source_path).
+                crate::converter::recover_interrupted_jobs(&db);
 
                 has_queued = db.query_row(
                     "SELECT COUNT(*) > 0 FROM jobs WHERE status = 'queued'",

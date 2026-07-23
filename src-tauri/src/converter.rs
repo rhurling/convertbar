@@ -31,6 +31,36 @@ pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
     parent.join(format!(".{stem}{IN_PLACE_TEMP_MARKER}mp4"))
 }
 
+/// Reset jobs interrupted by a quit/crash (`encoding`/`paused`) back to `queued` for the next
+/// run, deleting only the partial output — NEVER the source. For an in-place job `output_path`
+/// equals `source_path`, so the partial to remove is the hidden temp sibling, not the original
+/// (mirrors `cancel_conversion`'s guard; deleting `output_path` here would destroy the user's file).
+pub(crate) fn recover_interrupted_jobs(db: &Connection) {
+    let mut stmt = match db.prepare(
+        "SELECT id, source_path, output_path FROM jobs WHERE status IN ('encoding', 'paused')",
+    ) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let interrupted: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+
+    for (id, source_path, output_path) in &interrupted {
+        let target = if is_in_place(source_path, output_path) {
+            in_place_temp_path(source_path)
+        } else {
+            std::path::PathBuf::from(output_path)
+        };
+        let _ = std::fs::remove_file(&target);
+        let _ = db.execute(
+            "UPDATE jobs SET status = 'queued' WHERE id = ?1",
+            params![id],
+        );
+    }
+}
+
 /// Refresh a completed job's source-identity fingerprint to the file currently at `path`.
 /// Called after an in-place encode replaces the source: the recorded `(size, mtime)` must match
 /// what a folder re-scan will stat, so the encoded result is recognized as already done (no
@@ -2385,5 +2415,60 @@ HandBrake has exited.";
             b"original",
             "the source is left intact when the rename could not happen"
         );
+    }
+
+    #[test]
+    fn recover_interrupted_jobs_preserves_an_in_place_source() {
+        // An in-place job (output_path == source_path) interrupted mid-encode: recovery must delete
+        // the hidden temp sibling and REQUEUE the job, and must NOT delete the user's original source.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        std::fs::write(&source, b"original").unwrap();
+        let temp = in_place_temp_path(source.to_str().unwrap());
+        std::fs::write(&temp, b"partial").unwrap();
+        let s = source.to_str().unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j', ?1, ?1, 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            params![s],
+        ).unwrap();
+
+        recover_interrupted_jobs(&conn);
+
+        assert!(source.exists(), "the in-place source must NOT be deleted");
+        assert!(!temp.exists(), "the in-place temp partial must be removed");
+        let status: String = conn
+            .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "queued");
+    }
+
+    #[test]
+    fn recover_interrupted_jobs_removes_a_distinct_output_and_keeps_the_source() {
+        // A normal (distinct-output) interrupted job: the partial output is removed, the source is
+        // untouched, and the job is requeued.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("in.mkv");
+        let output = dir.path().join("in.h265.mp4");
+        std::fs::write(&source, b"src").unwrap();
+        std::fs::write(&output, b"partial").unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j', ?1, ?2, 'p', 'paused', 0, '2020-01-01T00:00:00Z')",
+            params![source.to_str().unwrap(), output.to_str().unwrap()],
+        ).unwrap();
+
+        recover_interrupted_jobs(&conn);
+
+        assert!(source.exists(), "the source is never touched");
+        assert!(!output.exists(), "the partial output is removed");
+        let status: String = conn
+            .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "queued");
     }
 }
