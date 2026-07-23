@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useQueue } from "../hooks/useQueue";
 import DropZone from "../components/DropZone";
 import ActiveJob from "../components/ActiveJob";
 import QueueItem from "../components/QueueItem";
 import { commands } from "../lib/tauri";
 import type { HandbrakeStatus } from "../lib/tauri";
+import { formatBytes } from "../lib/format";
 import AddingIndicator from "../components/AddingIndicator";
 import type { AddActivity } from "../lib/tauri";
 import type { FileIntake } from "../hooks/useFileIntake";
@@ -16,14 +18,39 @@ interface QueuePageProps {
   intake: FileIntake;
 }
 
+interface LowDiskPayload {
+  path: string;
+  available_bytes: number;
+  required_bytes: number;
+}
+
 export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueuePageProps) {
-  const { activeJob, pendingJobs, progress, refresh } =
-    useQueue();
+  const { activeJob, pendingJobs, progress, refresh } = useQueue();
   const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const [lowDiskMsg, setLowDiskMsg] = useState<string | null>(null);
+
+  // The queue stops itself before starting a file when the destination disk is low; surface why.
+  useEffect(() => {
+    const un = listen<LowDiskPayload>("queue-paused-low-disk", (e) => {
+      setLowDiskMsg(
+        `Only ${formatBytes(e.payload.available_bytes)} free on the destination — ` +
+          `need ${formatBytes(e.payload.required_bytes)} to start the next file. ` +
+          `Free up space, then Resume.`,
+      );
+    });
+    return () => {
+      un.then((u) => u());
+    };
+  }, []);
+
+  // A restarted queue (an active job appears) clears the low-disk notice.
+  useEffect(() => {
+    if (activeJob) setLowDiskMsg(null);
+  }, [activeJob]);
 
   const handleDrop = async (draggedId: string, targetId: string) => {
     setDragOverId(null);
-    const ids = pendingJobs.map(j => j.id);
+    const ids = pendingJobs.map((j) => j.id);
     const fromIdx = ids.indexOf(draggedId);
     const toIdx = ids.indexOf(targetId);
     if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) return;
@@ -54,16 +81,44 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
 
       <AddingIndicator activity={adding} />
 
+      {lowDiskMsg && (
+        <div className="hb-warning">
+          <span className="hb-warning-icon">&#9888;&#65039;</span>
+          <div>
+            <strong>Queue paused — low disk space</strong>
+            <p>{lowDiskMsg}</p>
+          </div>
+        </div>
+      )}
+
       {activeJob && <ActiveJob job={activeJob} progress={progress} />}
 
       {pendingJobs.length > 0 && (
         <div className="section">
           <div className="section-header">
             <span>Pending ({pendingJobs.length})</span>
-            <button className="btn btn-small btn-dim" onClick={async () => {
-              await commands.clearQueue();
-              refresh();
-            }}>Clear</button>
+            <div className="section-header-actions">
+              {!activeJob && (
+                <button
+                  className="btn btn-small"
+                  onClick={async () => {
+                    await commands.startQueue();
+                    refresh();
+                  }}
+                >
+                  Resume
+                </button>
+              )}
+              <button
+                className="btn btn-small btn-dim"
+                onClick={async () => {
+                  await commands.clearQueue();
+                  refresh();
+                }}
+              >
+                Clear
+              </button>
+            </div>
           </div>
           <div className="item-list">
             {pendingJobs.map((job) => (

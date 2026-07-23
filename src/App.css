@@ -1021,3 +1021,8 @@ select.setting-input {
   border-radius: 50%;
   animation: cb-spin 0.7s linear infinite;
 }
+
+.section-header-actions {
+  display: flex;
+  gap: 8px;
+}
