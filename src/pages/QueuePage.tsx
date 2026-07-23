@@ -43,10 +43,11 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
     };
   }, []);
 
-  // A restarted queue (an active job appears) clears the low-disk notice.
+  // Clear the low-disk notice once the queue restarts (an active job appears) or the pending
+  // list empties (e.g. the user hit Clear) — otherwise the banner lingers over an empty queue.
   useEffect(() => {
-    if (activeJob) setLowDiskMsg(null);
-  }, [activeJob]);
+    if (activeJob || pendingJobs.length === 0) setLowDiskMsg(null);
+  }, [activeJob, pendingJobs.length]);
 
   const handleDrop = async (draggedId: string, targetId: string) => {
     setDragOverId(null);
@@ -82,7 +83,7 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
       <AddingIndicator activity={adding} />
 
       {lowDiskMsg && (
-        <div className="hb-warning">
+        <div className="hb-warning" role="status" aria-live="polite">
           <span className="hb-warning-icon">&#9888;&#65039;</span>
           <div>
             <strong>Queue paused — low disk space</strong>
