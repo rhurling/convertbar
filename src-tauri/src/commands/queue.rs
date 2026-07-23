@@ -708,10 +708,19 @@ pub fn clear_completed(state: State<'_, AppState>, mode: String) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn clear_queue(state: State<'_, AppState>) -> Result<(), String> {
+pub fn clear_queue(
+    state: State<'_, AppState>,
+    converter_state: State<'_, std::sync::Arc<crate::converter::ConverterState>>,
+) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM jobs WHERE status = 'queued'", [])
         .map_err(|e| e.to_string())?;
+    // A cleared queue has no job to justify a low-disk pause reason; drop it so the banner
+    // can't be re-seeded over an empty queue after a remount.
+    *converter_state
+        .low_disk_pause
+        .lock()
+        .map_err(|e| e.to_string())? = None;
     Ok(())
 }
 
@@ -1829,6 +1838,52 @@ mod tests {
             at_target_again.map(|c| c.count),
             Some(1),
             "the cached at-target source is still recognized on re-scan"
+        );
+    }
+
+    // Clearing the queue must also drop any low-disk pause reason: otherwise a Some reason
+    // outlives the jobs that justified it, and a QueuePage remount re-seeds the "low disk"
+    // banner over an empty queue (the async seed races past the clear-on-empty effect).
+    #[test]
+    fn clear_queue_drops_the_low_disk_pause_reason() {
+        use crate::converter::{ConverterState, LowDiskPause};
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+
+        let conn = test_conn();
+        insert_queued(&conn, "j1", "/m/a.mp4", "queued", 0);
+        app.manage(crate::AppState {
+            db: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+            preset_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        let converter = std::sync::Arc::new(ConverterState::new());
+        *converter.low_disk_pause.lock().unwrap() = Some(LowDiskPause {
+            path: "/m/a.mp4.out".into(),
+            available_bytes: 3,
+            required_bytes: 5,
+        });
+        app.manage(converter.clone());
+
+        clear_queue(app.state(), app.state()).unwrap();
+
+        let state: State<'_, AppState> = app.state();
+        let remaining: i64 = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "clearing the queue deletes the queued job");
+        assert!(
+            converter.low_disk_pause().is_none(),
+            "clearing the queue also drops the low-disk pause reason so it can't re-seed the banner"
         );
     }
 }

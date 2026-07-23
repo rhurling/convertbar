@@ -31,6 +31,36 @@ pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
     parent.join(format!(".{stem}{IN_PLACE_TEMP_MARKER}mp4"))
 }
 
+/// Reset jobs interrupted by a quit/crash (`encoding`/`paused`) back to `queued` for the next
+/// run, deleting only the partial output — NEVER the source. For an in-place job `output_path`
+/// equals `source_path`, so the partial to remove is the hidden temp sibling, not the original
+/// (mirrors `cancel_conversion`'s guard; deleting `output_path` here would destroy the user's file).
+pub(crate) fn recover_interrupted_jobs(db: &Connection) {
+    let mut stmt = match db.prepare(
+        "SELECT id, source_path, output_path FROM jobs WHERE status IN ('encoding', 'paused')",
+    ) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let interrupted: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+
+    for (id, source_path, output_path) in &interrupted {
+        let target = if is_in_place(source_path, output_path) {
+            in_place_temp_path(source_path)
+        } else {
+            std::path::PathBuf::from(output_path)
+        };
+        let _ = std::fs::remove_file(&target);
+        let _ = db.execute(
+            "UPDATE jobs SET status = 'queued' WHERE id = ?1",
+            params![id],
+        );
+    }
+}
+
 /// Refresh a completed job's source-identity fingerprint to the file currently at `path`.
 /// Called after an in-place encode replaces the source: the recorded `(size, mtime)` must match
 /// what a folder re-scan will stat, so the encoded result is recognized as already done (no
@@ -104,6 +134,11 @@ pub struct ConverterState {
     /// One-way app-teardown latch: armed by `kill_active_child`, checked by
     /// `process_queue` so the queue thread never spawns another encoder mid-quit.
     pub shutdown: std::sync::atomic::AtomicBool,
+    /// Reason the queue is currently paused for low disk space, if any. Set when the low-disk
+    /// gate trips, cleared at the start of every `process_queue` run so a resume (or a run that
+    /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
+    /// backend state on mount, not just the live `queue-paused-low-disk` event.
+    pub low_disk_pause: Mutex<Option<LowDiskPause>>,
 }
 
 impl ConverterState {
@@ -116,11 +151,19 @@ impl ConverterState {
             is_running: Mutex::new(false),
             pause_after_current: Mutex::new(false),
             shutdown: std::sync::atomic::AtomicBool::new(false),
+            low_disk_pause: Mutex::new(None),
         }
     }
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn low_disk_pause(&self) -> Option<LowDiskPause> {
+        self.low_disk_pause
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(None)
     }
 
     /// Returns true if the current platform supports real process pause/resume (SIGSTOP/SIGCONT).
@@ -215,6 +258,13 @@ pub struct ConversionProgress {
     pub eta_seconds: u64,
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct LowDiskPause {
+    pub path: String,
+    pub available_bytes: u64,
+    pub required_bytes: u64,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct MenuBarUpdate {
     pub status: String,
@@ -263,6 +313,40 @@ fn parse_progress(line: &str) -> Option<(f64, f64, f64, u64)> {
     }
 
     None
+}
+
+/// Peak disk headroom multiplier applied to the next file's source size. An in-place re-encode
+/// writes its temp output alongside the still-present source on the same filesystem, so usage
+/// peaks at ~2× the source before cleanup removes one.
+const LOW_DISK_HEADROOM_FACTOR: u64 = 2;
+
+/// Bytes that must remain free on a job's destination filesystem before its encode may start:
+/// the user's configured floor plus headroom for the encode itself. Saturating so an enormous
+/// configured floor (or source size) can't wrap.
+pub(crate) fn required_free_bytes(reserve_floor: u64, source_size: u64) -> u64 {
+    reserve_floor.saturating_add(source_size.saturating_mul(LOW_DISK_HEADROOM_FACTOR))
+}
+
+/// Whether `available` free bytes clear the reserve floor plus the encode headroom.
+pub(crate) fn has_enough_disk(available: u64, reserve_floor: u64, source_size: u64) -> bool {
+    available >= required_free_bytes(reserve_floor, source_size)
+}
+
+/// GiB (1024³ bytes), as configured in settings, to bytes. `f64 as u64` saturates at `u64::MAX`
+/// and clamps negatives/zero to 0, so a garbage or huge stored value can't panic or wrap.
+pub(crate) fn gb_to_bytes(gb: f64) -> u64 {
+    if gb <= 0.0 {
+        return 0;
+    }
+    (gb * 1024.0 * 1024.0 * 1024.0) as u64
+}
+
+/// Free bytes available to this process on the filesystem holding `output_path`'s parent
+/// directory (the output file itself does not exist yet). `None` when the parent can't be
+/// resolved or the platform query fails — the caller treats that as "don't block the queue".
+fn destination_available_bytes(output_path: &str) -> Option<u64> {
+    let parent = std::path::Path::new(output_path).parent()?;
+    fs4::available_space(parent).ok()
 }
 
 fn get_next_job(db: &Connection) -> Option<JobInfo> {
@@ -320,6 +404,40 @@ fn get_cleanup_mode(db: &Connection) -> String {
         |row| row.get::<_, String>(0),
     )
     .unwrap_or_else(|_| "trash".to_string())
+}
+
+fn get_low_disk_min_gb(db: &Connection) -> f64 {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = 'low_disk_min_gb'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse::<f64>().ok())
+    .unwrap_or(0.0)
+}
+
+/// Outcome of trying to claim the next job by flipping it 'queued' -> 'encoding'. The claim is
+/// conditional (`AND status = 'queued'`) so a job that `clear_queue`/`remove_job` deleted during
+/// the pre-spawn window is not resurrected — spawning on a deleted row could trash the source.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimOutcome {
+    Claimed,
+    Gone,
+    Failed(String),
+}
+
+/// Atomically claim `job_id` for encoding iff it is still queued. Distinguishes a genuine DB
+/// error from "row no longer queued" so a failing UPDATE can't spin the queue on the same job.
+fn claim_job(db: &Connection, job_id: &str) -> ClaimOutcome {
+    match db.execute(
+        "UPDATE jobs SET status = 'encoding' WHERE id = ?1 AND status = 'queued'",
+        params![job_id],
+    ) {
+        Ok(0) => ClaimOutcome::Gone,
+        Ok(_) => ClaimOutcome::Claimed,
+        Err(e) => ClaimOutcome::Failed(e.to_string()),
+    }
 }
 
 const STDERR_TAIL_BYTES: usize = 4096;
@@ -511,6 +629,9 @@ fn process_queue<R: tauri::Runtime>(
 ) {
     // Clears is_running on every exit path (normal, early return, or panic).
     let _running = RunningGuard(converter);
+    // Every run/resume starts fresh: a stale reason from a prior pause must not linger once
+    // the queue is running again (and be gone entirely if this run never hits the gate).
+    *converter.low_disk_pause.lock().unwrap() = None;
     let mut had_errors = false;
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
@@ -522,6 +643,7 @@ fn process_queue<R: tauri::Runtime>(
         let job;
         let handbrake_path_opt;
         let cleanup_mode;
+        let low_disk_min_gb;
         {
             let db = db.lock().unwrap();
             job = match get_next_job(&db) {
@@ -530,13 +652,9 @@ fn process_queue<R: tauri::Runtime>(
             };
             handbrake_path_opt = get_handbrake_path(&db);
             cleanup_mode = get_cleanup_mode(&db);
-
-            if handbrake_path_opt.is_some() {
-                let _ = db.execute(
-                    "UPDATE jobs SET status = 'encoding' WHERE id = ?1",
-                    params![job.id],
-                );
-            }
+            low_disk_min_gb = get_low_disk_min_gb(&db);
+            // The job is flipped to 'encoding' below, AFTER the low-disk gate — a gated job
+            // must stay 'queued' so the Resume button can retry it.
         }
 
         let file_name = std::path::Path::new(&job.source_path)
@@ -544,6 +662,43 @@ fn process_queue<R: tauri::Runtime>(
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
+
+        // Low-disk gate: before committing this job to 'encoding', ensure the destination
+        // filesystem has room for the floor plus the encode (2× source). On a shortfall, stop
+        // the run like "Pause after this" — leave the job 'queued', tell the UI why, and return
+        // (nothing completed, so no "Queue complete" notification). Fail open: a 0 threshold, an
+        // unresolvable parent, or a failed free-space query all let the encode proceed.
+        if low_disk_min_gb > 0.0 {
+            if let Some(available) = destination_available_bytes(&job.output_path) {
+                let floor = gb_to_bytes(low_disk_min_gb);
+                let source_size = job.original_size.unwrap_or(0).max(0) as u64;
+                if !has_enough_disk(available, floor, source_size) {
+                    let required = required_free_bytes(floor, source_size);
+                    let pause = LowDiskPause {
+                        path: job.output_path.clone(),
+                        available_bytes: available,
+                        required_bytes: required,
+                    };
+                    *converter.low_disk_pause.lock().unwrap() = Some(pause.clone());
+                    let _ = app.emit("queue-paused-low-disk", &pause);
+                    let _ = app.emit(
+                        "menu-bar-update",
+                        MenuBarUpdate {
+                            // Reuse the end-of-run status so a prior job's failure in this run
+                            // still surfaces as "error" in the tray; otherwise a paused queue reads
+                            // "idle". (had_errors is in scope at the top of process_queue.)
+                            status: final_run_status(had_errors).to_string(),
+                            percent: None,
+                            file_name: None,
+                            eta_seconds: None,
+                            queue_count: None,
+                            fps: None,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
 
         // Outside the db-lock scope: record_job_error takes the lock itself, and this
         // failure must count toward had_errors and emit the same events as any other.
@@ -555,6 +710,36 @@ fn process_queue<R: tauri::Runtime>(
                 continue;
             }
         };
+
+        // Claim the job by flipping it to 'encoding' ONLY if it is still 'queued'. The original
+        // code did this select+flip under a single db-lock; relocating the flip past the disk
+        // gate (whose statvfs can stall on a slow/asleep/network volume) reopened a window where
+        // `clear_queue`/`remove_job` — which delete 'queued' rows — could remove this job before
+        // the flip. Without the `AND status = 'queued'` guard the loop would then spawn HandBrake
+        // on a deleted row and, on success, trash/delete the user's SOURCE file. The conditional
+        // claim + row-count check closes that window: 0 rows affected means the job is gone, so
+        // skip it.
+        let claim = {
+            let conn = db.lock().unwrap();
+            claim_job(&conn, &job.id)
+        };
+        match claim {
+            ClaimOutcome::Claimed => {}
+            // Removed during the pre-spawn window (e.g. Clear/Remove while the disk stat stalled).
+            ClaimOutcome::Gone => continue,
+            // A failing UPDATE must NOT re-loop on the same job forever; record and move on.
+            ClaimOutcome::Failed(e) => {
+                had_errors = true;
+                record_job_error(
+                    app,
+                    db,
+                    &job.id,
+                    &file_name,
+                    &format!("Failed to claim job: {e}"),
+                );
+                continue;
+            }
+        }
 
         *converter.current_job_id.lock().unwrap() = Some(job.id.clone());
         *converter.is_paused.lock().unwrap() = false;
@@ -1172,6 +1357,202 @@ mod tests {
         );
     }
 
+    #[test]
+    fn low_disk_threshold_pauses_before_spawning_and_leaves_the_job_queued() {
+        // An absurd threshold makes required-free exceed any real disk, so the gate always trips —
+        // deterministic regardless of the test machine's free space.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        // A real fake HandBrake IS configured: if the gate failed to stop the run, the job would be
+        // spawned and end 'error' (empty output). Staying 'queued' proves the gate blocked the spawn.
+        let script = fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "low_disk_min_gb", "1000000000"); // 1e9 GB
+        let out = dir.path().join("out.mp4");
+        queue_job(&db, "j1", "/nowhere/a.mp4", out.to_str().unwrap(), 1000);
+
+        let paused_events = record_events(&app, "queue-paused-low-disk");
+        let status_events = record_events(&app, "job-status-changed");
+
+        *converter.is_running.lock().unwrap() = true;
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, _msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "queued",
+            "a low-disk pause leaves the job queued, never encoding/error"
+        );
+        assert!(
+            !out.exists(),
+            "the encode must never start, so no output is written"
+        );
+        assert_eq!(
+            paused_events.lock().unwrap().len(),
+            1,
+            "exactly one low-disk pause event fires"
+        );
+        assert!(
+            paused_events.lock().unwrap()[0].contains("required_bytes"),
+            "the event carries the required-free figure for the UI"
+        );
+        // Assert the actual payload VALUES, not just the presence of the key: an available/required
+        // swap or the wrong path would still contain "required_bytes" but mislead the UI.
+        let payload = paused_events.lock().unwrap()[0].clone();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let available = v["available_bytes"]
+            .as_u64()
+            .expect("available_bytes is a number");
+        let required = v["required_bytes"]
+            .as_u64()
+            .expect("required_bytes is a number");
+        assert!(
+            available < required,
+            "a pause only fires on a shortfall: available ({available}) must be < required ({required})"
+        );
+        assert_eq!(
+            v["path"].as_str(),
+            out.to_str(),
+            "the pause event names the job's output path so the UI can point the user at it"
+        );
+        assert!(
+            status_events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|p| !p.contains("\"encoding\"")),
+            "the job must never transition to encoding"
+        );
+        assert!(
+            !*converter.is_running.lock().unwrap(),
+            "the queue thread must have stopped"
+        );
+    }
+
+    #[test]
+    fn low_disk_check_is_skipped_when_threshold_is_zero() {
+        // Threshold 0 = disabled: the gate is a no-op and the job runs through to the encode stage.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_handbrake_script(dir.path()); // exits 0, writes nothing -> empty-output error
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "low_disk_min_gb", "0");
+        let out = dir.path().join("out.mp4");
+        // i64::MAX source: a wrongly-running gate would saturate the requirement to ~u64::MAX and
+        // trip (job stays 'queued'), so reaching the encode/error outcome proves the gate was
+        // genuinely skipped, not that it ran and happened to pass on a tiny source.
+        queue_job(&db, "j1", "/nowhere/a.mp4", out.to_str().unwrap(), i64::MAX);
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "error",
+            "with the check disabled, the job is processed, not held 'queued'"
+        );
+        assert!(
+            msg.unwrap().contains("empty output file"),
+            "the job reached the encode stage (fake HandBrake produced no output)"
+        );
+    }
+
+    // Unix-only: this exercises fail-open when statvfs ERRORS for a missing path. On Windows,
+    // GetDiskFreeSpaceEx resolves a missing subdir to the volume root and returns Some, so the
+    // job would (correctly) be gated by the absurd threshold instead. The universal fail-open
+    // path (a None parent) is covered by `destination_available_bytes_resolves_or_fails_open`.
+    #[cfg(unix)]
+    #[test]
+    fn low_disk_check_fails_open_when_destination_is_unstattable() {
+        // A configured threshold must NOT block a job whose destination free space can't be
+        // read (nonexistent parent dir -> fs4::available_space errs -> None). Fail open: the
+        // encode proceeds rather than the queue wedging on an unreadable volume.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_handbrake_script(dir.path()); // exits 0, writes nothing -> empty-output error
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        // Absurd threshold: ANY real stat result would trip the gate (job stays 'queued'), so
+        // reaching the encode/error outcome below proves a genuine None (fail open), not that
+        // some other disk's ample free space slipped through.
+        set_setting(&db, "low_disk_min_gb", "1000000000"); // 1e9 GB
+                                                           // Output under a parent directory that does not exist -> available-space query fails -> None.
+        queue_job(
+            &db,
+            "j1",
+            "/nowhere/a.mp4",
+            "/no-such-dir-xyz/out.mp4",
+            1000,
+        );
+
+        let paused_events = record_events(&app, "queue-paused-low-disk");
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "error",
+            "fail-open: the job runs to the encode stage, not held 'queued'"
+        );
+        assert!(
+            msg.unwrap().contains("empty output file"),
+            "the disabled/unreadable-disk gate let the encode proceed"
+        );
+        assert!(
+            paused_events.lock().unwrap().is_empty(),
+            "no low-disk pause event fires when free space is unknown"
+        );
+    }
+
+    #[test]
+    fn low_disk_paused_job_is_resumable_after_the_threshold_is_lowered() {
+        // Paused-for-disk jobs stay 'queued'; lowering the threshold (freeing space) and re-running
+        // the queue must let them proceed — the "free up space, then Resume" contract.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "low_disk_min_gb", "1000000000");
+        let out = dir.path().join("out.mp4");
+        queue_job(&db, "j1", "/nowhere/a.mp4", out.to_str().unwrap(), 1000);
+
+        process_queue(app.handle(), &db, &converter);
+        assert_eq!(job_row(&db, "j1").0, "queued", "gate pauses the job");
+        let pause = converter
+            .low_disk_pause()
+            .expect("the pause reason is persisted in backend state, not just emitted");
+        assert_eq!(
+            pause.path,
+            out.to_str().unwrap(),
+            "the persisted reason names the job's output path"
+        );
+        assert!(
+            pause.available_bytes < pause.required_bytes,
+            "the persisted reason reflects the shortfall"
+        );
+
+        // Free space (disable the gate) and run again: the job must now reach the encode stage.
+        set_setting(&db, "low_disk_min_gb", "0");
+        process_queue(app.handle(), &db, &converter);
+        assert_eq!(
+            job_row(&db, "j1").0,
+            "error",
+            "after resume the job runs (fake HB -> empty output)"
+        );
+        assert!(
+            converter.low_disk_pause().is_none(),
+            "a resumed run that gets past the gate must clear the stale pause reason"
+        );
+    }
+
     // A stand-in for HandBrakeCLI that logs to stderr, writes no output, and exits 0 —
     // the "successful" run that produces nothing, which D3 defines as a failure.
     fn fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1441,6 +1822,103 @@ mod tests {
         // the tray showing an error state until the next run starts.
         assert_eq!(final_run_status(false), "idle");
         assert_eq!(final_run_status(true), "error");
+    }
+
+    #[test]
+    fn required_free_bytes_adds_double_the_source_to_the_floor() {
+        // Peak disk during an in-place encode is source + temp ≈ 2× source, on top of the floor.
+        assert_eq!(required_free_bytes(1000, 500), 1000 + 1000);
+        // Unknown/zero source size degrades to the bare floor.
+        assert_eq!(required_free_bytes(1000, 0), 1000);
+    }
+
+    #[test]
+    fn required_free_bytes_saturates_instead_of_wrapping() {
+        assert_eq!(required_free_bytes(u64::MAX, 10), u64::MAX);
+        assert_eq!(required_free_bytes(10, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn has_enough_disk_is_true_only_at_or_above_the_requirement() {
+        // floor 1000 + 2*500 = 2000 required.
+        assert!(has_enough_disk(2000, 1000, 500));
+        assert!(has_enough_disk(2001, 1000, 500));
+        assert!(!has_enough_disk(1999, 1000, 500));
+    }
+
+    #[test]
+    fn claim_job_only_claims_a_queued_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+         VALUES ('q', '/s.mp4', '/o.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z'),
+                ('d', '/s2.mp4', '/o2.mp4', 'p', 'done', 1, '2020-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        // A queued row is claimed and flipped to encoding.
+        assert_eq!(claim_job(&conn, "q"), ClaimOutcome::Claimed);
+        let s: String = conn
+            .query_row("SELECT status FROM jobs WHERE id='q'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(s, "encoding");
+        // Re-claiming the now-encoding row reports Gone and does not change it.
+        assert_eq!(claim_job(&conn, "q"), ClaimOutcome::Gone);
+        // A non-queued (done) row is never claimed and is left untouched.
+        assert_eq!(claim_job(&conn, "d"), ClaimOutcome::Gone);
+        let sd: String = conn
+            .query_row("SELECT status FROM jobs WHERE id='d'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sd, "done");
+        // A missing id is Gone.
+        assert_eq!(claim_job(&conn, "nope"), ClaimOutcome::Gone);
+    }
+
+    #[test]
+    fn gb_to_bytes_converts_a_fractional_threshold() {
+        // A non-integer configured floor (e.g. 2.5 GB) must scale exactly, not truncate the GiB
+        // before multiplying.
+        assert_eq!(gb_to_bytes(2.5), (2.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn destination_available_bytes_resolves_or_fails_open() {
+        // A real, existing parent directory yields a concrete free-space figure.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.mp4");
+        assert!(
+            destination_available_bytes(out.to_str().unwrap()).is_some(),
+            "an output inside a real directory has a stat-able free-space figure"
+        );
+        // The fail-open-to-None cases below rely on POSIX statvfs erroring for an unreadable
+        // location; Windows' GetDiskFreeSpaceEx resolves a missing subdir to the volume root and
+        // returns Some, so these are Unix-only.
+        #[cfg(unix)]
+        {
+            // A nonexistent parent can't be stat'd -> None (fail open, don't wedge the queue).
+            assert_eq!(
+                destination_available_bytes("/no-such-dir-xyz/out.mp4"),
+                None
+            );
+            // A bare filename's parent is "" (not None), and statting "" fails -> None.
+            assert_eq!(destination_available_bytes("out.mp4"), None);
+        }
+    }
+
+    #[test]
+    fn gb_to_bytes_converts_and_clamps() {
+        assert_eq!(gb_to_bytes(1.0), 1024 * 1024 * 1024);
+        // Disabled / nonsense values clamp to 0 (never panic, never wrap).
+        assert_eq!(gb_to_bytes(0.0), 0);
+        assert_eq!(gb_to_bytes(-5.0), 0);
+        // Absurd values saturate rather than panicking (used by the Task 4 integration test).
+        assert_eq!(gb_to_bytes(f64::MAX), u64::MAX);
+        // A stored "NaN"/"inf" (f64::parse accepts both) must resolve to a safe extreme, not a
+        // panic. NaN reaches 0 via the float->int cast (NaN < 0.0 is false, so the `gb <= 0.0`
+        // guard does NOT catch it) — pin both so a future refactor of the guard can't silently
+        // break NaN handling.
+        assert_eq!(gb_to_bytes(f64::NAN), 0);
+        assert_eq!(gb_to_bytes(f64::INFINITY), u64::MAX);
     }
 
     #[test]
@@ -1948,5 +2426,60 @@ HandBrake has exited.";
             b"original",
             "the source is left intact when the rename could not happen"
         );
+    }
+
+    #[test]
+    fn recover_interrupted_jobs_preserves_an_in_place_source() {
+        // An in-place job (output_path == source_path) interrupted mid-encode: recovery must delete
+        // the hidden temp sibling and REQUEUE the job, and must NOT delete the user's original source.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        std::fs::write(&source, b"original").unwrap();
+        let temp = in_place_temp_path(source.to_str().unwrap());
+        std::fs::write(&temp, b"partial").unwrap();
+        let s = source.to_str().unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j', ?1, ?1, 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            params![s],
+        ).unwrap();
+
+        recover_interrupted_jobs(&conn);
+
+        assert!(source.exists(), "the in-place source must NOT be deleted");
+        assert!(!temp.exists(), "the in-place temp partial must be removed");
+        let status: String = conn
+            .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "queued");
+    }
+
+    #[test]
+    fn recover_interrupted_jobs_removes_a_distinct_output_and_keeps_the_source() {
+        // A normal (distinct-output) interrupted job: the partial output is removed, the source is
+        // untouched, and the job is requeued.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("in.mkv");
+        let output = dir.path().join("in.h265.mp4");
+        std::fs::write(&source, b"src").unwrap();
+        std::fs::write(&output, b"partial").unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j', ?1, ?2, 'p', 'paused', 0, '2020-01-01T00:00:00Z')",
+            params![source.to_str().unwrap(), output.to_str().unwrap()],
+        ).unwrap();
+
+        recover_interrupted_jobs(&conn);
+
+        assert!(source.exists(), "the source is never touched");
+        assert!(!output.exists(), "the partial output is removed");
+        let status: String = conn
+            .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "queued");
     }
 }

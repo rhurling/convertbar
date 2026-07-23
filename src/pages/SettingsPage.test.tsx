@@ -34,6 +34,7 @@ function makeSettings(): AppSettings {
     skip_already_converted: false,
     skip_by_source_media: true,
     watch_skip_marker: ".downloading",
+    low_disk_min_gb: 0,
   };
 }
 
@@ -112,6 +113,23 @@ describe("SettingsPage", () => {
       expect(invokeMock).toHaveBeenCalledWith("update_setting", {
         key: "watch_skip_marker",
         value: ".part",
+      }),
+    );
+  });
+
+  it("does not write the low-disk threshold per keystroke; commits on blur", async () => {
+    render(<SettingsPage />);
+    const input = await screen.findByRole("spinbutton"); // the only number input on the page
+    fireEvent.change(input, { target: { value: "2" } });
+    fireEvent.change(input, { target: { value: "2.5" } });
+    expect(updateCallsFor("low_disk_min_gb")).toHaveLength(0);
+
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+        key: "low_disk_min_gb",
+        value: "2.5",
       }),
     );
   });

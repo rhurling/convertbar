@@ -33,6 +33,7 @@ notify = "8"
 tauri-plugin-notification = "2"
 dunce = "1.0.5"
 tauri-plugin-opener = "2"
+fs4 = { version = "0.13", features = ["sync"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

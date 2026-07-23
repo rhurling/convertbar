@@ -90,6 +90,7 @@ export interface AppSettings {
   skip_already_converted: boolean;
   skip_by_source_media: boolean;
   watch_skip_marker: string;
+  low_disk_min_gb: number;
 }
 
 export interface PathsExist {
@@ -120,6 +121,12 @@ export interface HandbrakeStatus {
 
 export interface PlatformCapabilities {
   can_pause_process: boolean;
+}
+
+export interface LowDiskPause {
+  path: string;
+  available_bytes: number;
+  required_bytes: number;
 }
 
 export interface PresetMetadata {
@@ -183,6 +190,7 @@ export const commands = {
   pauseAfterCurrent: () => invoke<void>("pause_after_current"),
   cancelPauseAfterCurrent: () => invoke<void>("cancel_pause_after_current"),
   getPauseAfterCurrent: () => invoke<boolean>("get_pause_after_current"),
+  getLowDiskPause: () => invoke<LowDiskPause | null>("get_low_disk_pause"),
   getPlatformCapabilities: () =>
     invoke<PlatformCapabilities>("get_platform_capabilities"),
   validateHandbrake: () => invoke<HandbrakeStatus>("validate_handbrake"),
