@@ -402,6 +402,11 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     }
     let db = app_state.db.clone();
     let converter = (*app.state::<Arc<ConverterState>>()).clone();
+    // A watched-folder file arriving is an add; per the design, adding files starts the queue,
+    // so clear any remembered pause before running.
+    if let Ok(conn) = app_state.db.lock() {
+        crate::converter::set_queue_paused(&conn, false);
+    }
     converter::run_queue(app.clone(), db, converter);
     let _ = app.emit("queue-updated", ());
 }

@@ -417,6 +417,33 @@ fn get_low_disk_min_gb(db: &Connection) -> f64 {
     .unwrap_or(0.0)
 }
 
+/// Persisted "the user deliberately stopped the queue" flag, stored in the settings table.
+/// Read-with-default (no seed) so existing databases need no migration and the settings-count
+/// guard test is untouched. It is backend runtime state — NOT in ALLOWED_KEYS, NOT in the UI.
+pub(crate) fn set_queue_paused(db: &Connection, paused: bool) {
+    let _ = db.execute(
+        "INSERT INTO settings (key, value) VALUES ('queue_paused', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        params![if paused { "true" } else { "false" }],
+    );
+}
+
+pub(crate) fn is_queue_paused(db: &Connection) -> bool {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = 'queue_paused'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .map(|v| v == "true")
+    .unwrap_or(false)
+}
+
+/// Whether launch should auto-start the queue: only when jobs are queued AND the user did not
+/// leave the queue deliberately paused. Pure so the launch decision is unit-testable.
+pub(crate) fn should_auto_resume(has_queued: bool, queue_paused: bool) -> bool {
+    has_queued && !queue_paused
+}
+
 /// Outcome of trying to claim the next job by flipping it 'queued' -> 'encoding'. The claim is
 /// conditional (`AND status = 'queued'`) so a job that `clear_queue`/`remove_job` deleted during
 /// the pre-spawn window is not resurrected — spawning on a deleted row could trash the source.
@@ -1084,6 +1111,7 @@ fn process_queue<R: tauri::Runtime>(
                 // Pause after this job if the one-shot flag is armed (consumed here so the next
                 // queued job does not also pause).
                 if take_pause_after_current(converter) {
+                    set_queue_paused(&db.lock().unwrap(), true);
                     let _ = app.emit(
                         "menu-bar-update",
                         MenuBarUpdate {
@@ -2481,5 +2509,89 @@ HandBrake has exited.";
             .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "queued");
+    }
+
+    #[test]
+    fn queue_paused_round_trips_and_defaults_false() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        // Absent row -> false (no seed, existing DBs need no migration).
+        assert!(!is_queue_paused(&conn));
+        set_queue_paused(&conn, true);
+        assert!(is_queue_paused(&conn));
+        set_queue_paused(&conn, false);
+        assert!(!is_queue_paused(&conn));
+    }
+
+    #[test]
+    fn should_auto_resume_only_when_queued_and_not_paused() {
+        assert!(
+            should_auto_resume(true, false),
+            "queued + not paused -> auto-start"
+        );
+        assert!(
+            !should_auto_resume(true, true),
+            "a remembered pause blocks auto-start"
+        );
+        assert!(
+            !should_auto_resume(false, false),
+            "nothing queued -> nothing to start"
+        );
+        assert!(!should_auto_resume(false, true));
+    }
+
+    // A stand-in for HandBrakeCLI that writes a small non-empty output (the last CLI arg, like -o)
+    // and exits 0 — a job that completes successfully, so process_queue reaches its success/cleanup
+    // and pause-after-current path.
+    fn successful_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb-ok.cmd");
+            std::fs::write(
+                &p,
+                "@echo off\r\n:loop\r\nif not \"%~2\"==\"\" (\r\nshift\r\ngoto loop\r\n)\r\necho done> \"%~1\"\r\nexit /b 0\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("hb-ok.sh");
+            std::fs::write(
+                &p,
+                "#!/bin/sh\nfor a; do out=\"$a\"; done\necho done > \"$out\"\nexit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    #[test]
+    fn pause_after_current_firing_persists_queue_paused() {
+        // When "Pause after this" is armed, the job completes and the queue stops — and that stop
+        // must be REMEMBERED (queue_paused persisted) so the next launch does not auto-resume.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+        set_setting(&db, "cleanup_mode", "delete"); // keep cleanup filesystem-local (no Trash)
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let src = dir.path().join("in.mp4");
+        std::fs::write(&src, b"0123456789").unwrap(); // real source (10 bytes) so cleanup/metadata work
+        let out = dir.path().join("out.mp4");
+        queue_job(&db, "j1", src.to_str().unwrap(), out.to_str().unwrap(), 10);
+        // Arm "pause after this" before the run.
+        *converter.pause_after_current.lock().unwrap() = true;
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(job_row(&db, "j1").0, "done", "the job completes");
+        assert!(
+            is_queue_paused(&db.lock().unwrap()),
+            "pause-after-current firing must persist the paused state"
+        );
     }
 }
