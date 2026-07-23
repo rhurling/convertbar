@@ -1507,6 +1507,12 @@ mod tests {
         assert_eq!(gb_to_bytes(-5.0), 0);
         // Absurd values saturate rather than panicking (used by the Task 4 integration test).
         assert_eq!(gb_to_bytes(f64::MAX), u64::MAX);
+        // A stored "NaN"/"inf" (f64::parse accepts both) must resolve to a safe extreme, not a
+        // panic. NaN reaches 0 via the float->int cast (NaN < 0.0 is false, so the `gb <= 0.0`
+        // guard does NOT catch it) — pin both so a future refactor of the guard can't silently
+        // break NaN handling.
+        assert_eq!(gb_to_bytes(f64::NAN), 0);
+        assert_eq!(gb_to_bytes(f64::INFINITY), u64::MAX);
     }
 
     #[test]
