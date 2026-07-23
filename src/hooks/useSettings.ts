@@ -3,8 +3,10 @@ import { commands, type AppSettings, type PresetMetadata } from "../lib/tauri";
 
 // `update_setting` is stringly-typed on the wire ("true"/"false" for booleans); the
 // optimistic merge must land booleans as real booleans so `checked={value === true}` works.
-function coerceSettingValue(current: unknown, value: string): string | boolean {
-  return typeof current === "boolean" ? value === "true" : value;
+function coerceSettingValue(current: unknown, value: string): string | boolean | number {
+  if (typeof current === "boolean") return value === "true";
+  if (typeof current === "number") return Number(value);
+  return value;
 }
 
 export function useSettings() {

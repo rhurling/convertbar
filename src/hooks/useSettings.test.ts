@@ -136,6 +136,18 @@ describe("useSettings", () => {
     expect(result.current.settings?.skip_already_converted).toBe(true);
   });
 
+  it("coerces numeric settings to real numbers in the optimistic merge", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.updateSetting("low_disk_min_gb", "5");
+    });
+
+    // A stringly "5" must land as a real number so the number input binds correctly.
+    expect(result.current.settings?.low_disk_min_gb).toBe(5);
+  });
+
   it("surfaces an error and restores the value when a write fails", async () => {
     const { result } = renderHook(() => useSettings());
     await waitFor(() => expect(result.current.loading).toBe(false));

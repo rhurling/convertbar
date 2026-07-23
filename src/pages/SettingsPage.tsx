@@ -46,6 +46,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   // instead of round-tripping an IPC write per character (which dropped/reordered characters).
   const [hbDraft, setHbDraft] = useState(settings?.handbrake_path ?? "");
   const [markerDraft, setMarkerDraft] = useState(settings?.watch_skip_marker ?? "");
+  const [diskDraft, setDiskDraft] = useState(String(settings?.low_disk_min_gb ?? 0));
   const [suffixDraft, setSuffixDraft] = useState(presetSuffix);
   const [resolvedSuffix, setResolvedSuffix] = useState("");
 
@@ -56,6 +57,9 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   useEffect(() => {
     if (settings) setMarkerDraft(settings.watch_skip_marker);
   }, [settings?.watch_skip_marker]);
+  useEffect(() => {
+    if (settings) setDiskDraft(String(settings.low_disk_min_gb));
+  }, [settings?.low_disk_min_gb]);
   useEffect(() => {
     setSuffixDraft(presetSuffix);
   }, [presetSuffix]);
@@ -97,6 +101,12 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const commitMarker = () => {
     if (markerDraft !== settings?.watch_skip_marker) {
       updateSetting("watch_skip_marker", markerDraft);
+    }
+  };
+
+  const commitDisk = () => {
+    if (diskDraft !== String(settings?.low_disk_min_gb)) {
+      updateSetting("low_disk_min_gb", diskDraft);
     }
   };
 
@@ -267,6 +277,30 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           When adding files, skip any whose codec and resolution already meet the target
           preset, so they aren&apos;t needlessly re-encoded. Turn this off to force a
           conversion (e.g. for device compatibility).
+        </p>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label">Pause when destination free space is low</label>
+        <div className="setting-row">
+          <input
+            className="setting-input"
+            type="number"
+            min="0"
+            step="0.5"
+            value={diskDraft}
+            onChange={(e) => setDiskDraft(e.target.value)}
+            onBlur={commitDisk}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+            }}
+          />
+          <span>GB</span>
+        </div>
+        <p className="setting-hint">
+          Before starting each file, if the destination disk has less free space than this (plus
+          room for the encode), the queue pauses instead of converting the next file. Resume it
+          from the Queue tab once you&apos;ve freed space. Set to 0 to never pause.
         </p>
       </div>
 
