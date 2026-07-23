@@ -356,6 +356,17 @@ fn get_cleanup_mode(db: &Connection) -> String {
     .unwrap_or_else(|_| "trash".to_string())
 }
 
+fn get_low_disk_min_gb(db: &Connection) -> f64 {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = 'low_disk_min_gb'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse::<f64>().ok())
+    .unwrap_or(0.0)
+}
+
 const STDERR_TAIL_BYTES: usize = 4096;
 
 /// Drain a reader to EOF keeping only the last STDERR_TAIL_BYTES bytes, so the pipe
@@ -556,6 +567,7 @@ fn process_queue<R: tauri::Runtime>(
         let job;
         let handbrake_path_opt;
         let cleanup_mode;
+        let low_disk_min_gb;
         {
             let db = db.lock().unwrap();
             job = match get_next_job(&db) {
@@ -564,13 +576,9 @@ fn process_queue<R: tauri::Runtime>(
             };
             handbrake_path_opt = get_handbrake_path(&db);
             cleanup_mode = get_cleanup_mode(&db);
-
-            if handbrake_path_opt.is_some() {
-                let _ = db.execute(
-                    "UPDATE jobs SET status = 'encoding' WHERE id = ?1",
-                    params![job.id],
-                );
-            }
+            low_disk_min_gb = get_low_disk_min_gb(&db);
+            // The job is flipped to 'encoding' below, AFTER the low-disk gate — a gated job
+            // must stay 'queued' so the Resume button can retry it.
         }
 
         let file_name = std::path::Path::new(&job.source_path)
@@ -578,6 +586,44 @@ fn process_queue<R: tauri::Runtime>(
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
+
+        // Low-disk gate: before committing this job to 'encoding', ensure the destination
+        // filesystem has room for the floor plus the encode (2× source). On a shortfall, stop
+        // the run like "Pause after this" — leave the job 'queued', tell the UI why, and return
+        // (nothing completed, so no "Queue complete" notification). Fail open: a 0 threshold, an
+        // unresolvable parent, or a failed free-space query all let the encode proceed.
+        if low_disk_min_gb > 0.0 {
+            if let Some(available) = destination_available_bytes(&job.output_path) {
+                let floor = gb_to_bytes(low_disk_min_gb);
+                let source_size = job.original_size.unwrap_or(0).max(0) as u64;
+                if !has_enough_disk(available, floor, source_size) {
+                    let required = required_free_bytes(floor, source_size);
+                    let _ = app.emit(
+                        "queue-paused-low-disk",
+                        serde_json::json!({
+                            "path": job.output_path,
+                            "available_bytes": available,
+                            "required_bytes": required,
+                        }),
+                    );
+                    let _ = app.emit(
+                        "menu-bar-update",
+                        MenuBarUpdate {
+                            // Reuse the end-of-run status so a prior job's failure in this run
+                            // still surfaces as "error" in the tray; otherwise a paused queue reads
+                            // "idle". (had_errors is in scope at the top of process_queue.)
+                            status: final_run_status(had_errors).to_string(),
+                            percent: None,
+                            file_name: None,
+                            eta_seconds: None,
+                            queue_count: None,
+                            fps: None,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
 
         // Outside the db-lock scope: record_job_error takes the lock itself, and this
         // failure must count toward had_errors and emit the same events as any other.
@@ -589,6 +635,26 @@ fn process_queue<R: tauri::Runtime>(
                 continue;
             }
         };
+
+        // Claim the job by flipping it to 'encoding' ONLY if it is still 'queued'. The original
+        // code did this select+flip under a single db-lock; relocating the flip past the disk
+        // gate (whose statvfs can stall on a slow/asleep/network volume) reopened a window where
+        // `clear_queue`/`remove_job` — which delete 'queued' rows — could remove this job before
+        // the flip. Without the `AND status = 'queued'` guard the loop would then spawn HandBrake
+        // on a deleted row and, on success, trash/delete the user's SOURCE file. The conditional
+        // claim + row-count check closes that window: 0 rows affected means the job is gone, so
+        // skip it.
+        let claimed = {
+            let db = db.lock().unwrap();
+            db.execute(
+                "UPDATE jobs SET status = 'encoding' WHERE id = ?1 AND status = 'queued'",
+                params![job.id],
+            )
+            .unwrap_or(0)
+        };
+        if claimed == 0 {
+            continue;
+        }
 
         *converter.current_job_id.lock().unwrap() = Some(job.id.clone());
         *converter.is_paused.lock().unwrap() = false;
@@ -1203,6 +1269,87 @@ mod tests {
         assert!(
             final_update.contains("\"error\""),
             "a run where the only job failed must end 'error', got: {final_update}"
+        );
+    }
+
+    #[test]
+    fn low_disk_threshold_pauses_before_spawning_and_leaves_the_job_queued() {
+        // An absurd threshold makes required-free exceed any real disk, so the gate always trips —
+        // deterministic regardless of the test machine's free space.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        // A real fake HandBrake IS configured: if the gate failed to stop the run, the job would be
+        // spawned and end 'error' (empty output). Staying 'queued' proves the gate blocked the spawn.
+        let script = fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "low_disk_min_gb", "1000000000"); // 1e9 GB
+        let out = dir.path().join("out.mp4");
+        queue_job(&db, "j1", "/nowhere/a.mp4", out.to_str().unwrap(), 1000);
+
+        let paused_events = record_events(&app, "queue-paused-low-disk");
+        let status_events = record_events(&app, "job-status-changed");
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, _msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "queued",
+            "a low-disk pause leaves the job queued, never encoding/error"
+        );
+        assert!(
+            !out.exists(),
+            "the encode must never start, so no output is written"
+        );
+        assert_eq!(
+            paused_events.lock().unwrap().len(),
+            1,
+            "exactly one low-disk pause event fires"
+        );
+        assert!(
+            paused_events.lock().unwrap()[0].contains("required_bytes"),
+            "the event carries the required-free figure for the UI"
+        );
+        assert!(
+            status_events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|p| !p.contains("\"encoding\"")),
+            "the job must never transition to encoding"
+        );
+        assert!(
+            !*converter.is_running.lock().unwrap(),
+            "the queue thread must have stopped"
+        );
+    }
+
+    #[test]
+    fn low_disk_check_is_skipped_when_threshold_is_zero() {
+        // Threshold 0 = disabled: the gate is a no-op and the job runs through to the encode stage.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_handbrake_script(dir.path()); // exits 0, writes nothing -> empty-output error
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "low_disk_min_gb", "0");
+        let out = dir.path().join("out.mp4");
+        queue_job(&db, "j1", "/nowhere/a.mp4", out.to_str().unwrap(), 1000);
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "error",
+            "with the check disabled, the job is processed, not held 'queued'"
+        );
+        assert!(
+            msg.unwrap().contains("empty output file"),
+            "the job reached the encode stage (fake HandBrake produced no output)"
         );
     }
 
