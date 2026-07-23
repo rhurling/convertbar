@@ -112,6 +112,8 @@ it("seeds the low-disk banner from backend state on mount, without the event fir
     available_bytes: 3_000_000_000,
     required_bytes: 5_000_000_000,
   });
+  // A persisted reason implies the queue still holds pending jobs — clear_queue drops the
+  // reason, so a Some seed always coincides with a non-empty pending list.
   queueMock = {
     activeJob: null,
     pendingJobs: [{ id: "j1", source_path: "/m/a.mp4", status: "queued" }],
