@@ -721,6 +721,8 @@ pub fn clear_queue(
         .low_disk_pause
         .lock()
         .map_err(|e| e.to_string())? = None;
+    // A cleared queue has no jobs to stay paused for.
+    crate::converter::set_queue_paused(&conn, false);
     Ok(())
 }
 
@@ -1885,5 +1887,54 @@ mod tests {
             converter.low_disk_pause().is_none(),
             "clearing the queue also drops the low-disk pause reason so it can't re-seed the banner"
         );
+    }
+
+    #[test]
+    fn clear_queue_clears_the_persisted_pause() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        // A remembered pause + a queued job.
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('queue_paused', 'true')
+             ON CONFLICT(key) DO UPDATE SET value = 'true'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j', '/s.mp4', '/o.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        app.manage(crate::AppState {
+            db: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+            preset_cache: std::sync::Mutex::new(Default::default()),
+        });
+        app.manage(std::sync::Arc::new(crate::converter::ConverterState::new()));
+
+        clear_queue(app.state(), app.state()).unwrap();
+
+        let state: State<'_, AppState> = app.state();
+        let db = state.db.lock().unwrap();
+        let paused: String = db
+            .query_row(
+                "SELECT value FROM settings WHERE key='queue_paused'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            paused, "false",
+            "clearing the queue drops the remembered pause"
+        );
+        let n: i64 = db
+            .query_row("SELECT COUNT(*) FROM jobs WHERE status='queued'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

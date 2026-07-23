@@ -1111,6 +1111,7 @@ fn process_queue<R: tauri::Runtime>(
                 // Pause after this job if the one-shot flag is armed (consumed here so the next
                 // queued job does not also pause).
                 if take_pause_after_current(converter) {
+                    set_queue_paused(&db.lock().unwrap(), true);
                     let _ = app.emit(
                         "menu-bar-update",
                         MenuBarUpdate {
@@ -2537,5 +2538,60 @@ HandBrake has exited.";
             "nothing queued -> nothing to start"
         );
         assert!(!should_auto_resume(false, true));
+    }
+
+    // A stand-in for HandBrakeCLI that writes a small non-empty output (the last CLI arg, like -o)
+    // and exits 0 — a job that completes successfully, so process_queue reaches its success/cleanup
+    // and pause-after-current path.
+    fn successful_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb-ok.cmd");
+            std::fs::write(
+                &p,
+                "@echo off\r\n:loop\r\nif not \"%~2\"==\"\" (\r\nshift\r\ngoto loop\r\n)\r\necho done> \"%~1\"\r\nexit /b 0\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("hb-ok.sh");
+            std::fs::write(
+                &p,
+                "#!/bin/sh\nfor a; do out=\"$a\"; done\necho done > \"$out\"\nexit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    #[test]
+    fn pause_after_current_firing_persists_queue_paused() {
+        // When "Pause after this" is armed, the job completes and the queue stops — and that stop
+        // must be REMEMBERED (queue_paused persisted) so the next launch does not auto-resume.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+        set_setting(&db, "cleanup_mode", "delete"); // keep cleanup filesystem-local (no Trash)
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let src = dir.path().join("in.mp4");
+        std::fs::write(&src, b"0123456789").unwrap(); // real source (10 bytes) so cleanup/metadata work
+        let out = dir.path().join("out.mp4");
+        queue_job(&db, "j1", src.to_str().unwrap(), out.to_str().unwrap(), 10);
+        // Arm "pause after this" before the run.
+        *converter.pause_after_current.lock().unwrap() = true;
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(job_row(&db, "j1").0, "done", "the job completes");
+        assert!(
+            is_queue_paused(&db.lock().unwrap()),
+            "pause-after-current firing must persist the paused state"
+        );
     }
 }

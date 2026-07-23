@@ -5,8 +5,8 @@ use crate::converter::{self, ConverterState};
 use crate::AppState;
 
 #[tauri::command]
-pub fn start_queue(
-    app: AppHandle,
+pub fn start_queue<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     converter_state: State<'_, Arc<ConverterState>>,
 ) -> Result<(), String> {
@@ -20,6 +20,12 @@ pub fn start_queue(
 
     let db = state.db.clone();
     let conv = (*converter_state).clone();
+
+    // A user (re)starting the queue — Resume button, or a drag-drop add which routes through
+    // startQueue — clears any remembered pause.
+    if let Ok(conn) = state.db.lock() {
+        crate::converter::set_queue_paused(&conn, false);
+    }
 
     converter::run_queue(app, db, conv);
     Ok(())
@@ -73,6 +79,7 @@ pub fn pause_conversion(
                     "UPDATE jobs SET status = 'paused' WHERE id = ?1",
                     rusqlite::params![job_id],
                 );
+                crate::converter::set_queue_paused(&db, true);
 
                 let _ = app.emit(
                     "job-status-changed",
@@ -108,6 +115,11 @@ pub fn resume_conversion(
     state: State<'_, AppState>,
     converter_state: State<'_, Arc<ConverterState>>,
 ) -> Result<(), String> {
+    // Resuming un-pauses the queue on either platform; drop the remembered pause.
+    if let Ok(conn) = state.db.lock() {
+        crate::converter::set_queue_paused(&conn, false);
+    }
+
     // On non-macOS, cancel the queue-level pause
     if !ConverterState::can_pause_process() {
         *converter_state
@@ -199,6 +211,13 @@ pub fn cancel_conversion<R: tauri::Runtime>(
     state: State<'_, AppState>,
     converter_state: State<'_, Arc<ConverterState>>,
 ) -> Result<(), String> {
+    // Cancelling the current job doesn't stop the queue (it continues with the next job), so a
+    // pause remembered from an earlier SIGSTOP must be dropped — otherwise the next launch would
+    // wrongly stay paused for a queue that was actively running.
+    if let Ok(conn) = state.db.lock() {
+        crate::converter::set_queue_paused(&conn, false);
+    }
+
     let job_id_val = {
         let job_id = converter_state
             .current_job_id
@@ -458,5 +477,47 @@ mod tests {
             "the recorded PID must be cleared too, so a racing quit can't SIGCONT a reaped, \
              possibly-recycled PID before the queue loop clears it"
         );
+    }
+
+    #[test]
+    fn start_queue_clears_the_persisted_pause() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        // A remembered pause; disable notifications (mock app has no notification plugin).
+        conn.execute(
+            "UPDATE settings SET value='false' WHERE key IN ('notifications_per_file','notifications_queue_done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('queue_paused', 'true')
+             ON CONFLICT(key) DO UPDATE SET value = 'true'",
+            [],
+        )
+        .unwrap();
+        app.manage(crate::AppState {
+            db: Arc::new(Mutex::new(conn)),
+            preset_cache: Mutex::new(Default::default()),
+        });
+        app.manage(Arc::new(ConverterState::new()));
+
+        // Resume: clears the remembered pause (synchronously, before spawning the queue thread).
+        start_queue(app.handle().clone(), app.state(), app.state()).unwrap();
+
+        let state: State<'_, AppState> = app.state();
+        let paused: String = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='queue_paused'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(paused, "false", "Resume clears the remembered pause");
     }
 }

@@ -350,6 +350,7 @@ pub fn run() {
             let app_state = app.state::<AppState>();
             let conv_state = app.state::<Arc<ConverterState>>();
             let has_queued;
+            let queue_paused;
             {
                 let db = app_state.db.lock().unwrap();
 
@@ -362,9 +363,10 @@ pub fn run() {
                     [],
                     |row| row.get::<_, bool>(0),
                 ).unwrap_or(false);
+                queue_paused = crate::converter::is_queue_paused(&db);
             }
 
-            if has_queued {
+            if converter::should_auto_resume(has_queued, queue_paused) {
                 let db_arc = app_state.db.clone();
                 let conv_arc = (*conv_state).clone();
                 let app_handle = app.handle().clone();
