@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { commands, type JobInfo, type PurgeResult } from "../lib/tauri";
 
 export function useBadSources() {
@@ -23,6 +24,18 @@ export function useBadSources() {
 
   useEffect(() => {
     refresh();
+  }, [refresh]);
+
+  // A newly-classified bad source arrives as a job-error, the same event HistoryPage's own
+  // useHistory already listens on — mirror that effect so the review list stays live while
+  // the queue is running, instead of only ever reflecting whatever was true on mount.
+  useEffect(() => {
+    const unlisten = listen("job-error", () => {
+      refresh();
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
   }, [refresh]);
 
   return { badSources, refresh, purge };

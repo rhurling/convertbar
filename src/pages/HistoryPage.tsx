@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useHistory } from "../hooks/useHistory";
 import { useBadSources } from "../hooks/useBadSources";
 import { useSettings } from "../hooks/useSettings";
@@ -33,20 +33,41 @@ export default function HistoryPage() {
     ? `Delete ${badSources.length} permanently`
     : `Move ${badSources.length} to Trash`;
 
+  // A purge can only ever REMOVE rows that were already in the list when it started (purged
+  // or already-gone rows drop out; every other outcome leaves a row in place) — it can never
+  // add one. So if the list ever contains an id that wasn't present the last time we saw it,
+  // that arrival is unrelated to any purge in flight (e.g. a new job just failed) and any
+  // outcome note on screen no longer describes what's currently shown.
+  const seenIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const isNewArrival = badSources.some((j) => !seenIdsRef.current.has(j.id));
+    if (isNewArrival) {
+      setPurgeOutcomeNote(null);
+    }
+    seenIdsRef.current = new Set(badSources.map((j) => j.id));
+  }, [badSources]);
+
   const runPurge = async () => {
-    // Safety-critical: pass the review list's own ids, never history's. The backend also
-    // rejects ids that don't belong to a live bad-source row, but that is a backstop, not a
-    // substitute for wiring the right collection here.
-    const results = await purge(badSources.map((j) => j.id));
-    setConfirmingPurge(false);
-    const skipped = results.filter((r) => r.outcome !== "purged");
-    setPurgeOutcomeNote(
-      skipped.length === 0
-        ? null
-        : `${skipped.length} file(s) were left alone: ${skipped
-            .map((r) => r.outcome.replace(/_/g, " "))
-            .join(", ")}`,
-    );
+    setPurgeOutcomeNote(null);
+    try {
+      // Safety-critical: pass the review list's own ids, never history's. The backend also
+      // rejects ids that don't belong to a live bad-source row, but that is a backstop, not a
+      // substitute for wiring the right collection here.
+      const results = await purge(badSources.map((j) => j.id));
+      setConfirmingPurge(false);
+      const skipped = results.filter((r) => r.outcome !== "purged");
+      setPurgeOutcomeNote(
+        skipped.length === 0
+          ? null
+          : `${skipped.length} file(s) were left alone: ${skipped
+              .map((r) => r.outcome.replace(/_/g, " "))
+              .join(", ")}`,
+      );
+    } catch (e) {
+      console.error("Failed to purge bad sources:", e);
+      setConfirmingPurge(false);
+      setPurgeOutcomeNote("Failed to process bad sources. Please try again.");
+    }
   };
 
   const handleItemContextMenu = (e: React.MouseEvent, job: JobInfo) => {

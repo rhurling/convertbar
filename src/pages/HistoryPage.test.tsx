@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -89,6 +89,11 @@ let badSources: JobInfo[] = [];
 let settings: AppSettings = makeSettings("trash");
 let purgeResults: PurgeResult[] = [];
 
+const listeners = new Map<string, Set<(e: { payload: unknown }) => void>>();
+function emit(event: string, payload?: unknown) {
+  listeners.get(event)?.forEach((cb) => cb({ payload }));
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   page = { jobs: [], total: 0 };
@@ -97,7 +102,14 @@ beforeEach(() => {
   badSources = [];
   settings = makeSettings("trash");
   purgeResults = [];
-  listenMock.mockImplementation((() => Promise.resolve(() => {})) as typeof listen);
+  listeners.clear();
+  listenMock.mockImplementation(((event: string, cb: (e: { payload: unknown }) => void) => {
+    if (!listeners.has(event)) listeners.set(event, new Set());
+    listeners.get(event)!.add(cb);
+    return Promise.resolve(() => {
+      listeners.get(event)!.delete(cb);
+    });
+  }) as typeof listen);
   invokeMock.mockImplementation(((cmd: string) => {
     if (cmd === "get_history") return Promise.resolve(page);
     if (cmd === "get_history_summary") return Promise.resolve(summary);
@@ -367,6 +379,114 @@ describe("HistoryPage", () => {
       // ...but the note explaining the file was left alone must still be visible.
       expect(
         screen.getByText(/1 file\(s\) were left alone: already gone/i),
+      ).toBeInTheDocument();
+    });
+
+    // M4: with I3 wired up, a job-error event can bring in a bad source unrelated to whatever
+    // purge last ran. A stale note from that earlier purge must not linger beside it — it would
+    // read as if it described the newly-arrived row.
+    it("clears a stale outcome note once an unrelated new bad source arrives", async () => {
+      badSources = [badSourceJob("a"), badSourceJob("b")];
+      purgeResults = [
+        { id: "a", outcome: "purged" },
+        { id: "b", outcome: "in_use" },
+      ];
+      invokeMock.mockImplementation(((cmd: string) => {
+        if (cmd === "get_history") return Promise.resolve(page);
+        if (cmd === "get_history_summary") return Promise.resolve(summary);
+        if (cmd === "get_settings") return Promise.resolve(settings);
+        if (cmd === "get_bad_sources") return Promise.resolve(badSources);
+        if (cmd === "purge_bad_sources") return Promise.resolve(purgeResults);
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }) as typeof invoke);
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(2\)/i);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 2 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+      await screen.findByText(/1 file\(s\) were left alone: in use/i);
+
+      // A new, unrelated job fails independently — the review list grows with an id that was
+      // never part of the purge just run.
+      badSources = [badSourceJob("b"), badSourceJob("c")];
+      act(() => emit("job-error"));
+
+      await waitFor(() => expect(screen.getByText(/bad sources \(2\)/i)).toBeInTheDocument());
+      // The note clears via a cascading effect one render after the list itself updates, so
+      // this must be polled too rather than asserted synchronously right after the line above.
+      await waitFor(() =>
+        expect(
+          screen.queryByText(/1 file\(s\) were left alone: in use/i),
+        ).not.toBeInTheDocument(),
+      );
+    });
+
+    // M4: pressing Confirm again must not leave a PREVIOUS run's note on screen while the new
+    // purge (which can take up to ~30s per rescanned row) is still in flight.
+    it("clears a stale outcome note the instant a new purge attempt starts", async () => {
+      badSources = [badSourceJob("a")];
+      purgeResults = [{ id: "a", outcome: "in_use" }];
+      let resolvePurge: (r: PurgeResult[]) => void = () => {};
+      invokeMock.mockImplementation(((cmd: string) => {
+        if (cmd === "get_history") return Promise.resolve(page);
+        if (cmd === "get_history_summary") return Promise.resolve(summary);
+        if (cmd === "get_settings") return Promise.resolve(settings);
+        if (cmd === "get_bad_sources") return Promise.resolve(badSources);
+        if (cmd === "purge_bad_sources") {
+          return new Promise<PurgeResult[]>((resolve) => {
+            resolvePurge = resolve;
+          });
+        }
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }) as typeof invoke);
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(1\)/i);
+
+      // First purge: resolves immediately and leaves a note.
+      fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+      resolvePurge(purgeResults);
+      await screen.findByText(/1 file\(s\) were left alone: in use/i);
+
+      // Second purge attempt on the same row: the stale note must disappear right away, not
+      // only once this new (still-pending) purge resolves.
+      fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      expect(
+        screen.queryByText(/1 file\(s\) were left alone: in use/i),
+      ).not.toBeInTheDocument();
+    });
+
+    // M3: purge() (unlike refresh()) does not catch its own rejection. Without a catch here, a
+    // rejected purge_bad_sources escapes the click handler entirely — the confirm UI stays
+    // armed and the user gets zero feedback that anything went wrong.
+    it("surfaces a message and disarms the confirm UI when purge_bad_sources rejects", async () => {
+      badSources = [badSourceJob("a")];
+      invokeMock.mockImplementation(((cmd: string) => {
+        if (cmd === "get_history") return Promise.resolve(page);
+        if (cmd === "get_history_summary") return Promise.resolve(summary);
+        if (cmd === "get_settings") return Promise.resolve(settings);
+        if (cmd === "get_bad_sources") return Promise.resolve(badSources);
+        if (cmd === "purge_bad_sources") return Promise.reject(new Error("IPC failed"));
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }) as typeof invoke);
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(1\)/i);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      await waitFor(() =>
+        expect(screen.getByText(/failed to process bad sources/i)).toBeInTheDocument(),
+      );
+      // The confirm step must not stay stuck armed after a failure.
+      expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: /move 1 to trash/i }),
       ).toBeInTheDocument();
     });
   });
