@@ -4,10 +4,6 @@
 //!
 //! The governing rule is the same as the skip policy's: uncertainty is never destructive.
 
-// Nothing calls this module yet — the encode loop wires it in as a follow-up task. Silence
-// dead_code until then rather than let clippy -D warnings block landing the policy on its own.
-#![allow(dead_code)]
-
 /// Stored `jobs.failure_class` value for a source condemned by rule 4 (HandBrake could not
 /// scan a file we ourselves could read).
 pub const CLASS_BAD_SOURCE: &str = "bad_source";
