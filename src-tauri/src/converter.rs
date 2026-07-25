@@ -2230,11 +2230,22 @@ mod tests {
     #[test]
     fn stderr_tail_window_holds_the_frame_marker_with_room_to_spare() {
         // Measured headroom from EOF: ~1.2 KB with x264, ~305 B with VideoToolbox — but each
-        // extra audio track appends a mux: line AFTER the marker. 8192 is the insurance.
-        assert!(
-            STDERR_TAIL_BYTES >= 8192,
-            "shrinking this window can silently disable truncation detection on \
-             multi-track files"
+        // extra audio track appends a mux: line AFTER the marker, eating into that headroom.
+        // Simulate a worst-case multi-track trailer behind a flood of preceding noise (so the
+        // window's front edge actually gets exercised) and confirm the marker still survives —
+        // shrinking STDERR_TAIL_BYTES could silently disable truncation detection on
+        // multi-track files without this catching it.
+        let body = format!(
+            "{}[00:00:01] sync: got 131 frames, 480 expected\n{}",
+            "noise\n".repeat(2000),
+            "mux: track 2, 100 frames\n".repeat(20),
+        );
+        let tail = read_bounded_tail(std::io::Cursor::new(body.into_bytes()));
+        assert_eq!(
+            crate::failure_class::decode_shortfall(&tail),
+            Some((131, 480)),
+            "a realistic multi-track trailer after the marker must not push it out of the \
+             STDERR_TAIL_BYTES window"
         );
     }
 
@@ -2364,6 +2375,135 @@ mod tests {
         // Cleanup ran: converted kept on disk, original deleted (mode 'delete').
         assert!(output.exists());
         assert!(!source.exists());
+    }
+
+    // End-to-end (local/e2e-ignored CI only): the tripwire for the ENTIRE truncation guard.
+    // Every other truncation test (truncated_encode_errors_and_leaves_the_source_on_disk and
+    // friends) drives a FAKE stand-in script that echoes the exact
+    // `sync: got N frames, M expected` string this guard parses — a string ConvertBar does not
+    // control. If a future HandBrake release ever reformats that line, the guard silently stops
+    // firing, the ORIGINAL data-loss bug (a truncated download recorded as 'done' and the
+    // source trashed) returns, and every one of those fake-script tests stays green regardless,
+    // because none of them ever touch real HandBrake output. This is the only test that can
+    // catch that. Needs ffmpeg to synthesize a clip and a real HandBrakeCLI on PATH. Run with:
+    //   cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored real_handbrake_flags_a_truncated_source
+    #[test]
+    #[ignore]
+    fn real_handbrake_flags_a_truncated_source_and_spares_the_original() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+        let handbrake_path =
+            crate::handbrake::detect_handbrake_path().expect("HandBrakeCLI must be on PATH");
+        set_setting(&db, "handbrake_path", &handbrake_path);
+        // 'delete' keeps the survival assertion filesystem-local (no Trash involved).
+        set_setting(&db, "cleanup_mode", "delete");
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.mp4");
+        // +faststart is essential: without it, the moov atom is written at the END of the file
+        // by default, so truncating below destroys it outright and HandBrake can't open the
+        // file AT ALL (a scan failure / bad_source) — a different failure mode than the one
+        // this guard exists to catch.
+        // 20s is deliberate, not arbitrary: HandBrake's scan samples preview frames spread
+        // across the container's FULL declared duration (faststart keeps that duration
+        // metadata intact even after truncation). A too-short clip puts every preview past
+        // the truncation point, so the SCAN itself fails to find a title (a different failure
+        // mode, bad_source) instead of the scan succeeding and the WORK/decode phase running
+        // out of data partway through — which is what this guard exists to catch.
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=20:size=1280x720:rate=25",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-movflags",
+                "+faststart",
+            ])
+            .arg(&source)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        assert!(ok, "ffmpeg failed to synthesize the source clip");
+
+        let full_bytes = std::fs::read(&source).unwrap();
+        let truncated_len = (full_bytes.len() as f64 * 0.35) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(truncated_len)
+            .unwrap();
+        let truncated_bytes = std::fs::read(&source).unwrap();
+
+        // Independently run the REAL HandBrakeCLI ourselves (same args process_queue will use
+        // below) to capture its raw stderr on the truncated source. This is a second, separate
+        // encode from the one process_queue performs — deliberately: it decouples "does real
+        // HandBrake still emit a parseable marker" from "did our code correctly react to it",
+        // so a HandBrake output-format change is diagnosed precisely as that, rather than the
+        // vaguer "the guard didn't fire".
+        let preset: String = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let probe_output = dir.path().join("probe-out.mkv");
+        let probe = Command::new(&handbrake_path)
+            .arg("-Z")
+            .arg(&preset)
+            .arg("-O")
+            .arg("-i")
+            .arg(&source)
+            .arg("-o")
+            .arg(&probe_output)
+            .output()
+            .expect("run real HandBrakeCLI directly to capture its raw stderr");
+        let raw_tail = String::from_utf8_lossy(&probe.stderr).to_string();
+        let _ = std::fs::remove_file(&probe_output);
+        assert!(
+            crate::failure_class::decode_shortfall(&raw_tail).is_some(),
+            "real HandBrakeCLI no longer emits a parseable 'sync: got N frames, M expected' \
+             line on a truncated source — HandBrake changed its output format, this is NOT \
+             \"the guard didn't fire\". Raw tail:\n{raw_tail}"
+        );
+        // The probe encode must not have disturbed the truncated source under test.
+        assert_eq!(std::fs::read(&source).unwrap(), truncated_bytes);
+
+        let output = dir.path().join("out.mkv");
+        queue_job(
+            &db,
+            "j1",
+            source.to_str().unwrap(),
+            output.to_str().unwrap(),
+            truncated_len as i64,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "error",
+            "a truncated source must fail, not succeed: {msg:?}"
+        );
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("bad_source_truncated"),
+            "real HandBrake output must still trip the decode-shortfall guard"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            truncated_bytes,
+            "THE POINT OF THIS FEATURE: the truncated source must survive byte-identical, not \
+             be replaced or trashed"
+        );
+        assert!(!output.exists(), "the partial output must be removed");
     }
 
     #[test]

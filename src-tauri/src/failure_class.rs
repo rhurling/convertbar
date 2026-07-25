@@ -111,7 +111,7 @@ fn parse_sync_line(line: &str) -> Option<(u64, u64)> {
 /// Takes the LAST such line in the tail. Returns `None` when the marker is absent or
 /// unparseable, which the caller must treat as uncertainty — never as truncation.
 pub fn decode_shortfall(stderr_tail: &str) -> Option<(u64, u64)> {
-    stderr_tail.lines().filter_map(parse_sync_line).last()
+    stderr_tail.lines().filter_map(parse_sync_line).next_back()
 }
 
 /// Whether a decode shortfall is large enough to mean the source is truncated.
