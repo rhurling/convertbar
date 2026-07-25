@@ -1,0 +1,264 @@
+# Bad-Source Handling — Design
+
+## Problem
+
+Two distinct gaps, one root cause: ConvertBar never asks *why* a job failed, and never checks whether a job that "succeeded" actually converted the whole file.
+
+**1. Failures are undifferentiated.** Every failure path calls `record_job_error` with a stderr tail and sets `status='error'`. A genuinely corrupt download and a full disk produce the same history row. There is no way to act on "this file is garbage" because nothing knows which failures mean that.
+
+**2. A truncated source is recorded as a success — and its original is trashed.** A partially-downloaded video keeps a valid container header declaring the full duration. HandBrake reads the header, encodes the bytes that are actually present, and **exits 0**. ConvertBar then:
+
+- records `status='done'`,
+- computes `space_saved` against the full original size (wildly inflated — the output is short, not smaller),
+- and, under the default `cleanup_mode='trash'`, sends the **original to Trash** (`converter.rs:991`).
+
+The user is left with a truncated output, an inflated savings stat, and the source in the Trash. This is live data loss on ordinary download corruption.
+
+## Evidence
+
+Reproduced locally against HandBrakeCLI 1.11.2 (macOS, Homebrew). A 20 s H.264 clip written with `+faststart`, truncated to 35 % of its bytes:
+
+```
+--scan --json  →  Duration: 20s          (container header intact — it lies)
+encode         →  EXIT 0, "Encode done!"
+output         →  Duration: 5s
+
+stderr, healthy:    sync: got 480 frames, 480 expected   (0 decoder errors)
+stderr, truncated:  sync: got 131 frames, 480 expected   (1 decoder errors)
+```
+
+### The frame-count marker is a usable signal
+
+| case | container | exit | `sync: got …` | decoder errors |
+|---|---|---|---|---|
+| healthy CFR | MP4 | 0 | `480 / 480` | 0 |
+| healthy VFR | MP4 | 0 | `150 / 150` | 0 |
+| healthy | MKV | 0 | `480 / 480` | 0 |
+| truncated | MP4 | 0 | `131 / 480` | 1 |
+| truncated | MKV | 0 | `155 / 480` | **0** |
+
+- **Variable framerate does not false-positive.** `expected` comes from the sync stage's own frame accounting, not `duration × fps`.
+- **Decoder errors must NOT be a required condition.** A cleanly-truncated MKV decodes its available frames without a single error. Requiring `decoder errors > 0` would miss truncation in MKV — the most common download container and the Linux default output format. **Shortfall alone is the signal.**
+- **Encoder-independent.** Verified identical under `Fast 480p30` (x264) and `H.265 Apple VideoToolbox 1080p`. The marker is emitted by the decode/sync stage, upstream of the encoder.
+- **Already captured.** The marker sits ~1.2 KB from EOF under x264 and ~305 B under VideoToolbox, inside the existing 4096-byte `STDERR_TAIL_BYTES` window.
+
+### Exit codes classify — but only partially
+
+| case | exit |
+|---|---|
+| source unreadable / unscannable / missing / zero-byte / a directory | 2 |
+| valid source, output dir missing | 3 |
+| valid source, output dir read-only | 3 |
+| `-Z "No Such Preset 9000"` | **2** |
+
+### HandBrake's stderr CANNOT distinguish corrupt from unreadable
+
+This is the finding the entire safety design rests on. Three cases produce **byte-identical** scan-stage output and the same exit code:
+
+```
+zero-byte file:        hb_stream_open: open X failed
+a directory:           scan: unrecognized file type
+GOOD file, chmod 000:  libhb: scan thread found 0 valid title(s)
+                       No title found.                          exit = 2
+```
+
+A healthy movie on a network mount that hiccuped is indistinguishable from garbage **using HandBrake's output alone**. Any implementation that trusts HandBrake's verdict will eventually destroy good files.
+
+Separately, `Invalid preset` also exits 2. That is a *global config* fault — a HandBrake upgrade renaming a preset would make it fire on **every file in the queue**. A denylist ("destroy anything that isn't a recognized environment fault") would turn one broken dependency into a trashed library.
+
+## Goal
+
+1. **Stop the data loss:** a truncated source must never be recorded as a success and its original must never be trashed. Unconditional — this corrects a wrong answer, not a preference.
+2. **Classify failures** into `BadSource` / `Environment` / `Unknown`, conservatively enough that a misclassification cannot destroy a healthy file.
+3. **Give the user a deliberate way to clean up** confirmed-bad sources, without the app ever destroying anything on its own.
+
+## Decisions (settled with the user)
+
+- **Scope:** one spec, two phases. Phase 1 = classification + review list. Phase 2 = truncation detection feeding the same pipeline.
+- **Truncation outcome:** treat as a **failure** — `status='error'`, discard the short output, source untouched. Not a new `incomplete` status (avoids touching the DB status vocabulary, queue filters, menu-bar roll-up, and every test enumerating statuses). The salvageable partial output is deliberately discarded; the source survives, so nothing is unrecoverable.
+- **No automatic destruction, ever.** Classification only *labels*. Destruction happens when the user presses a button in a review list.
+- **Setting:** `bad_source_action` = `trash` | `delete`, default `trash`. No `off` value — the review list is harmless until pressed, so gating it behind a setting would only hide corrupt-download information from users who never find the toggle.
+
+## Non-goals
+
+- No retry / two-strike mechanism. There is no way to re-run an errored job today, and building one is out of scope.
+- No backfill of existing history rows. `failure_class` is NULL for pre-existing entries, and NULL never appears in the review list.
+- No mid-file corruption detection beyond frame shortfall. A file that decodes end-to-end with artefacts is not detectable this way.
+- **Exit 0 with a 0-byte output stays `Unknown`.** Rule 3 below requires exit 2, so the existing empty-output guard (`converter.rs:976`) will not classify as `BadSource`. Deliberate: the cause of that state is not understood well enough to destroy on it.
+
+---
+
+## Phase 1 — Failure classification
+
+### New module: `src-tauri/src/failure_class.rs`
+
+Pure, no I/O, table-testable. Same shape and rationale as `media_skip.rs`: the caller gathers facts, the module decides.
+
+```rust
+pub enum FailureClass { BadSource, Environment, Unknown }
+
+pub struct FailureFacts<'a> {
+    pub exit_code: Option<i32>,   // None = killed / signalled
+    pub source_readable: bool,    // OUR observation, not HandBrake's
+    pub stderr_tail: &'a str,
+}
+
+pub fn classify(facts: &FailureFacts) -> FailureClass
+```
+
+Rules, first match wins:
+
+1. `!source_readable` → **Environment**.
+   The load-bearing rule. It is the *only* thing separating `chmod 000` from a zero-byte file.
+2. stderr contains an environment marker → **Environment**.
+   `invalid preset`, `no space left`, `permission denied`, `not permitted`, `read-only`, `cannot create`.
+   Checked **before** rule 3 so `Invalid preset` (exit 2) can never reach the `BadSource` branch.
+3. `exit_code == Some(2)` **and** stderr contains a source marker → **BadSource**.
+   `unrecognized file type`, `no title found`, `0 valid title`.
+4. Otherwise → **Unknown**.
+
+Matching is lowercase-substring, consistent with the existing `DIAGNOSTIC_MARKERS` handling (`converter.rs:516`).
+
+Truncation is deliberately **not** a rule here. By the time the Phase 2 guard fires it has already decided, so its call site passes `BadSource` directly rather than round-tripping a fact through `classify`. `decode_shortfall` / `is_truncated` still live in this module — they are pure parsing and policy — they are just not inputs to `classify`.
+
+### Readability probe
+
+```rust
+fn source_is_readable(path: &Path) -> bool
+```
+
+`File::open` followed by a 1-byte read. Any `Err` yields `false`.
+
+Note the polarity: `false` routes to **Environment**, which never destroys. So every probe failure — EACCES, EIO, a stalled mount, the file having vanished since — fails *safe*. This is the mirror image of `source_is_confirmed_missing` (`converter.rs:451`), which fails open in the other direction because there the safe answer is "let HandBrake try".
+
+Probed at the failure point, not at spawn time: the question is whether the file is readable *now*, when we are deciding whether to believe HandBrake's verdict.
+
+### Wiring into `converter.rs`
+
+`record_job_error` and `record_job_error_quiet` take a new `class: FailureClass` argument and persist it. The eight call sites:
+
+| line | failure | class |
+|---|---|---|
+| `:721` | source vanished (`_quiet`) | `Environment` (static) |
+| `:768` | HandBrakeCLI not found | `Environment` (static) |
+| `:792` | DB claim failed | `Environment` (static) |
+| `:865` | spawn failed | `Environment` (static) |
+| `:984` | empty output | **classify** |
+| `:1052` | in-place apply failed | `Environment` (static) |
+| `:1190` | nonzero exit / wait error | **classify** |
+| *new* | truncation (Phase 2) | `BadSource` (static) |
+
+Only three sites consult the classifier — precisely the ones where HandBrake's output is the sole evidence. The other five already know structurally what went wrong.
+
+**Exit code capture.** The failure arm is currently `Ok(_) | Err(_)` (`converter.rs:1161`), discarding the status. It becomes a single bound arm extracting `exit_code`:
+
+```rust
+other => {
+    let exit_code = match &other { Ok(s) => s.code(), Err(_) => None };
+    …
+}
+```
+
+### Persistence
+
+```sql
+ALTER TABLE jobs ADD COLUMN failure_class TEXT
+```
+
+Additive only, NULL for existing rows — an auto-updating install with an existing `convertbar.db` needs no data migration. Follows the established `db.rs` migration pattern.
+
+### Setting
+
+`bad_source_action`, values `trash` | `delete`, default `trash`. Touches the standard six places:
+
+- `db.rs:173` defaults list → **`init_db_seeds_defaults` count assertion 16 → 17** (`db.rs:252`), plus a value assertion explaining why `trash` is the default.
+- `commands/settings.rs:107` `ALLOWED_KEYS`
+- `commands/settings.rs` `get_settings` parse (unrecognized value → `trash`)
+- `types.rs` `Settings` struct
+- `src/lib/tauri.ts:91` `Settings` type
+- `src/pages/SettingsPage.tsx`
+
+### Review list
+
+- **`get_bad_sources()`** → `SELECT … WHERE status='error' AND failure_class='bad_source' ORDER BY completed_at DESC`
+- **`purge_bad_sources(ids: Vec<String>)`** → per id: if the path is gone, report `AlreadyGone`; if its current size differs from the row's `original_size`, report `Changed` and **do not touch it**; otherwise `trash::delete` or `fs::remove_file` per `bad_source_action`. Returns per-id outcomes.
+
+  The size check is a cheap identity guard. Classification may be days old, and a path that has since been re-downloaded or replaced must not be destroyed on the strength of a stale verdict. `original_size` is already recorded on every job.
+
+  On a successful purge the row's `failure_class` becomes `bad_source_purged`. The list query matches `= 'bad_source'` exactly, so purged entries drop out of the list while remaining visible in normal history — without this the same rows reappear and a second press produces nothing but errors.
+- `HistoryPage` gains a **Bad sources (N)** filter, shown only when N > 0. Rows show file name + reason, where the reason is the **first line of `error_message`** (already headlined with the diagnostic by `message_with_tail`, `converter.rs:528`) — no new field, and no second place that has to stay in sync with the failure text. Bulk button worded per setting: **Move N to Trash** / **Delete N permanently**, with an in-app confirm step for `delete`.
+
+Both commands are app-defined `#[tauri::command]`s, so they are **ACL-exempt** — `capabilities/default.json` is unchanged. The confirm step is in-app UI rather than the dialog plugin's frontend half, which would require a new grant.
+
+---
+
+## Phase 2 — Truncation detection
+
+### Parsing
+
+```rust
+pub fn decode_shortfall(stderr_tail: &str) -> Option<(u64, u64)>  // (got, expected)
+pub fn is_truncated(got: u64, expected: u64) -> bool
+```
+
+`decode_shortfall` parses `sync: got N frames, M expected`. Absent or unparseable → `None` → no action (uncertainty never destroys).
+
+```rust
+const MIN_DECODED_FRACTION: f64 = 0.90;
+```
+
+`is_truncated` → `expected > 0 && (got as f64 / expected as f64) < MIN_DECODED_FRACTION`. Measured margin is wide: healthy cases sit at exactly 1.00, truncated cases at 0.27–0.32. The 10 % slack absorbs container-level frame accounting quirks without approaching either cluster.
+
+### Wiring
+
+Three changes in `converter.rs`:
+
+1. **Hoist the `stderr_tail_thread` join above `match exit_status`** (`:966`). Today it is joined only inside the two failure arms (`:981`, `:1187`), so the success path never reads it. The child has already exited by this point, so the drain thread is at EOF and the join is prompt in every arm. This also removes the current duplicate join.
+
+2. **New guard in the success arm**, immediately after the empty-output guard (`:976`) and **before** `decide_cleanup` (`:1004`) — deliberately the same shape as its neighbour:
+
+   ```rust
+   if let Some((got, expected)) = decode_shortfall(&tail) {
+       if is_truncated(got, expected) {
+           had_errors = true;
+           let _ = std::fs::remove_file(&encode_target);
+           let pct = (got as f64 / expected as f64 * 100.0).round() as u64;
+           record_job_error(app, db, &job.id, &file_name,
+               &format!("Source appears truncated: decoded {got} of {expected} frames ({pct}%)"),
+               FailureClass::BadSource);
+           continue;
+       }
+   }
+   ```
+
+   Because it `continue`s before `decide_cleanup`, the cleanup branch never runs: the source is never trashed and the inflated `space_saved` is never recorded.
+
+3. **`STDERR_TAIL_BYTES` 4096 → 8192** (`converter.rs:478`). Measured headroom is 1.2 KB (x264) / 305 B (VideoToolbox), but each additional audio track appends a `mux:` line *after* the marker. Cheap insurance against a multi-track file pushing it out of the window.
+
+---
+
+## Testing
+
+### `failure_class.rs` — table tests over real captured stderr
+
+The stderr from the reproduction above is checked in as `&str` fixtures, following the `SCAN_FIXTURE_*` pattern in `probe.rs:162`.
+
+**The load-bearing test is the `chmod 000` vs zero-byte pair:** identical stderr, identical exit code, **opposite** classification, distinguished only by `source_readable`. It fails the moment anyone "simplifies" rule 1 away — which is exactly the change that would start destroying healthy files. This encodes *why* rule 1 exists, not merely that it is present.
+
+Also covered:
+- `Invalid preset` (exit 2) → `Environment`, asserting rule 2 is evaluated before rule 3. Without the ordering this classifies as `BadSource` and a preset rename destroys every file in the queue.
+- exit 3 (bad output dir, read-only dir) → `Environment`.
+- Unmatched stderr, `exit_code: None` → `Unknown`.
+
+### Phase 2
+
+- `decode_shortfall`: parses the real marker; returns `None` for absent/garbled input.
+- `is_truncated`: boundary table around `MIN_DECODED_FRACTION` — `expected == 0` → false; 480/480 → false; 150/150 (VFR) → false; 131/480 and 155/480 → true.
+- An MKV truncation case with **0 decoder errors**, pinning that decoder errors are not required. This is a regression guard against the tempting-but-wrong tightening.
+- Integration test on the existing fake-HandBrake harness in `converter.rs` tests: a truncated encode must leave the source file **present on disk** and record `status='error'`, not `done`.
+
+### Cross-platform
+
+- The `chmod 000` readability test is `#[cfg(unix)]`; Windows gets its own unreadable-file case or skips it.
+- Path separators normalized in assertions — PR CI is ubuntu-only, so a hardcoded `/` only reddens `main` after merge.
+- No new platform-gated dependencies: `trash` and `std::fs` are already in use on all three targets.
