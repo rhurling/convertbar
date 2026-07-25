@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::converter::IN_PLACE_TEMP_MARKER;
-use crate::failure_class::{CLASS_BAD_SOURCE, CLASS_BAD_SOURCE_PURGED, CLASS_BAD_SOURCE_TRUNCATED};
+use crate::failure_class::{
+    CLASS_BAD_SOURCE, CLASS_BAD_SOURCE_PURGED, CLASS_BAD_SOURCE_RECOVERED,
+    CLASS_BAD_SOURCE_TRUNCATED,
+};
 use crate::handbrake;
 use crate::types::{
     AddResult, ClassifiedPaths, FolderScanResult, HistoryPage, HistorySummary, JobInfo,
@@ -121,15 +124,31 @@ fn should_rescan_before_purge(class: Option<&str>) -> bool {
 }
 
 /// Whether any live job still points at `path`.
+/// Canonicalize `path` for the in-use comparison, falling back to the raw path unchanged when
+/// canonicalization fails (e.g. a dead mount, or a path that no longer resolves) — a failure
+/// here must never make a live job's path silently drop out of the comparison.
+fn canonical_or_raw(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+/// Whether any live job still points at `path`. Compares canonicalized paths, not raw strings:
+/// an exact-string match misses a case-insensitive filesystem (macOS/Windows default), `/tmp`
+/// vs `/private/tmp`, or a symlinked watched directory — any of which would let a live job's
+/// source look "free" to purge under a different spelling of the same file.
 fn path_is_in_use(conn: &rusqlite::Connection, path: &str) -> bool {
-    conn.query_row(
-        "SELECT COUNT(*) FROM jobs
-         WHERE source_path = ?1 AND status IN ('queued', 'encoding', 'paused')",
-        params![path],
-        |r| r.get::<_, i64>(0),
-    )
-    .map(|n| n > 0)
-    .unwrap_or(true) // a failed check means "assume in use" — never destroy on uncertainty
+    let mut stmt = match conn
+        .prepare("SELECT source_path FROM jobs WHERE status IN ('queued', 'encoding', 'paused')")
+    {
+        Ok(s) => s,
+        // a failed check means "assume in use" — never destroy on uncertainty
+        Err(_) => return true,
+    };
+    let live_paths: Vec<String> = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => return true,
+    };
+    let target = canonical_or_raw(path);
+    live_paths.iter().any(|p| canonical_or_raw(p) == target)
 }
 
 /// Outcome of the DB-only part of the ladder: eligibility (folded into the row lookup),
@@ -138,23 +157,19 @@ fn path_is_in_use(conn: &rusqlite::Connection, path: &str) -> bool {
 enum PreDestroy {
     /// A final, non-destructive verdict. Nothing more to do.
     Stop(PurgeOutcome),
-    /// Everything before the scan passed and a rescan is required: probe `handbrake_path`
-    /// against `path`. The probe can block for `PROBE_TIMEOUT` (~30s), so callers that share
-    /// `conn` with other threads must not hold that lock while probing. A scan that runs to
-    /// completion and finds no title (`ScanOutcome::NoTitle`) is a real, re-confirmed verdict
-    /// and falls through to destroy `path`, same as `ReadyToDestroy`.
-    NeedsScan {
-        path: String,
-        handbrake_path: String,
-    },
+    /// A rescan is required for this row's class. When `pre_destroy_check` runs as the FINAL
+    /// re-verify (`purge_one_locked`'s only caller), the scan already ran in phase 2 and
+    /// confirmed `RescanVerdict::Destroy` — this variant just means "every DB-side fact still
+    /// holds," not "run the scan (again)". No `handbrake_path` is carried: nothing here needs it.
+    NeedsScan { path: String },
     /// Everything passed and no rescan is required (a `bad_source_truncated` row, whose
     /// verdict does not depend on a scan) — safe to destroy `path`.
     ReadyToDestroy { path: String },
 }
 
-/// The row facts `pre_destroy_check` needs about a candidate id, before any filesystem or scan
-/// work. A named struct instead of a raw tuple — clippy's `type_complexity` lint flagged the
-/// previous `(String, Option<String>, Option<i64>, Option<i64>)`.
+/// The row facts the ladder needs about a candidate id, before any filesystem or scan work. A
+/// named struct instead of a raw tuple — clippy's `type_complexity` lint flagged the previous
+/// `(String, Option<String>, Option<i64>, Option<i64>)`.
 struct BadSourceRow {
     path: String,
     class: Option<String>,
@@ -162,15 +177,13 @@ struct BadSourceRow {
     mtime: Option<i64>,
 }
 
-/// Rungs 1-3 of the ladder plus the rung-4 rescan decision, against a single already-acquired
-/// connection. Callers own how long any lock around `conn` is held.
-fn pre_destroy_check(conn: &rusqlite::Connection, id: &str) -> PreDestroy {
-    // Eligibility is folded into the row lookup itself: an id that is not a live, unpurged
-    // bad-source error row (wrong status, wrong/absent failure_class, or simply nonexistent)
-    // matches no row, and the existing "not found" arm below reports Failed for it. The UI is
-    // expected to only ever pass ids from the review list, but a wiring mistake (e.g. passing
-    // a History row's id) must never be able to reach a live `done`/`queued` row.
-    let row: Result<BadSourceRow, _> = conn.query_row(
+/// Eligibility lookup: the id must be a live, unpurged bad-source error row (right status, right
+/// failure_class). An id that fails this (wrong status, wrong/absent failure_class, or simply
+/// nonexistent) matches no row — the UI is expected to only ever pass ids from the review list,
+/// but a wiring mistake (e.g. passing a History row's id) must never be able to reach a live
+/// `done`/`queued` row. DB-only: no filesystem I/O.
+fn lookup_bad_source_row(conn: &rusqlite::Connection, id: &str) -> Option<BadSourceRow> {
+    conn.query_row(
         "SELECT source_path, failure_class, source_size, source_mtime FROM jobs
          WHERE id = ?1 AND status = 'error' AND failure_class IN (?2, ?3)",
         params![id, CLASS_BAD_SOURCE, CLASS_BAD_SOURCE_TRUNCATED],
@@ -182,38 +195,41 @@ fn pre_destroy_check(conn: &rusqlite::Connection, id: &str) -> PreDestroy {
                 mtime: r.get(3)?,
             })
         },
-    );
-    let BadSourceRow {
-        path,
-        class,
-        size,
-        mtime,
-    } = match row {
-        Ok(v) => v,
-        Err(_) => return PreDestroy::Stop(PurgeOutcome::Failed),
-    };
+    )
+    .ok()
+}
 
-    if path_is_in_use(conn, &path) {
-        return PreDestroy::Stop(PurgeOutcome::InUse);
-    }
-    if !std::path::Path::new(&path).exists() {
-        // The path itself being missing is ambiguous: an unplugged external/network volume
-        // makes every path under it look identical to "the file was deleted" — `exists()` is
-        // false either way. Only stamp the row purged when the PARENT directory is confirmed
-        // reachable, which positively attributes the absence to the file itself rather than to
-        // the whole volume being offline. If the parent can't be confirmed either, this is not
-        // a verdict at all — leave failure_class untouched so the row survives in the review
-        // list and can be retried once the volume returns, instead of being permanently erased
-        // by a transient condition.
-        let parent_exists = Path::new(&path).parent().is_some_and(|p| p.exists());
-        if !parent_exists {
-            return PreDestroy::Stop(PurgeOutcome::Unverifiable);
+/// FS-only verdict for a source path against its stored `(size, mtime)` fingerprint. No DB
+/// access, so this can run with the mutex released — see `purge_one_locked`'s doc comment for
+/// why that split matters (a dead SMB/NFS mount can block a stat for 30-60s).
+///
+/// Uses `try_exists`, NOT `exists` (which collapses every stat error — a Windows ACL denial, an
+/// EIO on a half-broken mount — into a bare `false`). An error here proves nothing about whether
+/// the file exists, so it must route to `Unverifiable`, never be misread as "deleted" and get the
+/// row permanently stamped. Mirrors `converter::source_is_confirmed_missing`'s convention.
+fn verify_source_identity_on_disk(
+    path: &str,
+    size: Option<i64>,
+    mtime: Option<i64>,
+) -> Result<(), PurgeOutcome> {
+    match Path::new(path).try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            // The path itself being missing is ambiguous: an unplugged external/network volume
+            // makes every path under it look identical to "the file was deleted" — `try_exists`
+            // reads `Ok(false)` either way. Only treat this as AlreadyGone when the PARENT
+            // directory is confirmed reachable, which positively attributes the absence to the
+            // file itself rather than to the whole volume being offline.
+            let parent_reachable = Path::new(path)
+                .parent()
+                .is_some_and(|p| matches!(p.try_exists(), Ok(true)));
+            return Err(if parent_reachable {
+                PurgeOutcome::AlreadyGone
+            } else {
+                PurgeOutcome::Unverifiable
+            });
         }
-        // Nothing left to destroy, but the user's intent (this file should be gone) is
-        // already satisfied — stamp it purged so the row leaves the review list instead of
-        // reappearing (and re-reporting AlreadyGone) on every future press.
-        mark_purged(conn, id);
-        return PreDestroy::Stop(PurgeOutcome::AlreadyGone);
+        Err(_) => return Err(PurgeOutcome::Unverifiable),
     }
 
     // Identity: the (size, mtime) fingerprint the codebase already keeps. A replacement file
@@ -222,11 +238,43 @@ fn pre_destroy_check(conn: &rusqlite::Connection, id: &str) -> PreDestroy {
     // that was itself unstattable at add time) — is treated as a mismatch: there is nothing to
     // verify against, so purge refuses rather than guess.
     let identity_matches = matches!(
-        (file_identity(&path), size, mtime),
+        (file_identity(path), size, mtime),
         (Some(current), Some(s), Some(m)) if current.size == s && current.mtime == m
     );
     if !identity_matches {
-        return PreDestroy::Stop(PurgeOutcome::Changed);
+        return Err(PurgeOutcome::Changed);
+    }
+    Ok(())
+}
+
+/// Rungs 1-3 of the ladder plus the rung-4 rescan decision, against a single already-acquired
+/// connection. Used both by the initial DB-only phase (`quick_db_check`, which skips the FS
+/// parts) and by the FINAL re-verify immediately before destroying, where the FS re-stat here is
+/// cheap because `purge_one_locked`'s earlier, unlocked pass already proved the mount responsive.
+fn pre_destroy_check(conn: &rusqlite::Connection, id: &str) -> PreDestroy {
+    let BadSourceRow {
+        path,
+        class,
+        size,
+        mtime,
+    } = match lookup_bad_source_row(conn, id) {
+        Some(v) => v,
+        None => return PreDestroy::Stop(PurgeOutcome::Failed),
+    };
+
+    if path_is_in_use(conn, &path) {
+        return PreDestroy::Stop(PurgeOutcome::InUse);
+    }
+
+    if let Err(outcome) = verify_source_identity_on_disk(&path, size, mtime) {
+        // Nothing left to destroy, but the user's intent (this file should be gone) is already
+        // satisfied — stamp it purged so the row leaves the review list instead of reappearing
+        // (and re-reporting AlreadyGone) on every future press. Every other Stop outcome must
+        // leave failure_class untouched so the row survives in the review list for a retry.
+        if outcome == PurgeOutcome::AlreadyGone {
+            mark_purged(conn, id);
+        }
+        return PreDestroy::Stop(outcome);
     }
 
     if should_rescan_before_purge(class.as_deref()) {
@@ -235,10 +283,7 @@ fn pre_destroy_check(conn: &rusqlite::Connection, id: &str) -> PreDestroy {
             // indistinguishable from "the scan ran and failed", so this must not fall through
             // to destruction.
             Err(_) => PreDestroy::Stop(PurgeOutcome::Unverifiable),
-            Ok(handbrake_path) => PreDestroy::NeedsScan {
-                path,
-                handbrake_path,
-            },
+            Ok(_) => PreDestroy::NeedsScan { path },
         };
     }
     PreDestroy::ReadyToDestroy { path }
@@ -278,18 +323,54 @@ fn mark_purged(conn: &rusqlite::Connection, id: &str) {
     );
 }
 
+/// Stamp a row recovered so it drops out of the review list too (F12) — without this, a file
+/// the rescan just PROVED healthy stays listed under "Bad sources" forever, costing a fresh
+/// ~30s rescan on every subsequent purge press. See `CLASS_BAD_SOURCE_RECOVERED` for why this
+/// uses a distinct value rather than NULL or `CLASS_BAD_SOURCE_PURGED`.
+fn mark_recovered(conn: &rusqlite::Connection, id: &str) {
+    let _ = conn.execute(
+        "UPDATE jobs SET failure_class = ?2 WHERE id = ?1",
+        params![id, CLASS_BAD_SOURCE_RECOVERED],
+    );
+}
+
+/// The two ways a condemned source can be disposed of, mapped from the persisted
+/// `bad_source_action` setting via `normalize_bad_source_action` (so "trash"/"delete" stay the
+/// single source of truth for what counts as which). A typed enum instead of comparing
+/// `action == "delete"` inline so the setting -> dispatch mapping is a pure, unit-testable
+/// function: mutation testing found this routing completely unverified — every purge test
+/// passed `"delete"` literally, so the DEFAULT `"trash"` arm, sold to users as recoverable, was
+/// never distinguished from a permanent delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PurgeAction {
+    Trash,
+    Delete,
+}
+
+impl PurgeAction {
+    fn from_setting(value: &str) -> Self {
+        match crate::commands::settings::normalize_bad_source_action(value) {
+            "delete" => PurgeAction::Delete,
+            _ => PurgeAction::Trash,
+        }
+    }
+}
+
 /// Destroy `path` per `action` and stamp the row purged. Called only once every earlier rung
-/// has passed.
-fn destroy_and_record(
+/// has passed. The actual filesystem primitive is injected (`remove_file`/`trash_delete`) so the
+/// trash-vs-delete DISPATCH — not just the pure `PurgeAction::from_setting` mapping above — can
+/// be pinned by a test without ever deleting a real file or touching the OS Trash.
+fn destroy_and_record_with(
     conn: &rusqlite::Connection,
     id: &str,
-    action: &str,
+    action: PurgeAction,
     path: &str,
+    remove_file: impl FnOnce(&str) -> bool,
+    trash_delete: impl FnOnce(&str) -> bool,
 ) -> PurgeOutcome {
-    let destroyed = if action == "delete" {
-        std::fs::remove_file(path).is_ok()
-    } else {
-        trash::delete(path).is_ok()
+    let destroyed = match action {
+        PurgeAction::Delete => remove_file(path),
+        PurgeAction::Trash => trash_delete(path),
     };
     if !destroyed {
         return PurgeOutcome::Failed;
@@ -299,10 +380,71 @@ fn destroy_and_record(
     PurgeOutcome::Purged
 }
 
+fn destroy_and_record(
+    conn: &rusqlite::Connection,
+    id: &str,
+    action: PurgeAction,
+    path: &str,
+) -> PurgeOutcome {
+    destroy_and_record_with(
+        conn,
+        id,
+        action,
+        path,
+        |p| std::fs::remove_file(p).is_ok(),
+        |p| trash::delete(p).is_ok(),
+    )
+}
+
+/// DB-only phase of the ladder: row lookup, eligibility, InUse, and — if a rescan will be
+/// needed — resolving `handbrake_path`. Nothing here touches the SOURCE path's filesystem state,
+/// so this lock is always brief even when that path lives on a dead mount.
+struct QuickCheck {
+    path: String,
+    size: Option<i64>,
+    mtime: Option<i64>,
+    /// `Some` iff the row's class requires a rescan before destruction; the inner `Result`
+    /// mirrors `get_handbrake_path`'s outcome, resolved once here rather than again per phase.
+    handbrake_path: Option<Result<String, String>>,
+}
+
+enum QuickOutcome {
+    Stop(PurgeOutcome),
+    Proceed(QuickCheck),
+}
+
+fn quick_db_check(conn: &rusqlite::Connection, id: &str) -> QuickOutcome {
+    let row = match lookup_bad_source_row(conn, id) {
+        Some(v) => v,
+        None => return QuickOutcome::Stop(PurgeOutcome::Failed),
+    };
+    if path_is_in_use(conn, &row.path) {
+        return QuickOutcome::Stop(PurgeOutcome::InUse);
+    }
+    let handbrake_path = if should_rescan_before_purge(row.class.as_deref()) {
+        Some(get_handbrake_path(conn))
+    } else {
+        None
+    };
+    QuickOutcome::Proceed(QuickCheck {
+        path: row.path,
+        size: row.size,
+        mtime: row.mtime,
+        handbrake_path,
+    })
+}
+
 /// Same ladder as `pre_destroy_check` + `destroy_and_record`, for the production async command:
-/// the shared DB mutex is released around the rung-4 scan (which can block for `PROBE_TIMEOUT`,
-/// ~30s) so it cannot stall the converter thread's progress writes — or any other command — for
-/// the duration.
+/// the shared DB mutex is released around EVERY step that can block on the filesystem or a
+/// subprocess — the identity re-stat, the rung-4 scan (`PROBE_TIMEOUT`, ~30s), and the destroy
+/// call itself — so none of them can stall the converter thread's progress writes, or any other
+/// command, for the duration. On a dead SMB/NFS mount a single stat can block 30-60s; doing that
+/// under this mutex used to freeze the whole UI (every command takes this same lock) and stall
+/// the queue thread's next DB write — exactly the hardware this feature targets.
+///
+/// The lock is held only for: the initial DB-only lookup (`quick_db_check`), a brief re-acquire
+/// to stamp `AlreadyGone`, and the final re-verify + destroy. Phase 2's filesystem checks and the
+/// rescan run with the mutex fully released.
 ///
 /// Before the async/lock restructure, identity -> (scan) -> destroy all ran under ONE held
 /// lock, so nothing else could touch this row or path in between (the converter itself must
@@ -320,30 +462,63 @@ fn destroy_and_record(
 /// still passes. A row that needed a rescan will report `NeedsScan` again here (its
 /// `failure_class` hasn't changed) rather than `ReadyToDestroy` — that's expected, and is
 /// treated as "every DB-side fact still holds," not as a signal to scan a second time: the
-/// `RescanVerdict::Destroy` obtained outside the lock already stands as the scan's answer.
-fn purge_one_locked(db: &Arc<Mutex<rusqlite::Connection>>, id: &str, action: &str) -> PurgeOutcome {
-    let pre = {
+/// `RescanVerdict::Destroy` obtained outside the lock already stands as the scan's answer. This
+/// final re-stat is cheap: phase 2 already proved the mount responsive, so re-acquiring the lock
+/// here cannot stall.
+fn purge_one_locked(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    id: &str,
+    action: PurgeAction,
+) -> PurgeOutcome {
+    // Phase 1: DB-only.
+    let check = {
         let conn = db.lock().unwrap();
-        pre_destroy_check(&conn, id)
+        match quick_db_check(&conn, id) {
+            QuickOutcome::Stop(outcome) => return outcome,
+            QuickOutcome::Proceed(c) => c,
+        }
     };
-    match pre {
-        PreDestroy::Stop(outcome) => return outcome,
-        PreDestroy::ReadyToDestroy { .. } => {}
-        PreDestroy::NeedsScan {
-            path,
-            handbrake_path,
-        } => {
-            // Deliberately outside the lock acquired above (already dropped) — see the
-            // doc comment above.
-            match rescan_verdict(crate::probe::scan_outcome(&handbrake_path, &path)) {
-                RescanVerdict::Recovered => return PurgeOutcome::Recovered,
-                RescanVerdict::Unverifiable => return PurgeOutcome::Unverifiable,
-                RescanVerdict::Destroy => {}
+
+    // Phase 2: filesystem work OUTSIDE the lock — see the doc comment above.
+    if let Err(outcome) = verify_source_identity_on_disk(&check.path, check.size, check.mtime) {
+        if outcome == PurgeOutcome::AlreadyGone {
+            let conn = db.lock().unwrap();
+            mark_purged(&conn, id);
+        }
+        return outcome;
+    }
+
+    if let Some(handbrake_path_result) = check.handbrake_path {
+        let handbrake_path = match handbrake_path_result {
+            Ok(p) => p,
+            Err(_) => return PurgeOutcome::Unverifiable,
+        };
+        // Deliberately outside any lock — see the doc comment above.
+        match rescan_verdict(crate::probe::scan_outcome(&handbrake_path, &check.path)) {
+            RescanVerdict::Recovered => {
+                // F12: a file just PROVED healthy must exit the review list, not sit there
+                // forever costing a fresh rescan on every future purge press. Nothing is
+                // destroyed, so a brief re-acquired lock to stamp the row is all this needs.
+                let conn = db.lock().unwrap();
+                mark_recovered(&conn, id);
+                return PurgeOutcome::Recovered;
+            }
+            RescanVerdict::Unverifiable => return PurgeOutcome::Unverifiable,
+            RescanVerdict::Destroy => {
+                // Rule-1 evidence (failure_class.rs): HandBrake's diagnostics are byte-identical
+                // for a genuinely corrupt file and a healthy one we merely can't open (a
+                // hiccuping mount, a permission fluke). The rescan proves HandBrake still can't
+                // parse it; only WE opening the file ourselves proves it is truly unreadable and
+                // not just transiently so.
+                if !crate::converter::source_is_readable(&check.path) {
+                    return PurgeOutcome::Unverifiable;
+                }
             }
         }
     }
 
-    // Re-verify everything — not just InUse — under a freshly acquired lock before destroying.
+    // Phase 3: re-acquire the lock and re-verify EVERYTHING — not just InUse — before
+    // destroying. See the doc comment above.
     let conn = db.lock().unwrap();
     match pre_destroy_check(&conn, id) {
         PreDestroy::Stop(outcome) => outcome,
@@ -1028,7 +1203,7 @@ pub async fn purge_bad_sources(
             )
             .unwrap_or_else(|_| "trash".to_string())
         };
-        let action = crate::commands::settings::normalize_bad_source_action(&action);
+        let action = PurgeAction::from_setting(&action);
         Ok(ids
             .iter()
             .map(|id| PurgeResult {
@@ -2349,30 +2524,40 @@ mod tests {
 
     #[test]
     fn purge_skips_a_path_a_live_job_still_needs() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::init_db(&conn).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("movie.mkv");
-        std::fs::write(&f, b"content").unwrap();
-        let p = f.to_str().unwrap();
+        // F7: all three LIVE statuses must block a destroy, not just 'queued' — mutation testing
+        // showed narrowing path_is_in_use's `IN ('queued', 'encoding', 'paused')` down to just
+        // `IN ('queued')` survived the whole suite, because only a 'queued' sibling was ever
+        // tested. 'encoding' is the sharpest case: it is the running job's OWN source file.
+        for live_status in ["queued", "encoding", "paused"] {
+            let conn = Connection::open_in_memory().unwrap();
+            crate::db::init_db(&conn).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("movie.mkv");
+            std::fs::write(&f, b"content").unwrap();
+            let p = f.to_str().unwrap();
 
-        // The bad-source row, plus a re-added copy of the same file now queued.
-        insert_error_row(&conn, "old", p, "bad_source");
-        conn.execute(
-            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
-                               created_at)
-             VALUES ('new', ?1, '/o.mp4', 'p', 'queued', 0, '2026-07-25T10:00:00Z')",
-            params![p],
-        )
-        .unwrap();
-        let db = Arc::new(Mutex::new(conn));
+            // The bad-source row, plus a re-added copy of the same file now live.
+            insert_error_row(&conn, "old", p, "bad_source");
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at)
+                 VALUES ('new', ?1, '/o.mp4', 'p', ?2, 0, '2026-07-25T10:00:00Z')",
+                params![p, live_status],
+            )
+            .unwrap();
+            let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
-        assert_eq!(outcome, PurgeOutcome::InUse);
-        assert!(
-            f.exists(),
-            "a file a queued job depends on must never be destroyed"
-        );
+            let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
+            assert_eq!(
+                outcome,
+                PurgeOutcome::InUse,
+                "a '{live_status}' job depending on this path must block the purge"
+            );
+            assert!(
+                f.exists(),
+                "a file a '{live_status}' job depends on must never be destroyed"
+            );
+        }
     }
 
     #[test]
@@ -2393,7 +2578,7 @@ mod tests {
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(outcome, PurgeOutcome::Changed);
         assert!(
             f.exists(),
@@ -2410,7 +2595,7 @@ mod tests {
         insert_error_row(&conn, "old", missing.to_str().unwrap(), "bad_source");
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(outcome, PurgeOutcome::AlreadyGone);
         // A file the user already deleted by hand must leave the review list too — otherwise
         // it reappears and reports AlreadyGone again on every future press, and the list can
@@ -2455,7 +2640,7 @@ mod tests {
         std::fs::remove_dir_all(&volume).unwrap();
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(
             outcome,
             PurgeOutcome::Unverifiable,
@@ -2485,7 +2670,7 @@ mod tests {
         stamp_identity(&conn, "old", p);
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(outcome, PurgeOutcome::Purged);
         assert!(!f.exists(), "delete mode removes the file");
         assert!(
@@ -2531,7 +2716,7 @@ mod tests {
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "done1", "delete");
+        let outcome = purge_one_locked(&db, "done1", PurgeAction::Delete);
         assert_eq!(outcome, PurgeOutcome::Failed);
         assert!(
             f.exists(),
@@ -2591,7 +2776,7 @@ mod tests {
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(outcome, PurgeOutcome::Unverifiable);
         assert!(
             f.exists(),
@@ -2599,10 +2784,100 @@ mod tests {
         );
     }
 
+    // F9: stand-in HandBrake `--scan` scripts for the three purge tests below that drive a real
+    // rescan through `purge_one_locked`. Both platform variants live here so all three tests run
+    // on Windows CI too — before this, they were `#[cfg(unix)]` with inline `/bin/sh` scripts,
+    // so `destroy_and_record` never executed on Windows at all.
+
+    /// A stand-in that runs to completion but emits no parseable title set
+    /// (`ScanOutcome::NoTitle`) — the shape of a real scan that opened the file fine and found
+    /// nothing.
+    fn no_title_scan_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("fake-handbrake.cmd");
+            std::fs::write(&p, "@echo off\r\necho no title here\r\n@exit /b 0\r\n").unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("fake-handbrake.sh");
+            std::fs::write(&p, "#!/bin/sh\necho 'no title here'\nexit 0\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    /// A stand-in that runs to completion and DOES emit a parseable title set
+    /// (`ScanOutcome::Titled`) — the shape of a real scan succeeding on a rescan after the
+    /// original scan failed to run.
+    fn titled_scan_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("fake-handbrake-titled.cmd");
+            std::fs::write(
+                &p,
+                "@echo off\r\necho JSON Title Set: {\"TitleList\":[{\"Geometry\":{\"Height\":1080},\"VideoCodec\":\"h264\"}]}\r\n@exit /b 0\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("fake-handbrake-titled.sh");
+            std::fs::write(
+                &p,
+                "#!/bin/sh\nprintf 'JSON Title Set: {\"TitleList\":[{\"Geometry\":{\"Height\":1080},\"VideoCodec\":\"h264\"}]}'\nexit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    /// A stand-in that overwrites `target` (standing in for an in-place re-conversion completing
+    /// mid-scan) before reporting no title and exiting cleanly.
+    fn scan_script_that_overwrites_then_reports_no_title(
+        dir: &std::path::Path,
+        target: &str,
+    ) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("fake-handbrake-overwrite.cmd");
+            // Redirect BEFORE the write, same reason as bad_source_fake_handbrake_script
+            // (converter.rs): cmd.exe keeps a space in front of a trailing redirect token.
+            std::fs::write(
+                &p,
+                format!(
+                    "@echo off\r\n>\"{target}\" echo freshly converted, different bytes\r\n\
+                     echo no title here\r\n@exit /b 0\r\n"
+                ),
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("fake-handbrake-overwrite.sh");
+            std::fs::write(
+                &p,
+                format!(
+                    "#!/bin/sh\nprintf 'freshly converted, different bytes' > '{target}'\n\
+                     echo 'no title here'\nexit 0\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
     // The primary scenario the whole feature exists for: a genuinely corrupt file must still be
     // purgeable, not just recoverable/unverifiable. Round 1's fix for I2 over-corrected and made
     // every bad_source row permanently un-purgeable; this pins that round 2 restores the case.
-    #[cfg(unix)]
     #[test]
     fn purge_destroys_a_bad_source_row_when_the_rescan_confirms_it_is_still_bad() {
         // A configured handbrake_path pointing at a real, executable stand-in that runs to
@@ -2617,12 +2892,7 @@ mod tests {
         insert_error_row(&conn, "old", p, "bad_source");
         stamp_identity(&conn, "old", p);
 
-        let script = dir.path().join("fake-handbrake.sh");
-        std::fs::write(&script, "#!/bin/sh\necho 'no title here'\nexit 0\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let script = no_title_scan_script(dir.path());
         conn.execute(
             "UPDATE settings SET value = ?1 WHERE key = 'handbrake_path'",
             params![script.to_str().unwrap()],
@@ -2630,7 +2900,7 @@ mod tests {
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(
             outcome,
             PurgeOutcome::Purged,
@@ -2646,7 +2916,6 @@ mod tests {
     // hiccuping mount) rather than a genuinely corrupt file. Only the pure `rescan_verdict`
     // mapping was pinned before this; this drives the real `PurgeOutcome::Recovered` outcome
     // end-to-end through the production `purge_one_locked` path.
-    #[cfg(unix)]
     #[test]
     fn purge_recovers_a_bad_source_row_when_the_rescan_finds_a_title() {
         // A configured handbrake_path pointing at a real, executable stand-in that runs to
@@ -2661,16 +2930,7 @@ mod tests {
         insert_error_row(&conn, "old", p, "bad_source");
         stamp_identity(&conn, "old", p);
 
-        let script = dir.path().join("fake-handbrake.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf 'JSON Title Set: {\"TitleList\":[{\"Geometry\":{\"Height\":1080},\"VideoCodec\":\"h264\"}]}'\nexit 0\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let script = titled_scan_script(dir.path());
         conn.execute(
             "UPDATE settings SET value = ?1 WHERE key = 'handbrake_path'",
             params![script.to_str().unwrap()],
@@ -2678,7 +2938,7 @@ mod tests {
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(
             outcome,
             PurgeOutcome::Recovered,
@@ -2688,6 +2948,22 @@ mod tests {
             f.exists(),
             "THE POINT OF THIS RUNG: a file recovered on rescan must survive"
         );
+        // F12: a file just proved healthy must not sit in "Bad sources" forever.
+        assert!(
+            get_bad_sources_inner(&db.lock().unwrap())
+                .unwrap()
+                .is_empty(),
+            "a recovered row must drop out of the review list, or it costs a fresh ~30s \
+             rescan on every future purge press"
+        );
+        let still_there: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM jobs WHERE id = 'old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(still_there, 1, "the history entry itself survives");
     }
 
     #[test]
@@ -2705,7 +2981,7 @@ mod tests {
         insert_error_row(&conn, "old", p, "bad_source");
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(outcome, PurgeOutcome::Changed);
         assert!(
             f.exists(),
@@ -2739,7 +3015,7 @@ mod tests {
         file.set_modified(pre_epoch).unwrap();
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(outcome, PurgeOutcome::Changed);
         assert!(
             f.exists(),
@@ -2758,6 +3034,41 @@ mod tests {
         assert!(path_is_in_use(&conn, "/whatever.mkv"));
     }
 
+    // F13: an exact-string comparison misses a live job recorded under a different spelling of
+    // the SAME file — a symlinked watched directory being the clearest, most portable case to
+    // force deterministically (macOS/Windows case-insensitivity and /tmp vs /private/tmp are
+    // platform quirks, not something a test can rely on everywhere).
+    #[cfg(unix)]
+    #[test]
+    fn path_is_in_use_matches_through_a_symlinked_directory() {
+        let real_dir = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let link = outer.path().join("watched-link");
+        std::os::unix::fs::symlink(real_dir.path(), &link).unwrap();
+
+        let real_path = real_dir.path().join("movie.mkv");
+        std::fs::write(&real_path, b"content").unwrap();
+        let via_symlink = link.join("movie.mkv");
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        // A live job recorded via the SYMLINKED path...
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                               created_at)
+             VALUES ('new', ?1, '/o.mp4', 'p', 'queued', 0, '2026-07-25T10:00:00Z')",
+            params![via_symlink.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // ...must still be found in-use when purge checks the REAL (canonical) path.
+        assert!(
+            path_is_in_use(&conn, real_path.to_str().unwrap()),
+            "a live job recorded under a symlinked path must still block a purge check against \
+             the same file's real path"
+        );
+    }
+
     // N2 regression test: the DB lock is released around the rung-4 scan (up to PROBE_TIMEOUT,
     // ~30s), and in that window an in-place re-conversion of the SAME path could complete —
     // leaving a brand-new file at `path` with different bytes, while InUse alone reads as free
@@ -2767,7 +3078,6 @@ mod tests {
     // rewrites the target file before reporting no title, standing in for a completed in-place
     // conversion landing during the scan. If the post-scan re-check is ever narrowed back down
     // to just path_is_in_use, this test destroys the file and fails.
-    #[cfg(unix)]
     #[test]
     fn purge_one_locked_refuses_when_the_file_changes_during_the_scan_window() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2781,19 +3091,7 @@ mod tests {
 
         // Stand-in HandBrake: overwrite the target file (an in-place re-conversion completing
         // mid-scan), then report no title and exit cleanly.
-        let script = dir.path().join("fake-handbrake.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf 'freshly converted, different bytes' > '{p}'\n\
-                 echo 'no title here'\nexit 0\n"
-            ),
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let script = scan_script_that_overwrites_then_reports_no_title(dir.path(), p);
         conn.execute(
             "UPDATE settings SET value = ?1 WHERE key = 'handbrake_path'",
             params![script.to_str().unwrap()],
@@ -2801,7 +3099,7 @@ mod tests {
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
 
-        let outcome = purge_one_locked(&db, "old", "delete");
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
         assert_eq!(
             outcome,
             PurgeOutcome::Changed,
@@ -2812,6 +3110,166 @@ mod tests {
             f.exists(),
             "a file that changed during the scan window must never be destroyed, even though \
              the scan confirmed the ORIGINAL content had no title"
+        );
+    }
+
+    // F1: HandBrake's rescan diagnostics are byte-identical for a genuinely corrupt file and a
+    // healthy file WE merely can't open right now (a hiccuping mount, a permission fluke) — the
+    // exact blind spot the whole rescan-before-destroy design exists to close. The rescan alone
+    // proving "HandBrake still can't parse it" is not enough; purge must also prove it can read
+    // the file itself before honoring RescanVerdict::Destroy. Root bypasses mode bits entirely,
+    // so this assertion is meaningless as uid 0 (rootful docker / `act`); GitHub's ubuntu runner
+    // is non-root, so PR CI runs it — mirrors converter.rs's `source_is_readable` root guard.
+    #[cfg(unix)]
+    #[test]
+    fn purge_refuses_to_destroy_a_confirmed_bad_source_it_cannot_read_itself() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("movie.mkv");
+        std::fs::write(&f, b"garbage").unwrap();
+        let p = f.to_str().unwrap();
+        insert_error_row(&conn, "old", p, "bad_source");
+        stamp_identity(&conn, "old", p);
+
+        // Lock the file down AFTER stamping identity: chmod does not change mtime, so the
+        // identity check still passes and the rescan gate is reached.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // A rescan stand-in that runs to completion and confirms no title — the primary
+        // Destroy-producing case, just like `purge_destroys_a_bad_source_row_...` above.
+        let script = dir.path().join("fake-handbrake.sh");
+        std::fs::write(&script, "#!/bin/sh\necho 'no title here'\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        conn.execute(
+            "UPDATE settings SET value = ?1 WHERE key = 'handbrake_path'",
+            params![script.to_str().unwrap()],
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(conn));
+
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
+        // Restore permissions unconditionally so the tempdir's Drop cleanup can remove it.
+        let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644));
+
+        assert_eq!(
+            outcome,
+            PurgeOutcome::Unverifiable,
+            "HandBrake's word alone must never be enough — we could not confirm this ourselves"
+        );
+        assert!(
+            f.exists(),
+            "THE POINT OF THIS RUNG: a file we cannot verify ourselves must survive"
+        );
+    }
+
+    // F4: `Path::exists()` collapses every stat error (a Windows ACL denial, an EIO on a
+    // half-broken mount) into a bare `false`, which the old code read as "the file was deleted"
+    // and permanently stamped the row purged. A NUL byte in the path is a portable, deterministic
+    // way to force the underlying stat syscall itself to fail (`InvalidInput`) rather than merely
+    // report "not found" — without needing a real permission fault or a dead network mount.
+    #[test]
+    fn purge_treats_a_stat_error_as_unverifiable_never_as_already_gone() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let bogus_path = "/tmp/convertbar-test-\0-nul-byte.mkv";
+        insert_error_row(&conn, "old", bogus_path, "bad_source");
+        let db = Arc::new(Mutex::new(conn));
+
+        let outcome = purge_one_locked(&db, "old", PurgeAction::Delete);
+        assert_eq!(
+            outcome,
+            PurgeOutcome::Unverifiable,
+            "a stat error must never be read as \"confirmed gone\" — Path::exists() would have \
+             swallowed this into false and AlreadyGone"
+        );
+        assert_eq!(
+            get_bad_sources_inner(&db.lock().unwrap()).unwrap().len(),
+            1,
+            "an unverifiable row must not be stamped purged"
+        );
+    }
+
+    // ---- F5: trash-vs-delete dispatch, previously completely unverified ----
+
+    #[test]
+    fn purge_action_from_setting_maps_trash_delete_and_garbage() {
+        assert_eq!(PurgeAction::from_setting("trash"), PurgeAction::Trash);
+        assert_eq!(PurgeAction::from_setting("delete"), PurgeAction::Delete);
+        assert_eq!(
+            PurgeAction::from_setting(""),
+            PurgeAction::Trash,
+            "a missing/empty setting must default to the recoverable option"
+        );
+        assert_eq!(
+            PurgeAction::from_setting("garbage"),
+            PurgeAction::Trash,
+            "a corrupted/future setting value must never silently escalate to permanent delete"
+        );
+    }
+
+    #[test]
+    fn destroy_and_record_routes_delete_action_to_remove_file_never_trash() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        insert_error_row(&conn, "old", "/whatever.mkv", "bad_source");
+        let mut remove_called = false;
+        let mut trash_called = false;
+
+        let outcome = destroy_and_record_with(
+            &conn,
+            "old",
+            PurgeAction::Delete,
+            "/whatever.mkv",
+            |_| {
+                remove_called = true;
+                true
+            },
+            |_| {
+                trash_called = true;
+                true
+            },
+        );
+
+        assert_eq!(outcome, PurgeOutcome::Purged);
+        assert!(
+            remove_called && !trash_called,
+            "setting=delete must dispatch to remove_file, never trash::delete"
+        );
+    }
+
+    #[test]
+    fn destroy_and_record_routes_trash_action_to_trash_delete_never_remove_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        insert_error_row(&conn, "old", "/whatever.mkv", "bad_source");
+        let mut remove_called = false;
+        let mut trash_called = false;
+
+        let outcome = destroy_and_record_with(
+            &conn,
+            "old",
+            PurgeAction::Trash,
+            "/whatever.mkv",
+            |_| {
+                remove_called = true;
+                true
+            },
+            |_| {
+                trash_called = true;
+                true
+            },
+        );
+
+        assert_eq!(outcome, PurgeOutcome::Purged);
+        assert!(
+            trash_called && !remove_called,
+            "setting=trash (the DEFAULT, sold to users as recoverable) must dispatch to \
+             trash::delete, never a permanent remove_file"
         );
     }
 }

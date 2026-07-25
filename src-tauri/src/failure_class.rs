@@ -14,6 +14,13 @@ pub const CLASS_BAD_SOURCE_TRUNCATED: &str = "bad_source_truncated";
 /// Stored value after the user's bulk action destroyed the source. Keeps the history row
 /// visible while dropping it out of the review list.
 pub const CLASS_BAD_SOURCE_PURGED: &str = "bad_source_purged";
+/// Stored value after a purge rescan finds the file fine after all (`PurgeOutcome::Recovered`).
+/// Distinct from `CLASS_BAD_SOURCE_PURGED` (nothing was destroyed here) and from NULL (which
+/// reads as "this row predates the failure_class feature") — a recovered row's history stays a
+/// distinguishable, debuggable fact instead of being erased or conflated with pre-feature data.
+/// Like `CLASS_BAD_SOURCE_PURGED`, this drops the row out of the review list's `IN (...)` filter
+/// (see `get_bad_sources_inner`) without touching the row's terminal `status`.
+pub const CLASS_BAD_SOURCE_RECOVERED: &str = "bad_source_recovered";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {
@@ -230,6 +237,7 @@ HandBrake has exited.
         assert_eq!(CLASS_BAD_SOURCE, "bad_source");
         assert_eq!(CLASS_BAD_SOURCE_TRUNCATED, "bad_source_truncated");
         assert_eq!(CLASS_BAD_SOURCE_PURGED, "bad_source_purged");
+        assert_eq!(CLASS_BAD_SOURCE_RECOVERED, "bad_source_recovered");
         assert_ne!(
             FailureClass::Unknown.as_str(),
             "",
