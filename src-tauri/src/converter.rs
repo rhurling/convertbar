@@ -75,6 +75,32 @@ fn record_source_identity(db: &Connection, job_id: &str, path: &str) {
     }
 }
 
+/// Re-stamp a condemned row's identity fingerprint to the source's CURRENT stat, taken at the
+/// moment we classify it bad_source[_truncated] — NOT the stale fingerprint recorded when the
+/// file was queued.
+///
+/// Without this: a healthy file is queued (fingerprint S,M); it is truncated in place by a sync
+/// tool before its turn; the encode condemns it while the DB fingerprint still describes the
+/// HEALTHY original; the sync tool then repairs it, and — because rsync -t / Syncthing / wget -N
+/// all preserve mtime — it lands back at exactly (S,M). Purge would see a "match" against the
+/// stale fingerprint and destroy the REPAIRED file. Stamping at condemnation time closes that
+/// window. Unlike `record_source_identity` (called only on a SUCCESSFUL in-place encode, where
+/// leaving a slightly-stale fingerprint on a rare failed stat is harmless), a failed stat here
+/// writes NULL: purge already refuses to destroy a row with a NULL fingerprint, and leaving the
+/// old, now-provably-wrong "healthy" fingerprint in place would be actively unsafe.
+fn record_condemned_identity(db: &Arc<Mutex<Connection>>, job_id: &str, path: &str) {
+    let id = crate::commands::queue::file_identity(path);
+    let db = db.lock().unwrap();
+    let _ = db.execute(
+        "UPDATE jobs SET source_size = ?2, source_mtime = ?3 WHERE id = ?1",
+        params![
+            job_id,
+            id.as_ref().map(|i| i.size),
+            id.as_ref().map(|i| i.mtime)
+        ],
+    );
+}
+
 /// Filesystem action for an in-place job once the keep/discard decision is made. Pure mapping so
 /// it can be table-tested apart from the side effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,7 +491,7 @@ fn source_is_confirmed_missing(probe: std::io::Result<bool>) -> bool {
 /// therefore never destroys. That is the opposite polarity from
 /// [`source_is_confirmed_missing`], which fails open because there the safe answer is
 /// "let HandBrake try".
-fn source_is_readable(path: &str) -> bool {
+pub(crate) fn source_is_readable(path: &str) -> bool {
     use std::io::Read;
     match std::fs::File::open(path) {
         Ok(mut f) => {
@@ -1033,6 +1059,13 @@ fn process_queue<R: tauri::Runtime>(
                             source_readable: source_is_readable(&job.source_path),
                             stderr_tail: &tail,
                         });
+                    // Stamp the identity fingerprint to the source's CURRENT stat at the
+                    // moment of condemnation, not the stale add-time value — see
+                    // `record_condemned_identity`. Never for Environment/Unknown: those aren't
+                    // a verdict on the file at all.
+                    if class == crate::failure_class::FailureClass::BadSource {
+                        record_condemned_identity(db, &job.id, &job.source_path);
+                    }
                     record_job_error(
                         app,
                         db,
@@ -1057,6 +1090,10 @@ fn process_queue<R: tauri::Runtime>(
                         // output_path IS the source, so removing it would delete the original.
                         let _ = std::fs::remove_file(&encode_target);
                         let pct = (got as f64 / expected as f64 * 100.0).round() as u64;
+                        // Same re-stamp as the classify()-based site below: the truncation is
+                        // discovered right now, so the fingerprint recorded at queue time is
+                        // stale the instant it's condemned. See `record_condemned_identity`.
+                        record_condemned_identity(db, &job.id, &job.source_path);
                         record_job_error(
                             app,
                             db,
@@ -1282,6 +1319,10 @@ fn process_queue<R: tauri::Runtime>(
                             source_readable: source_is_readable(&job.source_path),
                             stderr_tail: &tail,
                         });
+                    // See `record_condemned_identity`: never for Environment/Unknown.
+                    if class == crate::failure_class::FailureClass::BadSource {
+                        record_condemned_identity(db, &job.id, &job.source_path);
+                    }
                     record_job_error(
                         app,
                         db,
@@ -1920,7 +1961,14 @@ mod tests {
         #[cfg(windows)]
         {
             let p = dir.join("hb-badsource.cmd");
-            std::fs::write(&p, "@echo No title found. 1>&2\r\n@exit /b 2\r\n").unwrap();
+            // Redirect BEFORE `echo` (see truncating_fake_handbrake_script's comment below):
+            // cmd.exe strips the `1>&2` token but keeps the space in front of it, so
+            // `echo No title found. 1>&2` would emit a trailing space after "found.".
+            std::fs::write(
+                &p,
+                "@echo off\r\n>&2 echo No title found.\r\n@exit /b 2\r\n",
+            )
+            .unwrap();
             p
         }
         #[cfg(not(windows))]
@@ -2283,6 +2331,155 @@ mod tests {
             class_of(&db, "j1").as_deref(),
             Some("bad_source"),
             "exit 2 + a source-marker diagnostic against a readable source must be bad_source"
+        );
+    }
+
+    // F6: the sibling of the test above with the SAME script (so the diagnostic and exit code
+    // are byte-identical), but a source we ourselves cannot open. Pins the wiring of
+    // `source_readable: source_is_readable(&job.source_path)` at process_queue's call sites —
+    // mutation testing showed hardcoding `source_readable: true` at BOTH call sites survives the
+    // whole suite, because only the pure `classify()` was pinned and the observation feeding it
+    // was never exercised end-to-end.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_failure_on_a_source_we_cannot_read_is_classified_environment_not_bad_source() {
+        // Root bypasses mode bits entirely, so this assertion is meaningless as uid 0 (rootful
+        // docker / `act`). GitHub's ubuntu runner is non-root, so PR CI runs it.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = bad_source_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let out = dir.path().join("out.mp4");
+        let src = real_source(dir.path(), "a.mp4");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        // Restore unconditionally so the tempdir's Drop cleanup can remove it.
+        let _ = std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644));
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(status, "error");
+        assert!(msg.unwrap().contains("No title found"));
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("environment"),
+            "we could not open the source ourselves, so HandBrake's IDENTICAL exit-2 \
+             diagnostic must never be credited as a verdict on the file"
+        );
+    }
+
+    fn source_size_mtime(db: &Arc<Mutex<Connection>>, id: &str) -> (Option<i64>, Option<i64>) {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT source_size, source_mtime FROM jobs WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    // F2 regression: the fingerprint recorded at ADD time describes the file as it was WHEN
+    // QUEUED, not as it is when condemned. Without re-stamping at condemnation time, a healthy
+    // file queued with fingerprint (S,M) that is later truncated in place before its turn is
+    // condemned while the DB still says (S,M) — and a sync tool that repairs it back to exactly
+    // (S,M) (rsync -t / Syncthing / wget -N all preserve mtime) would make purge see a "match"
+    // and destroy the REPAIRED file.
+    #[test]
+    fn bad_source_condemnation_restamps_identity_to_the_current_file_not_the_stale_add_time_value()
+    {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = bad_source_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let out = dir.path().join("out.mp4");
+        let src = real_source(dir.path(), "a.mp4");
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+        // Simulate a fingerprint captured when a DIFFERENT (larger, healthy) file lived at this
+        // path at queue time.
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET source_size = 999999, source_mtime = 1 WHERE id = 'j1'",
+                [],
+            )
+            .unwrap();
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source"));
+        let current = crate::commands::queue::file_identity(src.to_str().unwrap())
+            .expect("source is still on disk");
+        assert_eq!(
+            source_size_mtime(&db, "j1"),
+            (Some(current.size), Some(current.mtime)),
+            "the fingerprint must be re-stamped to the CURRENT file at condemnation time, not \
+             left at the stale add-time value — otherwise a later repair landing back at the \
+             stale (size, mtime) would look like a match to purge"
+        );
+    }
+
+    // Sibling of the test above for the truncation guard's direct (non-classify()) condemnation
+    // site — the same stale-fingerprint window applies there too.
+    #[test]
+    fn truncated_condemnation_restamps_identity_to_the_current_file_not_the_stale_add_time_value() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = truncating_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET source_size = 999999, source_mtime = 1 WHERE id = 'j1'",
+                [],
+            )
+            .unwrap();
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source_truncated"));
+        let current = crate::commands::queue::file_identity(source.to_str().unwrap())
+            .expect("source is still on disk");
+        assert_eq!(
+            source_size_mtime(&db, "j1"),
+            (Some(current.size), Some(current.mtime)),
+            "the truncation guard must also re-stamp the fingerprint at condemnation time"
         );
     }
 
