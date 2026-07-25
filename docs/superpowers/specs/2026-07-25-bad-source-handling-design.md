@@ -122,10 +122,10 @@ If wasted encodes on corrupt downloads prove annoying in practice, this is the f
 
 ## Non-goals
 
-- No retry / two-strike mechanism. There is no way to re-run an errored job today, and building one is out of scope.
+- No retry / two-strike mechanism, and no in-app "retry this errored job" action. Re-adding the file by hand is the retry path, and it stays permissive for exactly that reason (see Watched folders).
 - No backfill of existing history rows. `failure_class` is NULL for pre-existing entries, and NULL never appears in the review list.
 - No mid-file corruption detection beyond frame shortfall. A file that decodes end-to-end with artefacts is not detectable this way.
-- **Exit 0 with a 0-byte output stays `Unknown`.** Rule 3 below requires exit 2, so the existing empty-output guard (`converter.rs:976`) will not classify as `BadSource`. Deliberate: the cause of that state is not understood well enough to destroy on it.
+- **Exit 0 with a 0-byte output stays `Unknown`.** Rule 4 below requires exit 2, so the existing empty-output guard will not classify as `BadSource`. Deliberate: the cause of that state is not understood well enough to destroy on it.
 
 ---
 
@@ -214,17 +214,20 @@ Additive only, NULL for existing rows — an auto-updating install with an exist
 
 The existing ALTER loop at `db.rs:150` is hardcoded to `INTEGER` (it exists for `source_size`/`source_mtime`), so `failure_class` needs its **own** idempotent ALTER following the same duplicate-column-name pattern, not a new entry in that loop.
 
-**Stored values are pinned strings**, all four of them:
+**Stored values are pinned strings:**
 
-| variant | stored |
-|---|---|
-| `BadSource` via rule 4 (scan failure) | `'bad_source'` |
-| `BadSource` via Phase 2 (truncation) | `'bad_source_truncated'` |
-| either, after a successful purge | `'bad_source_purged'` |
-| `Environment` | `'environment'` |
-| `Unknown` | `'unknown'` |
+| variant | stored | in the review list? |
+|---|---|---|
+| `BadSource` via rule 4 (scan failure) | `'bad_source'` | yes |
+| `BadSource` via Phase 2 (truncation) | `'bad_source_truncated'` | yes |
+| either, after a successful purge | `'bad_source_purged'` | no |
+| a row the purge re-scan proved readable | `'bad_source_recovered'` | no |
+| `Environment` | `'environment'` | no |
+| `Unknown` | `'unknown'` | no |
 
 Rule-4 and truncation rows are stored **distinctly** because purge must treat them differently: rule-4 rows are re-scanned before destruction, truncation rows must not be (they pass a scan by construction — see the purge ladder). A single `'bad_source'` value would make that distinction unrecoverable at purge time. The review list matches `IN ('bad_source','bad_source_truncated')`.
+
+`'bad_source_recovered'` exists so a row the re-scan just *proved healthy* leaves the list. Without it the row stays listed forever and costs a fresh HandBrake scan — up to the 30 s `PROBE_TIMEOUT` — on every subsequent purge press.
 
 `Unknown` is stored as `'unknown'`, **never NULL**. NULL means exactly one thing — a row written before this feature existed. Collapsing the two would make new unclassified failures indistinguishable from legacy history, and the review list's "NULL never appears" property depends on the distinction.
 
@@ -242,15 +245,27 @@ Rule-4 and truncation rows are stored **distinctly** because purge must treat th
 ### Review list
 
 - **`get_bad_sources()`** → `SELECT … WHERE status='error' AND failure_class IN ('bad_source','bad_source_truncated') ORDER BY completed_at DESC`
-- **`purge_bad_sources(ids: Vec<String>)`** → returns per-id outcomes. Per id, in order — the first four all mean "do not touch the file":
+- **`purge_bad_sources(ids: Vec<String>)`** → `async` + `spawn_blocking`, returns per-id outcomes. Every outcome except `Purged` means **the file was not touched**:
 
-  1. **`InUse`** — some job in `('queued','encoding','paused')` has this `source_path`. A user may have re-added the file (error rows do not block re-add: `fetch_skip_sets`, `queue.rs:188`, skips only active and done rows). Destroying it mid-run would yank the source out from under a live encode.
-  2. **`AlreadyGone`** — the path no longer exists.
-  3. **`Changed`** — the current `(size, mtime)` does not match the row's `source_size`/`source_mtime`. The path has been re-downloaded or replaced, and a stale verdict must not condemn a new file.
-  4. **`Recovered`** — *only for `'bad_source'` (rule-4) rows* — a fresh `--scan` now finds a valid title. See below.
-  5. Otherwise `trash::delete` or `fs::remove_file` per `bad_source_action`.
+  1. **`InUse`** — some job in `('queued','encoding','paused')` has this `source_path`. Destroying it mid-run would yank the source out from under a live encode. A failed lookup counts as in-use — uncertainty never destroys.
+  2. **`AlreadyGone`** — the path is confirmed absent *and its parent directory is reachable*. Only then is the row stamped `bad_source_purged`, so it leaves the list instead of re-reporting forever.
+  3. **`Unverifiable`** — anything that means "could not confirm": a `try_exists` error on the leaf or the parent, an unreachable parent (an unplugged volume), the re-scan being unable to *run*, or the file not being readable by us at destroy time. Never stamps, so the row survives for a later retry.
+  4. **`Changed`** — the current `(size, mtime)` does not match the row's `source_size`/`source_mtime`. The path has been re-downloaded or replaced, and a stale verdict must not condemn a new file.
+  5. **`Recovered`** — *only for `'bad_source'` rows* — a fresh scan now finds a valid title. Stamps `bad_source_recovered` so the row leaves the list.
+  6. **`Failed`** — the row is not an eligible bad source, or the delete/trash call itself failed.
+  7. Otherwise destroy per `bad_source_action`.
 
-  **Identity uses the fingerprint the codebase already has.** `file_identity` (`queue.rs:77`) returns `probe_cache::FileIdentity { size, mtime }`, and `record_source_identity` (`converter.rs:69`) stores it per job in `jobs.source_size`/`source_mtime` — existing infrastructure that already guards the *re-encode skip* decision. Reusing it here, where the operation is irreversible, is strictly better than a size-only comparison: a replacement file of coincidentally identical size passes a size check and fails an mtime check. Rows with NULL fingerprints (pre-feature history, or a source that was itself unstattable at add time) have nothing to verify current identity against, so purge **refuses** them (`PurgeOutcome::Changed`) rather than falling back to a weaker `original_size`-only comparison — uncertainty is never destructive.
+  **Row eligibility is part of the lookup, not a separate check.** The row SELECT is `WHERE id = ?1 AND status = 'error' AND failure_class IN ('bad_source','bad_source_truncated')`. Every rung verifies *the file*; this is what verifies *the row*. Without it, a caller passing the wrong id collection — the History list's ids rather than the review list's, a one-identifier mistake — reaches a `done` **in-place** conversion whose fingerprint was refreshed after that encode, so the identity check passes exactly, and destroys the user's only remaining copy.
+
+  **`source_readable` gates the destroy, not just the classification.** Before honoring a re-scan's Destroy verdict, purge re-checks that *we* can open the file. HandBrake's stdout and exit code are byte-identical (no title block, exit 2) for a genuinely corrupt file and for a healthy file we merely cannot open — measured, not assumed — so without this gate the re-scan carries the exact blind spot it was built to close, and a healthy file on a flaky mount is destroyed by its own safeguard. This is the same rule-1 evidence the classifier already treats as load-bearing.
+
+  Note the fix could **not** be "require a successful scan exit": real HandBrakeCLI exits 2 on a legitimate no-title scan, so keying on exit status would make every `bad_source` row permanently un-purgeable. Only a *signalled* scan process (`status.code().is_none()` — segfault, abort, OOM-kill) counts as `CouldNotRun`.
+
+  **Identity uses the fingerprint the codebase already has, re-stamped at condemnation time.** `file_identity` returns `probe_cache::FileIdentity { size, mtime }` — existing infrastructure that already guards the *re-encode skip* decision. Reusing it here, where the operation is irreversible, beats a size-only comparison: a replacement of coincidentally identical size passes a size check and fails an mtime check. Rows with NULL fingerprints (pre-feature history, or a source unstattable at add time) have nothing to verify against, so purge **refuses** them (`PurgeOutcome::Changed`) rather than falling back to a weaker `original_size` comparison.
+
+  The fingerprint is re-stamped when a job is condemned `BadSource`/`BadSourceTruncated`, **not** left at its add-time value. Otherwise purge verifies the file *as queued* while the verdict describes the file *as encoded*. The gap is exploitable: a healthy file is queued (fingerprint S,M), truncated in place by a sync tool, condemned `bad_source_truncated` — fingerprint still describing the healthy file — then repaired by that same tool. Because rsync `-t`, Syncthing and `wget -N` all preserve mtime, the repaired file is again exactly (S,M), identity "matches", and a fully repaired file is destroyed. A failed re-stat stores NULL, which purge already refuses.
+
+  **Locking.** The DB mutex is held only for DB work. Filesystem probes and the re-scan run off-lock, so a bad source on a dead SMB/NFS mount cannot freeze the UI or stall the converter thread behind a 30–60 s `stat`. The final eligibility+identity re-check and the destroy itself share one guard, which keeps the check atomic against the queue's job claim (a DB write under that same mutex). The path comparison in the in-use check is canonicalized only in that final phase — by then the mount has been proven responsive — because `canonicalize` is `realpath(3)` and blocks exactly like the calls this structure exists to keep off the lock.
 
   **Rule-4 rows are re-scanned before destruction.** This is the guard against the design's sharpest failure mode: a healthy file on a network mount that hiccupped during scan produces exit 2 + `No title found.` — indistinguishable from garbage — and, if the mount heals before the readability probe runs, passes rule 1 and lands in the review list as `'bad_source'`. Nothing about the file changed, so the identity check passes too. Without a re-scan, **Delete permanently** destroys a healthy file, which contradicts Goal 2 outright.
 
@@ -258,14 +273,32 @@ Rule-4 and truncation rows are stored **distinctly** because purge must treat th
 
   **It must be scoped to `'bad_source'` rows.** Phase 2 truncation rows *pass* a scan by construction: the container header is intact and reports a full title — that is the entire reason truncation is undetectable at scan time. Applying the re-scan to them would clear every truncated file from the list and silently disable Phase 2. Truncation rows are defended by the identity check alone.
 
-  On a successful purge the row's `failure_class` becomes `bad_source_purged`. The list query matches the two unpurged values, so purged entries drop out while remaining visible in normal history — without this the same rows reappear and a second press produces nothing but errors.
+  **Three outcomes retire a row** by stamping `failure_class`: a successful destroy and a confirmed-absent file both stamp `bad_source_purged`; a re-scan that proves the file readable stamps `bad_source_recovered`. The list query matches only the two unpurged values, so retired entries drop out while remaining visible in normal history — without this the same rows reappear and every press produces nothing but errors and repeated 30 s scans. Every other outcome deliberately leaves the row listed, because every other outcome means the situation may still change.
 
 ### Interaction with existing history clearing — accepted as-is
 
 `clear_completed` (`queue.rs:691`) deletes with `WHERE status = 'error'` (mode `errors`) or `status IN ('done','skipped','error')` (mode `all`). Every `bad_source` row has `status='error'`, so the existing **Clear errors** button wipes the review list and the corrupt files stay on disk unnoticed.
 
 **This is accepted, not fixed.** The bad-sources list is a *view over history*, and history is the record; clearing history emptying the view is the consistent outcome. Carving out an exception would leave rows behind after the user pressed a button that says it clears errors — more surprising than the loss. The spec records the decision so an implementer does not silently pick the other behavior. `remove_history_entry` (`queue.rs:658`) behaves the same way per-row and is likewise unchanged.
-- `HistoryPage` gains a **Bad sources (N)** filter, shown only when N > 0. Rows show file name + reason, where the reason is the **first line of `error_message`** (already headlined with the diagnostic by `message_with_tail`, `converter.rs:536`) — no new field, and no second place that has to stay in sync with the failure text. Bulk button worded per setting: **Move N to Trash** / **Delete N permanently**, with an in-app confirm step for `delete`.
+### Watched folders must not re-ingest condemned files
+
+The intake dedup ignores error rows, and the watcher rescans every enabled folder on **every launch**. Left alone, one corrupt file in a watched folder produces a fresh `bad_source` row, a wasted failed encode, and a "failed" notification each time the app starts — so the review list fills with duplicates of a single file and the count stops meaning anything.
+
+The **watcher** intake therefore skips paths that already have an unpurged `bad_source`/`bad_source_truncated` row. **Manual drag-and-drop adds stay permissive** — a user re-adding a file by hand is deliberately asking for a retry, and that is the escape hatch from a wrong verdict. The skip query must stay in step with the review-list query; they describe the same membership.
+
+### The panel
+
+`HistoryPage` gains a **Bad sources (N)** panel above the history list, shown only when N > 0 — an always-visible panel rather than a filter the user has to discover, since a corrupt download they never learn about is the failure this feature exists to prevent. Rows show file name + reason, where the reason is the **first line of `error_message`** (already headlined with the diagnostic by `message_with_tail`) — no new field, and no second place to keep in sync with the failure text. The list is scroll-capped so a folder of several hundred corrupt stubs cannot push the button out of a menu-bar popover.
+
+Bulk button worded per setting: **Move N to Trash** / **Delete N permanently**, and it is not rendered at all until settings resolve — a `null` settings object must never front a permanent delete under Trash wording.
+
+**The confirm step applies to both modes**, not only `delete`. Trash is recoverable but still touches user data, and the count is restated at the moment of commitment.
+
+**The armed confirm binds to a snapshot.** Arming captures the id set; confirming purges only that snapshot, intersected with the ids still present. Any change to the set while armed disarms. This matters because the panel live-refreshes on `job-error`: without the snapshot, a job failing between arm and confirm would silently enlarge the batch, and the user would destroy a file they never reviewed — violating the design's own principle that destruction acts on files the user actually saw.
+
+While a purge is in flight both buttons are disabled and a pending indicator shows. Otherwise a second click starts a concurrent batch whose rows are already stamped purged, and the later-resolving note reports "left alone: failed" for files that were in fact just destroyed.
+
+Outcomes are reported in plain language aggregated by kind ("2 are still being converted, 1 changed on disk since it was flagged"), including how many were removed, with a safe fallback for any outcome string the frontend does not recognize.
 
 **Frontend data path.** `get_bad_sources` returns `Vec<JobInfo>` — no new type. That requires adding `failure_class: Option<String>` to `JobInfo` (`types.rs:4`), to its mirror in `src/lib/tauri.ts:4`, and to `row_to_job` (`queue.rs:56`) together with **every** SELECT column list that feeds it — `get_queue`, `get_bad_sources_inner`, and both branches of `get_history_inner` — none of which select it today. Missing one yields a column-count mismatch at runtime, not at compile time. This is not what the `ipc-contract` test covers (it checks `invoke`/`emit` name parity between frontend and backend, not SQL column lists); the equivalent coverage here is `get_bad_sources_inner` itself being exercised end-to-end against the real query in `get_bad_sources_lists_both_bad_classes_and_excludes_everything_else`, plus the frontend mocks kept in sync by hand. The list refreshes on mount and on the existing `job-error` event, reusing whatever `HistoryPage`'s `useHistory` already subscribes to rather than adding a new event.
 
@@ -331,7 +364,7 @@ The stderr from the reproduction above is checked in as `&str` fixtures, followi
 **The load-bearing test is the `chmod 000` vs zero-byte pair:** identical stderr, identical exit code, **opposite** classification, distinguished only by `source_readable`. It fails the moment anyone "simplifies" rule 1 away — which is exactly the change that would start destroying healthy files. This encodes *why* rule 1 exists, not merely that it is present.
 
 Also covered:
-- `Invalid preset` (exit 2) → `Environment`, asserting rule 2 is evaluated before rule 3. Without the ordering this classifies as `BadSource` and a preset rename destroys every file in the queue.
+- `Invalid preset` (exit 2) → `Environment`, asserting rule 2 is evaluated before rule 4. Without the ordering this classifies as `BadSource` and a preset rename destroys every file in the queue.
 - exit 3 (bad output dir, read-only dir) → `Environment`.
 - Unmatched stderr, `exit_code: None` → `Unknown`.
 
@@ -343,10 +376,28 @@ Also covered:
 - Integration tests on the existing fake-HandBrake harness in `converter.rs` tests (`converter.rs:1650`, `:2631` — the scripts already echo stderr, write an output, and exit 0, on both unix and Windows `.cmd`, so a truncated encode is expressible):
   - a truncated **distinct-file** encode leaves the source **present on disk** and records `status='error'`, not `done`;
   - a truncated **in-place** encode leaves the source present and byte-identical, with only the temp removed. This is the test that fails if someone swaps `encode_target` for `job.output_path`.
-- `purge_bad_sources` outcome table: `InUse`, `AlreadyGone`, `Changed` (mtime differs at equal size — the case a size-only guard misses), `Recovered` (rule-3 row that now scans clean), and the destructive path. The `Recovered` test must assert a `'bad_source_truncated'` row is **not** recovered by a re-scan, pinning the scoping — without it, a re-scan applied to all rows silently empties the list of every truncated file.
+- `purge_bad_sources` outcome table: `InUse`, `AlreadyGone`, `Unverifiable`, `Changed` (mtime differs at equal size — the case a size-only guard misses), `Recovered` (rule-4 row that now scans clean), `Failed`, and the destructive path. The `Recovered` test must assert a `'bad_source_truncated'` row is **not** recovered by a re-scan, pinning the scoping — without it, a re-scan applied to all rows silently empties the list of every truncated file.
+
+### Tests that exist because a mutation proved the suite blind
+
+Each of these was added after a specific one-line mutation survived the entire suite. They are listed with the mutation they must fail against, because that is what makes them worth keeping:
+
+- **Trash-vs-delete dispatch.** Making the destroy path ignore the setting and always permanently delete once survived every test — the **default** action was entirely unverified. Pinned via a dispatch seam so both arms are assertable without touching the real Trash, including that the binding itself is not swapped.
+- **`source_readable` wiring.** Hardcoding `source_readable: true` at both classification call sites survived the suite; only the pure `classify()` was pinned, not the observation feeding it. Now covered end-to-end by a mode-000 source that must classify `environment`.
+- **The in-use status set.** Narrowing `IN ('queued','encoding','paused')` to `IN ('queued')` survived; the test only ever inserted a queued sibling. Now loops all three.
+- **The exit-code extraction.** Collapsing it to `None` survived, which silently disables rule 4 at the only site that can ever return `BadSource` — a green suite with the feature permanently inert.
+- **A signalled scan process.** A scan killed by a signal was indistinguishable from "scan confirmed the file is bad", so a segfaulting HandBrake destroyed files. Pinned by a `kill -SEGV` stand-in asserting `CouldNotRun`.
+- **The armed-confirm snapshot.** No test bound the armed state to the ids the user reviewed, so a file arriving between arm and confirm would have been destroyed unreviewed.
+- **StrictMode unmount latching.** RTL's `render()` does not wrap in `StrictMode`, so 138 tests were blind to a guard that latched `false` under React's dev double-invoke and wedged the purge UI mid-flight — files destroyed, nothing reported. One test now renders inside `StrictMode` deliberately.
+
+### Reality tripwire
+
+Every end-to-end truncation test echoes `sync: got N frames, M expected` from a fake script — a string this project does not control. If a HandBrake release reformats that line, the guard silently stops firing and the original data-loss bug returns with the whole suite green.
+
+An `#[ignore]`d test therefore drives the guard with the **real** HandBrakeCLI against a real truncated file (synthesized with `-movflags +faststart`, so truncation leaves the moov atom intact and tests truncation rather than an unreadable file). It asserts the marker was found *separately* from the outcome, so a format change is diagnosed as "HandBrake changed its output" rather than the vaguer "guard didn't fire". `e2e-ignored.yml` already installs HandBrakeCLI and ffmpeg and runs the ignored suite on every push to `main`, so it costs nothing at PR time and runs continuously afterwards.
 
 ### Cross-platform
 
 - The `chmod 000` readability test is `#[cfg(unix)]` **and must skip when running as root** — `File::open` succeeds regardless of mode 000 for uid 0, so the test would fail in a rootful container (`act`, docker) while passing on GitHub's non-root ubuntu runner. Guard on an effective-uid check.
 - Path separators normalized in assertions — PR CI is ubuntu-only, so a hardcoded `/` only reddens `main` after merge.
-- No new platform-gated dependencies: `trash` and `std::fs` are already in use on all three targets.
+- One new platform-gated dependency: `libc` under `[target.'cfg(unix)'.dev-dependencies]`, needed by the root-skip guard above. Production `libc` stays macOS-only (SIGSTOP/SIGCONT) and is gated with `#[cfg(...)]` **attributes**, never the `cfg!()` macro — the macro only skips at runtime and would still force linking on every platform. `trash` and `std::fs` were already in use on all three targets.
