@@ -10,7 +10,7 @@ Two distinct gaps, one root cause: ConvertBar never asks *why* a job failed, and
 
 - records `status='done'`,
 - computes `space_saved` against the full original size (wildly inflated — the output is short, not smaller),
-- and, under the default `cleanup_mode='trash'`, sends the **original to Trash** (`converter.rs:991`).
+- and, under the default `cleanup_mode='trash'`, sends the **original to Trash** — `converter.rs:1023` on the distinct-file path, `converter.rs:111` (`TrashSourceThenRename`) for in-place jobs.
 
 The user is left with a truncated output, an inflated savings stat, and the source in the Trash. This is live data loss on ordinary download corruption.
 
@@ -158,7 +158,9 @@ Rules, first match wins:
    `unrecognized file type`, `no title found`, `0 valid title`.
 4. Otherwise → **Unknown**.
 
-Matching is lowercase-substring, consistent with the existing `DIAGNOSTIC_MARKERS` handling (`converter.rs:516`).
+Matching is lowercase-substring, consistent with the existing `DIAGNOSTIC_MARKERS` handling (`converter.rs:524`).
+
+**Known false-negative: markers match inside file paths.** HandBrake echoes the source path into stderr (`hb_stream_open: open <path> failed`), so a corrupt file named `no space left.mkv` — or `Permission Denied (2015).mkv`, `Read-Only Memories.mkv` — trips rule 2 and is classified `Environment`. Confirmed empirically. The direction is safe (Environment never destroys; the file simply never reaches the review list), so this is accepted rather than fixed. The reverse — a *source* marker in a filename flipping an environment fault to `BadSource` — additionally requires exit 2 and passing rules 1–2, and no construction of it was found. Rule 2 is therefore evaluated against the whole tail; matching only on lines that do not contain the source path is a possible future tightening, not a requirement.
 
 Truncation is deliberately **not** a rule here. By the time the Phase 2 guard fires it has already decided, so its call site passes `BadSource` directly rather than round-tripping a fact through `classify`. `decode_shortfall` / `is_truncated` still live in this module — they are pure parsing and policy — they are just not inputs to `classify`.
 
@@ -206,13 +208,26 @@ other => {
 ALTER TABLE jobs ADD COLUMN failure_class TEXT
 ```
 
-Additive only, NULL for existing rows — an auto-updating install with an existing `convertbar.db` needs no data migration. Follows the established `db.rs` migration pattern.
+Additive only, NULL for existing rows — an auto-updating install with an existing `convertbar.db` needs no data migration.
+
+The existing ALTER loop at `db.rs:150` is hardcoded to `INTEGER` (it exists for `source_size`/`source_mtime`), so `failure_class` needs its **own** idempotent ALTER following the same duplicate-column-name pattern, not a new entry in that loop.
+
+**Stored values are pinned strings**, all four of them:
+
+| variant | stored |
+|---|---|
+| `BadSource` | `'bad_source'` |
+| `BadSource`, after a successful purge | `'bad_source_purged'` |
+| `Environment` | `'environment'` |
+| `Unknown` | `'unknown'` |
+
+`Unknown` is stored as `'unknown'`, **never NULL**. NULL means exactly one thing — a row written before this feature existed. Collapsing the two would make new unclassified failures indistinguishable from legacy history, and the review list's "NULL never appears" property depends on the distinction.
 
 ### Setting
 
 `bad_source_action`, values `trash` | `delete`, default `trash`. Touches the standard six places:
 
-- `db.rs:173` defaults list → **`init_db_seeds_defaults` count assertion 16 → 17** (`db.rs:252`), plus a value assertion explaining why `trash` is the default.
+- `db.rs:173` defaults list → the count assertion **16 → 17 in _two_ tests**: `init_db_seeds_defaults` (`db.rs:252`) and `init_db_is_idempotent_and_preserves_user_changes` (`db.rs:312`). Plus a value assertion explaining why `trash` is the default.
 - `commands/settings.rs:107` `ALLOWED_KEYS`
 - `commands/settings.rs` `get_settings` parse (unrecognized value → `trash`)
 - `types.rs` `Settings` struct
@@ -222,12 +237,32 @@ Additive only, NULL for existing rows — an auto-updating install with an exist
 ### Review list
 
 - **`get_bad_sources()`** → `SELECT … WHERE status='error' AND failure_class='bad_source' ORDER BY completed_at DESC`
-- **`purge_bad_sources(ids: Vec<String>)`** → per id: if the path is gone, report `AlreadyGone`; if its current size differs from the row's `original_size`, report `Changed` and **do not touch it**; otherwise `trash::delete` or `fs::remove_file` per `bad_source_action`. Returns per-id outcomes.
+- **`purge_bad_sources(ids: Vec<String>)`** → returns per-id outcomes. Per id, in order — the first four all mean "do not touch the file":
 
-  The size check is a cheap identity guard. Classification may be days old, and a path that has since been re-downloaded or replaced must not be destroyed on the strength of a stale verdict. `original_size` is already recorded on every job.
+  1. **`InUse`** — some job in `('queued','encoding','paused')` has this `source_path`. A user may have re-added the file (error rows do not block re-add: `fetch_skip_sets`, `queue.rs:188`, skips only active and done rows). Destroying it mid-run would yank the source out from under a live encode.
+  2. **`AlreadyGone`** — the path no longer exists.
+  3. **`Changed`** — the current `(size, mtime)` does not match the row's `source_size`/`source_mtime`. The path has been re-downloaded or replaced, and a stale verdict must not condemn a new file.
+  4. **`Recovered`** — *only for rows classified by rule 3* — a fresh `--scan` now finds a valid title. See below.
+  5. Otherwise `trash::delete` or `fs::remove_file` per `bad_source_action`.
 
-  On a successful purge the row's `failure_class` becomes `bad_source_purged`. The list query matches `= 'bad_source'` exactly, so purged entries drop out of the list while remaining visible in normal history — without this the same rows reappear and a second press produces nothing but errors.
-- `HistoryPage` gains a **Bad sources (N)** filter, shown only when N > 0. Rows show file name + reason, where the reason is the **first line of `error_message`** (already headlined with the diagnostic by `message_with_tail`, `converter.rs:528`) — no new field, and no second place that has to stay in sync with the failure text. Bulk button worded per setting: **Move N to Trash** / **Delete N permanently**, with an in-app confirm step for `delete`.
+  **Identity uses the fingerprint the codebase already has.** `file_identity` (`queue.rs:77`) returns `probe_cache::FileIdentity { size, mtime }`, and `record_source_identity` (`converter.rs:69`) stores it per job in `jobs.source_size`/`source_mtime` — existing infrastructure that already guards the *re-encode skip* decision. Reusing it here, where the operation is irreversible, is strictly better than a size-only comparison: a replacement file of coincidentally identical size passes a size check and fails an mtime check. Rows with NULL fingerprints (pre-feature history) fall back to `original_size`.
+
+  **Rule-3 rows are re-scanned before destruction.** This is the guard against the design's sharpest failure mode: a healthy file on a network mount that hiccupped during scan produces exit 2 + `No title found.` — indistinguishable from garbage — and, if the mount heals before the readability probe runs, passes rule 1 and lands in the review list as `bad_source`. Nothing about the file changed, so the identity check passes too. Without a re-scan, **Delete permanently** destroys a healthy file, which contradicts Goal 2 outright.
+
+  A purge is rare and user-initiated, so one `--scan` per file is affordable — and it uses HandBrakeCLI, requiring no second engine.
+
+  **It must be scoped to rule-3 rows.** Phase 2 truncation rows *pass* a scan by construction: the container header is intact and reports a full title — that is the entire reason truncation is undetectable at scan time. Applying the re-scan to them would clear every truncated file from the list and silently disable Phase 2. Truncation rows are defended by the identity check alone.
+
+  On a successful purge the row's `failure_class` becomes `bad_source_purged`. The list query matches `= 'bad_source'` exactly, so purged entries drop out while remaining visible in normal history — without this the same rows reappear and a second press produces nothing but errors.
+
+### Interaction with existing history clearing — accepted as-is
+
+`clear_completed` (`queue.rs:691`) deletes with `WHERE status = 'error'` (mode `errors`) or `status IN ('done','skipped','error')` (mode `all`). Every `bad_source` row has `status='error'`, so the existing **Clear errors** button wipes the review list and the corrupt files stay on disk unnoticed.
+
+**This is accepted, not fixed.** The bad-sources list is a *view over history*, and history is the record; clearing history emptying the view is the consistent outcome. Carving out an exception would leave rows behind after the user pressed a button that says it clears errors — more surprising than the loss. The spec records the decision so an implementer does not silently pick the other behavior. `remove_history_entry` (`queue.rs:658`) behaves the same way per-row and is likewise unchanged.
+- `HistoryPage` gains a **Bad sources (N)** filter, shown only when N > 0. Rows show file name + reason, where the reason is the **first line of `error_message`** (already headlined with the diagnostic by `message_with_tail`, `converter.rs:536`) — no new field, and no second place that has to stay in sync with the failure text. Bulk button worded per setting: **Move N to Trash** / **Delete N permanently**, with an in-app confirm step for `delete`.
+
+**Frontend data path.** `get_bad_sources` returns `Vec<JobInfo>` — no new type. That requires adding `failure_class: Option<String>` to `JobInfo` (`types.rs:4`), to its mirror in `src/lib/tauri.ts:4`, and to `row_to_job` (`queue.rs:56`) together with **all three** SELECT column lists that feed it — `queue.rs:624`, `:778`, `:795` — none of which select it today. Missing one yields a column-count mismatch at runtime, not at compile time. The `ipc-contract` test must be extended alongside. The list refreshes on mount and on the existing `job-status-changed` event, reusing whatever `HistoryPage` already subscribes to rather than adding a new event.
 
 Both commands are app-defined `#[tauri::command]`s, so they are **ACL-exempt** — `capabilities/default.json` is unchanged. The confirm step is in-app UI rather than the dialog plugin's frontend half, which would require a new grant.
 
@@ -242,7 +277,9 @@ pub fn decode_shortfall(stderr_tail: &str) -> Option<(u64, u64)>  // (got, expec
 pub fn is_truncated(got: u64, expected: u64) -> bool
 ```
 
-`decode_shortfall` parses `sync: got N frames, M expected`. Absent or unparseable → `None` → no action (uncertainty never destroys).
+`decode_shortfall` parses `sync: got N frames, M expected`, taking the **last** match in the tail. Absent or unparseable → `None` → no action (uncertainty never destroys).
+
+Last-match is defensive rather than observed: `--multi-pass` and `--subtitle scan` encodes were both checked and emit exactly one such line. But a Phase 2 false positive routes a *healthy* file into the purge list (the guard passes `BadSource` statically, bypassing `classify`), so an extra line from some future configuration must not be allowed to decide the verdict.
 
 ```rust
 const MIN_DECODED_FRACTION: f64 = 0.90;
@@ -274,6 +311,8 @@ Three changes in `converter.rs`:
 
    Because it `continue`s before `decide_cleanup`, the cleanup branch never runs: the source is never trashed and the inflated `space_saved` is never recorded.
 
+   **`encode_target`, never `job.output_path`.** For an in-place job the two are different things — `encode_target` is `in_place_temp_path(&job.source_path)` (`converter.rs:838`) while `output_path` *is* the source. Removing `output_path` here would delete the user's original outright. This mirrors the existing empty-output guard, and it is the same defect class as the previously-fixed in-place auto-resume bug: any new partial-cleanup site must route in-place jobs to the temp path. An in-place truncation case belongs in the integration tests below for exactly this reason.
+
 3. **`STDERR_TAIL_BYTES` 4096 → 8192** (`converter.rs:478`). Measured headroom is 1.2 KB (x264) / 305 B (VideoToolbox), but each additional audio track appends a `mux:` line *after* the marker. Cheap insurance against a multi-track file pushing it out of the window.
 
 ---
@@ -296,10 +335,13 @@ Also covered:
 - `decode_shortfall`: parses the real marker; returns `None` for absent/garbled input.
 - `is_truncated`: boundary table around `MIN_DECODED_FRACTION` — `expected == 0` → false; 480/480 → false; 150/150 (VFR) → false; 131/480 and 155/480 → true.
 - An MKV truncation case with **0 decoder errors**, pinning that decoder errors are not required. This is a regression guard against the tempting-but-wrong tightening.
-- Integration test on the existing fake-HandBrake harness in `converter.rs` tests: a truncated encode must leave the source file **present on disk** and record `status='error'`, not `done`.
+- Integration tests on the existing fake-HandBrake harness in `converter.rs` tests (`converter.rs:1650`, `:2631` — the scripts already echo stderr, write an output, and exit 0, on both unix and Windows `.cmd`, so a truncated encode is expressible):
+  - a truncated **distinct-file** encode leaves the source **present on disk** and records `status='error'`, not `done`;
+  - a truncated **in-place** encode leaves the source present and byte-identical, with only the temp removed. This is the test that fails if someone swaps `encode_target` for `job.output_path`.
+- `purge_bad_sources` outcome table: `InUse`, `AlreadyGone`, `Changed` (mtime differs at equal size — the case a size-only guard misses), `Recovered` (rule-3 row that now scans clean), and the destructive path. The `Recovered` test must assert a *truncation* row is **not** recovered by a re-scan, pinning the rule-3 scoping — without it, a re-scan applied to all rows silently empties the list of every truncated file.
 
 ### Cross-platform
 
-- The `chmod 000` readability test is `#[cfg(unix)]`; Windows gets its own unreadable-file case or skips it.
+- The `chmod 000` readability test is `#[cfg(unix)]` **and must skip when running as root** — `File::open` succeeds regardless of mode 000 for uid 0, so the test would fail in a rootful container (`act`, docker) while passing on GitHub's non-root ubuntu runner. Guard on an effective-uid check.
 - Path separators normalized in assertions — PR CI is ubuntu-only, so a hardcoded `/` only reddens `main` after merge.
 - No new platform-gated dependencies: `trash` and `std::fs` are already in use on all three targets.
