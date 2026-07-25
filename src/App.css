@@ -336,6 +336,11 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  /* A watched folder can flag hundreds of files at once — cap the list's own height and
+     scroll inside it so the purge button stays reachable instead of being pushed below the
+     popover's fold. */
+  max-height: 140px;
+  overflow-y: auto;
 }
 
 .bad-sources-list li {

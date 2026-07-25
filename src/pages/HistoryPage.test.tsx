@@ -271,11 +271,15 @@ describe("HistoryPage", () => {
       expect(screen.queryByText(/bad sources/i)).toBeNull();
     });
 
-    it("reads a still-loading (null) settings object as the non-destructive Trash default, then switches to Delete once settings resolve", async () => {
+    // C4: while settings is still loading we don't yet know whether bad_source_action is
+    // trash or delete, but the backend always reads the real setting regardless of what the
+    // button says. Rendering *any* wording (even the "safe-looking" Trash default) risks
+    // fronting a permanent delete for a delete-configured user who clicks during the load
+    // window — so the button must not exist at all until settings resolve.
+    it("does not render the purge button until settings resolve, so Trash wording can never front a permanent delete", async () => {
       badSources = [badSourceJob("a")];
       // Hold get_settings pending so the component genuinely renders with
-      // settings === null before we resolve it — asserting the terminal "delete" state
-      // alone would never exercise the null-default branch this test is named for.
+      // settings === null before we resolve it.
       let resolveSettings: (s: AppSettings) => void = () => {};
       const settingsPromise = new Promise<AppSettings>((resolve) => {
         resolveSettings = resolve;
@@ -290,18 +294,15 @@ describe("HistoryPage", () => {
 
       render(<HistoryPage />);
 
-      // Settings is still unresolved (null) here — must read as the non-destructive default.
-      await screen.findByRole("button", { name: /move 1 to trash/i });
-      expect(
-        screen.queryByRole("button", { name: /delete 1 permanently/i }),
-      ).toBeNull();
+      // The review list itself is informational and safe to show immediately...
+      await screen.findByText(/bad sources \(1\)/i);
+      // ...but neither wording of the purge button exists while settings is unresolved.
+      expect(screen.queryByRole("button", { name: /move 1 to trash/i })).toBeNull();
+      expect(screen.queryByRole("button", { name: /delete 1 permanently/i })).toBeNull();
 
       resolveSettings(makeSettings("delete"));
 
       await screen.findByRole("button", { name: /delete 1 permanently/i });
-      expect(
-        screen.queryByRole("button", { name: /move 1 to trash/i }),
-      ).toBeNull();
     });
 
     // Safety-critical: the confirm button must pass the review list's own ids, never
@@ -342,7 +343,9 @@ describe("HistoryPage", () => {
       fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
 
       await waitFor(() =>
-        expect(screen.getByText(/1 file\(s\) were left alone: in use/i)).toBeInTheDocument(),
+        expect(
+          screen.getByText(/1 file\(s\) removed\. 1 still queued or being converted\./i),
+        ).toBeInTheDocument(),
       );
     });
 
@@ -378,7 +381,7 @@ describe("HistoryPage", () => {
       await waitFor(() => expect(screen.queryByText(/bad sources \(1\)/i)).toBeNull());
       // ...but the note explaining the file was left alone must still be visible.
       expect(
-        screen.getByText(/1 file\(s\) were left alone: already gone/i),
+        screen.getByText(/0 file\(s\) removed\. 1 already deleted\./i),
       ).toBeInTheDocument();
     });
 
@@ -405,7 +408,7 @@ describe("HistoryPage", () => {
 
       fireEvent.click(screen.getByRole("button", { name: /move 2 to trash/i }));
       fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
-      await screen.findByText(/1 file\(s\) were left alone: in use/i);
+      await screen.findByText(/1 file\(s\) removed\. 1 still queued or being converted\./i);
 
       // A new, unrelated job fails independently — the review list grows with an id that was
       // never part of the purge just run.
@@ -417,7 +420,7 @@ describe("HistoryPage", () => {
       // this must be polled too rather than asserted synchronously right after the line above.
       await waitFor(() =>
         expect(
-          screen.queryByText(/1 file\(s\) were left alone: in use/i),
+          screen.queryByText(/1 file\(s\) removed\. 1 still queued or being converted\./i),
         ).not.toBeInTheDocument(),
       );
     });
@@ -448,7 +451,7 @@ describe("HistoryPage", () => {
       fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
       fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
       resolvePurge(purgeResults);
-      await screen.findByText(/1 file\(s\) were left alone: in use/i);
+      await screen.findByText(/0 file\(s\) removed\. 1 still queued or being converted\./i);
 
       // Second purge attempt on the same row: the stale note must disappear right away, not
       // only once this new (still-pending) purge resolves.
@@ -456,7 +459,7 @@ describe("HistoryPage", () => {
       fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
 
       expect(
-        screen.queryByText(/1 file\(s\) were left alone: in use/i),
+        screen.queryByText(/0 file\(s\) removed\. 1 still queued or being converted\./i),
       ).not.toBeInTheDocument();
     });
 
@@ -488,6 +491,163 @@ describe("HistoryPage", () => {
       expect(
         screen.getByRole("button", { name: /move 1 to trash/i }),
       ).toBeInTheDocument();
+    });
+
+    // C1: confirmingPurge used to be a bare boolean and runPurge mapped over the CURRENT
+    // badSources at click time. So: arm on 3 reviewed rows, a 4th job fails while the confirm
+    // text is on screen, click Confirm — and a file the user never saw gets destroyed too.
+    // The fix snapshots the armed ids and disarms the instant the reviewed set changes, so a
+    // stale click can never reach the backend with an unreviewed id.
+    it("disarms the confirm when the bad-source list changes while armed, so a stale click can't purge an unreviewed arrival", async () => {
+      badSources = [badSourceJob("a"), badSourceJob("b"), badSourceJob("c")];
+      invokeMock.mockImplementation(((cmd: string) => {
+        if (cmd === "get_history") return Promise.resolve(page);
+        if (cmd === "get_history_summary") return Promise.resolve(summary);
+        if (cmd === "get_settings") return Promise.resolve(settings);
+        if (cmd === "get_bad_sources") return Promise.resolve(badSources);
+        if (cmd === "purge_bad_sources") return Promise.resolve(purgeResults);
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }) as typeof invoke);
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(3\)/i);
+
+      // Arm with exactly the 3 rows the user reviewed.
+      fireEvent.click(screen.getByRole("button", { name: /move 3 to trash/i }));
+      expect(
+        screen.getByRole("button", { name: /confirm — move 3 to trash/i }),
+      ).toBeInTheDocument();
+
+      // A 4th job fails while the confirm strip is up — the user never reviewed it.
+      badSources = [
+        badSourceJob("a"),
+        badSourceJob("b"),
+        badSourceJob("c"),
+        badSourceJob("d"),
+      ];
+      act(() => emit("job-error"));
+      await waitFor(() => expect(screen.getByText(/bad sources \(4\)/i)).toBeInTheDocument());
+
+      // The disarm runs in a cascading effect one render after the list itself updates (the
+      // same pattern the stale-note-clearing effect above has to be polled for), so this must
+      // be polled too rather than asserted synchronously right after the line above.
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument(),
+      );
+      expect(screen.getByRole("button", { name: /move 4 to trash/i })).toBeInTheDocument();
+
+      // Nothing was ever sent to the backend — the stale arm never reached purge_bad_sources.
+      expect(invokeMock).not.toHaveBeenCalledWith("purge_bad_sources", expect.anything());
+    });
+
+    // C1: the confirm strip must restate the count at the moment of commitment, not just show
+    // a bare "Confirm" that could apply to any number of files.
+    it("shows the reviewed count on the Confirm button itself", async () => {
+      badSources = [badSourceJob("a"), badSourceJob("b")];
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(2\)/i);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 2 to trash/i }));
+
+      expect(
+        screen.getByRole("button", { name: /confirm — move 2 to trash/i }),
+      ).toBeInTheDocument();
+    });
+
+    // C2: after Confirm the buttons used to stay enabled while the purge ran (each rescan can
+    // take ~30s per file), so a second click launched a concurrent second purge. Clicking
+    // Cancel mid-flight visually disarmed but aborted nothing, falsely implying the user had
+    // stopped it.
+    it("disables Confirm/Cancel and shows a pending indicator while a purge is in flight, guarding against re-entry", async () => {
+      badSources = [badSourceJob("a")];
+      let resolvePurge: (r: PurgeResult[]) => void = () => {};
+      let purgeCallCount = 0;
+      invokeMock.mockImplementation(((cmd: string) => {
+        if (cmd === "get_history") return Promise.resolve(page);
+        if (cmd === "get_history_summary") return Promise.resolve(summary);
+        if (cmd === "get_settings") return Promise.resolve(settings);
+        if (cmd === "get_bad_sources") return Promise.resolve(badSources);
+        if (cmd === "purge_bad_sources") {
+          purgeCallCount++;
+          return new Promise<PurgeResult[]>((resolve) => {
+            resolvePurge = resolve;
+          });
+        }
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }) as typeof invoke);
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(1\)/i);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      await waitFor(() => expect(screen.getByText(/removing 1 file/i)).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: /confirm/i })).toBeDisabled();
+      expect(screen.getByRole("button", { name: /cancel/i })).toBeDisabled();
+
+      // Further clicks on the disabled buttons must not fire a second purge or fake an abort.
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+      fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+      expect(purgeCallCount).toBe(1);
+
+      await act(async () => {
+        resolvePurge([{ id: "a", outcome: "purged" }]);
+      });
+    });
+
+    // C3: the old note was `skipped.map(r => r.outcome.replace(/_/g, " ")).join(", ")` — an
+    // underscore-stripped enum dump that concatenates duplicates and uses jargon
+    // ("unverifiable") a non-technical user can't act on. The fix aggregates by outcome with
+    // counts and plain-English wording for all six non-purged outcomes.
+    it("aggregates skipped outcomes into counted, plain-English phrasing instead of an enum dump", async () => {
+      badSources = [
+        badSourceJob("a"),
+        badSourceJob("b"),
+        badSourceJob("c"),
+        badSourceJob("d"),
+        badSourceJob("e"),
+      ];
+      purgeResults = [
+        { id: "a", outcome: "purged" },
+        { id: "b", outcome: "in_use" },
+        { id: "c", outcome: "in_use" },
+        { id: "d", outcome: "changed" },
+        { id: "e", outcome: "unverifiable" },
+      ];
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(5\)/i);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 5 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      await waitFor(() =>
+        expect(
+          screen.getByText(
+            /1 file\(s\) removed\. 2 still queued or being converted, 1 changed on disk since it was flagged, 1 couldn't be re-checked \(drive unavailable\?\)\./i,
+          ),
+        ).toBeInTheDocument(),
+      );
+    });
+
+    // C3: an outcome string the frontend doesn't recognize (a future backend variant) must
+    // still render safely — never "undefined" — and must not be silently dropped from the count.
+    it("falls back to generic wording for an outcome string the frontend doesn't recognize yet", async () => {
+      badSources = [badSourceJob("a")];
+      purgeResults = [
+        { id: "a", outcome: "mystery_outcome" as unknown as PurgeResult["outcome"] },
+      ];
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(1\)/i);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      await waitFor(() =>
+        expect(screen.getByText(/0 file\(s\) removed\. 1 left alone\./i)).toBeInTheDocument(),
+      );
     });
   });
 });
