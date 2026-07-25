@@ -125,7 +125,18 @@ fn scan_with(mut cmd: Command) -> ScanOutcome {
     };
     // `status` is None on a timeout kill or a `try_wait` OS-level error — either way the scan
     // did not complete, so there is no verdict to report.
-    if status.is_none() {
+    let status = match status {
+        Some(s) => s,
+        None => return ScanOutcome::CouldNotRun,
+    };
+    // A process terminated BY A SIGNAL (segfault, abort, OOM-kill) has no exit code at all —
+    // that is a crash, not a verdict: HandBrake never got the chance to say anything about the
+    // file. Falling through to `parse_scan_media` would read the empty/partial stdout as
+    // `NoTitle`, exactly the blind spot the purge re-scan exists to close (a healthy file on a
+    // hiccuping mount that happens to crash the scanner would then read as "confirmed bad").
+    // Deliberately `code().is_none()`, NOT `status.success()`: real HandBrakeCLI legitimately
+    // exits 2 on a genuine no-title scan, and that must still fall through to NoTitle below.
+    if status.code().is_none() {
         return ScanOutcome::CouldNotRun;
     }
     match parse_scan_media(&stdout) {
@@ -287,6 +298,27 @@ JSON Title Set: {
             outcome,
             ScanOutcome::CouldNotRun,
             "a scan that never launched says nothing about the file"
+        );
+    }
+
+    // F1: a crash-by-signal (segfault, abort, OOM-kill) is not a verdict about the file — the
+    // scan simply never completed. Before this fix, `scan_with` only checked `status.is_none()`
+    // (timeout/spawn/join failures) and let a signalled-but-present ExitStatus fall through to
+    // `parse_scan_media`, which finds no title block in the empty stdout and reports `NoTitle` —
+    // which `rescan_verdict` (commands/queue.rs) maps to Destroy. That is the exact blind spot
+    // the purge re-scan exists to close: real HandBrakeCLI's exit-2 "no title" output is
+    // byte-identical for a genuinely corrupt file and a healthy file that merely couldn't be
+    // opened this time, so a scanner that crashes on a hiccuping mount must never be read as
+    // "confirmed bad".
+    #[cfg(unix)]
+    #[test]
+    fn scan_with_reports_could_not_run_when_the_process_is_signalled() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "kill -SEGV $$"]);
+        assert_eq!(
+            scan_with(cmd),
+            ScanOutcome::CouldNotRun,
+            "a signal-terminated scan says nothing about the file"
         );
     }
 
