@@ -498,7 +498,7 @@ fn claim_job(db: &Connection, job_id: &str) -> ClaimOutcome {
     }
 }
 
-const STDERR_TAIL_BYTES: usize = 4096;
+const STDERR_TAIL_BYTES: usize = 8192;
 
 /// Drain a reader to EOF keeping only the last STDERR_TAIL_BYTES bytes, so the pipe
 /// never fills while memory stays bounded no matter how much HandBrake logs.
@@ -1004,6 +1004,14 @@ fn process_queue<R: tauri::Runtime>(
         *converter.current_child.lock().unwrap() = None;
         *converter.current_job_id.lock().unwrap() = None;
 
+        // Joined here rather than inside individual arms: the child has already exited, so
+        // the drain thread is at EOF and this returns promptly on every path. The success
+        // arm needs the tail too (truncation detection), and hoisting also removes the
+        // duplicate join the two failure arms previously had.
+        let tail = stderr_tail_thread
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default();
+
         match exit_status {
             Ok(status) if status.success() => {
                 let converted_size = std::fs::metadata(&encode_target)
@@ -1017,11 +1025,6 @@ fn process_queue<R: tauri::Runtime>(
                 if converted_size.unwrap_or(0) == 0 {
                     had_errors = true;
                     let _ = std::fs::remove_file(&encode_target);
-                    // The child exited, so the drain thread is at EOF and joins
-                    // promptly; its tail says why nothing was written.
-                    let tail = stderr_tail_thread
-                        .and_then(|t| t.join().ok())
-                        .unwrap_or_default();
                     let class =
                         crate::failure_class::classify(&crate::failure_class::FailureFacts {
                             exit_code: status.code(),
@@ -1037,6 +1040,36 @@ fn process_queue<R: tauri::Runtime>(
                         class,
                     );
                     continue;
+                }
+
+                // HandBrake exits 0 on a truncated source: it reads the container header,
+                // encodes the bytes that are actually there, and reports success. Without
+                // this guard the job records 'done', space_saved is computed against the
+                // full original size, and cleanup trashes the user's ORIGINAL in favour of
+                // a short file. Runs unconditionally — it corrects a wrong answer rather
+                // than adding a preference.
+                if let Some((got, expected)) = crate::failure_class::decode_shortfall(&tail) {
+                    if crate::failure_class::is_truncated(got, expected) {
+                        had_errors = true;
+                        // encode_target, NEVER job.output_path: for an in-place job
+                        // output_path IS the source, so removing it would delete the original.
+                        let _ = std::fs::remove_file(&encode_target);
+                        let pct = (got as f64 / expected as f64 * 100.0).round() as u64;
+                        record_job_error(
+                            app,
+                            db,
+                            &job.id,
+                            &file_name,
+                            &format!(
+                                "Source appears truncated: decoded {got} of {expected} frames ({pct}%)"
+                            ),
+                            // NOT BadSource: purge re-scans those rows, and a truncated
+                            // file passes a scan by construction, so it would be cleared
+                            // from the list every time.
+                            crate::failure_class::FailureClass::BadSourceTruncated,
+                        );
+                        continue;
+                    }
                 }
 
                 // For in-place, the source is unchanged during the temp encode, so re-stat it now.
@@ -1241,11 +1274,6 @@ fn process_queue<R: tauri::Runtime>(
                     .ok();
 
                 if current_status.as_deref() != Some("error") {
-                    // The drain thread hit EOF when the child died, so this join is
-                    // prompt. Its tail is the only diagnostic HandBrake leaves behind.
-                    let tail = stderr_tail_thread
-                        .and_then(|t| t.join().ok())
-                        .unwrap_or_default();
                     let class =
                         crate::failure_class::classify(&crate::failure_class::FailureFacts {
                             exit_code,
@@ -1583,6 +1611,13 @@ mod tests {
         let (status, msg) = job_row(&db, "j1");
         assert_eq!(status, "error");
         assert!(msg.unwrap().contains("Failed to start HandBrakeCLI"));
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("environment"),
+            "a spawn failure is an environment problem, never a bad-source verdict — \
+             purge must not treat every queued file as clearable just because HandBrakeCLI \
+             couldn't launch"
+        );
         assert!(
             status_events
                 .lock()
@@ -2021,6 +2056,128 @@ mod tests {
         );
         let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
         assert!(final_update.contains("\"error\""));
+    }
+
+    /// A stand-in for HandBrakeCLI that writes a small non-empty output, emits a stderr tail
+    /// claiming a large frame shortfall, and exits 0 — exactly what a truncated source
+    /// produces in reality.
+    fn truncating_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb-trunc.cmd");
+            std::fs::write(
+                &p,
+                "@echo off\r\n\
+                 echo [00:00:01] sync: got 131 frames, 480 expected 1>&2\r\n\
+                 for %%A in (%*) do set LAST=%%~A\r\n\
+                 echo data> \"%LAST%\"\r\n\
+                 exit /b 0\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            let p = dir.join("hb-trunc.sh");
+            std::fs::write(
+                &p,
+                "#!/bin/sh\n\
+                 echo '[00:00:01] sync: got 131 frames, 480 expected' >&2\n\
+                 eval \"last=\\${$#}\"\n\
+                 printf data > \"$last\"\n\
+                 exit 0\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    // The data-loss regression test. Before this guard, HandBrake exiting 0 on a truncated
+    // source made ConvertBar record 'done', compute an inflated space_saved, and — under the
+    // DEFAULT cleanup_mode='trash' — send the user's ORIGINAL to the Trash.
+    #[test]
+    fn truncated_encode_errors_and_leaves_the_source_on_disk() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = truncating_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "cleanup_mode", "trash");
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "error",
+            "a truncated source is a failure, not a success"
+        );
+        assert!(
+            msg.unwrap_or_default().contains("Source appears truncated"),
+            "history must say WHY, not just that it failed"
+        );
+        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source_truncated"));
+        assert!(
+            source.exists(),
+            "THE POINT OF THIS FEATURE: the user's original must still be on disk"
+        );
+        assert!(!out.exists(), "the short partial output must be removed");
+    }
+
+    // For an in-place job output_path IS the source. Removing output_path here would delete
+    // the original outright — the same defect class as the fixed auto-resume bug.
+    #[test]
+    fn truncated_in_place_encode_leaves_the_source_byte_identical() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = truncating_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "cleanup_mode", "trash");
+        let source = real_source(dir.path(), "movie.mkv");
+        let original_bytes = std::fs::read(&source).unwrap();
+        // in-place: output_path == source_path
+        let p = source.to_str().unwrap();
+        queue_job(&db, "j1", p, p, 1000);
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            original_bytes,
+            "an in-place truncated encode must leave the original untouched — not replaced \
+             by the partial temp, and not deleted. Swapping encode_target for \
+             job.output_path here destroys the user's file."
+        );
+        assert!(
+            !in_place_temp_path(p).exists(),
+            "only the temp is cleaned up"
+        );
+    }
+
+    #[test]
+    fn stderr_tail_window_holds_the_frame_marker_with_room_to_spare() {
+        // Measured headroom from EOF: ~1.2 KB with x264, ~305 B with VideoToolbox — but each
+        // extra audio track appends a mux: line AFTER the marker. 8192 is the insurance.
+        assert!(
+            STDERR_TAIL_BYTES >= 8192,
+            "shrinking this window can silently disable truncation detection on \
+             multi-track files"
+        );
     }
 
     #[test]
