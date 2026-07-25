@@ -2067,10 +2067,18 @@ mod tests {
             let p = dir.join("hb-trunc.cmd");
             std::fs::write(
                 &p,
+                // The redirect must come BEFORE `echo`: cmd.exe strips the `1>&2` token but
+                // keeps the space in front of it, so `echo ... expected 1>&2` would emit a
+                // trailing space after "expected" and break the `strip_suffix(" expected")`
+                // parse in parse_sync_line.
                 "@echo off\r\n\
-                 echo [00:00:01] sync: got 131 frames, 480 expected 1>&2\r\n\
-                 for %%A in (%*) do set LAST=%%~A\r\n\
-                 echo data> \"%LAST%\"\r\n\
+                 >&2 echo [00:00:01] sync: got 131 frames, 480 expected\r\n\
+                 :loop\r\n\
+                 if not \"%~2\"==\"\" (\r\n\
+                 shift\r\n\
+                 goto loop\r\n\
+                 )\r\n\
+                 echo data> \"%~1\"\r\n\
                  exit /b 0\r\n",
             )
             .unwrap();
@@ -2083,8 +2091,8 @@ mod tests {
                 &p,
                 "#!/bin/sh\n\
                  echo '[00:00:01] sync: got 131 frames, 480 expected' >&2\n\
-                 eval \"last=\\${$#}\"\n\
-                 printf data > \"$last\"\n\
+                 for a; do out=\"$a\"; done\n\
+                 printf data > \"$out\"\n\
                  exit 0\n",
             )
             .unwrap();
@@ -2117,6 +2125,8 @@ mod tests {
             1000,
         );
 
+        let menubar_events = record_events(&app, "menu-bar-update");
+
         process_queue(app.handle(), &db, &converter);
 
         let (status, msg) = job_row(&db, "j1");
@@ -2134,6 +2144,12 @@ mod tests {
             "THE POINT OF THIS FEATURE: the user's original must still be on disk"
         );
         assert!(!out.exists(), "the short partial output must be removed");
+        let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            final_update.contains("\"error\""),
+            "a run whose only job was truncated must end 'error', not a clean 'idle' that \
+             hides the rejection — got: {final_update}"
+        );
     }
 
     // For an in-place job output_path IS the source. Removing output_path here would delete
