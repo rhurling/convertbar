@@ -12,6 +12,7 @@ pub struct JobInfo {
     pub kept_file: Option<String>,
     pub space_saved: Option<i64>,
     pub error_message: Option<String>,
+    pub failure_class: Option<String>,
     pub queue_order: i32,
     pub created_at: String,
     pub completed_at: Option<String>,
@@ -111,4 +112,30 @@ pub struct SkipCount {
 pub struct AddResult {
     pub added: Vec<JobInfo>,
     pub skipped: Vec<SkipCount>,
+}
+
+/// What happened to one id during a bulk purge. Every variant except `Purged` means the
+/// file was left alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeOutcome {
+    /// Destroyed per `bad_source_action`.
+    Purged,
+    /// A live job still references this path — destroying it would yank the source out
+    /// from under a running or queued encode.
+    InUse,
+    /// The path no longer exists; nothing to do.
+    AlreadyGone,
+    /// The file at this path is not the one that was classified.
+    Changed,
+    /// A fresh scan now reads the file fine — the original verdict was a transient fault.
+    Recovered,
+    /// The delete/trash call itself failed.
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgeResult {
+    pub id: String,
+    pub outcome: PurgeOutcome,
 }

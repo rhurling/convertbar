@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::converter::IN_PLACE_TEMP_MARKER;
+use crate::failure_class::{CLASS_BAD_SOURCE, CLASS_BAD_SOURCE_PURGED, CLASS_BAD_SOURCE_TRUNCATED};
 use crate::handbrake;
 use crate::types::{
-    AddResult, ClassifiedPaths, FolderScanResult, HistoryPage, HistorySummary, JobInfo, SkipCount,
-    SkipReason,
+    AddResult, ClassifiedPaths, FolderScanResult, HistoryPage, HistorySummary, JobInfo,
+    PurgeOutcome, PurgeResult, SkipCount, SkipReason,
 };
 use crate::AppState;
 
@@ -65,9 +66,10 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobInfo> {
         kept_file: row.get(7)?,
         space_saved: row.get(8)?,
         error_message: row.get(9)?,
-        queue_order: row.get(10)?,
-        created_at: row.get(11)?,
-        completed_at: row.get(12)?,
+        failure_class: row.get(10)?,
+        queue_order: row.get(11)?,
+        created_at: row.get(12)?,
+        completed_at: row.get(13)?,
     })
 }
 
@@ -104,6 +106,121 @@ fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
     }
 
     handbrake::detect_handbrake_path().ok_or_else(|| "HandBrakeCLI not found".to_string())
+}
+
+/// Ids of the rows the review list shows: failures blamed on the source file that the user
+/// has not already dealt with.
+fn bad_source_ids(conn: &rusqlite::Connection) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM jobs
+             WHERE status = 'error' AND failure_class IN (?1, ?2)
+             ORDER BY completed_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![CLASS_BAD_SOURCE, CLASS_BAD_SOURCE_TRUNCATED], |r| {
+            r.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<String>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// Whether a row's verdict should be re-verified with a fresh scan before its file is
+/// destroyed.
+///
+/// Only scan-failure rows qualify. A truncated source passes a scan by construction — its
+/// container header is intact, which is exactly why truncation cannot be seen at scan time —
+/// so re-scanning those rows would report every one of them recovered and silently empty
+/// the review list.
+fn should_rescan_before_purge(class: Option<&str>) -> bool {
+    class == Some(CLASS_BAD_SOURCE)
+}
+
+/// Whether any live job still points at `path`.
+fn path_is_in_use(conn: &rusqlite::Connection, path: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM jobs
+         WHERE source_path = ?1 AND status IN ('queued', 'encoding', 'paused')",
+        params![path],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(true) // a failed check means "assume in use" — never destroy on uncertainty
+}
+
+/// Decide and act for one id. `action` is the stored `bad_source_action`.
+fn purge_one(conn: &rusqlite::Connection, id: &str, action: &str) -> PurgeOutcome {
+    let row: Result<(String, Option<String>, Option<i64>, Option<i64>), _> = conn.query_row(
+        "SELECT source_path, failure_class, source_size, source_mtime FROM jobs WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    );
+    let (path, class, size, mtime) = match row {
+        Ok(v) => v,
+        Err(_) => return PurgeOutcome::Failed,
+    };
+
+    if path_is_in_use(conn, &path) {
+        return PurgeOutcome::InUse;
+    }
+    if !std::path::Path::new(&path).exists() {
+        return PurgeOutcome::AlreadyGone;
+    }
+
+    // Identity: the (size, mtime) fingerprint the codebase already keeps. A replacement
+    // file of coincidentally identical size still fails on mtime.
+    match (file_identity(&path), size, mtime) {
+        (Some(current), Some(s), Some(m)) => {
+            if current.size != s || current.mtime != m {
+                return PurgeOutcome::Changed;
+            }
+        }
+        // Cannot stat it now — refuse rather than guess.
+        (None, _, _) => return PurgeOutcome::Changed,
+        // Pre-feature row with no fingerprint: nothing to verify against, so leave it.
+        _ => return PurgeOutcome::Changed,
+    }
+
+    // A scan that now succeeds means the original verdict was a transient environment fault
+    // (a mount that hiccuped mid-scan), not a bad file.
+    if should_rescan_before_purge(class.as_deref()) {
+        if let Ok(hb) = get_handbrake_path(conn) {
+            if crate::probe::probe_source(&hb, &path).is_some() {
+                return PurgeOutcome::Recovered;
+            }
+        }
+    }
+
+    let destroyed = if action == "delete" {
+        std::fs::remove_file(&path).is_ok()
+    } else {
+        trash::delete(&path).is_ok()
+    };
+    if !destroyed {
+        return PurgeOutcome::Failed;
+    }
+
+    let _ = conn.execute(
+        "UPDATE jobs SET failure_class = ?2 WHERE id = ?1",
+        params![id, CLASS_BAD_SOURCE_PURGED],
+    );
+    PurgeOutcome::Purged
+}
+
+fn purge_ids(
+    conn: &rusqlite::Connection,
+    ids: &[String],
+    action: &str,
+) -> Result<Vec<PurgeResult>, String> {
+    Ok(ids
+        .iter()
+        .map(|id| PurgeResult {
+            id: id.clone(),
+            outcome: purge_one(conn, id, action),
+        })
+        .collect())
 }
 
 /// The probe-free skip decision for one path: `Some(reason)` to skip it, `None` to keep it.
@@ -510,6 +627,7 @@ fn add_files_to_db(
             kept_file: None,
             space_saved: None,
             error_message: None,
+            failure_class: None,
             queue_order,
             created_at: now,
             completed_at: None,
@@ -622,7 +740,7 @@ pub fn get_queue(state: State<'_, AppState>) -> Result<Vec<JobInfo>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, queue_order, created_at, completed_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at
              FROM jobs
              WHERE status IN ('queued', 'encoding', 'paused', 'error')
              ORDER BY queue_order ASC",
@@ -727,6 +845,46 @@ pub fn clear_queue(
 }
 
 #[tauri::command]
+pub fn get_bad_sources(state: State<'_, AppState>) -> Result<Vec<JobInfo>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at,
+                    completed_at
+             FROM jobs
+             WHERE status = 'error' AND failure_class IN (?1, ?2)
+             ORDER BY completed_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            params![CLASS_BAD_SOURCE, CLASS_BAD_SOURCE_TRUNCATED],
+            row_to_job,
+        )
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<JobInfo>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn purge_bad_sources(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<Vec<PurgeResult>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let action: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'bad_source_action'",
+            params![],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "trash".to_string());
+    let action = crate::commands::settings::normalize_bad_source_action(&action);
+    purge_ids(&conn, &ids, action)
+}
+
+#[tauri::command]
 pub fn get_history(
     state: State<'_, AppState>,
     limit: u32,
@@ -776,7 +934,7 @@ fn get_history_inner(
     let jobs = if has_search {
         let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, queue_order, created_at, completed_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped') AND (source_path LIKE ?1 OR output_path LIKE ?1)
              ORDER BY {}
@@ -793,7 +951,7 @@ fn get_history_inner(
     } else {
         let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, queue_order, created_at, completed_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped')
              ORDER BY {}
@@ -1936,5 +2094,182 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ---- bad-source review list + purge ----
+
+    fn insert_error_row(conn: &Connection, id: &str, path: &str, class: &str) {
+        // queue_order and created_at are NOT NULL with no default; the review-list/purge
+        // logic under test doesn't touch either, so any fixed value satisfies the schema.
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, failure_class,
+                               queue_order, created_at, completed_at)
+             VALUES (?1, ?2, '/o.mp4', 'p', 'error', ?3, 0, '2026-07-25T10:00:00Z',
+                     '2026-07-25T10:00:00Z')",
+            params![id, path, class],
+        )
+        .unwrap();
+    }
+
+    /// Record the CURRENT on-disk fingerprint so the purge identity check passes. Without
+    /// this the row looks like a pre-feature NULL-fingerprint row and purge refuses.
+    fn stamp_identity(conn: &Connection, id: &str, path: &str) {
+        let ident = file_identity(path).expect("file exists");
+        conn.execute(
+            "UPDATE jobs SET source_size = ?2, source_mtime = ?3 WHERE id = ?1",
+            params![id, ident.size, ident.mtime],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn get_bad_sources_lists_both_bad_classes_and_excludes_everything_else() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        // completed_at is set explicitly: the query orders by it, and NULLs would make the
+        // assertion order-dependent on SQLite's row layout.
+        for (id, status, class, done_at) in [
+            ("a", "error", Some("bad_source"), "2026-07-25T10:00:00Z"),
+            (
+                "b",
+                "error",
+                Some("bad_source_truncated"),
+                "2026-07-25T09:00:00Z",
+            ),
+            ("c", "error", Some("environment"), "2026-07-25T08:00:00Z"),
+            ("d", "error", Some("unknown"), "2026-07-25T07:00:00Z"),
+            (
+                "e",
+                "error",
+                Some("bad_source_purged"),
+                "2026-07-25T06:00:00Z",
+            ),
+            ("f", "error", None, "2026-07-25T05:00:00Z"),
+            ("g", "done", Some("bad_source"), "2026-07-25T04:00:00Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, failure_class,
+                                   queue_order, created_at, completed_at)
+                 VALUES (?1, '/s.mkv', '/o.mp4', 'p', ?2, ?3, 0, ?4, ?4)",
+                params![id, status, class, done_at],
+            )
+            .unwrap();
+        }
+        let ids = bad_source_ids(&conn).unwrap();
+        assert_eq!(
+            ids,
+            vec!["a".to_string(), "b".to_string()],
+            "only unpurged bad-source errors belong in the review list: purged rows have been \
+             handled, environment/unknown are not the file's fault, NULL predates the feature, \
+             and a 'done' row is not a failure at all"
+        );
+    }
+
+    // Pins the scoping the whole purge safety story depends on, without needing a real
+    // HandBrake in the test. A truncated file PASSES a scan (its container header is
+    // intact — that is why truncation is invisible at scan time), so re-scanning those
+    // rows would report every one of them Recovered and silently empty the list.
+    #[test]
+    fn only_scan_failure_rows_are_rescanned_before_destruction() {
+        assert!(
+            should_rescan_before_purge(Some("bad_source")),
+            "a scan-failure verdict can be a transient mount fault — re-verify before destroying"
+        );
+        assert!(
+            !should_rescan_before_purge(Some("bad_source_truncated")),
+            "a truncated file scans clean, so re-scanning would clear it from the list forever"
+        );
+        assert!(!should_rescan_before_purge(None));
+        assert!(!should_rescan_before_purge(Some("environment")));
+    }
+
+    #[test]
+    fn purge_skips_a_path_a_live_job_still_needs() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("movie.mkv");
+        std::fs::write(&f, b"content").unwrap();
+        let p = f.to_str().unwrap();
+
+        // The bad-source row, plus a re-added copy of the same file now queued.
+        insert_error_row(&conn, "old", p, "bad_source");
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                               created_at)
+             VALUES ('new', ?1, '/o.mp4', 'p', 'queued', 0, '2026-07-25T10:00:00Z')",
+            params![p],
+        )
+        .unwrap();
+
+        let outcomes = purge_ids(&conn, &["old".to_string()], "delete").unwrap();
+        assert_eq!(outcomes[0].outcome, PurgeOutcome::InUse);
+        assert!(
+            f.exists(),
+            "a file a queued job depends on must never be destroyed"
+        );
+    }
+
+    #[test]
+    fn purge_skips_a_file_whose_identity_no_longer_matches() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("movie.mkv");
+        std::fs::write(&f, b"the replacement download").unwrap();
+        let p = f.to_str().unwrap();
+
+        insert_error_row(&conn, "old", p, "bad_source");
+        // Fingerprint recorded for a DIFFERENT file that used to live at this path.
+        conn.execute(
+            "UPDATE jobs SET source_size = 999999, source_mtime = 1 WHERE id = 'old'",
+            [],
+        )
+        .unwrap();
+
+        let outcomes = purge_ids(&conn, &["old".to_string()], "delete").unwrap();
+        assert_eq!(outcomes[0].outcome, PurgeOutcome::Changed);
+        assert!(
+            f.exists(),
+            "a stale verdict must not condemn a re-downloaded file"
+        );
+    }
+
+    #[test]
+    fn purge_reports_already_gone_without_failing() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-existed.mkv");
+        insert_error_row(&conn, "old", missing.to_str().unwrap(), "bad_source");
+
+        let outcomes = purge_ids(&conn, &["old".to_string()], "delete").unwrap();
+        assert_eq!(outcomes[0].outcome, PurgeOutcome::AlreadyGone);
+    }
+
+    #[test]
+    fn purged_rows_leave_the_list_but_stay_in_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("movie.mkv");
+        std::fs::write(&f, b"garbage").unwrap();
+        let p = f.to_str().unwrap();
+        insert_error_row(&conn, "old", p, "bad_source_truncated");
+        stamp_identity(&conn, "old", p);
+
+        let outcomes = purge_ids(&conn, &["old".to_string()], "delete").unwrap();
+        assert_eq!(outcomes[0].outcome, PurgeOutcome::Purged);
+        assert!(!f.exists(), "delete mode removes the file");
+        assert!(
+            bad_source_ids(&conn).unwrap().is_empty(),
+            "a purged row must drop out of the list or a second press just errors"
+        );
+        let still_there: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs WHERE id = 'old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(still_there, 1, "the history entry itself survives");
     }
 }

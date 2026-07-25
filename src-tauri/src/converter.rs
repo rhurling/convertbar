@@ -353,7 +353,8 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
     let mut stmt = db
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                kept_file, space_saved, error_message, queue_order, created_at, completed_at
+                kept_file, space_saved, error_message, failure_class, queue_order, created_at,
+                completed_at
          FROM jobs WHERE status = 'queued'
          ORDER BY queue_order ASC LIMIT 1",
         )
@@ -371,9 +372,10 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
             kept_file: row.get(7)?,
             space_saved: row.get(8)?,
             error_message: row.get(9)?,
-            queue_order: row.get(10)?,
-            created_at: row.get(11)?,
-            completed_at: row.get(12)?,
+            failure_class: row.get(10)?,
+            queue_order: row.get(11)?,
+            created_at: row.get(12)?,
+            completed_at: row.get(13)?,
         })
     })
     .ok()
@@ -1630,6 +1632,46 @@ mod tests {
         assert!(
             final_update.contains("\"error\""),
             "a run where the only job failed must end 'error', got: {final_update}"
+        );
+    }
+
+    #[test]
+    fn claim_failure_records_environment_not_bad_source() {
+        // A conditional trigger makes claim_job's UPDATE ... SET status='encoding' fail while
+        // leaving record_job_error's UPDATE ... SET status='error' untouched — the only way to
+        // exercise ClaimOutcome::Failed without a real concurrent DB error. Without this test,
+        // someone changing that call site's failure class to BadSource would pass the whole
+        // suite, and a transient DB error would route a healthy file into the purge list.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        db.lock()
+            .unwrap()
+            .execute(
+                "CREATE TRIGGER block_encoding_claim BEFORE UPDATE ON jobs \
+                 WHEN NEW.status = 'encoding' \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END",
+                [],
+            )
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let src = real_source(dir.path(), "in.mp4");
+        queue_job(&db, "j1", src.to_str().unwrap(), "/nowhere/out.mp4", 1000);
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(status, "error");
+        assert!(msg.unwrap().contains("Failed to claim job"));
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("environment"),
+            "a DB error while claiming the job is an environment problem, not a verdict on \
+             the source file"
         );
     }
 
