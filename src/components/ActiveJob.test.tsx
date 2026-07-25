@@ -21,6 +21,7 @@ function job(overrides: Partial<JobInfo> = {}): JobInfo {
     kept_file: null,
     space_saved: null,
     error_message: null,
+    failure_class: null,
     queue_order: 0,
     created_at: "",
     completed_at: null,

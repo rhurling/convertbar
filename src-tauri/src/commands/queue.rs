@@ -175,6 +175,10 @@ fn pre_destroy_check(conn: &rusqlite::Connection, id: &str) -> PreDestroy {
         return PreDestroy::Stop(PurgeOutcome::InUse);
     }
     if !std::path::Path::new(&path).exists() {
+        // Nothing left to destroy, but the user's intent (this file should be gone) is
+        // already satisfied — stamp it purged so the row leaves the review list instead of
+        // reappearing (and re-reporting AlreadyGone) on every future press.
+        mark_purged(conn, id);
         return PreDestroy::Stop(PurgeOutcome::AlreadyGone);
     }
 
@@ -231,6 +235,15 @@ fn rescan_verdict(outcome: crate::probe::ScanOutcome) -> RescanVerdict {
     }
 }
 
+/// Stamp a row purged so it drops out of the review list (`get_bad_sources_inner` filters on
+/// `failure_class`) while the history entry itself survives.
+fn mark_purged(conn: &rusqlite::Connection, id: &str) {
+    let _ = conn.execute(
+        "UPDATE jobs SET failure_class = ?2 WHERE id = ?1",
+        params![id, CLASS_BAD_SOURCE_PURGED],
+    );
+}
+
 /// Destroy `path` per `action` and stamp the row purged. Called only once every earlier rung
 /// has passed.
 fn destroy_and_record(
@@ -248,10 +261,7 @@ fn destroy_and_record(
         return PurgeOutcome::Failed;
     }
 
-    let _ = conn.execute(
-        "UPDATE jobs SET failure_class = ?2 WHERE id = ?1",
-        params![id, CLASS_BAD_SOURCE_PURGED],
-    );
+    mark_purged(conn, id);
     PurgeOutcome::Purged
 }
 
@@ -2398,6 +2408,19 @@ mod tests {
 
         let outcomes = purge_ids(&conn, &["old".to_string()], "delete").unwrap();
         assert_eq!(outcomes[0].outcome, PurgeOutcome::AlreadyGone);
+        // A file the user already deleted by hand must leave the review list too — otherwise
+        // it reappears and reports AlreadyGone again on every future press, and the list can
+        // never be emptied.
+        assert!(
+            get_bad_sources_inner(&conn).unwrap().is_empty(),
+            "an already-gone row must drop out of the list"
+        );
+        let still_there: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs WHERE id = 'old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(still_there, 1, "the history entry itself survives");
     }
 
     #[test]

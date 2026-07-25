@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { useHistory } from "../hooks/useHistory";
+import { useBadSources } from "../hooks/useBadSources";
+import { useSettings } from "../hooks/useSettings";
 import { formatBytes } from "../lib/format";
 import { commands, type JobInfo, type PathsExist } from "../lib/tauri";
 import { resolveTargetPath } from "../lib/historyTarget";
@@ -15,9 +17,37 @@ interface MenuState {
 
 export default function HistoryPage() {
   const { history, summary, hasMore, loading, loadMore, refresh, setSearchDebounced, sortBy, setSortBy } = useHistory();
+  const { badSources, purge } = useBadSources();
+  const { settings } = useSettings();
   const [showClearMenu, setShowClearMenu] = useState(false);
   const [searchInput, setSearchInput] = useState("");
   const [menu, setMenu] = useState<MenuState | null>(null);
+  const [confirmingPurge, setConfirmingPurge] = useState(false);
+  const [purgeOutcomeNote, setPurgeOutcomeNote] = useState<string | null>(null);
+
+  // useSettings() returns `AppSettings | null` while loading, so the optional chain is
+  // required — and a null settings object must read as the non-destructive default (Trash
+  // wording), never as delete.
+  const destructive = settings?.bad_source_action === "delete";
+  const purgeActionLabel = destructive
+    ? `Delete ${badSources.length} permanently`
+    : `Move ${badSources.length} to Trash`;
+
+  const runPurge = async () => {
+    // Safety-critical: pass the review list's own ids, never history's. The backend also
+    // rejects ids that don't belong to a live bad-source row, but that is a backstop, not a
+    // substitute for wiring the right collection here.
+    const results = await purge(badSources.map((j) => j.id));
+    setConfirmingPurge(false);
+    const skipped = results.filter((r) => r.outcome !== "purged");
+    setPurgeOutcomeNote(
+      skipped.length === 0
+        ? null
+        : `${skipped.length} file(s) were left alone: ${skipped
+            .map((r) => r.outcome.replace(/_/g, " "))
+            .join(", ")}`,
+    );
+  };
 
   const handleItemContextMenu = (e: React.MouseEvent, job: JobInfo) => {
     setMenu({ job, x: e.clientX, y: e.clientY, exists: null });
@@ -61,6 +91,46 @@ export default function HistoryPage() {
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {badSources.length > 0 && (
+        <div className="bad-sources-panel">
+          <span className="bad-sources-title">
+            Bad sources ({badSources.length})
+          </span>
+          <ul className="bad-sources-list">
+            {badSources.map((job) => (
+              <li key={job.id}>
+                <span className="bad-sources-name">
+                  {job.source_path.split(/[/\\]/).pop()}
+                </span>
+                <span className="bad-sources-reason">
+                  {(job.error_message ?? "").split("\n")[0]}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {!confirmingPurge ? (
+            <button className="btn btn-small" onClick={() => setConfirmingPurge(true)}>
+              {purgeActionLabel}
+            </button>
+          ) : (
+            <div className="bad-sources-confirm">
+              <span>
+                {destructive
+                  ? "This cannot be undone."
+                  : "Files move to your Trash."}
+              </span>
+              <button className="btn btn-small btn-danger" onClick={runPurge}>
+                Confirm
+              </button>
+              <button className="btn btn-small" onClick={() => setConfirmingPurge(false)}>
+                Cancel
+              </button>
+            </div>
+          )}
+          {purgeOutcomeNote && <p className="setting-hint">{purgeOutcomeNote}</p>}
         </div>
       )}
 
