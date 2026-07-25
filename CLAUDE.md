@@ -40,7 +40,7 @@ Window position is persisted across restarts via `tauri-plugin-window-state`. Sc
 
 ## Cross-Platform
 
-- `libc` (SIGSTOP/SIGCONT) is macOS-only — gated with `cfg!(target_os = "macos")` in Cargo.toml
+- `libc` (SIGSTOP/SIGCONT) is a `[target.'cfg(target_os = "macos")'.dependencies]` entry in Cargo.toml, and the call sites are gated with `#[cfg(target_os = "macos")]` attributes — never the `cfg!()` macro, which only skips code at runtime and would still require linking libc on every platform. There is also a `[target.'cfg(unix)'.dev-dependencies]` `libc` entry (for a Linux/macOS-only test), so don't assume the crate is macOS-exclusive when touching Cargo.toml.
 - Pause/resume: real process freeze on macOS, queue-level pause on other platforms
 - Cancel: `Child::kill()` on all platforms
 - HandBrakeCLI detection: `which` on Unix, `where` on Windows (PATH-only, no hardcoded paths)
