@@ -140,7 +140,9 @@ enum PreDestroy {
     Stop(PurgeOutcome),
     /// Everything before the scan passed and a rescan is required: probe `handbrake_path`
     /// against `path`. The probe can block for `PROBE_TIMEOUT` (~30s), so callers that share
-    /// `conn` with other threads must not hold that lock while probing.
+    /// `conn` with other threads must not hold that lock while probing. A scan that runs to
+    /// completion and finds no title (`ScanOutcome::NoTitle`) is a real, re-confirmed verdict
+    /// and falls through to destroy `path`, same as `ReadyToDestroy`.
     NeedsScan {
         path: String,
         handbrake_path: String,
@@ -204,6 +206,31 @@ fn pre_destroy_check(conn: &rusqlite::Connection, id: &str) -> PreDestroy {
     PreDestroy::ReadyToDestroy { path }
 }
 
+/// What rung 4 concludes from a rescan's outcome. Kept as a pure mapping — separate both from
+/// `ScanOutcome` (owned by probe.rs) and from actually running the scan — so the
+/// `NoTitle -> Destroy` / `CouldNotRun -> Unverifiable` split can be pinned by a unit test
+/// regardless of whether a real scan can run in the test environment. If someone later collapses
+/// these two back together, a test on this function alone catches it.
+#[derive(Debug, PartialEq, Eq)]
+enum RescanVerdict {
+    /// A transient environment fault (e.g. a mount that hiccuped mid-scan), not a bad file.
+    Recovered,
+    /// The scan ran to completion and still found nothing — a real, re-confirmed verdict that
+    /// the file is bad. Proceed to destroy.
+    Destroy,
+    /// The scan could not be run at all (spawn failure, HandBrakeCLI moved, timeout) — says
+    /// nothing about the file, so never treat it as confirmation.
+    Unverifiable,
+}
+
+fn rescan_verdict(outcome: crate::probe::ScanOutcome) -> RescanVerdict {
+    match outcome {
+        crate::probe::ScanOutcome::Titled(_) => RescanVerdict::Recovered,
+        crate::probe::ScanOutcome::NoTitle => RescanVerdict::Destroy,
+        crate::probe::ScanOutcome::CouldNotRun => RescanVerdict::Unverifiable,
+    }
+}
+
 /// Destroy `path` per `action` and stamp the row purged. Called only once every earlier rung
 /// has passed.
 fn destroy_and_record(
@@ -239,16 +266,12 @@ fn purge_one(conn: &rusqlite::Connection, id: &str, action: &str) -> PurgeOutcom
         PreDestroy::NeedsScan {
             path,
             handbrake_path,
-        } => {
-            match crate::probe::probe_source(&handbrake_path, &path) {
-                Some(_) => PurgeOutcome::Recovered,
-                // probe_source returns None on a clean "no title found" AND on a spawn
-                // failure/PROBE_TIMEOUT kill — this codebase's scan API cannot tell "confirmed
-                // still bad" apart from "could not check". Uncertainty is never destructive,
-                // so this never falls through to destroy.
-                None => PurgeOutcome::Unverifiable,
-            }
-        }
+        } => match rescan_verdict(crate::probe::scan_outcome(&handbrake_path, &path)) {
+            RescanVerdict::Recovered => PurgeOutcome::Recovered,
+            RescanVerdict::Unverifiable => PurgeOutcome::Unverifiable,
+            // The primary case the whole feature exists for: a re-confirmed bad file.
+            RescanVerdict::Destroy => destroy_and_record(conn, id, action, &path),
+        },
     }
 }
 
@@ -286,10 +309,13 @@ fn purge_one_locked(db: &Arc<Mutex<rusqlite::Connection>>, id: &str, action: &st
         } => {
             // Deliberately outside the lock acquired above (already dropped) — see the
             // doc comment above.
-            return match crate::probe::probe_source(&handbrake_path, &path) {
-                Some(_) => PurgeOutcome::Recovered,
-                None => PurgeOutcome::Unverifiable,
-            };
+            match rescan_verdict(crate::probe::scan_outcome(&handbrake_path, &path)) {
+                RescanVerdict::Recovered => return PurgeOutcome::Recovered,
+                RescanVerdict::Unverifiable => return PurgeOutcome::Unverifiable,
+                // A real, re-confirmed verdict — fall through to the same re-lock + destroy
+                // tail as a row that never needed a rescan.
+                RescanVerdict::Destroy => path,
+            }
         }
     };
     let conn = db.lock().unwrap();
@@ -2414,14 +2440,43 @@ mod tests {
         );
     }
 
+    // Pins the exact mapping I2's fix depends on. If someone later collapses NoTitle and
+    // CouldNotRun back into one arm — the mistake round 1 originally made — this fails
+    // regardless of whether HandBrakeCLI is installed on the machine running the test.
+    #[test]
+    fn rescan_verdict_maps_each_scan_outcome_independently() {
+        assert_eq!(
+            rescan_verdict(crate::probe::ScanOutcome::Titled(
+                crate::media_skip::SourceMedia {
+                    codec: "h264".to_string(),
+                    height: 1080
+                }
+            )),
+            RescanVerdict::Recovered,
+            "a title read on rescan means the original verdict was a transient fault"
+        );
+        assert_eq!(
+            rescan_verdict(crate::probe::ScanOutcome::NoTitle),
+            RescanVerdict::Destroy,
+            "a scan that ran to completion and still found nothing is a real, \
+             re-confirmed verdict — this is the primary case the feature exists for"
+        );
+        assert_eq!(
+            rescan_verdict(crate::probe::ScanOutcome::CouldNotRun),
+            RescanVerdict::Unverifiable,
+            "a scan that never ran says nothing about the file and must never be treated as \
+             confirmation"
+        );
+    }
+
     #[test]
     fn purge_marks_unverifiable_when_the_rescan_cannot_run() {
         // A configured handbrake_path that EXISTS (so get_handbrake_path returns Ok without
         // falling back to a real PATH search — keeping this test deterministic regardless of
         // whether the host running it has a real HandBrakeCLI installed) but is a directory,
-        // not an executable, makes probe_source's spawn fail. That is indistinguishable, via
-        // probe_source's Option return, from a scan that ran and legitimately found nothing —
-        // exactly the ambiguity that must never resolve toward destruction.
+        // not an executable, makes the scan's spawn fail (ScanOutcome::CouldNotRun). An
+        // end-to-end companion to rescan_verdict_maps_each_scan_outcome_independently, through
+        // the real purge_ids path rather than the pure mapping alone.
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -2442,6 +2497,46 @@ mod tests {
             f.exists(),
             "a rescan that could not even run must never be treated as confirming the file bad"
         );
+    }
+
+    // The primary scenario the whole feature exists for: a genuinely corrupt file must still be
+    // purgeable, not just recoverable/unverifiable. Round 1's fix for I2 over-corrected and made
+    // every bad_source row permanently un-purgeable; this pins that round 2 restores the case.
+    #[cfg(unix)]
+    #[test]
+    fn purge_destroys_a_bad_source_row_when_the_rescan_confirms_it_is_still_bad() {
+        // A configured handbrake_path pointing at a real, executable stand-in that runs to
+        // completion but emits no parseable title set (ScanOutcome::NoTitle) — the shape of a
+        // real HandBrakeCLI scan that opened the file fine and found nothing.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("movie.mkv");
+        std::fs::write(&f, b"garbage").unwrap();
+        let p = f.to_str().unwrap();
+        insert_error_row(&conn, "old", p, "bad_source");
+        stamp_identity(&conn, "old", p);
+
+        let script = dir.path().join("fake-handbrake.sh");
+        std::fs::write(&script, "#!/bin/sh\necho 'no title here'\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        conn.execute(
+            "UPDATE settings SET value = ?1 WHERE key = 'handbrake_path'",
+            params![script.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let outcomes = purge_ids(&conn, &["old".to_string()], "delete").unwrap();
+        assert_eq!(
+            outcomes[0].outcome,
+            PurgeOutcome::Purged,
+            "a bad_source row must still be purgeable once the rescan re-confirms it — \
+             I2's fix must not make bad_source rows permanently un-purgeable"
+        );
+        assert!(!f.exists(), "delete mode removes the confirmed-bad file");
     }
 
     #[test]
