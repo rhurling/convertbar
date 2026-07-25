@@ -259,10 +259,32 @@ describe("HistoryPage", () => {
       expect(screen.queryByText(/bad sources/i)).toBeNull();
     });
 
-    it("says 'Delete N permanently' when bad_source_action is delete, and reads null settings as the non-destructive default", async () => {
+    it("reads a still-loading (null) settings object as the non-destructive Trash default, then switches to Delete once settings resolve", async () => {
       badSources = [badSourceJob("a")];
-      settings = makeSettings("delete");
+      // Hold get_settings pending so the component genuinely renders with
+      // settings === null before we resolve it — asserting the terminal "delete" state
+      // alone would never exercise the null-default branch this test is named for.
+      let resolveSettings: (s: AppSettings) => void = () => {};
+      const settingsPromise = new Promise<AppSettings>((resolve) => {
+        resolveSettings = resolve;
+      });
+      invokeMock.mockImplementation(((cmd: string) => {
+        if (cmd === "get_history") return Promise.resolve(page);
+        if (cmd === "get_history_summary") return Promise.resolve(summary);
+        if (cmd === "get_bad_sources") return Promise.resolve(badSources);
+        if (cmd === "get_settings") return settingsPromise;
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }) as typeof invoke);
+
       render(<HistoryPage />);
+
+      // Settings is still unresolved (null) here — must read as the non-destructive default.
+      await screen.findByRole("button", { name: /move 1 to trash/i });
+      expect(
+        screen.queryByRole("button", { name: /delete 1 permanently/i }),
+      ).toBeNull();
+
+      resolveSettings(makeSettings("delete"));
 
       await screen.findByRole("button", { name: /delete 1 permanently/i });
       expect(
@@ -310,6 +332,42 @@ describe("HistoryPage", () => {
       await waitFor(() =>
         expect(screen.getByText(/1 file\(s\) were left alone: in use/i)).toBeInTheDocument(),
       );
+    });
+
+    // Regression: an already_gone row now gets stamped purged by the backend fix (see
+    // queue.rs mark_purged), so it drops out of the review list on refresh — the same as a
+    // genuinely destroyed row. If the outcome note were still scoped inside the
+    // badSources.length > 0 block, the whole panel — note included — would vanish the
+    // instant the list emptied, and the user would have zero indication the file was
+    // spared rather than destroyed.
+    it("keeps the outcome note visible even after the reviewed row drops out of the list entirely", async () => {
+      badSources = [badSourceJob("a")];
+      purgeResults = [{ id: "a", outcome: "already_gone" }];
+      let purged = false;
+      invokeMock.mockImplementation(((cmd: string) => {
+        if (cmd === "get_history") return Promise.resolve(page);
+        if (cmd === "get_history_summary") return Promise.resolve(summary);
+        if (cmd === "get_settings") return Promise.resolve(settings);
+        if (cmd === "get_bad_sources") return Promise.resolve(purged ? [] : badSources);
+        if (cmd === "purge_bad_sources") {
+          purged = true;
+          return Promise.resolve(purgeResults);
+        }
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }) as typeof invoke);
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(1\)/i);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      // The list itself empties out...
+      await waitFor(() => expect(screen.queryByText(/bad sources \(1\)/i)).toBeNull());
+      // ...but the note explaining the file was left alone must still be visible.
+      expect(
+        screen.getByText(/1 file\(s\) were left alone: already gone/i),
+      ).toBeInTheDocument();
     });
   });
 });

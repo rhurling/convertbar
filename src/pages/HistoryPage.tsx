@@ -94,42 +94,49 @@ export default function HistoryPage() {
         </div>
       )}
 
-      {badSources.length > 0 && (
+      {(badSources.length > 0 || purgeOutcomeNote) && (
         <div className="bad-sources-panel">
-          <span className="bad-sources-title">
-            Bad sources ({badSources.length})
-          </span>
-          <ul className="bad-sources-list">
-            {badSources.map((job) => (
-              <li key={job.id}>
-                <span className="bad-sources-name">
-                  {job.source_path.split(/[/\\]/).pop()}
-                </span>
-                <span className="bad-sources-reason">
-                  {(job.error_message ?? "").split("\n")[0]}
-                </span>
-              </li>
-            ))}
-          </ul>
-          {!confirmingPurge ? (
-            <button className="btn btn-small" onClick={() => setConfirmingPurge(true)}>
-              {purgeActionLabel}
-            </button>
-          ) : (
-            <div className="bad-sources-confirm">
-              <span>
-                {destructive
-                  ? "This cannot be undone."
-                  : "Files move to your Trash."}
+          {badSources.length > 0 && (
+            <>
+              <span className="bad-sources-title">
+                Bad sources ({badSources.length})
               </span>
-              <button className="btn btn-small btn-danger" onClick={runPurge}>
-                Confirm
-              </button>
-              <button className="btn btn-small" onClick={() => setConfirmingPurge(false)}>
-                Cancel
-              </button>
-            </div>
+              <ul className="bad-sources-list">
+                {badSources.map((job) => (
+                  <li key={job.id}>
+                    <span className="bad-sources-name">
+                      {job.source_path.split(/[/\\]/).pop()}
+                    </span>
+                    <span className="bad-sources-reason">
+                      {(job.error_message ?? "").split("\n")[0]}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {!confirmingPurge ? (
+                <button className="btn btn-small" onClick={() => setConfirmingPurge(true)}>
+                  {purgeActionLabel}
+                </button>
+              ) : (
+                <div className="bad-sources-confirm">
+                  <span>
+                    {destructive
+                      ? "This cannot be undone."
+                      : "Files move to your Trash."}
+                  </span>
+                  <button className="btn btn-small btn-danger" onClick={runPurge}>
+                    Confirm
+                  </button>
+                  <button className="btn btn-small" onClick={() => setConfirmingPurge(false)}>
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </>
           )}
+          {/* Rendered even when the list above just emptied out (e.g. every row was
+              already_gone and dropped out on refresh) — otherwise the panel vanishes
+              with the outcome unreported, silently implying everything was destroyed. */}
           {purgeOutcomeNote && <p className="setting-hint">{purgeOutcomeNote}</p>}
         </div>
       )}
