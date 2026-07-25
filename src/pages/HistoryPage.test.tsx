@@ -265,6 +265,69 @@ describe("HistoryPage", () => {
       );
     });
 
+    // Two REAL rows as stored by HandBrake 1.11.2: the promoted headline is ffmpeg's own
+    // diagnostic, so the messages differ only by a heap pointer. If the panel labels rows by
+    // that message the user is asked to approve destroying two rows they cannot tell apart —
+    // which is exactly what shipped. Each row must be identified by its own filename.
+    const REAL_PATH_A =
+      "/Users/x/Downloads/Archive/Loose Files (Bunkr)/4 GIRLS FOR YOU - Mia Nouvelle, Emma Spice und Elena Rebell.mp4";
+    const REAL_PATH_B =
+      "/Users/x/Downloads/Archive/emmaxspice (Bunkr)/0hhmaofaq461uv8t393t7_source.mp4";
+
+    function corruptJob(id: string, path: string, pointer: string): JobInfo {
+      return {
+        ...erroredJob(id),
+        source_path: path,
+        error_message: `Conversion failed: [mov,mp4,m4a,3gp,3g2,mj2 @ ${pointer}] moov atom not found\n[00:30:36] Compile-time hardening features are enabled`,
+        failure_class: "bad_source",
+      };
+    }
+
+    it("identifies every reviewed row by its own filename, with the full path on hover", async () => {
+      badSources = [
+        corruptJob("a", REAL_PATH_A, "0x8e0a44000"),
+        corruptJob("b", REAL_PATH_B, "0xbe8a3c000"),
+      ];
+      render(<HistoryPage />);
+
+      const nameA = await screen.findByText(
+        "4 GIRLS FOR YOU - Mia Nouvelle, Emma Spice und Elena Rebell.mp4",
+      );
+      const nameB = await screen.findByText("0hhmaofaq461uv8t393t7_source.mp4");
+      expect(nameA.getAttribute("title")).toBe(REAL_PATH_A);
+      expect(nameB.getAttribute("title")).toBe(REAL_PATH_B);
+    });
+
+    it("states the reason in plain English from failure_class, never HandBrake's raw stderr", async () => {
+      badSources = [
+        corruptJob("a", REAL_PATH_A, "0x8e0a44000"),
+        { ...corruptJob("b", REAL_PATH_B, "0xbe8a3c000"), failure_class: "bad_source_truncated" },
+      ];
+      render(<HistoryPage />);
+
+      expect(await screen.findByText(/unreadable/i)).toBeTruthy();
+      expect(screen.getByText(/incomplete/i)).toBeTruthy();
+      // The ffmpeg component tag and heap pointer are noise that pushed the real reason
+      // ("moov atom not found") off the right edge of the panel.
+      expect(screen.queryByText(/0x8e0a44000/)).toBeNull();
+      expect(screen.queryByText(/mov,mp4,m4a/)).toBeNull();
+    });
+
+    // A failure_class this build doesn't have wording for must still say SOMETHING about the
+    // row rather than render blank — same defensive posture as OUTCOME_LABELS.
+    it("falls back to the stored message for a failure_class it doesn't recognize yet", async () => {
+      badSources = [
+        {
+          ...corruptJob("a", REAL_PATH_A, "0x8e0a44000"),
+          error_message: "Conversion failed: some future diagnostic\nnoise below",
+          failure_class: "bad_source_from_a_future_version",
+        },
+      ];
+      render(<HistoryPage />);
+
+      expect(await screen.findByText("Conversion failed: some future diagnostic")).toBeTruthy();
+    });
+
     it("hides the banner entirely when there are no bad sources", async () => {
       badSources = [];
       render(<HistoryPage />);

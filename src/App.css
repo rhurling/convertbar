@@ -335,31 +335,39 @@ body {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
   /* A watched folder can flag hundreds of files at once — cap the list's own height and
      scroll inside it so the purge button stays reachable instead of being pushed below the
      popover's fold. */
   max-height: 140px;
   overflow-y: auto;
+  /* Explicit, because overflow-x would otherwise compute to auto (overflow-y isn't visible)
+     and any row wider than the panel would raise a 15px horizontal scrollbar. Rows ellipsize
+     instead — the popover is far too narrow to scroll a path into view usefully. */
+  overflow-x: hidden;
 }
 
+/* Stacked, not side by side: at ~310px of panel width a filename and a reason can never
+   share a line, and competing for it is what collapsed the name to zero width. */
 .bad-sources-list li {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
+  flex-direction: column;
   font-size: 12px;
 }
 
-.bad-sources-name {
-  color: var(--text-primary);
+.bad-sources-name,
+.bad-sources-reason {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.bad-sources-name {
+  color: var(--text-primary);
+}
+
 .bad-sources-reason {
   color: var(--text-secondary);
-  flex-shrink: 0;
 }
 
 .bad-sources-confirm {
