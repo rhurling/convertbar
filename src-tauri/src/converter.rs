@@ -444,6 +444,14 @@ pub(crate) fn should_auto_resume(has_queued: bool, queue_paused: bool) -> bool {
     has_queued && !queue_paused
 }
 
+/// Whether a source path is *confirmed* gone, from the result of a `try_exists` probe.
+/// Only a clean `Ok(false)` counts. An `Err` — an unreadable parent directory, a stalled
+/// mount — means the answer is unknown, so fail open (same policy as the low-disk gate) and
+/// let HandBrake try: a stat quirk must never report a file that exists as deleted.
+fn source_is_confirmed_missing(probe: std::io::Result<bool>) -> bool {
+    matches!(probe, Ok(false))
+}
+
 /// Outcome of trying to claim the next job by flipping it 'queued' -> 'encoding'. The claim is
 /// conditional (`AND status = 'queued'`) so a job that `clear_queue`/`remove_job` deleted during
 /// the pre-spawn window is not resurrected — spawning on a deleted row could trash the source.
@@ -571,13 +579,13 @@ fn empty_output_error_message(tail: &str) -> String {
     message_with_tail("Conversion produced an empty output file", tail)
 }
 
-/// Record a failed job: status + error_message in the DB, the two frontend events,
-/// and the per-file notification. Shared by every failure path in process_queue.
-fn record_job_error<R: tauri::Runtime>(
+/// Record a failed job WITHOUT notifying: status + error_message in the DB and the two
+/// frontend events. For failures the user already knows about because they caused them —
+/// a source file they moved or deleted — where a desktop notification is just noise.
+fn record_job_error_quiet<R: tauri::Runtime>(
     app: &AppHandle<R>,
     db: &Arc<Mutex<Connection>>,
     job_id: &str,
-    file_name: &str,
     err_msg: &str,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
@@ -596,6 +604,18 @@ fn record_job_error<R: tauri::Runtime>(
         "job-status-changed",
         serde_json::json!({ "job_id": job_id, "status": "error" }),
     );
+}
+
+/// Record a failed job: everything `record_job_error_quiet` does, plus the per-file
+/// notification. The default for every failure path in process_queue.
+fn record_job_error<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    db: &Arc<Mutex<Connection>>,
+    job_id: &str,
+    file_name: &str,
+    err_msg: &str,
+) {
+    record_job_error_quiet(app, db, job_id, err_msg);
 
     let notify_per_file = {
         let db = db.lock().unwrap();
@@ -689,6 +709,18 @@ fn process_queue<R: tauri::Runtime>(
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
+
+        // Vanished-source gate: a queued file can be moved, trashed, or consumed by another tool
+        // before its turn. Handing the dead path to HandBrakeCLI makes it fail with the reason
+        // buried in a stderr dump, so stat first and record what actually happened. Quietly: the
+        // user removed the file themselves, so the history entry is enough — no notification.
+        // Ahead of the low-disk gate on purpose: a job that can never run must not hold up the
+        // queue behind a disk pause, and the gate would size it from a source that isn't there.
+        if source_is_confirmed_missing(std::path::Path::new(&job.source_path).try_exists()) {
+            had_errors = true;
+            record_job_error_quiet(app, db, &job.id, "Source file no longer exists");
+            continue;
+        }
 
         // Low-disk gate: before committing this job to 'encoding', ensure the destination
         // filesystem has room for the floor plus the encode (2× source). On a shortfall, stop
@@ -1323,6 +1355,15 @@ mod tests {
             .unwrap();
     }
 
+    /// A real (tiny) file on disk to point a job's source at. process_queue stats the source
+    /// before spawning, so a fixture naming a path that was never created stops at the
+    /// vanished-source gate instead of exercising the behavior under test.
+    fn real_source(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, b"0123456789").unwrap();
+        p
+    }
+
     fn job_row(db: &Arc<Mutex<Connection>>, id: &str) -> (String, Option<String>) {
         db.lock()
             .unwrap()
@@ -1360,7 +1401,8 @@ mod tests {
         let fake = dir.path().join("not-a-binary.txt");
         std::fs::write(&fake, "plain text").unwrap();
         set_setting(&db, "handbrake_path", fake.to_str().unwrap());
-        queue_job(&db, "j1", "/nowhere/in.mp4", "/nowhere/out.mp4", 1000);
+        let src = real_source(dir.path(), "in.mp4");
+        queue_job(&db, "j1", src.to_str().unwrap(), "/nowhere/out.mp4", 1000);
 
         let status_events = record_events(&app, "job-status-changed");
         let menubar_events = record_events(&app, "menu-bar-update");
@@ -1400,7 +1442,14 @@ mod tests {
         set_setting(&db, "handbrake_path", script.to_str().unwrap());
         set_setting(&db, "low_disk_min_gb", "1000000000"); // 1e9 GB
         let out = dir.path().join("out.mp4");
-        queue_job(&db, "j1", "/nowhere/a.mp4", out.to_str().unwrap(), 1000);
+        let src = real_source(dir.path(), "a.mp4");
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
 
         let paused_events = record_events(&app, "queue-paused-low-disk");
         let status_events = record_events(&app, "job-status-changed");
@@ -1474,7 +1523,14 @@ mod tests {
         // i64::MAX source: a wrongly-running gate would saturate the requirement to ~u64::MAX and
         // trip (job stays 'queued'), so reaching the encode/error outcome proves the gate was
         // genuinely skipped, not that it ran and happened to pass on a tiny source.
-        queue_job(&db, "j1", "/nowhere/a.mp4", out.to_str().unwrap(), i64::MAX);
+        let src = real_source(dir.path(), "a.mp4");
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            i64::MAX,
+        );
 
         process_queue(app.handle(), &db, &converter);
 
@@ -1511,10 +1567,11 @@ mod tests {
         // some other disk's ample free space slipped through.
         set_setting(&db, "low_disk_min_gb", "1000000000"); // 1e9 GB
                                                            // Output under a parent directory that does not exist -> available-space query fails -> None.
+        let src = real_source(dir.path(), "a.mp4");
         queue_job(
             &db,
             "j1",
-            "/nowhere/a.mp4",
+            src.to_str().unwrap(),
             "/no-such-dir-xyz/out.mp4",
             1000,
         );
@@ -1550,7 +1607,14 @@ mod tests {
         set_setting(&db, "handbrake_path", script.to_str().unwrap());
         set_setting(&db, "low_disk_min_gb", "1000000000");
         let out = dir.path().join("out.mp4");
-        queue_job(&db, "j1", "/nowhere/a.mp4", out.to_str().unwrap(), 1000);
+        let src = real_source(dir.path(), "a.mp4");
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
 
         process_queue(app.handle(), &db, &converter);
         assert_eq!(job_row(&db, "j1").0, "queued", "gate pauses the job");
@@ -1658,7 +1722,14 @@ mod tests {
         let script = slow_fake_handbrake_script(dir.path());
         set_setting(&db, "handbrake_path", script.to_str().unwrap());
         let output = dir.path().join("out.mp4");
-        queue_job(&db, "j1", "/nowhere/a.mp4", output.to_str().unwrap(), 1000);
+        let src = real_source(dir.path(), "a.mp4");
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            output.to_str().unwrap(),
+            1000,
+        );
 
         let error_events = record_events(&app, "job-error");
 
@@ -1709,8 +1780,22 @@ mod tests {
         set_setting(&db, "handbrake_path", script.to_str().unwrap());
         let out1 = dir.path().join("out1.mp4");
         let out2 = dir.path().join("out2.mp4");
-        queue_job(&db, "j1", "/nowhere/a.mp4", out1.to_str().unwrap(), 1000);
-        queue_job(&db, "j2", "/nowhere/b.mp4", out2.to_str().unwrap(), 1000);
+        let src1 = real_source(dir.path(), "a.mp4");
+        let src2 = real_source(dir.path(), "b.mp4");
+        queue_job(
+            &db,
+            "j1",
+            src1.to_str().unwrap(),
+            out1.to_str().unwrap(),
+            1000,
+        );
+        queue_job(
+            &db,
+            "j2",
+            src2.to_str().unwrap(),
+            out2.to_str().unwrap(),
+            1000,
+        );
 
         let menubar_events = record_events(&app, "menu-bar-update");
 
@@ -2566,6 +2651,97 @@ HandBrake has exited.";
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             p
         }
+    }
+
+    #[test]
+    fn only_a_definitive_stat_condemns_a_source() {
+        assert!(
+            source_is_confirmed_missing(Ok(false)),
+            "a clean stat saying the file is not there is the one case that fails the job"
+        );
+        assert!(
+            !source_is_confirmed_missing(Ok(true)),
+            "a file that is there is never condemned"
+        );
+        assert!(
+            !source_is_confirmed_missing(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            "an unreadable parent directory means we cannot tell — fail open rather than \
+             report a file that exists as gone"
+        );
+    }
+
+    #[test]
+    fn a_vanished_source_fails_the_job_without_starting_handbrake() {
+        // A queued file can be moved, trashed, or consumed by another tool before its turn.
+        // Handing the dead path to HandBrakeCLI produces a failure whose reason is buried in a
+        // stderr dump, so the queue must stat the source first and fail the job with a message
+        // that says what actually happened.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        // A fake that DOES write its output: if the guard let the spawn through, out.mp4 exists
+        // and the job ends 'done' — so the assertions below can only pass if nothing was started.
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let gone = dir.path().join("gone.mp4"); // deliberately never created
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &db,
+            "j1",
+            gone.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(status, "error", "a vanished source fails the job");
+        assert!(
+            msg.unwrap().contains("Source file no longer exists"),
+            "the history entry must name the real reason, not HandBrake's stderr"
+        );
+        assert!(
+            !out.exists(),
+            "HandBrakeCLI must never be started for a source that is gone"
+        );
+    }
+
+    #[test]
+    fn a_vanished_source_is_recorded_without_a_notification() {
+        // The user removed the file themselves, so the history entry is the whole story — a
+        // desktop notification would just be noise. Observable because the mock app never
+        // registers the notification plugin: any code path that DOES notify panics with
+        // "state() called before manage()", failing this test.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+        // Per-file notifications ON — the setting that makes every other failure path notify.
+        set_setting(&db, "notifications_per_file", "true");
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let gone = dir.path().join("gone.mp4"); // deliberately never created
+        queue_job(
+            &db,
+            "j1",
+            gone.to_str().unwrap(),
+            dir.path().join("out.mp4").to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(
+            job_row(&db, "j1").0,
+            "error",
+            "the job still fails — it is only the notification that is suppressed"
+        );
     }
 
     #[test]
