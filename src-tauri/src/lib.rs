@@ -2,6 +2,7 @@ mod add_progress;
 mod commands;
 mod converter;
 mod db;
+mod failure_class;
 mod handbrake;
 mod media_skip;
 mod probe;
