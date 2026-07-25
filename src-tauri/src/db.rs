@@ -84,6 +84,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             kept_file       TEXT,
             space_saved     INTEGER,
             error_message   TEXT,
+            failure_class   TEXT,
             queue_order     INTEGER NOT NULL,
             created_at      TEXT NOT NULL,
             completed_at    TEXT
@@ -155,6 +156,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         }
     }
 
+    // Older DBs predate the failure classification column. Same idempotent pattern as the
+    // fingerprint columns above, but TEXT — so it needs its own ALTER rather than a new
+    // entry in that INTEGER-typed loop.
+    if let Err(e) = conn.execute("ALTER TABLE jobs ADD COLUMN failure_class TEXT", []) {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+
     // Backfill: Linux DBs seeded before 0.13.1 stored "H.265 MKV 1080p", which is not a
     // valid preset name in current HandBrake (the built-in is "H.265 MKV 1080p30"), so
     // every default conversion failed. INSERT OR IGNORE below won't touch existing rows,
@@ -187,6 +197,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("skip_by_source_media", "false"),
         ("watch_skip_marker", ".downloading"),
         ("low_disk_min_gb", "0"),
+        ("bad_source_action", "trash"),
     ];
 
     for (key, value) in defaults {
@@ -249,7 +260,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 16);
+        assert_eq!(count, 17);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -309,7 +320,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 16);
+        assert_eq!(count, 17);
     }
 
     #[test]
@@ -715,5 +726,77 @@ mod tests {
         .unwrap();
         assert_eq!(fingerprint("old"), (Some(123), Some(456)));
         assert_eq!(fingerprint("new"), (Some(789), Some(1011)));
+    }
+
+    #[test]
+    fn init_db_adds_failure_class_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Writing to the column is the real proof it exists and is TEXT-typed.
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at, failure_class)
+             VALUES ('j1', '/a.mkv', '/a.mp4', 'p', 'error', 0, '2026-01-01T00:00:00Z', 'bad_source')",
+            [],
+        )
+        .unwrap();
+        let got: Option<String> = conn
+            .query_row("SELECT failure_class FROM jobs WHERE id = 'j1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("bad_source"));
+    }
+
+    #[test]
+    fn failure_class_migrates_onto_a_pre_existing_database() {
+        // An auto-updating install already has a jobs table without the column. The
+        // migration must add it without destroying the row that is already there.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, source_path TEXT NOT NULL, output_path TEXT NOT NULL,
+                preset TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+                error_message TEXT, queue_order INTEGER NOT NULL, created_at TEXT NOT NULL,
+                completed_at TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('old', '/old.mkv', '/old.mp4', 'p', 'done', 0, '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let (id, class): (String, Option<String>) = conn
+            .query_row(
+                "SELECT id, failure_class FROM jobs WHERE id = 'old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "old", "the pre-existing row must survive the migration");
+        assert_eq!(
+            class, None,
+            "rows predating the feature are NULL — distinct from a classified 'unknown'"
+        );
+
+        // Idempotent: a second init on the same DB must not error.
+        init_db(&conn).unwrap();
+    }
+
+    #[test]
+    fn bad_source_action_defaults_to_trash() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(
+            setting(&conn, "bad_source_action").as_deref(),
+            Some("trash"),
+            "the review list's bulk action defaults to the recoverable option; permanent \
+             deletion must be chosen deliberately"
+        );
     }
 }
