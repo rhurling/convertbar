@@ -292,17 +292,32 @@ fn purge_ids(
 /// Same ladder as `purge_one`, for the production async command: the shared DB mutex is
 /// released around the rung-4 scan (which can block for `PROBE_TIMEOUT`, ~30s) so it cannot
 /// stall the converter thread's progress writes — or any other command — for the duration.
-/// Because the lock is released, `InUse` is re-checked once it is re-acquired for the destroy
-/// step: the file may have been re-queued while the scan (or simply the gap between the two
-/// lock acquisitions) was in progress. This is what keeps the InUse guarantee TOCTOU-free.
+///
+/// Before the async/lock restructure, identity -> (scan) -> destroy all ran under ONE held
+/// lock, so nothing else could touch this row or path in between (the converter itself must
+/// take this same lock to flip a job to 'encoding'). Releasing the lock around the scan reopens
+/// that window: in the up-to-30s gap, a job for the same path could be added, claimed, encoded
+/// IN PLACE, and complete (landing back at `status = 'done'`, so a same-path InUse check alone
+/// would read as free again) before the scan result comes back. Re-checking only `InUse` after
+/// re-acquiring the lock — the original round-1 fix — misses exactly this: the row's
+/// eligibility and the file's identity fingerprint are not re-verified, so a freshly converted
+/// file (the user's only copy, for an in-place job) could be destroyed as if it were still the
+/// original bad source.
+///
+/// The fix: re-run the FULL `pre_destroy_check` (eligibility, InUse, AlreadyGone, identity —
+/// everything but the scan itself) under the freshly re-acquired lock, and only destroy if it
+/// still passes. A row that needed a rescan will report `NeedsScan` again here (its
+/// `failure_class` hasn't changed) rather than `ReadyToDestroy` — that's expected, and is
+/// treated as "every DB-side fact still holds," not as a signal to scan a second time: the
+/// `RescanVerdict::Destroy` obtained outside the lock already stands as the scan's answer.
 fn purge_one_locked(db: &Arc<Mutex<rusqlite::Connection>>, id: &str, action: &str) -> PurgeOutcome {
     let pre = {
         let conn = db.lock().unwrap();
         pre_destroy_check(&conn, id)
     };
-    let path = match pre {
+    match pre {
         PreDestroy::Stop(outcome) => return outcome,
-        PreDestroy::ReadyToDestroy { path } => path,
+        PreDestroy::ReadyToDestroy { .. } => {}
         PreDestroy::NeedsScan {
             path,
             handbrake_path,
@@ -312,17 +327,22 @@ fn purge_one_locked(db: &Arc<Mutex<rusqlite::Connection>>, id: &str, action: &st
             match rescan_verdict(crate::probe::scan_outcome(&handbrake_path, &path)) {
                 RescanVerdict::Recovered => return PurgeOutcome::Recovered,
                 RescanVerdict::Unverifiable => return PurgeOutcome::Unverifiable,
-                // A real, re-confirmed verdict — fall through to the same re-lock + destroy
-                // tail as a row that never needed a rescan.
-                RescanVerdict::Destroy => path,
+                RescanVerdict::Destroy => {}
             }
         }
-    };
-    let conn = db.lock().unwrap();
-    if path_is_in_use(&conn, &path) {
-        return PurgeOutcome::InUse;
     }
-    destroy_and_record(&conn, id, action, &path)
+
+    // Re-verify everything — not just InUse — under a freshly acquired lock before destroying.
+    let conn = db.lock().unwrap();
+    match pre_destroy_check(&conn, id) {
+        PreDestroy::Stop(outcome) => outcome,
+        // Either never needed a rescan (bad_source_truncated), or needed one and every other
+        // rung still passes — in the latter case the scan already ran above and confirmed
+        // Destroy, so this is not a second rescan, just re-confirmation of the DB-side facts.
+        PreDestroy::ReadyToDestroy { path } | PreDestroy::NeedsScan { path, .. } => {
+            destroy_and_record(&conn, id, action, &path)
+        }
+    }
 }
 
 /// The probe-free skip decision for one path: `Some(reason)` to skip it, `None` to keep it.
@@ -2577,7 +2597,10 @@ mod tests {
         insert_error_row(&conn, "old", p, "bad_source");
         stamp_identity(&conn, "old", p);
 
-        let file = std::fs::File::open(&f).unwrap();
+        // A write handle, not a bare File::open: on Windows, std's set_times calls
+        // SetFileTime on the handle it's given without reopening, and that needs
+        // FILE_WRITE_ATTRIBUTES — a read-only (GENERIC_READ) handle gets ERROR_ACCESS_DENIED.
+        let file = std::fs::File::options().write(true).open(&f).unwrap();
         let pre_epoch = std::time::SystemTime::UNIX_EPOCH
             .checked_sub(std::time::Duration::from_secs(86_400))
             .unwrap();
@@ -2645,6 +2668,63 @@ mod tests {
         assert!(
             f.exists(),
             "a file a queued job depends on must never be destroyed via the locked path either"
+        );
+    }
+
+    // N2 regression test: the DB lock is released around the rung-4 scan (up to PROBE_TIMEOUT,
+    // ~30s), and in that window an in-place re-conversion of the SAME path could complete —
+    // leaving a brand-new file at `path` with different bytes, while InUse alone reads as free
+    // again (the job finished). Re-checking only InUse after re-acquiring the lock (round 1's
+    // fix) would miss this; the file's identity must be re-verified too. Simulated
+    // deterministically, without real thread concurrency: the stand-in HandBrake script itself
+    // rewrites the target file before reporting no title, standing in for a completed in-place
+    // conversion landing during the scan. If the post-scan re-check is ever narrowed back down
+    // to just path_is_in_use, this test destroys the file and fails.
+    #[cfg(unix)]
+    #[test]
+    fn purge_one_locked_refuses_when_the_file_changes_during_the_scan_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("movie.mkv");
+        std::fs::write(&f, b"original bad bytes").unwrap();
+        let p = f.to_str().unwrap();
+        insert_error_row(&conn, "old", p, "bad_source");
+        stamp_identity(&conn, "old", p); // fingerprint pinned to the ORIGINAL bytes
+
+        // Stand-in HandBrake: overwrite the target file (an in-place re-conversion completing
+        // mid-scan), then report no title and exit cleanly.
+        let script = dir.path().join("fake-handbrake.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'freshly converted, different bytes' > '{p}'\n\
+                 echo 'no title here'\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        conn.execute(
+            "UPDATE settings SET value = ?1 WHERE key = 'handbrake_path'",
+            params![script.to_str().unwrap()],
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(conn));
+
+        let outcome = purge_one_locked(&db, "old", "delete");
+        assert_eq!(
+            outcome,
+            PurgeOutcome::Changed,
+            "the file's identity changed while the lock was released for the scan — the \
+             post-scan re-check must catch this, not just re-check InUse"
+        );
+        assert!(
+            f.exists(),
+            "a file that changed during the scan window must never be destroyed, even though \
+             the scan confirmed the ORIGINAL content had no title"
         );
     }
 }
