@@ -79,6 +79,47 @@ Separately, `Invalid preset` also exits 2. That is a *global config* fault — a
 - **No automatic destruction, ever.** Classification only *labels*. Destruction happens when the user presses a button in a review list.
 - **Setting:** `bad_source_action` = `trash` | `delete`, default `trash`. No `off` value — the review list is harmless until pressed, so gating it behind a setting would only hide corrupt-download information from users who never find the toggle.
 
+## Rejected: an optional ffprobe / second-engine dependency
+
+Considered and measured. **Not adopted.**
+
+`ffprobe -count_packets` detects truncation without decoding, and it is fast:
+
+```
+ffprobe -count_packets trunc.mp4 → 132 packets (real 0.01s) vs declared 20s × 24fps = 480 → 27.5%
+ffprobe -count_packets trunc.mkv → 155 packets, plus an explicit "File ended prematurely"
+```
+
+Three findings sank it:
+
+1. **It adds no accuracy.** 132/480 is the same verdict the free post-encode check already reaches at 131/480. Its only advantage is *earliness*.
+2. **HandBrake already provides that earliness.** The default `--scan --json` — the exact command `probe.rs:72` already runs — decodes previews and reports the shortfall. ConvertBar discards it at `probe.rs:81` (`.stderr(Stdio::null())`):
+
+   ```
+   healthy:    scan: 10 previews, 320x240, 24.000 fps
+   truncated:  Warning: Could not read data for preview 7, skipped
+               scan: 6 previews, 320x240, 24.000 fps
+   truncated MKV: File ended prematurely (repeated)
+   ```
+
+   Healthy files return 10/10 at every duration tested (0.5 s, 1 s, 3 s, 8 s, 120 s).
+3. **The wasted-encode argument, the main reason to want pre-flight, is weak.** HandBrake stops at the data boundary rather than encoding the phantom tail — a 2-min clip truncated to 25 % encoded in 1.19 s against 2.82 s healthy. There is no full-length encode to save.
+
+Against that: a configured-optional engine means **two classification paths**, and the non-default one is by construction the under-tested one — plus binary detection, a settings field, docs, and cross-platform validation. Even its one theoretical edge (per-file pre-flight cheaper than a HandBrake scan) is uncertain: `-count_packets` is index-based and near-free on MP4, but must walk clusters on MKV, making it O(file size) I/O — worse than HandBrake's seek-based previews on a NAS.
+
+## Deferred: Phase 3 — pre-flight preview shortfall
+
+Recorded because the finding above makes it nearly free, **not committed to this spec.**
+
+Parse `scan: N previews` from the scan already run in `probe.rs`, flipping `.stderr(Stdio::null())` to piped. `N` < requested → the source is truncated, detectable before any encode.
+
+Two reasons it is deferred rather than included:
+
+- It only runs when `skip_by_source_media` is on, because that is the only time the scan happens. Making it universal means a HandBrake scan per file at add time — precisely the cost the project already decided must be opt-in (`db.rs:262`: "it shells out to HandBrake per file, so it is opt-in").
+- Preview shortfall is a weaker signal than frame shortfall and would be used *pre-flight*, where a false positive rejects a healthy file rather than merely re-checking one. It would need validation against real-world VBR and network-mounted media before it could be authoritative.
+
+If wasted encodes on corrupt downloads prove annoying in practice, this is the follow-up — and it changes nothing in Phases 1–2.
+
 ## Non-goals
 
 - No retry / two-strike mechanism. There is no way to re-run an errored job today, and building one is out of scope.
