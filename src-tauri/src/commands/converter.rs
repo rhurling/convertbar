@@ -241,8 +241,12 @@ pub fn cancel_conversion<R: tauri::Runtime>(
                 )
                 .ok();
             let update_result = db.execute(
-                "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user' WHERE id = ?1",
-                rusqlite::params![job_id],
+                "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user', \
+                 failure_class = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    job_id,
+                    crate::failure_class::FailureClass::Environment.as_str()
+                ],
             );
             (paths, Some(update_result))
         }
@@ -456,18 +460,24 @@ mod tests {
             "partial output must be gone — on Windows this fails if the delete runs before the child is reaped"
         );
         let state: State<'_, AppState> = app.state();
-        let (status, msg): (String, Option<String>) = state
+        let (status, msg, class): (String, Option<String>, Option<String>) = state
             .db
             .lock()
             .unwrap()
             .query_row(
-                "SELECT status, error_message FROM jobs WHERE id = 'j1'",
+                "SELECT status, error_message, failure_class FROM jobs WHERE id = 'j1'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(status, "error");
         assert_eq!(msg.as_deref(), Some("Cancelled by user"));
+        assert_eq!(
+            class.as_deref(),
+            Some("environment"),
+            "a cancellation is an external action, never the file's fault — and NULL would \
+             wrongly read as 'row predates this feature'"
+        );
         assert!(
             converter.current_child.lock().unwrap().is_none(),
             "the reaped handle must be cleared so the queue loop takes its cancel branch"

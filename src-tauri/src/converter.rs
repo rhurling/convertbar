@@ -1835,6 +1835,27 @@ mod tests {
         }
     }
 
+    // A stand-in for HandBrakeCLI failing to scan the input: exits 2 (HandBrake's real
+    // "bad input" code) with the exact diagnostic it emits when it can't parse a file —
+    // "No title found." — a SOURCE_MARKERS hit in failure_class.rs. Writes no output, so
+    // process_queue takes the generic failure arm (not the empty-output success guard).
+    fn bad_source_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb-badsource.cmd");
+            std::fs::write(&p, "@echo No title found. 1>&2\r\n@exit /b 2\r\n").unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("hb-badsource.sh");
+            std::fs::write(&p, "#!/bin/sh\necho \"No title found.\" >&2\nexit 2\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
     // A stand-in for a long-running encode: writes a partial output file (last CLI
     // arg, like HandBrakeCLI's -o), then blocks long past the test's timeouts.
     fn slow_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1984,6 +2005,15 @@ mod tests {
                 msg.contains("boom"),
                 "{id} must keep the stderr diagnostic, got: {msg}"
             );
+            // Exit 0 with an undiagnostic stderr ("boom", no source/environment marker)
+            // must classify as Unknown — never BadSource. Pins the empty-output call site
+            // against a regression that hardcodes/misreasons a class here instead of
+            // consulting classify().
+            assert_eq!(
+                class_of(&db, id).as_deref(),
+                Some("unknown"),
+                "{id}: an undiagnosable empty output must never be classified bad_source"
+            );
         }
         assert!(
             !out1.exists() && !out2.exists(),
@@ -1991,6 +2021,43 @@ mod tests {
         );
         let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
         assert!(final_update.contains("\"error\""));
+    }
+
+    #[test]
+    fn a_scan_failure_on_a_readable_source_is_classified_bad_source() {
+        // The only path that can produce failure_class = 'bad_source' end-to-end: exit 2
+        // (HandBrake's bad-input code) plus a source-marker diagnostic, against a source
+        // we ourselves can open. This pins the failure arm's `let exit_code = match &other
+        // {...}` wiring (converter.rs) — if that were ever collapsed to `None`, classify's
+        // rule 4 (`exit_code == Some(2)`) could never fire and every such job would
+        // silently fall through to Unknown with a still-green suite.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = bad_source_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let out = dir.path().join("out.mp4");
+        let src = real_source(dir.path(), "a.mp4"); // genuinely exists and is readable
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(status, "error");
+        assert!(msg.unwrap().contains("No title found"));
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("bad_source"),
+            "exit 2 + a source-marker diagnostic against a readable source must be bad_source"
+        );
     }
 
     // End-to-end (local/e2e-ignored CI only): needs ffmpeg to synthesize a clip and a
@@ -2912,6 +2979,12 @@ HandBrake has exited.";
             job_row(&db, "j1").0,
             "error",
             "the job still fails — it is only the notification that is suppressed"
+        );
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("environment"),
+            "a vanished source is structurally known to be Environment — never BadSource, \
+             since we never got the chance to read the file ourselves"
         );
     }
 
