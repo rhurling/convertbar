@@ -452,6 +452,29 @@ fn source_is_confirmed_missing(probe: std::io::Result<bool>) -> bool {
     matches!(probe, Ok(false))
 }
 
+/// Whether we can actually read `path` ourselves, right now.
+///
+/// This exists because HandBrake's stderr is byte-identical for a zero-byte file, a
+/// directory, and a healthy file we lack permission to open — all exit 2 with
+/// "No title found." Believing HandBrake alone would eventually offer good files for
+/// deletion. Opening and reading one byte is our own evidence.
+///
+/// Every failure mode returns `false`, which the classifier routes to `Environment` and
+/// therefore never destroys. That is the opposite polarity from
+/// [`source_is_confirmed_missing`], which fails open because there the safe answer is
+/// "let HandBrake try".
+fn source_is_readable(path: &str) -> bool {
+    use std::io::Read;
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            let mut byte = [0u8; 1];
+            // Ok(0) is a legitimately empty but readable file.
+            f.read(&mut byte).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Outcome of trying to claim the next job by flipping it 'queued' -> 'encoding'. The claim is
 /// conditional (`AND status = 'queued'`) so a job that `clear_queue`/`remove_job` deleted during
 /// the pre-spawn window is not resurrected — spawning on a deleted row could trash the source.
@@ -587,13 +610,15 @@ fn record_job_error_quiet<R: tauri::Runtime>(
     db: &Arc<Mutex<Connection>>,
     job_id: &str,
     err_msg: &str,
+    class: crate::failure_class::FailureClass,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
     {
         let db = db.lock().unwrap();
         let _ = db.execute(
-            "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3 WHERE id = ?1",
-            params![job_id, err_msg, now],
+            "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3, \
+             failure_class = ?4 WHERE id = ?1",
+            params![job_id, err_msg, now, class.as_str()],
         );
     }
     let _ = app.emit(
@@ -614,8 +639,9 @@ fn record_job_error<R: tauri::Runtime>(
     job_id: &str,
     file_name: &str,
     err_msg: &str,
+    class: crate::failure_class::FailureClass,
 ) {
-    record_job_error_quiet(app, db, job_id, err_msg);
+    record_job_error_quiet(app, db, job_id, err_msg, class);
 
     let notify_per_file = {
         let db = db.lock().unwrap();
@@ -718,7 +744,13 @@ fn process_queue<R: tauri::Runtime>(
         // queue behind a disk pause, and the gate would size it from a source that isn't there.
         if source_is_confirmed_missing(std::path::Path::new(&job.source_path).try_exists()) {
             had_errors = true;
-            record_job_error_quiet(app, db, &job.id, "Source file no longer exists");
+            record_job_error_quiet(
+                app,
+                db,
+                &job.id,
+                "Source file no longer exists",
+                crate::failure_class::FailureClass::Environment,
+            );
             continue;
         }
 
@@ -765,7 +797,14 @@ fn process_queue<R: tauri::Runtime>(
             Some(p) => p,
             None => {
                 had_errors = true;
-                record_job_error(app, db, &job.id, &file_name, "HandBrakeCLI not found");
+                record_job_error(
+                    app,
+                    db,
+                    &job.id,
+                    &file_name,
+                    "HandBrakeCLI not found",
+                    crate::failure_class::FailureClass::Environment,
+                );
                 continue;
             }
         };
@@ -795,6 +834,7 @@ fn process_queue<R: tauri::Runtime>(
                     &job.id,
                     &file_name,
                     &format!("Failed to claim job: {e}"),
+                    crate::failure_class::FailureClass::Environment,
                 );
                 continue;
             }
@@ -868,6 +908,7 @@ fn process_queue<R: tauri::Runtime>(
                     &job.id,
                     &file_name,
                     &format!("Failed to start HandBrakeCLI: {}", e),
+                    crate::failure_class::FailureClass::Environment,
                 );
                 *converter.current_job_id.lock().unwrap() = None;
                 continue;
@@ -981,12 +1022,19 @@ fn process_queue<R: tauri::Runtime>(
                     let tail = stderr_tail_thread
                         .and_then(|t| t.join().ok())
                         .unwrap_or_default();
+                    let class =
+                        crate::failure_class::classify(&crate::failure_class::FailureFacts {
+                            exit_code: status.code(),
+                            source_readable: source_is_readable(&job.source_path),
+                            stderr_tail: &tail,
+                        });
                     record_job_error(
                         app,
                         db,
                         &job.id,
                         &file_name,
                         &empty_output_error_message(&tail),
+                        class,
                     );
                     continue;
                 }
@@ -1049,7 +1097,14 @@ fn process_queue<R: tauri::Runtime>(
                     } else {
                         "In-place replacement failed; original may be in Trash"
                     };
-                    record_job_error(app, db, &job.id, &file_name, err_msg);
+                    record_job_error(
+                        app,
+                        db,
+                        &job.id,
+                        &file_name,
+                        err_msg,
+                        crate::failure_class::FailureClass::Environment,
+                    );
                     // Intentionally leave the temp (`.{stem}.convertbar-tmp.mp4`): it holds the
                     // re-encoded content, and in trash mode it is the only in-place copy (the
                     // original is in Trash), so removing it would force trash recovery. The marker
@@ -1158,7 +1213,11 @@ fn process_queue<R: tauri::Runtime>(
                     break;
                 }
             }
-            Ok(_) | Err(_) => {
+            other => {
+                let exit_code = match &other {
+                    Ok(s) => s.code(),
+                    Err(_) => None,
+                };
                 // Quit path: the exit handler killed this child, the encode didn't
                 // fail. Skip ALL bookkeeping — deleting the partial, writing
                 // status='error' (auto-resume only picks up 'encoding'/'paused'),
@@ -1187,12 +1246,19 @@ fn process_queue<R: tauri::Runtime>(
                     let tail = stderr_tail_thread
                         .and_then(|t| t.join().ok())
                         .unwrap_or_default();
+                    let class =
+                        crate::failure_class::classify(&crate::failure_class::FailureFacts {
+                            exit_code,
+                            source_readable: source_is_readable(&job.source_path),
+                            stderr_tail: &tail,
+                        });
                     record_job_error(
                         app,
                         db,
                         &job.id,
                         &file_name,
                         &error_message_from_tail(&tail),
+                        class,
                     );
                 }
             }
@@ -1385,6 +1451,111 @@ mod tests {
             sink.lock().unwrap().push(event.payload().to_string());
         });
         store
+    }
+
+    #[test]
+    fn source_is_readable_reports_a_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("clip.mkv");
+        std::fs::write(&f, b"data").unwrap();
+        assert!(source_is_readable(f.to_str().unwrap()));
+    }
+
+    #[test]
+    fn source_is_readable_fails_safe_on_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.mkv");
+        assert!(
+            !source_is_readable(missing.to_str().unwrap()),
+            "an unopenable path must report false, which routes to Environment — never destructive"
+        );
+    }
+
+    #[test]
+    fn source_is_readable_reports_false_for_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !source_is_readable(dir.path().to_str().unwrap()),
+            "a directory cannot be read as a file; failing safe is correct"
+        );
+    }
+
+    // A zero-byte file IS openable — readability is about access, not content. The
+    // classifier, not this probe, decides the file is garbage.
+    #[test]
+    fn source_is_readable_reports_true_for_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("empty.mkv");
+        std::fs::write(&f, b"").unwrap();
+        assert!(source_is_readable(f.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_is_readable_reports_false_without_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses mode bits entirely, so this assertion is meaningless as uid 0
+        // (rootful docker / `act`). GitHub's ubuntu runner is non-root, so PR CI runs it.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("locked.mkv");
+        std::fs::write(&f, b"data").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = source_is_readable(f.to_str().unwrap());
+        // Restore so tempdir cleanup works regardless of the assertion outcome.
+        let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644));
+        assert!(
+            !readable,
+            "an unreadable healthy file must never be credited as readable"
+        );
+    }
+
+    fn class_of(db: &Arc<Mutex<Connection>>, id: &str) -> Option<String> {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT failure_class FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn record_job_error_persists_the_failure_class() {
+        let app = mock_app();
+        let db = test_db();
+        queue_job(&db, "j1", "/src.mkv", "/out.mp4", 1000);
+        record_job_error(
+            app.handle(),
+            &db,
+            "j1",
+            "src.mkv",
+            "Conversion failed",
+            crate::failure_class::FailureClass::BadSource,
+        );
+        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source"));
+    }
+
+    #[test]
+    fn record_job_error_quiet_persists_environment_for_a_vanished_source() {
+        let app = mock_app();
+        let db = test_db();
+        queue_job(&db, "j2", "/gone.mkv", "/out.mp4", 1000);
+        record_job_error_quiet(
+            app.handle(),
+            &db,
+            "j2",
+            "Source file no longer exists",
+            crate::failure_class::FailureClass::Environment,
+        );
+        assert_eq!(
+            class_of(&db, "j2").as_deref(),
+            Some("environment"),
+            "a file that vanished is never the user's corrupt-download problem"
+        );
     }
 
     #[test]
