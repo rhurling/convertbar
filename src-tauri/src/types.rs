@@ -130,6 +130,12 @@ pub enum PurgeOutcome {
     Changed,
     /// A fresh scan now reads the file fine — the original verdict was a transient fault.
     Recovered,
+    /// A `bad_source` verdict requires a rescan to confirm before destroying, but the rescan
+    /// could not be run or could not be told apart from "confirmed still bad" (no HandBrakeCLI,
+    /// a spawn failure, or a scan timeout all surface identically). Left alone pending a retry.
+    // NOTE: no TS mirror exists yet for `PurgeOutcome` — get_bad_sources/purge_bad_sources have
+    // no frontend caller as of this task. Add this variant to that union when one is added.
+    Unverifiable,
     /// The delete/trash call itself failed.
     Failed,
 }
