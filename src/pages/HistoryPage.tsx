@@ -84,6 +84,12 @@ export default function HistoryPage() {
   // is still silently dropped rather than shown when they come back (see C6).
   const mountedRef = useRef(true);
   useEffect(() => {
+    // React 19's StrictMode dev double-invoke mounts, cleans up, and remounts every effect on
+    // the same component instance — without this line, the cleanup from that first synthetic
+    // pass leaves mountedRef latched false for the rest of the session, so runPurge's
+    // `if (!mountedRef.current) return;` guard (below) skips ALL post-await state updates,
+    // permanently.
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
     };

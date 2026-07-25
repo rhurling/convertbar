@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -648,6 +649,45 @@ describe("HistoryPage", () => {
       await waitFor(() =>
         expect(screen.getByText(/0 file\(s\) removed\. 1 left alone\./i)).toBeInTheDocument(),
       );
+    });
+
+    // R1: `mountedRef` only ever registered a cleanup (`mountedRef.current = false`) and never
+    // re-set it to `true` in the effect body. RTL's plain `render()` never exercises this,
+    // because it doesn't wrap in StrictMode — but src/main.tsx does, and React 19's dev
+    // double-invoke runs an effect's mount -> cleanup -> mount on the SAME instance, so that
+    // cleanup latches mountedRef.current false for the rest of the session. Every post-await
+    // update in runPurge (setArmedIds(null), setPurging(false), setPurgeOutcomeNote) is then
+    // silently skipped forever: the strip is stuck on "Removing 1 file…" with Confirm/Cancel
+    // both disabled, with zero indication of what happened to the file.
+    it("still reports the outcome and re-enables the strip after a purge, under StrictMode's double-invoked effects", async () => {
+      badSources = [badSourceJob("a")];
+      // A skipped outcome (rather than a fully-successful purge) so buildOutcomeNote actually
+      // renders text — an all-purged batch legitimately renders no note (see buildOutcomeNote),
+      // which would make this test pass vacuously regardless of the mountedRef bug.
+      purgeResults = [{ id: "a", outcome: "in_use" }];
+
+      render(
+        <StrictMode>
+          <HistoryPage />
+        </StrictMode>,
+      );
+
+      await screen.findByText(/bad sources \(1\)/i);
+      fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      await waitFor(() => expect(screen.getByText(/removing 1 file/i)).toBeInTheDocument());
+
+      // Without the fix, this never resolves — the note never appears and the strip stays
+      // stuck on "Removing 1 file…" forever.
+      await waitFor(() =>
+        expect(
+          screen.getByText(/0 file\(s\) removed\. 1 still queued or being converted\./i),
+        ).toBeInTheDocument(),
+      );
+      expect(screen.queryByText(/removing 1 file/i)).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /move 1 to trash/i })).toBeEnabled();
     });
   });
 });
