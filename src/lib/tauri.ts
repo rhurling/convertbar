@@ -91,6 +91,7 @@ export interface AppSettings {
   skip_by_source_media: boolean;
   watch_skip_marker: string;
   low_disk_min_gb: number;
+  bad_source_action: "trash" | "delete";
 }
 
 export interface PathsExist {

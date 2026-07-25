@@ -247,6 +247,34 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       </div>
 
       <div className="setting-group">
+        <label className="setting-label">Bad source files</label>
+        <p className="setting-hint">
+          Files ConvertBar could not read, or that turned out to be incomplete
+          downloads, are listed in History. Nothing is removed until you choose to.
+        </p>
+        <div className="setting-radios">
+          <label className="radio-label">
+            <input
+              type="radio"
+              name="badSource"
+              checked={settings.bad_source_action === "trash"}
+              onChange={() => updateSetting("bad_source_action", "trash")}
+            />
+            Move bad source files to Trash
+          </label>
+          <label className="radio-label">
+            <input
+              type="radio"
+              name="badSource"
+              checked={settings.bad_source_action === "delete"}
+              onChange={() => updateSetting("bad_source_action", "delete")}
+            />
+            Delete bad source files permanently
+          </label>
+        </div>
+      </div>
+
+      <div className="setting-group">
         <label className="setting-label">
           <input
             type="checkbox"

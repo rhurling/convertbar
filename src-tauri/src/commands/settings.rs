@@ -49,6 +49,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
     let mut skip_by_source_media = false;
     let mut watch_skip_marker = String::new();
     let mut low_disk_min_gb: f64 = 0.0;
+    let mut bad_source_action = String::from("trash");
 
     let rows = stmt
         .query_map([], |row| {
@@ -77,6 +78,9 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
             "skip_by_source_media" => skip_by_source_media = value == "true",
             "watch_skip_marker" => watch_skip_marker = value,
             "low_disk_min_gb" => low_disk_min_gb = value.parse().unwrap_or(0.0),
+            "bad_source_action" => {
+                bad_source_action = normalize_bad_source_action(&value).to_string()
+            }
             _ => {}
         }
     }
@@ -101,6 +105,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
         skip_by_source_media,
         watch_skip_marker,
         low_disk_min_gb,
+        bad_source_action,
     })
 }
 
@@ -121,7 +126,19 @@ const ALLOWED_KEYS: &[&str] = &[
     "skip_by_source_media",
     "watch_skip_marker",
     "low_disk_min_gb",
+    "bad_source_action",
 ];
+
+/// Coerce a stored `bad_source_action` to a known value. Anything other than an exact
+/// "delete" reads as "trash": a corrupted, empty, or future value must never silently
+/// escalate to permanent deletion.
+pub(crate) fn normalize_bad_source_action(value: &str) -> &'static str {
+    if value == "delete" {
+        "delete"
+    } else {
+        "trash"
+    }
+}
 
 #[tauri::command]
 pub fn update_setting(
@@ -222,5 +239,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_suffix_template(&conn, "P"), ".custom");
+    }
+
+    #[test]
+    fn bad_source_action_is_writable_and_unknown_values_fall_back_to_trash() {
+        assert!(
+            ALLOWED_KEYS.contains(&"bad_source_action"),
+            "the Settings UI writes this key via update_setting"
+        );
+        // Parse fallback: anything that is not exactly "delete" must read as "trash", so a
+        // corrupted or future value can never silently upgrade to permanent deletion.
+        assert_eq!(normalize_bad_source_action("delete"), "delete");
+        assert_eq!(normalize_bad_source_action("trash"), "trash");
+        assert_eq!(normalize_bad_source_action(""), "trash");
+        assert_eq!(normalize_bad_source_action("DELETE"), "trash");
+        assert_eq!(normalize_bad_source_action("nonsense"), "trash");
     }
 }
