@@ -92,6 +92,36 @@ pub fn classify(facts: &FailureFacts) -> FailureClass {
     FailureClass::Unknown
 }
 
+/// A source counts as truncated only when it decoded to less than this fraction of the
+/// frames HandBrake expected. Measured margin is wide — healthy encodes sit at exactly
+/// 1.00, truncated ones at 0.21–0.32 — so 0.90 absorbs container accounting quirks
+/// without approaching either cluster.
+pub const MIN_DECODED_FRACTION: f64 = 0.90;
+
+/// Parse one `sync: got N frames, M expected` line into `(got, expected)`.
+fn parse_sync_line(line: &str) -> Option<(u64, u64)> {
+    let rest = line.split_once("sync: got ")?.1;
+    let (got, rest) = rest.split_once(" frames, ")?;
+    let expected = rest.strip_suffix(" expected")?;
+    Some((got.trim().parse().ok()?, expected.trim().parse().ok()?))
+}
+
+/// The frame shortfall HandBrake reported, as `(decoded, expected)`.
+///
+/// Takes the LAST such line in the tail. Returns `None` when the marker is absent or
+/// unparseable, which the caller must treat as uncertainty — never as truncation.
+pub fn decode_shortfall(stderr_tail: &str) -> Option<(u64, u64)> {
+    stderr_tail.lines().filter_map(parse_sync_line).last()
+}
+
+/// Whether a decode shortfall is large enough to mean the source is truncated.
+///
+/// `expected == 0` is uncertainty (nothing to compare against) and is never truncated.
+/// Expressed as a multiplication rather than a division so a zero denominator is impossible.
+pub fn is_truncated(got: u64, expected: u64) -> bool {
+    expected > 0 && (got as f64) < (expected as f64) * MIN_DECODED_FRACTION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +235,80 @@ HandBrake has exited.
             "",
             "Unknown must never serialize to NULL/empty — NULL means 'predates this feature'"
         );
+    }
+
+    // Real tail from a truncated MP4 encode (HandBrakeCLI 1.11.2, exit 0).
+    const TRUNCATED_TAIL: &str = r#"[10:01:21] sync: expecting 480 video frames
+[10:01:21] h264-decoder done: 131 frames, 1 decoder errors
+[10:01:21] sync: got 131 frames, 480 expected
+[10:01:21] libhb: work result = 0
+"#;
+
+    // Real tail from a truncated MKV encode. Note ZERO decoder errors — a cleanly
+    // truncated MKV decodes its available frames without error, so decoder errors must
+    // NOT be a required condition or MKV truncation is missed entirely.
+    const TRUNCATED_MKV_TAIL: &str = r#"[10:12:15] h264-decoder done: 155 frames, 0 decoder errors
+[10:12:15] sync: got 155 frames, 480 expected
+"#;
+
+    const HEALTHY_TAIL: &str = r#"[10:01:59] h264-decoder done: 480 frames, 0 decoder errors
+[10:01:59] sync: got 480 frames, 480 expected
+"#;
+
+    #[test]
+    fn parses_the_frame_shortfall_marker() {
+        assert_eq!(decode_shortfall(TRUNCATED_TAIL), Some((131, 480)));
+        assert_eq!(decode_shortfall(TRUNCATED_MKV_TAIL), Some((155, 480)));
+        assert_eq!(decode_shortfall(HEALTHY_TAIL), Some((480, 480)));
+    }
+
+    #[test]
+    fn absent_or_garbled_marker_is_uncertainty_not_truncation() {
+        assert_eq!(decode_shortfall(""), None);
+        assert_eq!(decode_shortfall("no marker here at all"), None);
+        assert_eq!(
+            decode_shortfall("sync: got many frames, some expected"),
+            None
+        );
+        assert_eq!(decode_shortfall("sync: got 131 frames"), None);
+    }
+
+    #[test]
+    fn takes_the_last_marker_when_several_are_present() {
+        // Defensive: multi-pass and subtitle-scan encodes were both checked and emit exactly
+        // one line, but a Phase 2 false positive routes a HEALTHY file into the purge list,
+        // so a stray earlier line must never decide the verdict.
+        let two = "[00:00:01] sync: got 10 frames, 480 expected\n\
+                   [00:00:09] sync: got 480 frames, 480 expected\n";
+        assert_eq!(decode_shortfall(two), Some((480, 480)));
+    }
+
+    #[test]
+    fn truncation_threshold_separates_real_cases_with_margin() {
+        // (got, expected, expect_truncated, why)
+        let cases = [
+            (480u64, 480u64, false, "healthy CFR MP4 decodes every frame"),
+            (
+                150,
+                150,
+                false,
+                "healthy VFR — expected comes from sync's own accounting",
+            ),
+            (131, 480, true, "truncated MP4, 27%"),
+            (155, 480, true, "truncated MKV, 32%, zero decoder errors"),
+            (593, 2880, true, "truncated 2-min clip, 21%"),
+            (
+                0,
+                0,
+                false,
+                "no frames expected — uncertainty, never truncated",
+            ),
+            (0, 480, true, "nothing decoded at all"),
+            (432, 480, false, "exactly at the 90% floor is not truncated"),
+            (431, 480, true, "just past the floor is truncated"),
+        ];
+        for (got, expected, want, why) in cases {
+            assert_eq!(is_truncated(got, expected), want, "{why}");
+        }
     }
 }
