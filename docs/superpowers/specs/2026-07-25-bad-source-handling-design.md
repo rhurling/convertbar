@@ -154,9 +154,11 @@ Rules, first match wins:
 2. stderr contains an environment marker → **Environment**.
    `invalid preset`, `no space left`, `permission denied`, `not permitted`, `read-only`, `cannot create`.
    Checked **before** rule 3 so `Invalid preset` (exit 2) can never reach the `BadSource` branch.
-3. `exit_code == Some(2)` **and** stderr contains a source marker → **BadSource**.
+3. `exit_code == Some(3)` → **Environment**.
+   Exit 3 is `HB_ERROR_INIT` / a libhb work failure — measured for both "output dir missing" and "output dir read-only" with a *valid* source. HandBrake signals bad input with 2, never 3, so 3 is never the file's fault.
+4. `exit_code == Some(2)` **and** stderr contains a source marker → **BadSource**.
    `unrecognized file type`, `no title found`, `0 valid title`.
-4. Otherwise → **Unknown**.
+5. Otherwise → **Unknown**.
 
 Matching is lowercase-substring, consistent with the existing `DIAGNOSTIC_MARKERS` handling (`converter.rs:524`).
 
@@ -216,10 +218,13 @@ The existing ALTER loop at `db.rs:150` is hardcoded to `INTEGER` (it exists for 
 
 | variant | stored |
 |---|---|
-| `BadSource` | `'bad_source'` |
-| `BadSource`, after a successful purge | `'bad_source_purged'` |
+| `BadSource` via rule 4 (scan failure) | `'bad_source'` |
+| `BadSource` via Phase 2 (truncation) | `'bad_source_truncated'` |
+| either, after a successful purge | `'bad_source_purged'` |
 | `Environment` | `'environment'` |
 | `Unknown` | `'unknown'` |
+
+Rule-4 and truncation rows are stored **distinctly** because purge must treat them differently: rule-4 rows are re-scanned before destruction, truncation rows must not be (they pass a scan by construction — see the purge ladder). A single `'bad_source'` value would make that distinction unrecoverable at purge time. The review list matches `IN ('bad_source','bad_source_truncated')`.
 
 `Unknown` is stored as `'unknown'`, **never NULL**. NULL means exactly one thing — a row written before this feature existed. Collapsing the two would make new unclassified failures indistinguishable from legacy history, and the review list's "NULL never appears" property depends on the distinction.
 
@@ -236,24 +241,24 @@ The existing ALTER loop at `db.rs:150` is hardcoded to `INTEGER` (it exists for 
 
 ### Review list
 
-- **`get_bad_sources()`** → `SELECT … WHERE status='error' AND failure_class='bad_source' ORDER BY completed_at DESC`
+- **`get_bad_sources()`** → `SELECT … WHERE status='error' AND failure_class IN ('bad_source','bad_source_truncated') ORDER BY completed_at DESC`
 - **`purge_bad_sources(ids: Vec<String>)`** → returns per-id outcomes. Per id, in order — the first four all mean "do not touch the file":
 
   1. **`InUse`** — some job in `('queued','encoding','paused')` has this `source_path`. A user may have re-added the file (error rows do not block re-add: `fetch_skip_sets`, `queue.rs:188`, skips only active and done rows). Destroying it mid-run would yank the source out from under a live encode.
   2. **`AlreadyGone`** — the path no longer exists.
   3. **`Changed`** — the current `(size, mtime)` does not match the row's `source_size`/`source_mtime`. The path has been re-downloaded or replaced, and a stale verdict must not condemn a new file.
-  4. **`Recovered`** — *only for rows classified by rule 3* — a fresh `--scan` now finds a valid title. See below.
+  4. **`Recovered`** — *only for `'bad_source'` (rule-4) rows* — a fresh `--scan` now finds a valid title. See below.
   5. Otherwise `trash::delete` or `fs::remove_file` per `bad_source_action`.
 
   **Identity uses the fingerprint the codebase already has.** `file_identity` (`queue.rs:77`) returns `probe_cache::FileIdentity { size, mtime }`, and `record_source_identity` (`converter.rs:69`) stores it per job in `jobs.source_size`/`source_mtime` — existing infrastructure that already guards the *re-encode skip* decision. Reusing it here, where the operation is irreversible, is strictly better than a size-only comparison: a replacement file of coincidentally identical size passes a size check and fails an mtime check. Rows with NULL fingerprints (pre-feature history) fall back to `original_size`.
 
-  **Rule-3 rows are re-scanned before destruction.** This is the guard against the design's sharpest failure mode: a healthy file on a network mount that hiccupped during scan produces exit 2 + `No title found.` — indistinguishable from garbage — and, if the mount heals before the readability probe runs, passes rule 1 and lands in the review list as `bad_source`. Nothing about the file changed, so the identity check passes too. Without a re-scan, **Delete permanently** destroys a healthy file, which contradicts Goal 2 outright.
+  **Rule-4 rows are re-scanned before destruction.** This is the guard against the design's sharpest failure mode: a healthy file on a network mount that hiccupped during scan produces exit 2 + `No title found.` — indistinguishable from garbage — and, if the mount heals before the readability probe runs, passes rule 1 and lands in the review list as `'bad_source'`. Nothing about the file changed, so the identity check passes too. Without a re-scan, **Delete permanently** destroys a healthy file, which contradicts Goal 2 outright.
 
   A purge is rare and user-initiated, so one `--scan` per file is affordable — and it uses HandBrakeCLI, requiring no second engine.
 
-  **It must be scoped to rule-3 rows.** Phase 2 truncation rows *pass* a scan by construction: the container header is intact and reports a full title — that is the entire reason truncation is undetectable at scan time. Applying the re-scan to them would clear every truncated file from the list and silently disable Phase 2. Truncation rows are defended by the identity check alone.
+  **It must be scoped to `'bad_source'` rows.** Phase 2 truncation rows *pass* a scan by construction: the container header is intact and reports a full title — that is the entire reason truncation is undetectable at scan time. Applying the re-scan to them would clear every truncated file from the list and silently disable Phase 2. Truncation rows are defended by the identity check alone.
 
-  On a successful purge the row's `failure_class` becomes `bad_source_purged`. The list query matches `= 'bad_source'` exactly, so purged entries drop out while remaining visible in normal history — without this the same rows reappear and a second press produces nothing but errors.
+  On a successful purge the row's `failure_class` becomes `bad_source_purged`. The list query matches the two unpurged values, so purged entries drop out while remaining visible in normal history — without this the same rows reappear and a second press produces nothing but errors.
 
 ### Interaction with existing history clearing — accepted as-is
 
@@ -338,7 +343,7 @@ Also covered:
 - Integration tests on the existing fake-HandBrake harness in `converter.rs` tests (`converter.rs:1650`, `:2631` — the scripts already echo stderr, write an output, and exit 0, on both unix and Windows `.cmd`, so a truncated encode is expressible):
   - a truncated **distinct-file** encode leaves the source **present on disk** and records `status='error'`, not `done`;
   - a truncated **in-place** encode leaves the source present and byte-identical, with only the temp removed. This is the test that fails if someone swaps `encode_target` for `job.output_path`.
-- `purge_bad_sources` outcome table: `InUse`, `AlreadyGone`, `Changed` (mtime differs at equal size — the case a size-only guard misses), `Recovered` (rule-3 row that now scans clean), and the destructive path. The `Recovered` test must assert a *truncation* row is **not** recovered by a re-scan, pinning the rule-3 scoping — without it, a re-scan applied to all rows silently empties the list of every truncated file.
+- `purge_bad_sources` outcome table: `InUse`, `AlreadyGone`, `Changed` (mtime differs at equal size — the case a size-only guard misses), `Recovered` (rule-3 row that now scans clean), and the destructive path. The `Recovered` test must assert a `'bad_source_truncated'` row is **not** recovered by a re-scan, pinning the scoping — without it, a re-scan applied to all rows silently empties the list of every truncated file.
 
 ### Cross-platform
 
