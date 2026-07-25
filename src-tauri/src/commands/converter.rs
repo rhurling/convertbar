@@ -240,9 +240,18 @@ pub fn cancel_conversion<R: tauri::Runtime>(
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .ok();
+            // completed_at must be set here, not left for the next launch's backfill: until
+            // then the row sorts to the bottom of History (ordered by completed_at DESC)
+            // instead of showing up as the most recent entry, which is where a just-cancelled
+            // job belongs.
             let update_result = db.execute(
-                "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user' WHERE id = ?1",
-                rusqlite::params![job_id],
+                "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user', \
+                 failure_class = ?2, completed_at = ?3 WHERE id = ?1",
+                rusqlite::params![
+                    job_id,
+                    crate::failure_class::FailureClass::Environment.as_str(),
+                    chrono::Utc::now().to_rfc3339(),
+                ],
             );
             (paths, Some(update_result))
         }
@@ -456,18 +465,34 @@ mod tests {
             "partial output must be gone — on Windows this fails if the delete runs before the child is reaped"
         );
         let state: State<'_, AppState> = app.state();
-        let (status, msg): (String, Option<String>) = state
+        let (status, msg, class, completed_at): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = state
             .db
             .lock()
             .unwrap()
             .query_row(
-                "SELECT status, error_message FROM jobs WHERE id = 'j1'",
+                "SELECT status, error_message, failure_class, completed_at FROM jobs WHERE id = 'j1'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(status, "error");
         assert_eq!(msg.as_deref(), Some("Cancelled by user"));
+        assert_eq!(
+            class.as_deref(),
+            Some("environment"),
+            "a cancellation is an external action, never the file's fault — and NULL would \
+             wrongly read as 'row predates this feature'"
+        );
+        assert!(
+            completed_at.is_some(),
+            "F11: completed_at must be set on cancel, or the row sorts to the bottom of \
+             History (ordered by completed_at DESC) until the next launch's backfill repairs it"
+        );
         assert!(
             converter.current_child.lock().unwrap().is_none(),
             "the reaped handle must be cleared so the queue loop takes its cancel branch"

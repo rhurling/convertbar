@@ -75,6 +75,32 @@ fn record_source_identity(db: &Connection, job_id: &str, path: &str) {
     }
 }
 
+/// Re-stamp a condemned row's identity fingerprint to the source's CURRENT stat, taken at the
+/// moment we classify it bad_source[_truncated] — NOT the stale fingerprint recorded when the
+/// file was queued.
+///
+/// Without this: a healthy file is queued (fingerprint S,M); it is truncated in place by a sync
+/// tool before its turn; the encode condemns it while the DB fingerprint still describes the
+/// HEALTHY original; the sync tool then repairs it, and — because rsync -t / Syncthing / wget -N
+/// all preserve mtime — it lands back at exactly (S,M). Purge would see a "match" against the
+/// stale fingerprint and destroy the REPAIRED file. Stamping at condemnation time closes that
+/// window. Unlike `record_source_identity` (called only on a SUCCESSFUL in-place encode, where
+/// leaving a slightly-stale fingerprint on a rare failed stat is harmless), a failed stat here
+/// writes NULL: purge already refuses to destroy a row with a NULL fingerprint, and leaving the
+/// old, now-provably-wrong "healthy" fingerprint in place would be actively unsafe.
+fn record_condemned_identity(db: &Arc<Mutex<Connection>>, job_id: &str, path: &str) {
+    let id = crate::commands::queue::file_identity(path);
+    let db = db.lock().unwrap();
+    let _ = db.execute(
+        "UPDATE jobs SET source_size = ?2, source_mtime = ?3 WHERE id = ?1",
+        params![
+            job_id,
+            id.as_ref().map(|i| i.size),
+            id.as_ref().map(|i| i.mtime)
+        ],
+    );
+}
+
 /// Filesystem action for an in-place job once the keep/discard decision is made. Pure mapping so
 /// it can be table-tested apart from the side effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,7 +379,8 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
     let mut stmt = db
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                kept_file, space_saved, error_message, queue_order, created_at, completed_at
+                kept_file, space_saved, error_message, failure_class, queue_order, created_at,
+                completed_at
          FROM jobs WHERE status = 'queued'
          ORDER BY queue_order ASC LIMIT 1",
         )
@@ -371,9 +398,10 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
             kept_file: row.get(7)?,
             space_saved: row.get(8)?,
             error_message: row.get(9)?,
-            queue_order: row.get(10)?,
-            created_at: row.get(11)?,
-            completed_at: row.get(12)?,
+            failure_class: row.get(10)?,
+            queue_order: row.get(11)?,
+            created_at: row.get(12)?,
+            completed_at: row.get(13)?,
         })
     })
     .ok()
@@ -452,6 +480,29 @@ fn source_is_confirmed_missing(probe: std::io::Result<bool>) -> bool {
     matches!(probe, Ok(false))
 }
 
+/// Whether we can actually read `path` ourselves, right now.
+///
+/// This exists because HandBrake's stderr is byte-identical for a zero-byte file, a
+/// directory, and a healthy file we lack permission to open — all exit 2 with
+/// "No title found." Believing HandBrake alone would eventually offer good files for
+/// deletion. Opening and reading one byte is our own evidence.
+///
+/// Every failure mode returns `false`, which the classifier routes to `Environment` and
+/// therefore never destroys. That is the opposite polarity from
+/// [`source_is_confirmed_missing`], which fails open because there the safe answer is
+/// "let HandBrake try".
+pub(crate) fn source_is_readable(path: &str) -> bool {
+    use std::io::Read;
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            let mut byte = [0u8; 1];
+            // Ok(0) is a legitimately empty but readable file.
+            f.read(&mut byte).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Outcome of trying to claim the next job by flipping it 'queued' -> 'encoding'. The claim is
 /// conditional (`AND status = 'queued'`) so a job that `clear_queue`/`remove_job` deleted during
 /// the pre-spawn window is not resurrected — spawning on a deleted row could trash the source.
@@ -475,7 +526,7 @@ fn claim_job(db: &Connection, job_id: &str) -> ClaimOutcome {
     }
 }
 
-const STDERR_TAIL_BYTES: usize = 4096;
+const STDERR_TAIL_BYTES: usize = 8192;
 
 /// Drain a reader to EOF keeping only the last STDERR_TAIL_BYTES bytes, so the pipe
 /// never fills while memory stays bounded no matter how much HandBrake logs.
@@ -587,13 +638,15 @@ fn record_job_error_quiet<R: tauri::Runtime>(
     db: &Arc<Mutex<Connection>>,
     job_id: &str,
     err_msg: &str,
+    class: crate::failure_class::FailureClass,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
     {
         let db = db.lock().unwrap();
         let _ = db.execute(
-            "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3 WHERE id = ?1",
-            params![job_id, err_msg, now],
+            "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3, \
+             failure_class = ?4 WHERE id = ?1",
+            params![job_id, err_msg, now, class.as_str()],
         );
     }
     let _ = app.emit(
@@ -614,8 +667,9 @@ fn record_job_error<R: tauri::Runtime>(
     job_id: &str,
     file_name: &str,
     err_msg: &str,
+    class: crate::failure_class::FailureClass,
 ) {
-    record_job_error_quiet(app, db, job_id, err_msg);
+    record_job_error_quiet(app, db, job_id, err_msg, class);
 
     let notify_per_file = {
         let db = db.lock().unwrap();
@@ -718,7 +772,13 @@ fn process_queue<R: tauri::Runtime>(
         // queue behind a disk pause, and the gate would size it from a source that isn't there.
         if source_is_confirmed_missing(std::path::Path::new(&job.source_path).try_exists()) {
             had_errors = true;
-            record_job_error_quiet(app, db, &job.id, "Source file no longer exists");
+            record_job_error_quiet(
+                app,
+                db,
+                &job.id,
+                "Source file no longer exists",
+                crate::failure_class::FailureClass::Environment,
+            );
             continue;
         }
 
@@ -765,7 +825,14 @@ fn process_queue<R: tauri::Runtime>(
             Some(p) => p,
             None => {
                 had_errors = true;
-                record_job_error(app, db, &job.id, &file_name, "HandBrakeCLI not found");
+                record_job_error(
+                    app,
+                    db,
+                    &job.id,
+                    &file_name,
+                    "HandBrakeCLI not found",
+                    crate::failure_class::FailureClass::Environment,
+                );
                 continue;
             }
         };
@@ -795,6 +862,7 @@ fn process_queue<R: tauri::Runtime>(
                     &job.id,
                     &file_name,
                     &format!("Failed to claim job: {e}"),
+                    crate::failure_class::FailureClass::Environment,
                 );
                 continue;
             }
@@ -868,6 +936,7 @@ fn process_queue<R: tauri::Runtime>(
                     &job.id,
                     &file_name,
                     &format!("Failed to start HandBrakeCLI: {}", e),
+                    crate::failure_class::FailureClass::Environment,
                 );
                 *converter.current_job_id.lock().unwrap() = None;
                 continue;
@@ -963,6 +1032,14 @@ fn process_queue<R: tauri::Runtime>(
         *converter.current_child.lock().unwrap() = None;
         *converter.current_job_id.lock().unwrap() = None;
 
+        // Joined here rather than inside individual arms: the child has already exited, so
+        // the drain thread is at EOF and this returns promptly on every path. The success
+        // arm needs the tail too (truncation detection), and hoisting also removes the
+        // duplicate join the two failure arms previously had.
+        let tail = stderr_tail_thread
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default();
+
         match exit_status {
             Ok(status) if status.success() => {
                 let converted_size = std::fs::metadata(&encode_target)
@@ -976,19 +1053,62 @@ fn process_queue<R: tauri::Runtime>(
                 if converted_size.unwrap_or(0) == 0 {
                     had_errors = true;
                     let _ = std::fs::remove_file(&encode_target);
-                    // The child exited, so the drain thread is at EOF and joins
-                    // promptly; its tail says why nothing was written.
-                    let tail = stderr_tail_thread
-                        .and_then(|t| t.join().ok())
-                        .unwrap_or_default();
+                    let class =
+                        crate::failure_class::classify(&crate::failure_class::FailureFacts {
+                            exit_code: status.code(),
+                            source_readable: source_is_readable(&job.source_path),
+                            stderr_tail: &tail,
+                        });
+                    // Stamp the identity fingerprint to the source's CURRENT stat at the
+                    // moment of condemnation, not the stale add-time value — see
+                    // `record_condemned_identity`. Never for Environment/Unknown: those aren't
+                    // a verdict on the file at all.
+                    if class == crate::failure_class::FailureClass::BadSource {
+                        record_condemned_identity(db, &job.id, &job.source_path);
+                    }
                     record_job_error(
                         app,
                         db,
                         &job.id,
                         &file_name,
                         &empty_output_error_message(&tail),
+                        class,
                     );
                     continue;
+                }
+
+                // HandBrake exits 0 on a truncated source: it reads the container header,
+                // encodes the bytes that are actually there, and reports success. Without
+                // this guard the job records 'done', space_saved is computed against the
+                // full original size, and cleanup trashes the user's ORIGINAL in favour of
+                // a short file. Runs unconditionally — it corrects a wrong answer rather
+                // than adding a preference.
+                if let Some((got, expected)) = crate::failure_class::decode_shortfall(&tail) {
+                    if crate::failure_class::is_truncated(got, expected) {
+                        had_errors = true;
+                        // encode_target, NEVER job.output_path: for an in-place job
+                        // output_path IS the source, so removing it would delete the original.
+                        let _ = std::fs::remove_file(&encode_target);
+                        let pct = (got as f64 / expected as f64 * 100.0).round() as u64;
+                        // Same re-stamp as the classify()-based site below: the truncation is
+                        // discovered right now, so the fingerprint recorded at queue time is
+                        // stale the instant it's condemned. See `record_condemned_identity`.
+                        record_condemned_identity(db, &job.id, &job.source_path);
+                        record_job_error(
+                            app,
+                            db,
+                            &job.id,
+                            &file_name,
+                            &format!(
+                                "Source appears truncated: decoded {got} of {expected} frames ({pct}%)"
+                            ),
+                            // NOT BadSource: purge re-scans those rows, and a truncated
+                            // file passes a scan by construction, so it would be cleared
+                            // from the list every time.
+                            crate::failure_class::FailureClass::BadSourceTruncated,
+                        );
+                        continue;
+                    }
                 }
 
                 // For in-place, the source is unchanged during the temp encode, so re-stat it now.
@@ -1049,7 +1169,14 @@ fn process_queue<R: tauri::Runtime>(
                     } else {
                         "In-place replacement failed; original may be in Trash"
                     };
-                    record_job_error(app, db, &job.id, &file_name, err_msg);
+                    record_job_error(
+                        app,
+                        db,
+                        &job.id,
+                        &file_name,
+                        err_msg,
+                        crate::failure_class::FailureClass::Environment,
+                    );
                     // Intentionally leave the temp (`.{stem}.convertbar-tmp.mp4`): it holds the
                     // re-encoded content, and in trash mode it is the only in-place copy (the
                     // original is in Trash), so removing it would force trash recovery. The marker
@@ -1158,7 +1285,11 @@ fn process_queue<R: tauri::Runtime>(
                     break;
                 }
             }
-            Ok(_) | Err(_) => {
+            other => {
+                let exit_code = match &other {
+                    Ok(s) => s.code(),
+                    Err(_) => None,
+                };
                 // Quit path: the exit handler killed this child, the encode didn't
                 // fail. Skip ALL bookkeeping — deleting the partial, writing
                 // status='error' (auto-resume only picks up 'encoding'/'paused'),
@@ -1182,17 +1313,23 @@ fn process_queue<R: tauri::Runtime>(
                     .ok();
 
                 if current_status.as_deref() != Some("error") {
-                    // The drain thread hit EOF when the child died, so this join is
-                    // prompt. Its tail is the only diagnostic HandBrake leaves behind.
-                    let tail = stderr_tail_thread
-                        .and_then(|t| t.join().ok())
-                        .unwrap_or_default();
+                    let class =
+                        crate::failure_class::classify(&crate::failure_class::FailureFacts {
+                            exit_code,
+                            source_readable: source_is_readable(&job.source_path),
+                            stderr_tail: &tail,
+                        });
+                    // See `record_condemned_identity`: never for Environment/Unknown.
+                    if class == crate::failure_class::FailureClass::BadSource {
+                        record_condemned_identity(db, &job.id, &job.source_path);
+                    }
                     record_job_error(
                         app,
                         db,
                         &job.id,
                         &file_name,
                         &error_message_from_tail(&tail),
+                        class,
                     );
                 }
             }
@@ -1388,6 +1525,111 @@ mod tests {
     }
 
     #[test]
+    fn source_is_readable_reports_a_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("clip.mkv");
+        std::fs::write(&f, b"data").unwrap();
+        assert!(source_is_readable(f.to_str().unwrap()));
+    }
+
+    #[test]
+    fn source_is_readable_fails_safe_on_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.mkv");
+        assert!(
+            !source_is_readable(missing.to_str().unwrap()),
+            "an unopenable path must report false, which routes to Environment — never destructive"
+        );
+    }
+
+    #[test]
+    fn source_is_readable_reports_false_for_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !source_is_readable(dir.path().to_str().unwrap()),
+            "a directory cannot be read as a file; failing safe is correct"
+        );
+    }
+
+    // A zero-byte file IS openable — readability is about access, not content. The
+    // classifier, not this probe, decides the file is garbage.
+    #[test]
+    fn source_is_readable_reports_true_for_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("empty.mkv");
+        std::fs::write(&f, b"").unwrap();
+        assert!(source_is_readable(f.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_is_readable_reports_false_without_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses mode bits entirely, so this assertion is meaningless as uid 0
+        // (rootful docker / `act`). GitHub's ubuntu runner is non-root, so PR CI runs it.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("locked.mkv");
+        std::fs::write(&f, b"data").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = source_is_readable(f.to_str().unwrap());
+        // Restore so tempdir cleanup works regardless of the assertion outcome.
+        let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644));
+        assert!(
+            !readable,
+            "an unreadable healthy file must never be credited as readable"
+        );
+    }
+
+    fn class_of(db: &Arc<Mutex<Connection>>, id: &str) -> Option<String> {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT failure_class FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn record_job_error_persists_the_failure_class() {
+        let app = mock_app();
+        let db = test_db();
+        queue_job(&db, "j1", "/src.mkv", "/out.mp4", 1000);
+        record_job_error(
+            app.handle(),
+            &db,
+            "j1",
+            "src.mkv",
+            "Conversion failed",
+            crate::failure_class::FailureClass::BadSource,
+        );
+        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source"));
+    }
+
+    #[test]
+    fn record_job_error_quiet_persists_environment_for_a_vanished_source() {
+        let app = mock_app();
+        let db = test_db();
+        queue_job(&db, "j2", "/gone.mkv", "/out.mp4", 1000);
+        record_job_error_quiet(
+            app.handle(),
+            &db,
+            "j2",
+            "Source file no longer exists",
+            crate::failure_class::FailureClass::Environment,
+        );
+        assert_eq!(
+            class_of(&db, "j2").as_deref(),
+            Some("environment"),
+            "a file that vanished is never the user's corrupt-download problem"
+        );
+    }
+
+    #[test]
     fn spawn_failure_surfaces_like_every_other_error() {
         // A configured handbrake_path that exists but is not executable makes
         // Command::spawn fail. That branch must behave like all other failures:
@@ -1412,6 +1654,13 @@ mod tests {
         let (status, msg) = job_row(&db, "j1");
         assert_eq!(status, "error");
         assert!(msg.unwrap().contains("Failed to start HandBrakeCLI"));
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("environment"),
+            "a spawn failure is an environment problem, never a bad-source verdict — \
+             purge must not treat every queued file as clearable just because HandBrakeCLI \
+             couldn't launch"
+        );
         assert!(
             status_events
                 .lock()
@@ -1424,6 +1673,46 @@ mod tests {
         assert!(
             final_update.contains("\"error\""),
             "a run where the only job failed must end 'error', got: {final_update}"
+        );
+    }
+
+    #[test]
+    fn claim_failure_records_environment_not_bad_source() {
+        // A conditional trigger makes claim_job's UPDATE ... SET status='encoding' fail while
+        // leaving record_job_error's UPDATE ... SET status='error' untouched — the only way to
+        // exercise ClaimOutcome::Failed without a real concurrent DB error. Without this test,
+        // someone changing that call site's failure class to BadSource would pass the whole
+        // suite, and a transient DB error would route a healthy file into the purge list.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        db.lock()
+            .unwrap()
+            .execute(
+                "CREATE TRIGGER block_encoding_claim BEFORE UPDATE ON jobs \
+                 WHEN NEW.status = 'encoding' \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END",
+                [],
+            )
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let src = real_source(dir.path(), "in.mp4");
+        queue_job(&db, "j1", src.to_str().unwrap(), "/nowhere/out.mp4", 1000);
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(status, "error");
+        assert!(msg.unwrap().contains("Failed to claim job"));
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("environment"),
+            "a DB error while claiming the job is an environment problem, not a verdict on \
+             the source file"
         );
     }
 
@@ -1664,6 +1953,34 @@ mod tests {
         }
     }
 
+    // A stand-in for HandBrakeCLI failing to scan the input: exits 2 (HandBrake's real
+    // "bad input" code) with the exact diagnostic it emits when it can't parse a file —
+    // "No title found." — a SOURCE_MARKERS hit in failure_class.rs. Writes no output, so
+    // process_queue takes the generic failure arm (not the empty-output success guard).
+    fn bad_source_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb-badsource.cmd");
+            // Redirect BEFORE `echo` (see truncating_fake_handbrake_script's comment below):
+            // cmd.exe strips the `1>&2` token but keeps the space in front of it, so
+            // `echo No title found. 1>&2` would emit a trailing space after "found.".
+            std::fs::write(
+                &p,
+                "@echo off\r\n>&2 echo No title found.\r\n@exit /b 2\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("hb-badsource.sh");
+            std::fs::write(&p, "#!/bin/sh\necho \"No title found.\" >&2\nexit 2\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
     // A stand-in for a long-running encode: writes a partial output file (last CLI
     // arg, like HandBrakeCLI's -o), then blocks long past the test's timeouts.
     fn slow_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1813,6 +2130,15 @@ mod tests {
                 msg.contains("boom"),
                 "{id} must keep the stderr diagnostic, got: {msg}"
             );
+            // Exit 0 with an undiagnostic stderr ("boom", no source/environment marker)
+            // must classify as Unknown — never BadSource. Pins the empty-output call site
+            // against a regression that hardcodes/misreasons a class here instead of
+            // consulting classify().
+            assert_eq!(
+                class_of(&db, id).as_deref(),
+                Some("unknown"),
+                "{id}: an undiagnosable empty output must never be classified bad_source"
+            );
         }
         assert!(
             !out1.exists() && !out2.exists(),
@@ -1820,6 +2146,341 @@ mod tests {
         );
         let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
         assert!(final_update.contains("\"error\""));
+    }
+
+    /// A stand-in for HandBrakeCLI that writes a small non-empty output, emits a stderr tail
+    /// claiming a large frame shortfall, and exits 0 — exactly what a truncated source
+    /// produces in reality.
+    fn truncating_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb-trunc.cmd");
+            std::fs::write(
+                &p,
+                // The redirect must come BEFORE `echo`: cmd.exe strips the `1>&2` token but
+                // keeps the space in front of it, so `echo ... expected 1>&2` would emit a
+                // trailing space after "expected" and break the `strip_suffix(" expected")`
+                // parse in parse_sync_line.
+                "@echo off\r\n\
+                 >&2 echo [00:00:01] sync: got 131 frames, 480 expected\r\n\
+                 :loop\r\n\
+                 if not \"%~2\"==\"\" (\r\n\
+                 shift\r\n\
+                 goto loop\r\n\
+                 )\r\n\
+                 echo data> \"%~1\"\r\n\
+                 exit /b 0\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            let p = dir.join("hb-trunc.sh");
+            std::fs::write(
+                &p,
+                "#!/bin/sh\n\
+                 echo '[00:00:01] sync: got 131 frames, 480 expected' >&2\n\
+                 for a; do out=\"$a\"; done\n\
+                 printf data > \"$out\"\n\
+                 exit 0\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    // The data-loss regression test. Before this guard, HandBrake exiting 0 on a truncated
+    // source made ConvertBar record 'done', compute an inflated space_saved, and — under the
+    // DEFAULT cleanup_mode='trash' — send the user's ORIGINAL to the Trash.
+    #[test]
+    fn truncated_encode_errors_and_leaves_the_source_on_disk() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = truncating_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "cleanup_mode", "trash");
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        let menubar_events = record_events(&app, "menu-bar-update");
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "error",
+            "a truncated source is a failure, not a success"
+        );
+        assert!(
+            msg.unwrap_or_default().contains("Source appears truncated"),
+            "history must say WHY, not just that it failed"
+        );
+        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source_truncated"));
+        assert!(
+            source.exists(),
+            "THE POINT OF THIS FEATURE: the user's original must still be on disk"
+        );
+        assert!(!out.exists(), "the short partial output must be removed");
+        let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            final_update.contains("\"error\""),
+            "a run whose only job was truncated must end 'error', not a clean 'idle' that \
+             hides the rejection — got: {final_update}"
+        );
+    }
+
+    // For an in-place job output_path IS the source. Removing output_path here would delete
+    // the original outright — the same defect class as the fixed auto-resume bug.
+    #[test]
+    fn truncated_in_place_encode_leaves_the_source_byte_identical() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = truncating_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&db, "cleanup_mode", "trash");
+        let source = real_source(dir.path(), "movie.mkv");
+        let original_bytes = std::fs::read(&source).unwrap();
+        // in-place: output_path == source_path
+        let p = source.to_str().unwrap();
+        queue_job(&db, "j1", p, p, 1000);
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            original_bytes,
+            "an in-place truncated encode must leave the original untouched — not replaced \
+             by the partial temp, and not deleted. Swapping encode_target for \
+             job.output_path here destroys the user's file."
+        );
+        assert!(
+            !in_place_temp_path(p).exists(),
+            "only the temp is cleaned up"
+        );
+    }
+
+    #[test]
+    fn stderr_tail_window_holds_the_frame_marker_with_room_to_spare() {
+        // Measured headroom from EOF: ~1.2 KB with x264, ~305 B with VideoToolbox — but each
+        // extra audio track appends a mux: line AFTER the marker, eating into that headroom.
+        // Simulate a worst-case multi-track trailer behind a flood of preceding noise (so the
+        // window's front edge actually gets exercised) and confirm the marker still survives —
+        // shrinking STDERR_TAIL_BYTES could silently disable truncation detection on
+        // multi-track files without this catching it.
+        let body = format!(
+            "{}[00:00:01] sync: got 131 frames, 480 expected\n{}",
+            "noise\n".repeat(2000),
+            "mux: track 2, 100 frames\n".repeat(20),
+        );
+        let tail = read_bounded_tail(std::io::Cursor::new(body.into_bytes()));
+        assert_eq!(
+            crate::failure_class::decode_shortfall(&tail),
+            Some((131, 480)),
+            "a realistic multi-track trailer after the marker must not push it out of the \
+             STDERR_TAIL_BYTES window"
+        );
+    }
+
+    #[test]
+    fn a_scan_failure_on_a_readable_source_is_classified_bad_source() {
+        // The only path that can produce failure_class = 'bad_source' end-to-end: exit 2
+        // (HandBrake's bad-input code) plus a source-marker diagnostic, against a source
+        // we ourselves can open. This pins the failure arm's `let exit_code = match &other
+        // {...}` wiring (converter.rs) — if that were ever collapsed to `None`, classify's
+        // rule 4 (`exit_code == Some(2)`) could never fire and every such job would
+        // silently fall through to Unknown with a still-green suite.
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = bad_source_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let out = dir.path().join("out.mp4");
+        let src = real_source(dir.path(), "a.mp4"); // genuinely exists and is readable
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(status, "error");
+        assert!(msg.unwrap().contains("No title found"));
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("bad_source"),
+            "exit 2 + a source-marker diagnostic against a readable source must be bad_source"
+        );
+    }
+
+    // F6: the sibling of the test above with the SAME script (so the diagnostic and exit code
+    // are byte-identical), but a source we ourselves cannot open. Pins the wiring of
+    // `source_readable: source_is_readable(&job.source_path)` at process_queue's call sites —
+    // mutation testing showed hardcoding `source_readable: true` at BOTH call sites survives the
+    // whole suite, because only the pure `classify()` was pinned and the observation feeding it
+    // was never exercised end-to-end.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_failure_on_a_source_we_cannot_read_is_classified_environment_not_bad_source() {
+        // Root bypasses mode bits entirely, so this assertion is meaningless as uid 0 (rootful
+        // docker / `act`). GitHub's ubuntu runner is non-root, so PR CI runs it.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = bad_source_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let out = dir.path().join("out.mp4");
+        let src = real_source(dir.path(), "a.mp4");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        // Restore unconditionally so the tempdir's Drop cleanup can remove it.
+        let _ = std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644));
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(status, "error");
+        assert!(msg.unwrap().contains("No title found"));
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("environment"),
+            "we could not open the source ourselves, so HandBrake's IDENTICAL exit-2 \
+             diagnostic must never be credited as a verdict on the file"
+        );
+    }
+
+    fn source_size_mtime(db: &Arc<Mutex<Connection>>, id: &str) -> (Option<i64>, Option<i64>) {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT source_size, source_mtime FROM jobs WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    // F2 regression: the fingerprint recorded at ADD time describes the file as it was WHEN
+    // QUEUED, not as it is when condemned. Without re-stamping at condemnation time, a healthy
+    // file queued with fingerprint (S,M) that is later truncated in place before its turn is
+    // condemned while the DB still says (S,M) — and a sync tool that repairs it back to exactly
+    // (S,M) (rsync -t / Syncthing / wget -N all preserve mtime) would make purge see a "match"
+    // and destroy the REPAIRED file.
+    #[test]
+    fn bad_source_condemnation_restamps_identity_to_the_current_file_not_the_stale_add_time_value()
+    {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = bad_source_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let out = dir.path().join("out.mp4");
+        let src = real_source(dir.path(), "a.mp4");
+        queue_job(
+            &db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+        // Simulate a fingerprint captured when a DIFFERENT (larger, healthy) file lived at this
+        // path at queue time.
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET source_size = 999999, source_mtime = 1 WHERE id = 'j1'",
+                [],
+            )
+            .unwrap();
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source"));
+        let current = crate::commands::queue::file_identity(src.to_str().unwrap())
+            .expect("source is still on disk");
+        assert_eq!(
+            source_size_mtime(&db, "j1"),
+            (Some(current.size), Some(current.mtime)),
+            "the fingerprint must be re-stamped to the CURRENT file at condemnation time, not \
+             left at the stale add-time value — otherwise a later repair landing back at the \
+             stale (size, mtime) would look like a match to purge"
+        );
+    }
+
+    // Sibling of the test above for the truncation guard's direct (non-classify()) condemnation
+    // site — the same stale-fingerprint window applies there too.
+    #[test]
+    fn truncated_condemnation_restamps_identity_to_the_current_file_not_the_stale_add_time_value() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = truncating_fake_handbrake_script(dir.path());
+        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET source_size = 999999, source_mtime = 1 WHERE id = 'j1'",
+                [],
+            )
+            .unwrap();
+
+        process_queue(app.handle(), &db, &converter);
+
+        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source_truncated"));
+        let current = crate::commands::queue::file_identity(source.to_str().unwrap())
+            .expect("source is still on disk");
+        assert_eq!(
+            source_size_mtime(&db, "j1"),
+            (Some(current.size), Some(current.mtime)),
+            "the truncation guard must also re-stamp the fingerprint at condemnation time"
+        );
     }
 
     // End-to-end (local/e2e-ignored CI only): needs ffmpeg to synthesize a clip and a
@@ -1911,6 +2572,135 @@ mod tests {
         // Cleanup ran: converted kept on disk, original deleted (mode 'delete').
         assert!(output.exists());
         assert!(!source.exists());
+    }
+
+    // End-to-end (local/e2e-ignored CI only): the tripwire for the ENTIRE truncation guard.
+    // Every other truncation test (truncated_encode_errors_and_leaves_the_source_on_disk and
+    // friends) drives a FAKE stand-in script that echoes the exact
+    // `sync: got N frames, M expected` string this guard parses — a string ConvertBar does not
+    // control. If a future HandBrake release ever reformats that line, the guard silently stops
+    // firing, the ORIGINAL data-loss bug (a truncated download recorded as 'done' and the
+    // source trashed) returns, and every one of those fake-script tests stays green regardless,
+    // because none of them ever touch real HandBrake output. This is the only test that can
+    // catch that. Needs ffmpeg to synthesize a clip and a real HandBrakeCLI on PATH. Run with:
+    //   cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored real_handbrake_flags_a_truncated_source
+    #[test]
+    #[ignore]
+    fn real_handbrake_flags_a_truncated_source_and_spares_the_original() {
+        let app = mock_app();
+        let db = test_db();
+        let converter = ConverterState::new();
+        let handbrake_path =
+            crate::handbrake::detect_handbrake_path().expect("HandBrakeCLI must be on PATH");
+        set_setting(&db, "handbrake_path", &handbrake_path);
+        // 'delete' keeps the survival assertion filesystem-local (no Trash involved).
+        set_setting(&db, "cleanup_mode", "delete");
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.mp4");
+        // +faststart is essential: without it, the moov atom is written at the END of the file
+        // by default, so truncating below destroys it outright and HandBrake can't open the
+        // file AT ALL (a scan failure / bad_source) — a different failure mode than the one
+        // this guard exists to catch.
+        // 20s is deliberate, not arbitrary: HandBrake's scan samples preview frames spread
+        // across the container's FULL declared duration (faststart keeps that duration
+        // metadata intact even after truncation). A too-short clip puts every preview past
+        // the truncation point, so the SCAN itself fails to find a title (a different failure
+        // mode, bad_source) instead of the scan succeeding and the WORK/decode phase running
+        // out of data partway through — which is what this guard exists to catch.
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=20:size=1280x720:rate=25",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-movflags",
+                "+faststart",
+            ])
+            .arg(&source)
+            .status()
+            .expect("run ffmpeg")
+            .success();
+        assert!(ok, "ffmpeg failed to synthesize the source clip");
+
+        let full_bytes = std::fs::read(&source).unwrap();
+        let truncated_len = (full_bytes.len() as f64 * 0.35) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(truncated_len)
+            .unwrap();
+        let truncated_bytes = std::fs::read(&source).unwrap();
+
+        // Independently run the REAL HandBrakeCLI ourselves (same args process_queue will use
+        // below) to capture its raw stderr on the truncated source. This is a second, separate
+        // encode from the one process_queue performs — deliberately: it decouples "does real
+        // HandBrake still emit a parseable marker" from "did our code correctly react to it",
+        // so a HandBrake output-format change is diagnosed precisely as that, rather than the
+        // vaguer "the guard didn't fire".
+        let preset: String = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let probe_output = dir.path().join("probe-out.mkv");
+        let probe = Command::new(&handbrake_path)
+            .arg("-Z")
+            .arg(&preset)
+            .arg("-O")
+            .arg("-i")
+            .arg(&source)
+            .arg("-o")
+            .arg(&probe_output)
+            .output()
+            .expect("run real HandBrakeCLI directly to capture its raw stderr");
+        let raw_tail = String::from_utf8_lossy(&probe.stderr).to_string();
+        let _ = std::fs::remove_file(&probe_output);
+        assert!(
+            crate::failure_class::decode_shortfall(&raw_tail).is_some(),
+            "real HandBrakeCLI no longer emits a parseable 'sync: got N frames, M expected' \
+             line on a truncated source — HandBrake changed its output format, this is NOT \
+             \"the guard didn't fire\". Raw tail:\n{raw_tail}"
+        );
+        // The probe encode must not have disturbed the truncated source under test.
+        assert_eq!(std::fs::read(&source).unwrap(), truncated_bytes);
+
+        let output = dir.path().join("out.mkv");
+        queue_job(
+            &db,
+            "j1",
+            source.to_str().unwrap(),
+            output.to_str().unwrap(),
+            truncated_len as i64,
+        );
+
+        process_queue(app.handle(), &db, &converter);
+
+        let (status, msg) = job_row(&db, "j1");
+        assert_eq!(
+            status, "error",
+            "a truncated source must fail, not succeed: {msg:?}"
+        );
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("bad_source_truncated"),
+            "real HandBrake output must still trip the decode-shortfall guard"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            truncated_bytes,
+            "THE POINT OF THIS FEATURE: the truncated source must survive byte-identical, not \
+             be replaced or trashed"
+        );
+        assert!(!output.exists(), "the partial output must be removed");
     }
 
     #[test]
@@ -2741,6 +3531,12 @@ HandBrake has exited.";
             job_row(&db, "j1").0,
             "error",
             "the job still fails — it is only the notification that is suppressed"
+        );
+        assert_eq!(
+            class_of(&db, "j1").as_deref(),
+            Some("environment"),
+            "a vanished source is structurally known to be Environment — never BadSource, \
+             since we never got the chance to read the file ourselves"
         );
     }
 

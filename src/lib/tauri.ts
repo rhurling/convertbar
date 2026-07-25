@@ -12,6 +12,7 @@ export interface JobInfo {
   kept_file: "original" | "converted" | null;
   space_saved: number | null;
   error_message: string | null;
+  failure_class: string | null;
   queue_order: number;
   created_at: string;
   completed_at: string | null;
@@ -91,6 +92,7 @@ export interface AppSettings {
   skip_by_source_media: boolean;
   watch_skip_marker: string;
   low_disk_min_gb: number;
+  bad_source_action: "trash" | "delete";
 }
 
 export interface PathsExist {
@@ -106,6 +108,22 @@ export interface HistorySummary {
 export interface HistoryPage {
   jobs: JobInfo[];
   total: number;
+}
+
+// Mirrors src-tauri/src/types.rs PurgeOutcome exactly — every variant but "purged" means the
+// file was left alone, and the UI must report that honestly rather than implying destruction.
+export type PurgeOutcome =
+  | "purged"
+  | "in_use"
+  | "already_gone"
+  | "changed"
+  | "recovered"
+  | "unverifiable"
+  | "failed";
+
+export interface PurgeResult {
+  id: string;
+  outcome: PurgeOutcome;
 }
 
 export interface ClassifiedPaths {
@@ -223,4 +241,7 @@ export const commands = {
   removeWatchedDirectory: (id: string) =>
     invoke<void>("remove_watched_directory", { id }),
   pickFolder: () => invoke<string | null>("pick_folder"),
+  getBadSources: () => invoke<JobInfo[]>("get_bad_sources"),
+  purgeBadSources: (ids: string[]) =>
+    invoke<PurgeResult[]>("purge_bad_sources", { ids }),
 };

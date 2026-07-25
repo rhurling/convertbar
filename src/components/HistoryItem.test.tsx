@@ -16,6 +16,7 @@ function job(overrides: Partial<JobInfo>): JobInfo {
     kept_file: "converted",
     space_saved: 500,
     error_message: null,
+    failure_class: null,
     queue_order: 0,
     created_at: "",
     completed_at: null,

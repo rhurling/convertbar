@@ -314,6 +314,62 @@ body {
   color: var(--text-secondary);
 }
 
+/* Bad-source review list */
+.bad-sources-panel {
+  padding: 10px 12px;
+  background: var(--amber-bg);
+  border: 1px solid rgba(255, 152, 0, 0.3);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+}
+
+.bad-sources-title {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--amber);
+}
+
+.bad-sources-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* A watched folder can flag hundreds of files at once — cap the list's own height and
+     scroll inside it so the purge button stays reachable instead of being pushed below the
+     popover's fold. */
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.bad-sources-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.bad-sources-name {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bad-sources-reason {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.bad-sources-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
 /* Settings Page */
 .settings-page {
   padding: 12px 16px;

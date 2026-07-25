@@ -64,10 +64,34 @@ pub fn parse_scan_media(stdout: &str) -> Option<SourceMedia> {
     })
 }
 
+/// Why a scan did not confirm a title — a distinction `probe_source`'s bare `Option` collapses,
+/// but that `bad_source` purge (commands/queue.rs) needs: a scan that never ran says nothing
+/// about the file, while one that ran to completion and found nothing is a real verdict on it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanOutcome {
+    /// A valid title was read — the file is readable media.
+    Titled(SourceMedia),
+    /// HandBrake ran to completion but found no parseable title. A real verdict about the file.
+    NoTitle,
+    /// The scan could not be performed at all (spawn failed, the stdout reader thread could not
+    /// be joined, or the process was killed at `PROBE_TIMEOUT`). Says nothing about the file.
+    CouldNotRun,
+}
+
 /// Run `HandBrakeCLI --scan --json` on a file and return its normalized codec + height.
 /// Returns `None` if the process fails to launch, exceeds `PROBE_TIMEOUT`, or yields no parseable
 /// title — the caller treats `None` as uncertainty and queues the file rather than skipping it.
+/// A thin wrapper over `scan_outcome` for callers that don't need to distinguish those causes.
 pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
+    match scan_outcome(handbrake_path, file) {
+        ScanOutcome::Titled(media) => Some(media),
+        ScanOutcome::NoTitle | ScanOutcome::CouldNotRun => None,
+    }
+}
+
+/// Like `probe_source`, but preserves whether the scan ran at all — the distinction `bad_source`
+/// purge needs to avoid ever treating "could not check" as "confirmed still bad".
+pub fn scan_outcome(handbrake_path: &str, file: &str) -> ScanOutcome {
     let mut cmd = Command::new(handbrake_path);
     cmd.args(["--scan", "--json", "-i", file]);
     scan_with(cmd)
@@ -75,12 +99,11 @@ pub fn probe_source(handbrake_path: &str, file: &str) -> Option<SourceMedia> {
 
 /// The spawn/drain/parse core of a probe, taking the prepared command so tests can
 /// substitute a scan-shaped process without exec-ing a temp script.
-fn scan_with(mut cmd: Command) -> Option<SourceMedia> {
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+fn scan_with(mut cmd: Command) -> ScanOutcome {
+    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+        Ok(child) => child,
+        Err(_) => return ScanOutcome::CouldNotRun,
+    };
 
     // Drain stdout concurrently with the wait: with `--json`, scan Progress blocks and
     // multi-title/track sets can exceed the OS pipe buffer (~64KB). An undrained pipe
@@ -96,9 +119,30 @@ fn scan_with(mut cmd: Command) -> Option<SourceMedia> {
 
     let status = wait_with_timeout(&mut child, PROBE_TIMEOUT);
     // The child has exited (or been killed), so the reader hit EOF: join is prompt.
-    let stdout = stdout_thread.and_then(|t| t.join().ok())?;
-    status?;
-    parse_scan_media(&stdout)
+    let stdout = match stdout_thread.and_then(|t| t.join().ok()) {
+        Some(stdout) => stdout,
+        None => return ScanOutcome::CouldNotRun,
+    };
+    // `status` is None on a timeout kill or a `try_wait` OS-level error — either way the scan
+    // did not complete, so there is no verdict to report.
+    let status = match status {
+        Some(s) => s,
+        None => return ScanOutcome::CouldNotRun,
+    };
+    // A process terminated BY A SIGNAL (segfault, abort, OOM-kill) has no exit code at all —
+    // that is a crash, not a verdict: HandBrake never got the chance to say anything about the
+    // file. Falling through to `parse_scan_media` would read the empty/partial stdout as
+    // `NoTitle`, exactly the blind spot the purge re-scan exists to close (a healthy file on a
+    // hiccuping mount that happens to crash the scanner would then read as "confirmed bad").
+    // Deliberately `code().is_none()`, NOT `status.success()`: real HandBrakeCLI legitimately
+    // exits 2 on a genuine no-title scan, and that must still fall through to NoTitle below.
+    if status.code().is_none() {
+        return ScanOutcome::CouldNotRun;
+    }
+    match parse_scan_media(&stdout) {
+        Some(media) => ScanOutcome::Titled(media),
+        None => ScanOutcome::NoTitle,
+    }
 }
 
 /// Wait for `child` to exit, polling so we never block indefinitely. If it outlives `timeout` it
@@ -228,14 +272,65 @@ JSON Title Set: {
         ]);
 
         let started = Instant::now();
-        let media = scan_with(cmd);
+        let outcome = scan_with(cmd);
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "an oversized scan output must not stall until the timeout kill"
         );
-        let media = media.expect("the title set after the flood must still parse");
+        let media = match outcome {
+            ScanOutcome::Titled(media) => media,
+            other => panic!("the title set after the flood must still parse, got {other:?}"),
+        };
         assert_eq!(media.codec, "h264");
         assert_eq!(media.height, 240);
+    }
+
+    // Pins the distinction the whole ScanOutcome type exists for: a scan that never launched
+    // must never be conflated with one that ran and found nothing (probe_source's Option
+    // collapses both to None, which is exactly the ambiguity bad_source purge cannot afford).
+    #[test]
+    fn scan_outcome_reports_could_not_run_on_a_spawn_failure() {
+        let outcome = scan_outcome(
+            "/nonexistent/HandBrakeCLI-does-not-exist",
+            "/tmp/whatever.mkv",
+        );
+        assert_eq!(
+            outcome,
+            ScanOutcome::CouldNotRun,
+            "a scan that never launched says nothing about the file"
+        );
+    }
+
+    // F1: a crash-by-signal (segfault, abort, OOM-kill) is not a verdict about the file — the
+    // scan simply never completed. Before this fix, `scan_with` only checked `status.is_none()`
+    // (timeout/spawn/join failures) and let a signalled-but-present ExitStatus fall through to
+    // `parse_scan_media`, which finds no title block in the empty stdout and reports `NoTitle` —
+    // which `rescan_verdict` (commands/queue.rs) maps to Destroy. That is the exact blind spot
+    // the purge re-scan exists to close: real HandBrakeCLI's exit-2 "no title" output is
+    // byte-identical for a genuinely corrupt file and a healthy file that merely couldn't be
+    // opened this time, so a scanner that crashes on a hiccuping mount must never be read as
+    // "confirmed bad".
+    #[cfg(unix)]
+    #[test]
+    fn scan_with_reports_could_not_run_when_the_process_is_signalled() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "kill -SEGV $$"]);
+        assert_eq!(
+            scan_with(cmd),
+            ScanOutcome::CouldNotRun,
+            "a signal-terminated scan says nothing about the file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_outcome_reports_no_title_when_the_process_runs_but_finds_nothing() {
+        // A process that runs to completion (exit 0) but never emits a parseable title set —
+        // the real-world shape of a HandBrakeCLI scan that opened the file fine and found no
+        // title. Unlike the spawn-failure case above, this IS a verdict on the file.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo 'no title here'; exit 0"]);
+        assert_eq!(scan_with(cmd), ScanOutcome::NoTitle);
     }
 
     // The give-up paths (timeout and try_wait error) both route through kill_and_reap; this

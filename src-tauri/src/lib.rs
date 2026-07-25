@@ -2,6 +2,7 @@ mod add_progress;
 mod commands;
 mod converter;
 mod db;
+mod failure_class;
 mod handbrake;
 mod media_skip;
 mod probe;
@@ -87,6 +88,8 @@ pub fn run() {
             commands::queue::get_history_summary,
             commands::queue::classify_paths,
             commands::queue::clear_queue,
+            commands::queue::get_bad_sources,
+            commands::queue::purge_bad_sources,
             commands::converter::start_queue,
             commands::converter::pause_conversion,
             commands::converter::resume_conversion,

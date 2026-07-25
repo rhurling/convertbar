@@ -28,6 +28,7 @@ function makeSettings(preset: string): AppSettings {
     skip_by_source_media: true,
     watch_skip_marker: ".downloading",
     low_disk_min_gb: 0,
+    bad_source_action: "trash",
   };
 }
 

@@ -29,6 +29,7 @@ function job(id: string): JobInfo {
     kept_file: null,
     space_saved: null,
     error_message: null,
+    failure_class: null,
     queue_order: 0,
     created_at: "",
     completed_at: "2026-06-17",

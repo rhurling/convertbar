@@ -48,3 +48,9 @@ tempfile = "3"
 # Enables tauri::test (MockRuntime) for the process_queue / cancel integration tests.
 tauri = { version = "2", features = ["test"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# geteuid(), for a converter.rs test that skips the no-read-permission assertion when
+# running as root (rootful docker / `act`). Production libc usage stays macOS-only
+# (SIGSTOP/SIGCONT) — this is test-only and covers Linux CI too.
+libc = "0.2"
+

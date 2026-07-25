@@ -35,6 +35,7 @@ function makeSettings(): AppSettings {
     skip_by_source_media: true,
     watch_skip_marker: ".downloading",
     low_disk_min_gb: 0,
+    bad_source_action: "trash",
   };
 }
 
@@ -150,6 +151,19 @@ describe("SettingsPage", () => {
       expect(invokeMock).toHaveBeenCalledWith("set_preset_suffix", {
         preset: "Fast 1080p30",
         suffix: ".hevc",
+      }),
+    );
+  });
+
+  it("switches the bad-source action to permanent deletion", async () => {
+    render(<SettingsPage />);
+    const radio = await screen.findByLabelText(/delete bad source files permanently/i);
+    fireEvent.click(radio);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+        key: "bad_source_action",
+        value: "delete",
       }),
     );
   });

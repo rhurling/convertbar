@@ -352,6 +352,54 @@ fn filter_watched(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
     covered_paths(&configs, paths)
 }
 
+/// Paths with an unpurged `bad_source`/`bad_source_truncated` row — the same set the "Bad
+/// sources" review list shows (identical WHERE clause to `get_bad_sources_inner`). Fails open
+/// (returns empty) on a DB error: a lock hiccup must not silently block a legitimate add.
+fn unpurged_bad_source_paths(conn: &rusqlite::Connection) -> std::collections::HashSet<String> {
+    let mut stmt = match conn.prepare(
+        "SELECT source_path FROM jobs WHERE status = 'error' AND failure_class IN (?1, ?2)",
+    ) {
+        Ok(s) => s,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    stmt.query_map(
+        rusqlite::params![
+            crate::failure_class::CLASS_BAD_SOURCE,
+            crate::failure_class::CLASS_BAD_SOURCE_TRUNCATED,
+        ],
+        |row| row.get::<_, String>(0),
+    )
+    .map(|rows| rows.flatten().collect())
+    .unwrap_or_default()
+}
+
+/// Pure core of `filter_known_bad_sources`: drop any path present in `bad`. Split out so the
+/// rule is unit-testable without a live DB.
+fn drop_known_bad_sources(
+    bad: &std::collections::HashSet<String>,
+    paths: Vec<String>,
+) -> Vec<String> {
+    paths.into_iter().filter(|p| !bad.contains(p)).collect()
+}
+
+/// Drop paths that already have an unpurged bad-source verdict. Without this, one corrupt file
+/// sitting in a watched folder is re-ingested by EVERY launch's startup rescan (`reconcile` scans
+/// every enabled folder unconditionally): a new `bad_source` row, a failed encode, and a "failed"
+/// notification, forever — the review list grows unbounded with duplicates of the same file.
+///
+/// Applied ONLY at the watcher's enqueue chokepoint (`enqueue_and_start`), never from
+/// `add_files_inner` itself: manual drag-and-drop must stay permissive, since re-adding a file by
+/// hand is the user's deliberate retry mechanism (e.g. after fixing a permission problem or
+/// confirming a "corrupt" file is actually fine).
+fn filter_known_bad_sources(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
+    let app_state = app.state::<AppState>();
+    let bad = match app_state.db.lock() {
+        Ok(conn) => unpurged_bad_source_paths(&conn),
+        Err(_) => return paths,
+    };
+    drop_known_bad_sources(&bad, paths)
+}
+
 /// The basename of the single directory a batch of paths shares, or empty when the batch spans
 /// multiple directories (e.g. a recursive reaper batch). Used only to name the intake scanner in
 /// the UI, so an empty fallback is harmless.
@@ -381,6 +429,10 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
         return;
     }
     let paths = filter_marked(app, paths);
+    if paths.is_empty() {
+        return;
+    }
+    let paths = filter_known_bad_sources(app, paths);
     if paths.is_empty() {
         return;
     }
@@ -1079,5 +1131,54 @@ mod tests {
             "a multi-directory batch has no single name"
         );
         assert_eq!(super::batch_label(&[]), "", "empty batch → empty label");
+    }
+
+    // ---- F8: the watcher must not re-ingest a classified bad source forever ----
+
+    #[test]
+    fn drop_known_bad_sources_removes_only_paths_in_the_bad_set() {
+        let bad: std::collections::HashSet<String> =
+            ["/w/corrupt.mkv".to_string()].into_iter().collect();
+        let paths = vec!["/w/corrupt.mkv".to_string(), "/w/healthy.mkv".to_string()];
+        assert_eq!(
+            drop_known_bad_sources(&bad, paths),
+            vec!["/w/healthy.mkv".to_string()],
+            "only the path with an unpurged bad-source verdict is dropped"
+        );
+    }
+
+    #[test]
+    fn unpurged_bad_source_paths_matches_the_bad_sources_review_lists_query() {
+        // Deliberately the same fixture shape as
+        // get_bad_sources_lists_both_bad_classes_and_excludes_everything_else in
+        // commands/queue.rs, so this stays in lockstep with what the review list itself shows:
+        // a purged row, a live 'done' row, and an environment/unknown failure must all still be
+        // re-ingestible, while an unpurged bad_source or bad_source_truncated row must not.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        for (id, source_path, status, class) in [
+            ("a", "/w/bad.mkv", "error", Some("bad_source")),
+            ("b", "/w/trunc.mkv", "error", Some("bad_source_truncated")),
+            ("c", "/w/env.mkv", "error", Some("environment")),
+            ("d", "/w/purged.mkv", "error", Some("bad_source_purged")),
+            ("e", "/w/done.mkv", "done", Some("bad_source")),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, failure_class,
+                                   queue_order, created_at, completed_at)
+                 VALUES (?1, ?2, '/o.mp4', 'p', ?3, ?4, 0, '2026-07-25T10:00:00Z',
+                         '2026-07-25T10:00:00Z')",
+                rusqlite::params![id, source_path, status, class],
+            )
+            .unwrap();
+        }
+        let bad = unpurged_bad_source_paths(&conn);
+        assert_eq!(
+            bad,
+            ["/w/bad.mkv".to_string(), "/w/trunc.mkv".to_string()]
+                .into_iter()
+                .collect(),
+            "only unpurged bad_source/bad_source_truncated rows must be treated as known-bad"
+        );
     }
 }
