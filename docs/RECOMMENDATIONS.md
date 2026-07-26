@@ -60,13 +60,13 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 - `Space` — pause/resume active conversion
 - `Escape` — close/hide popover
 - `Cmd+Q` — quit app
-- `Cmd+Shift+C` (global) — toggle popover visibility from anywhere
+- ~~`Cmd+Shift+C` (global) — toggle popover visibility from anywhere~~ — **dropped at 1.0**, see the
+  spec-compliance table below
 
 **How:**
 - In-app shortcuts: add `onKeyDown` handler to the App component
-- Global hotkey: use Tauri's `tauri-plugin-global-shortcut`
 
-**Files:** `src/App.tsx` (keydown handler), `src-tauri/Cargo.toml` (global shortcut plugin), `src-tauri/src/lib.rs` (register global shortcut)
+**Files:** `src/App.tsx` (keydown handler)
 
 ---
 
@@ -153,7 +153,7 @@ registered in `src-tauri/src/lib.rs` — only the button and a dialog invocation
 | US1: Skipped files notification | **Done** | Skips reported via `SkipReason` / `summarizeAdds` feedback |
 | US2: Error state icon in menu bar | **Done** | Tray error state flag shared with menu-bar status |
 | Notifications on completion | **Done** (v0.5.0) | — |
-| Global hotkey for popover | Missing | Not implemented |
+| Global hotkey for popover | **Dropped** (1.0) | Deliberately not shipping. The tray click already opens the popover from anywhere; a configurable global shortcut needs a capture UI, persistence, and conflict handling when another app owns the combo — more surface than the convenience earns. Revisit if users ask. |
 | Launch at login | **Done** | `tauri-plugin-autostart` registered and wired to the setting (`src-tauri/src/lib.rs`) |
 
 ---
