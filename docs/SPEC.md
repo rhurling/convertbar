@@ -315,10 +315,15 @@ Skip logic:
 
 ## Open Questions
 
-1. **Notifications:** Should the app send a macOS notification when a conversion completes or the queue finishes? (Likely yes, but not discussed)
+1. ~~**Notifications:** Should the app send a macOS notification when a conversion completes or the queue finishes? (Likely yes, but not discussed)~~
+   **[Resolved — shipped in 0.5.0:** per-file, errors-only, and queue-complete notifications, each
+   independently toggleable in Settings.**]**
 2. **Multiple simultaneous encodes:** Currently sequential. Some users may want 2 parallel encodes on powerful machines. Defer to v2?
-3. **Keyboard shortcut:** Global hotkey to open the popover? (Nice to have, not essential)
-4. **App icon/name:** "ConvertBar" is a working title — finalize before release
+3. ~~**Keyboard shortcut:** Global hotkey to open the popover? (Nice to have, not essential)~~
+   **[Resolved — dropped at 1.0.** The tray click covers it; a configurable shortcut would need a
+   capture UI, persistence, and conflict handling. See `RECOMMENDATIONS.md`.**]**
+4. ~~**App icon/name:** "ConvertBar" is a working title — finalize before release~~
+   **[Resolved — "ConvertBar" is the final name, shipped since 0.1.0.]**
 
 ## Out of Scope
 
