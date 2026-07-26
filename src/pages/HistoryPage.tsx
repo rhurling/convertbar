@@ -53,6 +53,17 @@ function buildOutcomeNote(results: PurgeResult[]): string | null {
   return `${purgedCount} file(s) removed. ${parts.join(", ")}.`;
 }
 
+// Plain-English reason per reviewed row, keyed by the failure_class the backend already
+// distinguishes. The stored error_message can't serve here: its headline is HandBrake's own
+// promoted diagnostic, so two corrupt MP4s read as
+// "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x8e0a44000] moov atom not found" — differing only by a heap
+// pointer, with the informative words pushed past the panel's right edge. An unlabelled
+// failure_class falls back to the stored message rather than rendering blank.
+const BAD_SOURCE_REASONS: Record<string, string> = {
+  bad_source: "Unreadable — HandBrake found no video",
+  bad_source_truncated: "Incomplete — file stops partway through",
+};
+
 export default function HistoryPage() {
   const { history, summary, hasMore, loading, loadMore, refresh, setSearchDebounced, sortBy, setSortBy } = useHistory();
   const { badSources, purge } = useBadSources();
@@ -206,11 +217,12 @@ export default function HistoryPage() {
               <ul className="bad-sources-list">
                 {badSources.map((job) => (
                   <li key={job.id}>
-                    <span className="bad-sources-name">
+                    <span className="bad-sources-name" title={job.source_path}>
                       {job.source_path.split(/[/\\]/).pop()}
                     </span>
                     <span className="bad-sources-reason">
-                      {(job.error_message ?? "").split("\n")[0]}
+                      {BAD_SOURCE_REASONS[job.failure_class ?? ""] ??
+                        (job.error_message ?? "").split("\n")[0]}
                     </span>
                   </li>
                 ))}
