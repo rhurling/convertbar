@@ -41,6 +41,9 @@ pub struct ServerState {
     pub config: Arc<ServerConfig>,
     pub events_tx: broadcast::Sender<(String, Value)>,
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Per-source failed-credential ramp, shared by `auth_guard` and the login route
+    /// so failures at either accumulate together.
+    pub login_throttle: Arc<crate::throttle::LoginThrottle>,
 }
 
 /// Nests all `/api` routes; the caller (`main.rs`) adds the static/embed fallback.
@@ -201,6 +204,14 @@ pub(crate) mod tests {
             ),
             events_tx,
             shutdown_rx,
+            // Zero base delay so the existing suite does not sleep. Tests that
+            // exercise the ramp construct their own policy.
+            login_throttle: Arc::new(crate::throttle::LoginThrottle::new(
+                crate::throttle::ThrottlePolicy {
+                    base: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+            )),
         };
         (state, shutdown_tx)
     }

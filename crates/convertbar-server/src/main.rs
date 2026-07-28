@@ -83,6 +83,9 @@ async fn main() {
         config: Arc::new(config),
         events_tx,
         shutdown_rx,
+        login_throttle: Arc::new(throttle::LoginThrottle::new(
+            throttle::ThrottlePolicy::default(),
+        )),
     };
 
     let app = routes::app(state);
