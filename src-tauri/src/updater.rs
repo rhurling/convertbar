@@ -2259,6 +2259,28 @@ mod tests {
     }
 
     #[test]
+    fn a_user_pause_releases_the_updaters_claim_in_the_same_step() {
+        // The two writes are paired in `set_user_queue_pause` precisely so they cannot be
+        // separated: a user pause that left the breadcrumb standing is one a failed install or the
+        // next launch would lift. On macOS this is the only thing telling the two stops apart —
+        // SIGSTOP leaves the queue thread alive, so `is_running` never clears.
+        let conn = test_conn();
+        set_drain_pause(&conn, true);
+
+        crate::converter::set_user_queue_pause(&conn);
+
+        assert!(crate::converter::is_queue_paused(&conn));
+        assert!(
+            !read_drain_pause(&conn),
+            "a pause the user asked for is not the updater's to lift"
+        );
+        assert!(
+            !should_resume_queue_at_launch(&conn, true),
+            "and it survives the launch that would otherwise resume the batch"
+        );
+    }
+
+    #[test]
     fn a_clear_that_lifts_nothing_leaves_the_breadcrumb_alone() {
         // The watcher clears the remembered pause on every add. While a drain is armed but has not
         // landed yet, `queue_paused` is still false — that clear takes ownership of nothing, and
@@ -2293,9 +2315,8 @@ mod tests {
         {
             let conn = db.lock().unwrap();
             set_drain_pause(&conn, true);
-            // What pause_conversion does: the user's stop, and the updater's claim released.
-            crate::converter::set_queue_paused(&conn, true);
-            forget_drain_pause(&conn);
+            // Exactly what `pause_conversion` persists.
+            crate::converter::set_user_queue_pause(&conn);
         }
 
         {

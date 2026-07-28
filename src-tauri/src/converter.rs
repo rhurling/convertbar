@@ -471,6 +471,18 @@ pub(crate) fn set_queue_paused(db: &Connection, paused: bool) {
     );
 }
 
+/// Persists a stop the *user* asked for: the paused flag, plus the release of any updater claim
+/// on it.
+///
+/// One function so the two cannot drift apart. A user pause that left the updater's breadcrumb
+/// standing would be lifted by a failed install or by the next launch — and on macOS the two are
+/// otherwise indistinguishable, because SIGSTOP leaves the queue thread alive so `is_running`
+/// never clears.
+pub(crate) fn set_user_queue_pause(db: &Connection) {
+    set_queue_paused(db, true);
+    crate::updater::forget_drain_pause(db);
+}
+
 pub(crate) fn is_queue_paused(db: &Connection) -> bool {
     db.query_row(
         "SELECT value FROM settings WHERE key = 'queue_paused'",

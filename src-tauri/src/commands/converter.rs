@@ -89,14 +89,12 @@ pub fn pause_conversion(
                     "UPDATE jobs SET status = 'paused' WHERE id = ?1",
                     rusqlite::params![job_id],
                 );
-                crate::converter::set_queue_paused(&db, true);
-                // This pause is the user's, so the updater must not claim it. A drain armed for
-                // an "Install and restart" can still be outstanding here — on macOS the queue
-                // thread stays alive under SIGSTOP, so `is_running` never clears and the two
-                // persisted stops are otherwise indistinguishable. Without this, an install that
-                // later failed would lift the pause the user just set and the next launch would
-                // resume the batch they deliberately stopped.
-                crate::updater::forget_drain_pause(&db);
+                // Not `set_queue_paused`: this pause is the user's, so the updater's claim on the
+                // pause state has to be released with it. A drain armed for an "Install and
+                // restart" can still be outstanding here, and on macOS the queue thread stays
+                // alive under SIGSTOP so the two persisted stops are indistinguishable — an
+                // install that later failed would lift the pause the user just set.
+                crate::converter::set_user_queue_pause(&db);
 
                 let _ = app.emit(
                     "job-status-changed",
