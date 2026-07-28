@@ -1264,7 +1264,10 @@ pub fn purge_bad_sources(ctx: &Arc<Ctx>, ids: Vec<String>) -> Result<Vec<PurgeRe
     // unlocked, so R3 still holds — at the cost of one extra acquisition per batch, not per id.
     // A lock failure inside it now lands in this `Err` and reaches `purge_one_locked` per id
     // (which maps any `Err` to `Unverifiable`, destroying nothing) rather than failing the whole
-    // call; on a poisoned mutex the `action` read above would already have returned `Err` first.
+    // call. A mutex already poisoned when this call began would have failed the `action` read
+    // above; poisoning that lands BETWEEN the two acquisitions — the converter thread panicking
+    // under the lock mid-batch — surfaces here instead, as per-id `Unverifiable` rather than one
+    // `Err` for the call. Fail-safe either way: nothing is destroyed on an unverifiable verdict.
     let handbrake_path = handbrake::require_handbrake_path(ctx);
     Ok(ids
         .iter()

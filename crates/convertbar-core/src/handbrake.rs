@@ -837,6 +837,17 @@ Matroska/
     }
 
     #[test]
+    fn handbrake_not_found_wording_is_pinned() {
+        // The ONE place the wording itself is asserted. Every other site — production and test —
+        // references the constant, which protects the identifier but not its value. Without this,
+        // editing the string would silently change the HTTP error body, the persisted job
+        // `error_message`, and the text the user reads, with nothing going red. Changing this
+        // line is the deliberate act of changing a user- and API-visible contract; that is the
+        // point of it being exactly one line in exactly one place.
+        assert_eq!(HANDBRAKE_NOT_FOUND, "HandBrakeCLI not found");
+    }
+
+    #[test]
     fn require_handbrake_path_reports_missing_in_the_absent_world() {
         // The single production site of the `None` -> `Err` mapping. Eight call sites across
         // three crates each used to spell this out; if one drifts now it is a compile error

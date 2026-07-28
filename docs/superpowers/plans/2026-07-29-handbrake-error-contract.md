@@ -929,9 +929,16 @@ the constant in `crates/convertbar-core/src/handbrake.rs`:
 pub const HANDBRAKE_NOT_FOUND: &str = "XXX PLACEHOLDER XXX";
 ```
 
-Run `cargo test --workspace`. Expected: **green**. Any failure names a test that still hardcodes
-the words — fix that test to use the constant, then re-run. Restore the real value afterwards and
-confirm green again. Record both runs in the report.
+Run `cargo test --workspace`. Expected: **exactly one failure —
+`handbrake::tests::handbrake_not_found_wording_is_pinned`**, which asserts the literal wording on
+purpose. Any OTHER failure names a test that still hardcodes the words — fix that test to use the
+constant, then re-run.
+
+The single deliberate failure is the point. Every other site references the constant, which
+protects the identifier but not its value; without that one pin, editing the string would
+silently change the HTTP error body, the persisted job `error_message`, and the user-visible
+text with nothing going red — the exact silent break the constant's doc comment claims to
+prevent, inverted. Restore the real value afterwards and confirm fully green. Record both runs.
 
 - [ ] **Step 2: Panic-detection check**
 
