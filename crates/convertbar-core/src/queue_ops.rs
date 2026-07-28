@@ -1660,28 +1660,9 @@ mod tests {
             test_conn(),
             Arc::new(StubLocator("/opt/fake/HandBrakeCLI".into())),
         );
-        // `StubLocator` alone is not the installed world: past resolution `add_files_inner` calls
-        // `cached_preset_metadata`, which on a miss *runs* the resolved binary and propagates the
-        // failure — the stub path would make intake return Err and swallow the queue-updated emit.
-        // Pre-seeding the cache short-circuits that shell-out.
-        let preset: String = ctx
-            .db
-            .lock()
-            .unwrap()
-            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        ctx.preset_cache.lock().unwrap().insert(
-            preset,
-            crate::handbrake::PresetMetadata {
-                codec: "h265".into(),
-                resolution: "1080p".into(),
-                quality: "22".into(),
-                preset: "Fast 1080p30".into(),
-                device: "VideoToolbox".into(),
-            },
-        );
+        // Without the seed the stub path would be shelled out to and intake would return Err,
+        // swallowing the queue-updated emit this test asserts on.
+        crate::handbrake::seed_preset_cache(&ctx);
 
         // an empty add still brackets: add-started → add-finished → queue-updated
         let _ = add_files(&ctx, &[]);

@@ -203,32 +203,13 @@ pub(crate) mod tests {
     }
 
     /// `test_state` for route tests that add files and expect success: the "HandBrake installed"
-    /// world. A `StubLocator` alone is not that world — past resolution, intake fetches preset
-    /// metadata by *running* the resolved binary, so the cache is pre-seeded to short-circuit
-    /// that shell-out; without it every add would return the fetch's `Err` as a 500.
+    /// world. Needs the cache seed as well as the locator — see `seed_preset_cache` for why.
+    /// Without it every add would surface the metadata fetch's `Err` as a 500.
     fn test_state_installed() -> ServerState {
         let (state, _tx) = test_state_with_locator(Arc::new(
             convertbar_core::handbrake::StubLocator("/opt/fake/HandBrakeCLI".into()),
         ));
-        let preset: String = state
-            .ctx
-            .db
-            .lock()
-            .unwrap()
-            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        state.ctx.preset_cache.lock().unwrap().insert(
-            preset,
-            convertbar_core::handbrake::PresetMetadata {
-                codec: "h265".into(),
-                resolution: "1080p".into(),
-                quality: "22".into(),
-                preset: "Fast 1080p30".into(),
-                device: "VideoToolbox".into(),
-            },
-        );
+        convertbar_core::handbrake::seed_preset_cache(&state.ctx);
         state
     }
 

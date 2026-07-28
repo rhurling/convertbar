@@ -1170,24 +1170,7 @@ mod tests {
                 "/opt/fake/HandBrakeCLI".into(),
             )),
         );
-        let preset: String = ctx
-            .db
-            .lock()
-            .unwrap()
-            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        ctx.preset_cache.lock().unwrap().insert(
-            preset,
-            crate::handbrake::PresetMetadata {
-                codec: "h265".into(),
-                resolution: "1080p".into(),
-                quality: "22".into(),
-                preset: "Fast 1080p30".into(),
-                device: "VideoToolbox".into(),
-            },
-        );
+        crate::handbrake::seed_preset_cache(&ctx);
         // Cover the fake path with a watch so it survives `filter_watched`; nothing else needs
         // to exist on disk since add_files_inner's cheap skip checks are extension/DB-based.
         ctx.watcher

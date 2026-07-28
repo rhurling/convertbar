@@ -93,6 +93,38 @@ impl HandbrakeLocator for StubLocator {
     }
 }
 
+/// Test support, alongside the locator doubles above: pre-populates `ctx`'s preset-metadata
+/// cache for the configured preset.
+///
+/// [`StubLocator`] alone does *not* express the "HandBrake installed" world. Past resolution,
+/// intake calls [`cached_preset_metadata`], which on a cache miss runs the resolved path and
+/// propagates the failure — so a stub pointing at a non-existent binary makes `add_files_inner`
+/// return `Err`. Seeding short-circuits that shell-out, which is what lets `StubLocator` alone
+/// stand in for an installed HandBrake.
+///
+/// The values are fixed rather than parameterized because callers assert on what they expand to:
+/// the default `.{resolution}-{codec}` template becomes `.1080p-h265`.
+pub fn seed_preset_cache(ctx: &Ctx) {
+    let preset: String = ctx
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    ctx.preset_cache.lock().unwrap().insert(
+        preset,
+        PresetMetadata {
+            codec: "h265".into(),
+            resolution: "1080p".into(),
+            quality: "22".into(),
+            preset: "Fast 1080p30".into(),
+            device: "VideoToolbox".into(),
+        },
+    );
+}
+
 /// The configured path if it points at an existing file, otherwise the locator's answer.
 ///
 /// Filesystem work only — no DB access — so callers can hold or release the db guard as their
