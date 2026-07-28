@@ -226,7 +226,11 @@ mod throttle_tests {
         let t = LoginThrottle::new(policy());
         let now = Instant::now();
         let hot = id("192.168.1.1");
-        fail_n(&t, hot, now, 6);
+        // 4, not more: with `free: 3` only four evaluations fit at a single
+        // instant before the gate shuts (the fifth is Deny). Count 4 is still
+        // far hotter than the flood's count-of-1 entries, which is all this
+        // test needs to prove eviction keeps the right bucket.
+        fail_n(&t, hot, now, 4);
 
         for i in 0..(PRUNE_THRESHOLD as u32 * 2) {
             let o = i.to_be_bytes();
