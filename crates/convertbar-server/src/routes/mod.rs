@@ -14,6 +14,7 @@ pub mod fs;
 pub mod handbrake;
 pub mod history;
 pub mod info;
+pub mod login;
 pub mod queue;
 pub mod settings;
 pub mod watch;
@@ -47,6 +48,7 @@ pub fn api_router(state: ServerState) -> Router {
     // with 200 instead of a 404.
     let api = Router::new()
         .route("/info", get(info::get_app_info))
+        .route("/login", post(login::login))
         .route("/events", get(events::sse_handler))
         .route("/queue/files", post(queue::add_files))
         .route("/folders/scan", post(queue::scan_folder))
@@ -114,11 +116,26 @@ async fn api_not_found() -> impl IntoResponse {
     )
 }
 
-/// The full app: `api_router` plus the embedded SPA fallback, exactly as `main.rs` serves
-/// it. Factored out so tests can exercise the real composition (nest + outer fallback
-/// together) rather than `api_router` alone.
+/// The full app: `api_router` plus the embedded SPA fallback, wrapped in the security guard
+/// stack — exactly as `main.rs` serves it. Factored out so tests can exercise the real
+/// composition (nest + outer fallback + guards together) rather than `api_router` alone.
+///
+/// Guard layering order (outermost first): `host_guard` (always on, anti DNS-rebinding) ->
+/// `auth_guard` (bearer/cookie token check) -> `json_content_guard` (CSRF belt) -> routes.
+/// Each `.layer()` call below wraps everything added before it, so the LAST layer added ends
+/// up OUTERMOST — hence `host_guard` is added last. See `auth.rs` for each guard's contract.
 pub fn app(state: ServerState) -> Router {
-    api_router(state).fallback(crate::embed::fallback)
+    api_router(state.clone())
+        .fallback(crate::embed::fallback)
+        .layer(axum::middleware::from_fn(crate::auth::json_content_guard))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::auth_guard,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::auth::host_guard,
+        ))
 }
 
 // `pub(crate)` so sibling route modules' own `#[cfg(test)]` submodules (e.g.
@@ -625,8 +642,11 @@ pub(crate) mod tests {
 
         let response = app
             .oneshot(
+                // host_guard (Task 8) is now ALWAYS on, even in this test's Open auth mode —
+                // a Host header is required for the request to get past it at all.
                 Request::builder()
                     .uri("/api/does-not-exist")
+                    .header("Host", "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
