@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { MANUAL_CHECK_BLOCKED_STATUSES, useUpdate } from "../hooks/useUpdate";
-import { commands, type AvailableUpdate, type UpdateMode } from "../lib/tauri";
+import { type AvailableUpdate, type UpdateMode } from "../lib/tauri";
 
 const MODES: { value: UpdateMode; label: string }[] = [
   { value: "automatic", label: "Automatic" },
@@ -43,7 +43,8 @@ function AvailableDetails({ update }: { update: AvailableUpdate }) {
 }
 
 export default function UpdatePanel() {
-  const { state, actionError, checkNow, install, skip, restart, dismissError } = useUpdate();
+  const { state, actionError, checkNow, install, skip, setMode, restart, dismissError } =
+    useUpdate();
   const [lastAction, setLastAction] = useState<ActionKind | null>(null);
   const [pending, setPending] = useState(false);
 
@@ -81,6 +82,16 @@ export default function UpdatePanel() {
   // completed "What's new" restart prompt is fine once it reads as something that *was* refused,
   // not something that *is* happening).
   const framedActionError = lastAction ? `${ACTION_PREFIX[lastAction]}: ${actionError}` : actionError;
+  // Past the restart, "What's new" has to name the version actually running or it never ends: a
+  // Windows user who cancels the installer's UAC prompt (which `Update::install` raises *after*
+  // std::process::exit(0), so the app is already gone) is relaunched on the OLD binary with the
+  // marker still written, and nothing else clears it. `readyToRestart` is exempt on purpose — the
+  // marker is written BEFORE the install and this process keeps running the old binary until it
+  // restarts, so that is exactly the window where the two versions differ legitimately, and it is
+  // where the Restart button lives.
+  const justInstalledIsCurrent =
+    state.status === "readyToRestart" ||
+    state.just_installed?.version === state.current_version;
 
   return (
     <div className="setting-group">
@@ -95,7 +106,16 @@ export default function UpdatePanel() {
               type="radio"
               name="update_mode"
               checked={state.mode === m.value}
-              onChange={() => commands.updateSetting("update_mode", m.value)}
+              onChange={() => {
+                // Deliberately outside `startAction`: switching to Off is how a user cancels an
+                // install that is already downloading, and `startAction` would swallow the click
+                // for the whole length of that download. Staying outside it also makes this a
+                // second writer of `actionError`, so it clears `lastAction` instead of claiming
+                // it — an unframed message reads worse than a framed one, but never names the
+                // wrong action.
+                setLastAction(null);
+                void setMode(m.value);
+              }}
             />
             {m.label}
           </label>
@@ -164,8 +184,9 @@ export default function UpdatePanel() {
       {/* `just_installed` is read from the database independent of the in-memory `status`, so
           it survives the restart it names — after relaunch, status resets to idle on the new
           binary but this stays populated until the next update overwrites it. Suppressed only
-          while a *newer* update is on offer (status "available"), which takes visual priority. */}
-      {state.status !== "available" && state.just_installed && (
+          while a *newer* update is on offer (status "available"), which takes visual priority,
+          and once it stops naming the running version (see `justInstalledIsCurrent`). */}
+      {state.status !== "available" && state.just_installed && justInstalledIsCurrent && (
         <div className="update-available">
           <div className="update-version">What&apos;s new in {state.just_installed.version}</div>
           {state.just_installed.notes && (

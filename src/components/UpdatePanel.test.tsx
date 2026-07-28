@@ -9,6 +9,7 @@ const mockUpdate = {
   checkNow: vi.fn(),
   install: vi.fn(),
   skip: vi.fn(),
+  setMode: vi.fn(),
   restart: vi.fn(),
   dismissError: vi.fn(),
 };
@@ -20,12 +21,6 @@ vi.mock("../hooks/useUpdate", () => ({
   // "Check now" in exactly the statuses the backend's manual_check_block would refuse.
   MANUAL_CHECK_BLOCKED_STATUSES: new Set(["checking", "downloading", "waitingForIdle", "readyToRestart"]),
 }));
-vi.mock("../lib/tauri", () => ({
-  commands: { updateSetting: vi.fn().mockResolvedValue(undefined) },
-}));
-
-import { commands } from "../lib/tauri";
-
 const base = {
   mode: "automatic",
   status: "idle",
@@ -208,7 +203,34 @@ describe("UpdatePanel", () => {
     expect(screen.getByLabelText("Notify me")).not.toBeChecked();
 
     await userEvent.click(screen.getByLabelText("Notify me"));
-    expect(commands.updateSetting).toHaveBeenCalledWith("update_mode", "notify");
+    // Goes through the hook's setMode, not commands.updateSetting directly: that is what puts a
+    // rejected write into actionError instead of leaving an unhandled promise rejection.
+    expect(mockUpdate.setMode).toHaveBeenCalledWith("notify");
+  });
+
+  it("stops showing what's new once it no longer names the running version", async () => {
+    // On Windows `Update::install` exits the process *before* the installer's UAC prompt, so a
+    // user who cancels that prompt is relaunched on the OLD binary with the marker already
+    // written. Ungated, the panel advertises "What's new in 1.1.0" on a 1.0.0 app forever —
+    // nothing else ever clears the key. The readyToRestart test above covers the one window
+    // where the mismatch is legitimate (the marker is written before the install runs, and this
+    // process keeps the old binary until it restarts).
+    mockUpdate.state = {
+      ...base,
+      status: "idle",
+      just_installed: { version: "1.1.0", notes: "### Fixes\n- a fix" },
+    };
+    render(<UpdatePanel />);
+    expect(screen.queryByText(/what's new/i)).toBeNull();
+
+    mockUpdate.state = {
+      ...base,
+      status: "idle",
+      current_version: "1.1.0",
+      just_installed: { version: "1.1.0", notes: "### Fixes\n- a fix" },
+    };
+    render(<UpdatePanel />);
+    expect(await screen.findByText(/what's new in 1\.1\.0/i)).toBeInTheDocument();
   });
 
   it("disables Check now while an action the backend would refuse is in flight", async () => {

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { commands, type UpdateState, type UpdateStatus } from "../lib/tauri";
+import { commands, type UpdateMode, type UpdateState, type UpdateStatus } from "../lib/tauri";
 
 // Statuses where the backend's `manual_check_block` (updater.rs) would refuse a fresh manual
 // check: an install is downloading, waiting for the queue to drain, or installed and awaiting
@@ -75,6 +75,14 @@ export function useUpdate() {
     [runAction],
   );
   const restart = useCallback(() => commands.restartApp(), []);
+  // Routed through runAction like the other three: the write can reject, and an unhandled
+  // rejection is the one outcome the panel cannot show. The new mode is not mirrored locally —
+  // the backend's `on_mode_changed` pushes `update-state` back, which is what re-renders the
+  // radios.
+  const setMode = useCallback(
+    (mode: UpdateMode) => runAction(() => commands.updateSetting("update_mode", mode)),
+    [runAction],
+  );
 
   const skip = useCallback(
     () =>
@@ -88,5 +96,5 @@ export function useUpdate() {
 
   const dismissError = useCallback(() => setActionError(null), []);
 
-  return { state, actionError, checkNow, install, skip, restart, dismissError };
+  return { state, actionError, checkNow, install, skip, setMode, restart, dismissError };
 }
