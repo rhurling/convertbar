@@ -6,6 +6,7 @@ import WatchedFoldersPage from "./pages/WatchedFoldersPage";
 import SettingsPage from "./pages/SettingsPage";
 import LoginScreen from "./components/LoginScreen";
 import { commands, type HandbrakeStatus } from "./lib/tauri";
+import { isServerHead } from "./lib/head";
 import { useAddProgress } from "./hooks/useAddProgress";
 import { useFileIntake } from "./hooks/useFileIntake";
 import "./App.css";
@@ -36,6 +37,9 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // Desktop-only: hideWindow() has no server equivalent (there's no window to hide), so the
+    // listener itself is never registered on the server build rather than gating the call inside it.
+    if (isServerHead) return;
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         commands.hideWindow();

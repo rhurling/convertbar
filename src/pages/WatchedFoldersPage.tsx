@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useWatchedDirectories } from "../hooks/useWatchedDirectories";
 import { fileName } from "../lib/format";
 import type { WatchedDirectory } from "../lib/tauri";
+import { isServerHead } from "../lib/head";
+import FileBrowserModal from "../components/FileBrowserModal";
 
 interface WatchRowProps {
   dir: WatchedDirectory;
@@ -86,19 +88,37 @@ export default function WatchedFoldersPage() {
     loading,
     error,
     addDirectory,
+    addDirectoryAtPath,
     updateDirectory,
     setEnabled,
     removeDirectory,
   } = useWatchedDirectories();
+  const [showBrowser, setShowBrowser] = useState(false);
 
   return (
     <div className="section">
       <div className="section-header">
         <span>Watched Folders ({directories.length})</span>
-        <button className="btn btn-small" onClick={addDirectory}>
+        {/* Desktop uses the native folder picker; the server head has no pickFolder equivalent
+            and opens the file-browser modal in directory mode instead. */}
+        <button
+          className="btn btn-small"
+          onClick={() => (isServerHead ? setShowBrowser(true) : addDirectory())}
+        >
           + Add folder
         </button>
       </div>
+
+      {showBrowser && (
+        <FileBrowserModal
+          mode="directory"
+          onSelect={(paths) => {
+            setShowBrowser(false);
+            if (paths[0]) addDirectoryAtPath(paths[0]);
+          }}
+          onClose={() => setShowBrowser(false)}
+        />
+      )}
 
       {error && <div className="watch-error">{error}</div>}
 

@@ -21,8 +21,10 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
     progress && progress.job_id === job.id ? progress.fps : null;
 
   useEffect(() => {
-    commands.getPlatformCapabilities().then((caps) => {
-      setCanPauseProcess(caps.can_pause_process);
+    // getAppInfo() works on both heads (getPlatformCapabilities is desktop-only); can_pause_process
+    // is a runtime data field, not a build-time UI-presence gate.
+    commands.getAppInfo().then((info) => {
+      setCanPauseProcess(info.can_pause_process);
     });
     // The armed-state lives in the backend; seed from it so tab remounts (and the updater
     // flow arming it elsewhere) can't leave this button showing the wrong label.

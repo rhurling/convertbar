@@ -3,8 +3,8 @@ import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "../lib/events";
+import { isServerHead } from "../lib/head";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
@@ -50,7 +50,11 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [suffixDraft, setSuffixDraft] = useState(presetSuffix);
   const [resolvedSuffix, setResolvedSuffix] = useState("");
 
-  useEffect(() => { getVersion().then(setAppVersion); }, []);
+  // getAppInfo() works on both heads (desktop composes it from getVersion() internally, server
+  // hits /api/info) — version display is runtime data, not a build-time UI-presence gate.
+  useEffect(() => {
+    commands.getAppInfo().then((info) => setAppVersion(info.version)).catch(() => {});
+  }, []);
   useEffect(() => {
     if (settings) setHbDraft(settings.handbrake_path);
   }, [settings?.handbrake_path]);
@@ -224,26 +228,33 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
 
       <div className="setting-group">
         <label className="setting-label">After conversion</label>
-        <div className="setting-radios">
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="cleanup"
-              checked={settings.cleanup_mode === "trash"}
-              onChange={() => updateSetting("cleanup_mode", "trash")}
-            />
-            Move original to Trash
-          </label>
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="cleanup"
-              checked={settings.cleanup_mode === "delete"}
-              onChange={() => updateSetting("cleanup_mode", "delete")}
-            />
-            Delete permanently
-          </label>
-        </div>
+        {isServerHead ? (
+          <p className="setting-hint">
+            Originals are deleted permanently after conversion — the server has no Trash to
+            move them to.
+          </p>
+        ) : (
+          <div className="setting-radios">
+            <label className="radio-label">
+              <input
+                type="radio"
+                name="cleanup"
+                checked={settings.cleanup_mode === "trash"}
+                onChange={() => updateSetting("cleanup_mode", "trash")}
+              />
+              Move original to Trash
+            </label>
+            <label className="radio-label">
+              <input
+                type="radio"
+                name="cleanup"
+                checked={settings.cleanup_mode === "delete"}
+                onChange={() => updateSetting("cleanup_mode", "delete")}
+              />
+              Delete permanently
+            </label>
+          </div>
+        )}
       </div>
 
       <div className="setting-group">
@@ -252,26 +263,32 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           Files ConvertBar could not read, or that turned out to be incomplete
           downloads, are listed in History. Nothing is removed until you choose to.
         </p>
-        <div className="setting-radios">
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="badSource"
-              checked={settings.bad_source_action === "trash"}
-              onChange={() => updateSetting("bad_source_action", "trash")}
-            />
-            Move bad source files to Trash
-          </label>
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="badSource"
-              checked={settings.bad_source_action === "delete"}
-              onChange={() => updateSetting("bad_source_action", "delete")}
-            />
-            Delete bad source files permanently
-          </label>
-        </div>
+        {isServerHead ? (
+          <p className="setting-hint">
+            Bad source files are deleted permanently — the server has no Trash to move them to.
+          </p>
+        ) : (
+          <div className="setting-radios">
+            <label className="radio-label">
+              <input
+                type="radio"
+                name="badSource"
+                checked={settings.bad_source_action === "trash"}
+                onChange={() => updateSetting("bad_source_action", "trash")}
+              />
+              Move bad source files to Trash
+            </label>
+            <label className="radio-label">
+              <input
+                type="radio"
+                name="badSource"
+                checked={settings.bad_source_action === "delete"}
+                onChange={() => updateSetting("bad_source_action", "delete")}
+              />
+              Delete bad source files permanently
+            </label>
+          </div>
+        )}
       </div>
 
       <div className="setting-group">
@@ -352,67 +369,75 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         </p>
       </div>
 
-      <div className="setting-group">
-        <label className="setting-label">Menu bar display</label>
-        <p className="setting-hint">Choose what to show next to the icon during encoding</p>
-        <div className="setting-toggles">
-          {[
-            { key: "menubar_show_percent", label: "Percentage" },
-            { key: "menubar_show_eta", label: "ETA" },
-            { key: "menubar_show_queue", label: "Queue count" },
-            { key: "menubar_show_filename", label: "File name" },
-            { key: "menubar_show_fps", label: "Encoding speed" },
-          ].map(({ key, label }) => (
-            <label key={key} className="toggle-label">
-              <input
-                type="checkbox"
-                checked={settings[key as keyof AppSettings] === true}
-                onChange={(e) => updateSetting(key, String(e.target.checked))}
-              />
-              {label}
-            </label>
-          ))}
+      {/* Menu bar display, notifications, and launch-at-login are all macOS menu-bar-app
+          concepts with no equivalent on a headless server. */}
+      {!isServerHead && (
+        <div className="setting-group">
+          <label className="setting-label">Menu bar display</label>
+          <p className="setting-hint">Choose what to show next to the icon during encoding</p>
+          <div className="setting-toggles">
+            {[
+              { key: "menubar_show_percent", label: "Percentage" },
+              { key: "menubar_show_eta", label: "ETA" },
+              { key: "menubar_show_queue", label: "Queue count" },
+              { key: "menubar_show_filename", label: "File name" },
+              { key: "menubar_show_fps", label: "Encoding speed" },
+            ].map(({ key, label }) => (
+              <label key={key} className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={settings[key as keyof AppSettings] === true}
+                  onChange={(e) => updateSetting(key, String(e.target.checked))}
+                />
+                {label}
+              </label>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
-      <div className="setting-group">
-        <label className="setting-label">Notifications</label>
-        <div className="setting-toggles">
-          <label className="toggle-label">
-            <input type="checkbox"
-              checked={settings.notifications_per_file}
-              onChange={(e) => updateSetting("notifications_per_file", String(e.target.checked))} />
-            Notify per file
-          </label>
-          {settings.notifications_per_file && (
-            <label className="toggle-label toggle-sub">
+      {!isServerHead && (
+        <div className="setting-group">
+          <label className="setting-label">Notifications</label>
+          <div className="setting-toggles">
+            <label className="toggle-label">
               <input type="checkbox"
-                checked={settings.notifications_errors_only}
-                onChange={(e) => updateSetting("notifications_errors_only", String(e.target.checked))} />
-              Errors only
+                checked={settings.notifications_per_file}
+                onChange={(e) => updateSetting("notifications_per_file", String(e.target.checked))} />
+              Notify per file
             </label>
-          )}
-          <label className="toggle-label">
-            <input type="checkbox"
-              checked={settings.notifications_queue_done}
-              onChange={(e) => updateSetting("notifications_queue_done", String(e.target.checked))} />
-            Notify when queue finishes
+            {settings.notifications_per_file && (
+              <label className="toggle-label toggle-sub">
+                <input type="checkbox"
+                  checked={settings.notifications_errors_only}
+                  onChange={(e) => updateSetting("notifications_errors_only", String(e.target.checked))} />
+                Errors only
+              </label>
+            )}
+            <label className="toggle-label">
+              <input type="checkbox"
+                checked={settings.notifications_queue_done}
+                onChange={(e) => updateSetting("notifications_queue_done", String(e.target.checked))} />
+              Notify when queue finishes
+            </label>
+          </div>
+        </div>
+      )}
+
+      {!isServerHead && (
+        <div className="setting-group">
+          <label className="setting-label">
+            <input
+              type="checkbox"
+              checked={settings.launch_at_login}
+              onChange={(e) =>
+                updateSetting("launch_at_login", String(e.target.checked))
+              }
+            />
+            Launch at login
           </label>
         </div>
-      </div>
-
-      <div className="setting-group">
-        <label className="setting-label">
-          <input
-            type="checkbox"
-            checked={settings.launch_at_login}
-            onChange={(e) =>
-              updateSetting("launch_at_login", String(e.target.checked))
-            }
-          />
-          Launch at login
-        </label>
-      </div>
+      )}
 
       <div className="setting-group">
         <label className="setting-label">HandBrakeCLI path</label>
@@ -444,58 +469,68 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       </div>
 
       <div className="setting-group">
-        <label className="setting-label">Updates {appVersion && <span className="version-label">v{appVersion}</span>}</label>
-        <div className="setting-row">
-          <button
-            className="btn btn-small"
-            onClick={async () => {
-              setUpdateStatus("Checking...");
-              try {
-                const update = await check();
-                if (update) {
-                  setUpdateStatus(`Downloading v${update.version}...`);
-                  await update.downloadAndInstall();
+        <label className="setting-label">
+          {isServerHead ? "Version" : "Updates"}{" "}
+          {appVersion && <span className="version-label">v{appVersion}</span>}
+        </label>
+        {/* The auto-updater is a desktop-only concept (downloads and relaunches the app bundle);
+            the server head just shows its running version above, updated by redeploying. */}
+        {!isServerHead && (
+          <div className="setting-row">
+            <button
+              className="btn btn-small"
+              onClick={async () => {
+                setUpdateStatus("Checking...");
+                try {
+                  const update = await check();
+                  if (update) {
+                    setUpdateStatus(`Downloading v${update.version}...`);
+                    await update.downloadAndInstall();
 
-                  const queue = await commands.getQueue();
-                  const isEncoding = queue.some(j => j.status === "encoding" || j.status === "paused");
+                    const queue = await commands.getQueue();
+                    const isEncoding = queue.some(j => j.status === "encoding" || j.status === "paused");
 
-                  if (!isEncoding) {
-                    await relaunch();
+                    if (!isEncoding) {
+                      await relaunch();
+                    } else {
+                      await commands.pauseAfterCurrent();
+                      setUpdateStatus("Update ready, restarting after current job...");
+                      const unlisten = await listen<{ status: string }>("menu-bar-update", async (event) => {
+                        if (event.payload.status === "idle" || event.payload.status === "error") {
+                          unlisten();
+                          await relaunch();
+                        }
+                      });
+                    }
                   } else {
-                    await commands.pauseAfterCurrent();
-                    setUpdateStatus("Update ready, restarting after current job...");
-                    const unlisten = await listen<{ status: string }>("menu-bar-update", async (event) => {
-                      if (event.payload.status === "idle" || event.payload.status === "error") {
-                        unlisten();
-                        await relaunch();
-                      }
-                    });
+                    setUpdateStatus("You're up to date");
+                    setTimeout(() => setUpdateStatus(null), 3000);
                   }
-                } else {
-                  setUpdateStatus("You're up to date");
-                  setTimeout(() => setUpdateStatus(null), 3000);
+                } catch (e) {
+                  setUpdateStatus(`Error: ${e}`);
+                  setTimeout(() => setUpdateStatus(null), 5000);
                 }
-              } catch (e) {
-                setUpdateStatus(`Error: ${e}`);
-                setTimeout(() => setUpdateStatus(null), 5000);
-              }
-            }}
-            disabled={updateStatus === "Checking..." || updateStatus?.startsWith("Downloading") || updateStatus?.startsWith("Update ready")}
-          >
-            Check for updates
-          </button>
-          {updateStatus && <span className="update-status">{updateStatus}</span>}
-        </div>
+              }}
+              disabled={updateStatus === "Checking..." || updateStatus?.startsWith("Downloading") || updateStatus?.startsWith("Update ready")}
+            >
+              Check for updates
+            </button>
+            {updateStatus && <span className="update-status">{updateStatus}</span>}
+          </div>
+        )}
       </div>
 
-      <div className="setting-group setting-group-quit">
-        <button
-          className="btn btn-quit"
-          onClick={() => commands.quitApp()}
-        >
-          Quit ConvertBar
-        </button>
-      </div>
+      {/* quitApp() has no server equivalent (there's no local app process for the user to quit). */}
+      {!isServerHead && (
+        <div className="setting-group setting-group-quit">
+          <button
+            className="btn btn-quit"
+            onClick={() => commands.quitApp()}
+          >
+            Quit ConvertBar
+          </button>
+        </div>
+      )}
     </div>
   );
 }

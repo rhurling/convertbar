@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// ActiveJob now reads capabilities via commands.getAppInfo(), which on desktop composes
+// getVersion() + get_platform_capabilities — mock getVersion so that composition resolves.
+vi.mock("@tauri-apps/api/app", () => ({ getVersion: () => Promise.resolve("1.2.3") }));
 
 import { invoke } from "@tauri-apps/api/core";
 import ActiveJob from "./ActiveJob";

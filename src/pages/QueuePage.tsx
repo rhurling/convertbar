@@ -10,6 +10,8 @@ import { formatBytes } from "../lib/format";
 import AddingIndicator from "../components/AddingIndicator";
 import type { AddActivity } from "../lib/tauri";
 import type { FileIntake } from "../hooks/useFileIntake";
+import { isServerHead } from "../lib/head";
+import FileBrowserModal from "../components/FileBrowserModal";
 
 interface QueuePageProps {
   hbStatus: HandbrakeStatus | null;
@@ -29,6 +31,7 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
   const { activeJob, pendingJobs, progress, refresh } = useQueue();
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [lowDiskMsg, setLowDiskMsg] = useState<string | null>(null);
+  const [showBrowser, setShowBrowser] = useState(false);
 
   // The queue stops itself before starting a file when the destination disk is low; surface why.
   useEffect(() => {
@@ -87,6 +90,27 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
         status={intake.status}
         isDragOver={intake.isDragOver}
       />
+
+      {/* Desktop takes files via native OS drag-drop; the server head has no such event in a
+          browser tab, so it gets an explicit picker into the file-browser modal instead. */}
+      {isServerHead && (
+        <div className="intake-actions">
+          <button className="btn btn-small" onClick={() => setShowBrowser(true)}>
+            Add files…
+          </button>
+        </div>
+      )}
+
+      {showBrowser && (
+        <FileBrowserModal
+          mode="files"
+          onSelect={(paths) => {
+            setShowBrowser(false);
+            intake.addPaths(paths);
+          }}
+          onClose={() => setShowBrowser(false)}
+        />
+      )}
 
       <AddingIndicator activity={adding} />
 

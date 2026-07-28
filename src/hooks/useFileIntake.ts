@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { commands, type FolderScanResult, type AddResult } from "../lib/tauri";
+import { isServerHead } from "../lib/head";
 import { summarizeAdds } from "../lib/addSummary";
 
 /** Folders with this many files or fewer are added without a confirm prompt. */
@@ -16,6 +17,8 @@ export interface FileIntake {
   onSkip: () => void;
   status: string | null;
   isDragOver: boolean;
+  /** Feeds the same classify → enqueue pipeline as a drag-drop, for the server head's file-browser modal. */
+  addPaths: (paths: string[]) => Promise<void>;
 }
 
 /**
@@ -121,6 +124,10 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
 
   // Register the single window-level listener once (empty deps + refs), StrictMode-safe.
   useEffect(() => {
+    // Desktop-only: there's no native OS drag-drop event in a browser tab. The server head's
+    // intake goes through the file-browser modal (addPaths, below) instead, so the listener is
+    // never registered at all on that build rather than gating the handler's body.
+    if (isServerHead) return;
     const appWindow = getCurrentWebviewWindow();
     const unlisten = appWindow.onDragDropEvent((event) => {
       if (event.payload.type === "over" || event.payload.type === "enter") {
@@ -154,5 +161,5 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
 
   const pendingConfirm = confirmQueueRef.current[0] ?? null;
 
-  return { pendingConfirm, onAdd, onSkip, status, isDragOver };
+  return { pendingConfirm, onAdd, onSkip, status, isDragOver, addPaths: handlePaths };
 }

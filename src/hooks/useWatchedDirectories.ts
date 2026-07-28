@@ -29,23 +29,38 @@ export function useWatchedDirectories() {
     };
   }, [refresh]);
 
-  // Opens the folder picker, then registers the chosen folder with default settings. Returns
-  // silently if the user cancels the picker.
+  // Registers a folder (already chosen, by whatever means) with default settings. Shared by
+  // both the desktop picker flow below and the server head's file-browser modal (directory
+  // mode), which has no pickFolder equivalent and calls this directly with its selected path.
+  const addDirectoryAtPath = useCallback(
+    async (path: string) => {
+      setError(null);
+      try {
+        await commands.addWatchedDirectory(
+          path,
+          DEFAULT_RECURSIVE,
+          DEFAULT_DELAY_SECS,
+        );
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [refresh],
+  );
+
+  // Opens the folder picker, then registers the chosen folder. Returns silently if the user
+  // cancels the picker. Desktop-only: pickFolder() has no server implementation.
   const addDirectory = useCallback(async () => {
     setError(null);
     try {
       const path = await commands.pickFolder();
       if (!path) return;
-      await commands.addWatchedDirectory(
-        path,
-        DEFAULT_RECURSIVE,
-        DEFAULT_DELAY_SECS,
-      );
-      await refresh();
+      await addDirectoryAtPath(path);
     } catch (e) {
       setError(String(e));
     }
-  }, [refresh]);
+  }, [addDirectoryAtPath]);
 
   const updateDirectory = useCallback(
     async (id: string, recursive: boolean, stabilityDelaySecs: number) => {
@@ -95,6 +110,7 @@ export function useWatchedDirectories() {
     loading,
     error,
     addDirectory,
+    addDirectoryAtPath,
     updateDirectory,
     setEnabled,
     removeDirectory,
