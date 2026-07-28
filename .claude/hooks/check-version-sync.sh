@@ -5,7 +5,7 @@
 # On mismatch it prints the warning to stderr and exits 2, which blocks the Stop and
 # feeds the message back to Claude so the drift is actually acted on. Exit-0 stdout from
 # a Stop hook is only surfaced in transcript mode — effectively invisible in normal use,
-# which defeats the point of a drift check (see docs/fable-review/DECISIONS.md D7).
+# which defeats the point of a drift check (see docs/archive/fable-review/DECISIONS.md D7).
 set -u
 d="${CLAUDE_PROJECT_DIR:-.}"
 command -v jq >/dev/null 2>&1 || exit 0
