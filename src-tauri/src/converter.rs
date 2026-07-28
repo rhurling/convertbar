@@ -160,6 +160,10 @@ pub struct ConverterState {
     /// One-way app-teardown latch: armed by `kill_active_child`, checked by
     /// `process_queue` so the queue thread never spawns another encoder mid-quit.
     pub shutdown: std::sync::atomic::AtomicBool,
+    /// Latched while an update is installing, so the queue cannot start a job underneath it.
+    /// Claimed and released under the `is_running` lock, making the gate atomic against
+    /// `run_queue` rather than a check-then-act race.
+    pub installing: std::sync::atomic::AtomicBool,
     /// Reason the queue is currently paused for low disk space, if any. Set when the low-disk
     /// gate trips, cleared at the start of every `process_queue` run so a resume (or a run that
     /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
@@ -177,6 +181,7 @@ impl ConverterState {
             is_running: Mutex::new(false),
             pause_after_current: Mutex::new(false),
             shutdown: std::sync::atomic::AtomicBool::new(false),
+            installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
         }
     }
@@ -1374,6 +1379,26 @@ fn process_queue<R: tauri::Runtime>(
     // is_running is reset by RunningGuard on return (and on an unwinding panic).
 }
 
+/// Atomically claims the right to run the queue. Returns false when the queue is already
+/// running or an update install holds the interlock. Poison-tolerant: if a prior queue thread
+/// panicked while briefly holding this lock, recover the flag rather than propagating the
+/// poison and permanently wedging starts.
+pub(crate) fn claim_queue_slot(converter: &ConverterState) -> bool {
+    let mut running = converter
+        .is_running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if *running
+        || converter
+            .installing
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return false;
+    }
+    *running = true;
+    true
+}
+
 /// Starts queue processing in a new background thread.
 /// Sets `is_running` to true atomically before spawning.
 pub fn run_queue<R: tauri::Runtime>(
@@ -1381,17 +1406,8 @@ pub fn run_queue<R: tauri::Runtime>(
     db: Arc<Mutex<Connection>>,
     converter: Arc<ConverterState>,
 ) {
-    {
-        // Poison-tolerant: if a prior queue thread panicked while briefly holding this lock,
-        // recover the flag rather than propagating the poison and permanently wedging starts.
-        let mut running = converter
-            .is_running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if *running {
-            return;
-        }
-        *running = true;
+    if !claim_queue_slot(&converter) {
+        return;
     }
 
     std::thread::spawn(move || {
@@ -3564,6 +3580,31 @@ HandBrake has exited.";
         assert!(
             is_queue_paused(&db.lock().unwrap()),
             "pause-after-current firing must persist the paused state"
+        );
+    }
+
+    #[test]
+    fn claim_queue_slot_refuses_while_an_update_is_installing() {
+        // Both sides serialize on the same is_running mutex, so the gate is atomic rather
+        // than check-then-act.
+        let converter = ConverterState::new();
+        converter
+            .installing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!claim_queue_slot(&converter));
+        assert!(
+            !*converter.is_running.lock().unwrap(),
+            "a refused claim must not leave is_running set"
+        );
+
+        converter
+            .installing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(claim_queue_slot(&converter));
+        assert!(*converter.is_running.lock().unwrap());
+        assert!(
+            !claim_queue_slot(&converter),
+            "second claim is refused while running"
         );
     }
 }

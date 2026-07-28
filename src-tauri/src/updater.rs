@@ -189,6 +189,45 @@ pub trait Installer: Send + Sync {
     fn install(&self, update: &AvailableUpdate) -> Result<(), String>;
 }
 
+/// Outcome of one install attempt.
+#[derive(Debug)]
+pub enum InstallAttempt {
+    Installed,
+    /// The queue was busy; the caller keeps the update pending and retries when it drains.
+    Deferred,
+    Failed(String),
+}
+
+/// Installs only when the queue is genuinely idle, holding `installing` for the whole
+/// operation so no job can start underneath. Claims under the same `is_running` lock
+/// `run_queue` uses, so the two cannot interleave.
+///
+/// On Windows this never returns — `Update::install()` calls `std::process::exit(0)`. The
+/// caller must therefore persist anything the user needs after the restart BEFORE calling.
+pub fn try_install_now(
+    conv: &crate::converter::ConverterState,
+    installer: &dyn Installer,
+    update: &AvailableUpdate,
+) -> InstallAttempt {
+    use std::sync::atomic::Ordering;
+
+    {
+        let running = conv.is_running.lock().unwrap_or_else(|e| e.into_inner());
+        if *running {
+            return InstallAttempt::Deferred;
+        }
+        conv.installing.store(true, Ordering::SeqCst);
+    }
+
+    let result = installer.install(update);
+    conv.installing.store(false, Ordering::SeqCst);
+
+    match result {
+        Ok(()) => InstallAttempt::Installed,
+        Err(e) => InstallAttempt::Failed(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +377,124 @@ mod tests {
 
         let outcome = decide_manual(Some(upd("2.0.0")));
         assert!(matches!(outcome, CheckOutcome::Notify(u) if u.version == "2.0.0"));
+    }
+
+    use crate::converter::ConverterState;
+    use std::sync::Mutex as StdMutex;
+
+    /// Records every install it is asked to perform, so a test can assert on what the real
+    /// scheduler path actually did — not on what a predicate said it would do.
+    struct RecordingInstaller {
+        installed: StdMutex<Vec<String>>,
+        result: Result<(), String>,
+    }
+
+    impl RecordingInstaller {
+        fn ok() -> Self {
+            Self {
+                installed: StdMutex::new(Vec::new()),
+                result: Ok(()),
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                installed: StdMutex::new(Vec::new()),
+                result: Err("bundle is corrupt".to_string()),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.installed.lock().unwrap().clone()
+        }
+    }
+
+    impl Installer for RecordingInstaller {
+        fn install(&self, update: &AvailableUpdate) -> Result<(), String> {
+            self.installed.lock().unwrap().push(update.version.clone());
+            self.result.clone()
+        }
+    }
+
+    #[test]
+    fn an_install_never_runs_while_a_job_is_encoding() {
+        // LOAD-BEARING. On Windows, install() calls std::process::exit(0), bypassing the
+        // ExitRequested handler that kills HandBrakeCLI — orphaning the encoder, which then
+        // keeps writing into the partial output while the next launch's auto-resume deletes
+        // that file and starts a second encoder against the same path.
+        // Verify by deleting the gate in try_install_now and confirming this goes red.
+        let conv = ConverterState::new();
+        *conv.is_running.lock().unwrap() = true;
+
+        let installer = RecordingInstaller::ok();
+        let attempt = try_install_now(&conv, &installer, &upd("2.0.0"));
+
+        assert!(matches!(attempt, InstallAttempt::Deferred));
+        assert!(
+            installer.calls().is_empty(),
+            "install must not be attempted while the queue is running"
+        );
+        assert!(
+            !conv.installing.load(std::sync::atomic::Ordering::SeqCst),
+            "a deferred attempt must not leave the interlock latched"
+        );
+    }
+
+    #[test]
+    fn an_install_runs_when_the_queue_is_idle() {
+        let conv = ConverterState::new();
+        let installer = RecordingInstaller::ok();
+
+        let attempt = try_install_now(&conv, &installer, &upd("2.0.0"));
+
+        assert!(matches!(attempt, InstallAttempt::Installed));
+        assert_eq!(installer.calls(), vec!["2.0.0".to_string()]);
+    }
+
+    #[test]
+    fn the_interlock_is_held_during_the_install_and_blocks_run_queue() {
+        // A download takes minutes and watcher.rs:462 starts run_queue whenever a watched
+        // file lands, so "idle when the download began" says nothing about idle at install
+        // time. The interlock closes that check-then-act window.
+        struct StartsAJobMidInstall<'a>(&'a ConverterState);
+        impl Installer for StartsAJobMidInstall<'_> {
+            fn install(&self, _u: &AvailableUpdate) -> Result<(), String> {
+                assert!(
+                    self.0.installing.load(std::sync::atomic::Ordering::SeqCst),
+                    "installing must be latched for the whole install"
+                );
+                // run_queue's claim must refuse while installing is latched.
+                assert!(
+                    !crate::converter::claim_queue_slot(self.0),
+                    "run_queue must not start a job during an install"
+                );
+                Ok(())
+            }
+        }
+
+        let conv = ConverterState::new();
+        let installer = StartsAJobMidInstall(&conv);
+        let attempt = try_install_now(&conv, &installer, &upd("2.0.0"));
+
+        assert!(matches!(attempt, InstallAttempt::Installed));
+        assert!(
+            !conv.installing.load(std::sync::atomic::Ordering::SeqCst),
+            "interlock must be released after the install returns"
+        );
+    }
+
+    #[test]
+    fn a_failed_install_releases_the_interlock_and_reports_why() {
+        // On macOS/Linux install() returns Err. If the interlock leaked here, the queue
+        // would be permanently wedged by one bad download.
+        let conv = ConverterState::new();
+        let installer = RecordingInstaller::failing();
+
+        let attempt = try_install_now(&conv, &installer, &upd("2.0.0"));
+
+        assert!(matches!(attempt, InstallAttempt::Failed(e) if e.contains("corrupt")));
+        assert!(!conv.installing.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            crate::converter::claim_queue_slot(&conv),
+            "queue must be startable again"
+        );
     }
 }
