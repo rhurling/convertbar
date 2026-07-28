@@ -267,3 +267,38 @@ guard that cannot fail is not a guard.
 None. `Ctx::new` gains a parameter; both heads pass `PathLocator`, which calls
 `detect_handbrake_path()` exactly as today. No behavior change ships to users — this is a
 testability seam, and production resolution is byte-for-byte what it was.
+
+## Verification (Task 6, 2026-07-28)
+
+Ran `cargo test --workspace` twice at `af6f90b`: once with HandBrakeCLI present at
+`/opt/homebrew/bin/HandBrakeCLI`, once with that directory stripped from `PATH` (confirmed absent
+via `which HandBrakeCLI` in the stripped environment). Every crate's `test result` line was
+identical between the two runs:
+
+- `convertbar-core` (unit): `259 passed; 0 failed; 4 ignored` — both runs
+- `convertbar-desktop` / `src-tauri` (unit): `47 passed; 0 failed; 0 ignored` — both runs
+- `convertbar-server`: `93 passed; 0 failed; 0 ignored` — both runs
+- three doctest/integration harnesses: `0 passed; 0 failed; 0 ignored` — both runs (unchanged)
+
+Total: **399 passed / 0 failed / 4 ignored**, matching in both worlds. That identity is the
+evidence the ambient PATH read is gone from every test that runs in CI.
+
+Mutation check, both claims exercised separately (each reverted with `git checkout` immediately
+after, nothing committed):
+
+- **Mutation A** (does the absent-world test depend on absence?): swapped
+  `Arc::new(AbsentLocator)` for `Arc::new(PathLocator)` in
+  `add_files_inner_reports_handbrake_missing_when_the_suffix_needs_a_probe`. Result: **FAILED**, as
+  predicted — with HandBrake genuinely installed, the real locator resolves it and the file gets
+  queued instead of erroring, so the `expect_err` panics.
+- **Mutation B** (does `PanickingLocator` actually fire?): removed the explicit
+  `Arc::new(AbsentLocator)` world declaration from
+  `purge_bad_sources_destroys_through_the_ctx_disposer`, falling back to the `test_ctx` fixture
+  default. Result: **FAILED**, as predicted — panicked with the `PanickingLocator` message
+  ("Declare the world explicitly: `Arc::new(AbsentLocator)` ... or `Arc::new(StubLocator(path))`
+  ...").
+
+Both mutations produced the predicted failure, so the guard is not decorative.
+
+Frontend: `git diff --stat f3ca8b4 -- src/` (merge base with `origin/main`) is empty — no frontend
+files touched by this branch. `npm test` passes **206/206**.
