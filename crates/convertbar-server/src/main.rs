@@ -4,6 +4,7 @@ mod embed;
 mod routes;
 mod sink;
 mod startup;
+mod throttle;
 
 use std::sync::Arc;
 
