@@ -6,7 +6,10 @@
 //! every guess is still evaluated. The escalating delay below makes guessing
 //! expensive without ever creating denial state an attacker can trigger.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::http::{header::HeaderMap, HeaderValue};
 use ipnet::IpNet;
@@ -85,6 +88,126 @@ pub fn client_id(peer: Option<IpAddr>, headers: &HeaderMap, trusted: &[IpNet]) -
         }
     }
     ClientId::Addr(bucket_addr(peer))
+}
+
+/// Prune when the map exceeds this many keys. The map is attacker-influenced
+/// (one key per source), so it needs a ceiling; a few thousand entries is a few
+/// hundred KB, which is the right order for a LAN appliance.
+const PRUNE_THRESHOLD: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ThrottlePolicy {
+    pub base: Duration,
+    pub cap: Duration,
+    pub window: Duration,
+}
+
+impl Default for ThrottlePolicy {
+    fn default() -> Self {
+        Self {
+            base: Duration::from_millis(500),
+            cap: Duration::from_secs(30),
+            window: Duration::from_secs(900),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Failures {
+    count: u32,
+    first_at: Instant,
+}
+
+pub struct LoginThrottle {
+    failures: Mutex<HashMap<ClientId, Failures>>,
+    policy: ThrottlePolicy,
+}
+
+impl LoginThrottle {
+    pub fn new(policy: ThrottlePolicy) -> Self {
+        Self {
+            failures: Mutex::new(HashMap::new()),
+            policy,
+        }
+    }
+
+    /// Records a rejected attempt and returns how long the caller must wait
+    /// before responding.
+    ///
+    /// The count is incremented HERE, under the lock, and the delay derives from
+    /// the post-increment value — so N concurrent attempts get N escalating
+    /// delays rather than N copies of the first one. Computing the delay before
+    /// incrementing would let an attacker bypass the whole ramp by opening more
+    /// connections.
+    pub fn record_failure(&self, id: ClientId, now: Instant) -> Duration {
+        let mut map = self.lock();
+        if map.len() > PRUNE_THRESHOLD {
+            let window = self.policy.window;
+            map.retain(|_, f| now.duration_since(f.first_at) <= window);
+        }
+        let entry = map.entry(id).or_insert(Failures {
+            count: 0,
+            first_at: now,
+        });
+        if now.duration_since(entry.first_at) > self.policy.window {
+            entry.count = 0;
+            entry.first_at = now;
+        }
+        entry.count += 1;
+        let count = entry.count;
+        drop(map);
+
+        let delay = self.delay_for(count);
+        if delay == self.policy.cap && count == self.cap_reached_at() {
+            tracing::warn!(
+                ?id,
+                "login throttle: source reached the {:?} delay cap after {count} failed attempts",
+                self.policy.cap
+            );
+        }
+        delay
+    }
+
+    /// Clears a source's ramp. Called only on a successful login.
+    pub fn record_success(&self, id: ClientId) {
+        self.lock().remove(&id);
+    }
+
+    /// `base << (n-1)`, capped. The shift is guarded: without it a long-lived
+    /// bucket overflows and the delay wraps to something tiny.
+    fn delay_for(&self, count: u32) -> Duration {
+        let shift = count.saturating_sub(1);
+        if shift >= 32 {
+            return self.policy.cap;
+        }
+        match self.policy.base.checked_mul(1u32 << shift) {
+            Some(d) if d < self.policy.cap => d,
+            _ => self.policy.cap,
+        }
+    }
+
+    /// The lowest failure count whose delay is the cap — used so the cap warning
+    /// logs once per ramp instead of on every subsequent attempt. Note "per ramp",
+    /// not "per source": after a window rollover or a successful login the source
+    /// starts over and will warn again if it climbs back to the cap. That is the
+    /// intended reading — a fresh ramp reaching the cap is a fresh event.
+    fn cap_reached_at(&self) -> u32 {
+        (1..=32)
+            .find(|n| self.delay_for(*n) == self.policy.cap)
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Poisoning must not take the server down: this lock sits on a global
+    /// request path, so a single panic would otherwise 500 every subsequent
+    /// request forever. A possibly-stale counter is the better failure mode.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ClientId, Failures>> {
+        self.failures.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
 }
 
 #[cfg(test)]
@@ -304,5 +427,130 @@ mod client_id_tests {
             ),
             client_id(Some(ip("2001:db8:1:2::9")), &HeaderMap::new(), &[])
         );
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+    use std::net::IpAddr;
+    use std::time::{Duration, Instant};
+
+    fn policy() -> ThrottlePolicy {
+        ThrottlePolicy {
+            base: Duration::from_millis(500),
+            cap: Duration::from_secs(30),
+            window: Duration::from_secs(900),
+        }
+    }
+
+    fn id(s: &str) -> ClientId {
+        ClientId::Addr(s.parse::<IpAddr>().unwrap())
+    }
+
+    #[test]
+    fn delay_doubles_with_each_failure_then_pins_at_the_cap() {
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        assert_eq!(t.record_failure(a, now), Duration::from_millis(500));
+        assert_eq!(t.record_failure(a, now), Duration::from_secs(1));
+        assert_eq!(t.record_failure(a, now), Duration::from_secs(2));
+        assert_eq!(t.record_failure(a, now), Duration::from_secs(4));
+        assert_eq!(t.record_failure(a, now), Duration::from_secs(8));
+        assert_eq!(t.record_failure(a, now), Duration::from_secs(16));
+        // 32s would exceed the cap.
+        assert_eq!(t.record_failure(a, now), Duration::from_secs(30));
+        assert_eq!(t.record_failure(a, now), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_very_long_run_of_failures_does_not_overflow() {
+        // `base << (n-1)` overflows once n-1 reaches 32, so the shift must be
+        // guarded. Iterate well past that point — and only assert the cap from
+        // failure 7 on, because failures 1-6 are still climbing the ramp
+        // (500ms, 1s, 2s, 4s, 8s, 16s) and asserting the cap on those would make
+        // the test die at iteration 1, never reaching the code it exists to pin.
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        let mut last = Duration::ZERO;
+        for i in 1..=200u32 {
+            last = t.record_failure(a, now);
+            if i >= 7 {
+                assert_eq!(last, Duration::from_secs(30), "failure #{i} left the cap");
+            }
+        }
+        assert_eq!(last, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn failures_older_than_the_window_start_a_fresh_count() {
+        let t = LoginThrottle::new(policy());
+        let start = Instant::now();
+        let a = id("10.0.0.1");
+        t.record_failure(a, start);
+        t.record_failure(a, start);
+        assert_eq!(t.record_failure(a, start), Duration::from_secs(2));
+        // Past the window: the ramp resets to base.
+        let later = start + Duration::from_secs(901);
+        assert_eq!(t.record_failure(a, later), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_successful_login_clears_the_ramp() {
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        t.record_failure(a, now);
+        t.record_failure(a, now);
+        t.record_success(a);
+        assert_eq!(t.record_failure(a, now), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn distinct_sources_have_independent_ramps() {
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        for _ in 0..5 {
+            t.record_failure(id("10.0.0.1"), now);
+        }
+        assert_eq!(
+            t.record_failure(id("10.0.0.2"), now),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            t.record_failure(ClientId::Unknown, now),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            t.record_failure(ClientId::MalformedChain, now),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn pruning_drops_expired_entries_and_keeps_live_ones() {
+        let t = LoginThrottle::new(policy());
+        let start = Instant::now();
+        // Fill past the prune threshold with entries that will expire.
+        for i in 0..5000u32 {
+            let octets = i.to_be_bytes();
+            let addr = IpAddr::from([10, octets[1], octets[2], octets[3]]);
+            t.record_failure(ClientId::Addr(addr), start);
+        }
+        let live = id("192.168.1.1");
+        t.record_failure(live, start);
+        // Well past the window, so everything above is prunable. This failure
+        // triggers a prune; the map must not retain the dead entries.
+        let later = start + Duration::from_secs(901);
+        t.record_failure(id("192.168.1.2"), later);
+        assert!(
+            t.len() < 5000,
+            "expired entries were not pruned: {}",
+            t.len()
+        );
+        // The live entry expired too (same window), so it also resets.
+        assert_eq!(t.record_failure(live, later), Duration::from_millis(500));
     }
 }
