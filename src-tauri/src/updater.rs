@@ -578,6 +578,15 @@ impl Installer for PluginInstaller {
 fn build_updater<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<tauri_plugin_updater::Updater> {
     let handle = app.clone();
     app.updater_builder()
+        // The crate defaults to no timeout at all (updater.rs:176), and `CycleGuard` is held
+        // across this `.await`. A request that connects and then stalls — a sleeping laptop whose
+        // NAT mapping died, a captive portal swallowing the response — would therefore wedge the
+        // updater for the life of the process: status stuck on "Checking…", "Check now" disabled,
+        // every hourly tick refused by the latch, every manual attempt told an operation is
+        // already running. This app runs for weeks at a time, so "until the next restart" means
+        // "never". 30s is generous for a ~1 KB latest.json; the download gets its own, much
+        // longer bound in `perform_install`.
+        .timeout(std::time::Duration::from_secs(CHECK_TIMEOUT_SECS))
         .on_before_exit(move || {
             // Windows `install()` calls std::process::exit(0), bypassing the ExitRequested
             // handler — without this, HandBrakeCLI is orphaned and keeps encoding into the
@@ -791,9 +800,17 @@ async fn perform_install<R: tauri::Runtime>(
     app: &AppHandle<R>,
     _cycle: &CycleGuard,
     meta: AvailableUpdate,
-    raw: tauri_plugin_updater::Update,
+    mut raw: tauri_plugin_updater::Update,
 ) -> InstallOutcome {
     set_status(app, UpdateStatus::Downloading);
+
+    // The download does NOT inherit the builder's timeout: the crate hard-codes `timeout: None`
+    // when it constructs the `Update` (tauri-plugin-updater-2.10.1/src/updater.rs:553). It has to
+    // be set here or the download has no bound at all, and a stalled transfer holds the
+    // single-flight latch with the status wedged on "Downloading…". Far longer than the check's,
+    // because reqwest treats this as a total deadline including the response body: it must bound
+    // a hung transfer without failing a slow but working one.
+    raw.timeout = Some(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS));
 
     let bytes = match raw.download(|_, _| {}, || {}).await {
         Ok(b) => b,
@@ -1178,6 +1195,17 @@ pub async fn install_pending<R: tauri::Runtime>(
 
 const CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 const TICK_INTERVAL_SECS: u64 = 60 * 60;
+
+/// Total deadline for the `latest.json` fetch. Small enough that a stalled check cannot hold the
+/// single-flight latch for any noticeable time, and enormous for a payload of about a kilobyte.
+const CHECK_TIMEOUT_SECS: u64 = 30;
+
+/// Total deadline for the bundle download. reqwest counts this from connect until the body is
+/// finished, so it is sized to bound a *hung* transfer without failing a slow but working one:
+/// half an hour is well over a minute per megabyte of the release artifact. A download that does
+/// blow through it lands in the ordinary failure path — status `Error`, deferral dropped, drain
+/// undone, next scheduled check re-decides — rather than wedging the updater until a restart.
+const DOWNLOAD_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Whether enough wall-clock time has passed to check again. A future `last_checked` (a
 /// backwards clock jump, or a restored backup) also checks, so a bad timestamp cannot
