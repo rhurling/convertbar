@@ -81,7 +81,7 @@
     Name="Auth Token"
     Target="CONVERTBAR_AUTH_TOKEN"
     Default=""
-    Description="Token required on every request. Pick a long random string &#8212; the login page and API both accept it. The container refuses to start unless this or No Auth is set. There is no rate limiting on login, so a short token is a weak token."
+    Description="Token required on every request. Must be at least 16 characters with at least 8 distinct characters, or the container refuses to start. Generate one with: openssl rand -base64 24. Failed login attempts from the same source are throttled with an escalating delay (up to 30s); there is no lockout, so the correct token always works."
     Type="Variable"
     Display="always"
     Required="true"

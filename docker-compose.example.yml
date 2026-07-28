@@ -4,7 +4,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      CONVERTBAR_AUTH_TOKEN: "change-me"     # always set a token
+      # Generate with: openssl rand -base64 24
+      # Must be >=16 chars using >=8 distinct characters, or the server exits.
+      CONVERTBAR_AUTH_TOKEN: "REPLACE_ME_WITH_A_GENERATED_TOKEN"
       # CONVERTBAR_BROWSE_ROOTS: "/media"    # optional: restrict the file browser
       # CONVERTBAR_ALLOWED_HOSTS: "nas.local"   # needed if you browse by hostname instead of IP
     volumes:

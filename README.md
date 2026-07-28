@@ -133,13 +133,49 @@ caveats it also documents inline:
 | `CONVERTBAR_PORT` | `8080` | Port to listen on. |
 | `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; needed if you browse by hostname instead of IP (e.g. `nas.local`) or use a reverse proxy. |
 | `CONVERTBAR_BROWSE_ROOTS` | `/` | Colon-separated paths the web file browser may navigate. Restrict it to your media mount(s), e.g. `/media`. |
+| `CONVERTBAR_TRUSTED_PROXIES` | *(none)* | Comma-separated IPs or CIDR ranges whose `X-Forwarded-For` header is believed, so login throttling counts real client addresses instead of the proxy's. **Set this as narrowly as possible** — see [Auth](#auth). |
 
 ### Auth
 
 The server refuses to start unless `CONVERTBAR_AUTH_TOKEN` or
 `CONVERTBAR_NO_AUTH=1` is set — there is no unauthenticated-by-default mode.
-Always set a real token in the compose example; `CONVERTBAR_NO_AUTH=1` is only
-for a trusted LAN or a deployment where a reverse proxy already gates access.
+`CONVERTBAR_NO_AUTH=1` is only for a trusted LAN or a deployment where a reverse
+proxy already gates access.
+
+**Token requirements.** `CONVERTBAR_AUTH_TOKEN` must be at least 16 characters
+long and use at least 8 distinct characters; anything weaker is refused at
+startup rather than warned about. Generate one with:
+
+```sh
+openssl rand -base64 24
+```
+
+**Failed-attempt throttling.** Each failed credential — at `/api/login` or via
+an `Authorization` header — makes the *next* failure from that source slower:
+500 ms, then 1 s, 2 s, 4 s, and so on to a 30-second ceiling. A successful login
+clears it. There is deliberately no lockout, so no amount of guessing by anyone
+else can stop you getting in with the right token; the ramp only ever delays
+attempts that are already wrong.
+
+Rotating the token means changing the variable and restarting the container.
+Open browser tabs will be signed out and can log in again immediately. A script
+looping on an outdated token will ramp itself to the 30-second delay — that is
+working as intended, and is indistinguishable from an attacker.
+
+**Behind a reverse proxy**, every request appears to come from the proxy, so all
+clients share one throttling ramp. Set `CONVERTBAR_TRUSTED_PROXIES` to the
+proxy's address to have `X-Forwarded-For` believed instead:
+
+```
+CONVERTBAR_TRUSTED_PROXIES=172.18.0.5
+```
+
+> Set it as narrowly as possible. Every address listed is trusted to assert who
+> it is, so a range that contains *clients* rather than only the proxy lets each
+> of them forge a fresh identity per request and skip throttling entirely —
+> worse than leaving it unset. Do not use a whole Docker bridge network
+> (`172.18.0.0/16`) or a LAN range; pin the proxy to a static address and list
+> that. This cannot help behind plain NAT, where there is no forwarded header.
 
 ### Reverse proxy / HTTPS
 
