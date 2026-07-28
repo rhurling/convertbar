@@ -5,8 +5,9 @@ shipped, or a decision that was made and is not being relitigated. Archived 2026
 after each document was verified against v1.0.0 source rather than against its own
 checkboxes.
 
-Live documents stay in `docs/`: `RECOMMENDATIONS.md` (backlog) and `OPEN_ISSUES.md`
-(larger unstarted ideas).
+Live documents stay in `docs/`: `RECOMMENDATIONS.md` is now the only one — the backlog,
+including larger unstarted ideas. `OPEN_ISSUES.md` was archived here on 2026-07-28 when
+its single item (the Docker/web-UI server head) shipped.
 
 ## Read the code, not these docs, for current behaviour
 
