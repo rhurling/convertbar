@@ -49,7 +49,8 @@ pub async fn login(
     }
 
     if !token_matches(&body.token, expected) {
-        s.login_throttle.record_failure(id, now);
+        // `check` already recorded this attempt — there is nothing left to
+        // do but answer.
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "unauthorized"})),
@@ -185,8 +186,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_correct_token_is_accepted_after_many_failed_logins() {
-        // No lockout, by design: repeated failures must never deny the owner.
+    async fn a_correct_token_is_accepted_on_a_clean_bucket_after_many_prior_attempts() {
+        // NOT a no-lockout guarantee — revision 3 retired that requirement: a
+        // shut gate refuses even a correct token by design (that refusal is
+        // the rate limit). `base: ZERO` here means the gate never actually
+        // shuts, so this only proves a valid token works while the bucket
+        // stays clean/ungated — don't read more into it than that.
         let app = login_app("abcdefghijklmnop", Duration::ZERO);
         for _ in 0..40 {
             let response = try_login(app.clone(), "wrong").await;
@@ -205,6 +210,10 @@ mod tests {
         assert!(response.headers().get(SET_COOKIE).is_none());
     }
 
+    /// `free: 0` gates on the first evaluation. The 1-hour base is immediately
+    /// clamped down to the (default) 30s cap — it does NOT mean the gate stays
+    /// shut for an hour, only that spacing saturates the cap on the first
+    /// closure. Every test using this fixture runs in well under 30s.
     fn gated_login_app(token: &str) -> axum::Router {
         let mut state = state_with_auth(AuthMode::Token(token.to_string()));
         state.login_throttle = std::sync::Arc::new(crate::throttle::LoginThrottle::new(
@@ -233,6 +242,26 @@ mod tests {
             "the gate was open, so the token was still evaluated"
         );
         assert!(response.headers().get(SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_successful_login_clears_the_gate_for_the_next_attempt() {
+        // Blocking-1 regression coverage for the login route: deleting
+        // `record_success` must fail this test. Concrete scenario: the owner
+        // mistypes a few times, then gets it right — but with `free: 0` even
+        // that SUCCESSFUL evaluation reserves a slot. If nothing clears it,
+        // the browser's immediate page-load fan-out (or a retry after a
+        // reload) is bounced by the gate that just let the owner in.
+        let app = gated_login_app("abcdefghijklmnop");
+        let first = try_login(app.clone(), "abcdefghijklmnop").await;
+        assert_eq!(first.status(), axum::http::StatusCode::NO_CONTENT);
+
+        let second = try_login(app, "abcdefghijklmnop").await;
+        assert_eq!(
+            second.status(),
+            axum::http::StatusCode::NO_CONTENT,
+            "the gate stayed shut after a successful login"
+        );
     }
 
     #[tokio::test]

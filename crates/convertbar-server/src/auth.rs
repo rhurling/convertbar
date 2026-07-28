@@ -161,7 +161,8 @@ pub async fn auth_guard(State(s): State<ServerState>, req: Request, next: Next) 
         return next.run(req).await;
     }
 
-    s.login_throttle.record_failure(id, now);
+    // `check` already recorded this attempt — there is nothing left to do
+    // but answer.
     json_err(StatusCode::UNAUTHORIZED, "unauthorized")
 }
 
@@ -696,7 +697,7 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             }
 
-            // If the twelve requests above had counted, the free allowance (3) would
+            // If the twelve requests above had counted, the free allowance (8) would
             // be long spent and the gate would be shut — refusing even this correct
             // credential.
             let response = send(
@@ -714,9 +715,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_correct_token_always_succeeds_no_matter_how_many_failures_precede_it() {
-            // The goal-3 regression test. There is no lockout by design: no sequence of
-            // unauthenticated requests may deny a client holding the right token.
+        async fn a_correct_token_succeeds_on_a_clean_bucket_after_many_prior_attempts() {
+            // NOT a no-lockout guarantee — revision 3 retired that requirement: a
+            // shut gate refuses even a correct token by design (that refusal is
+            // the rate limit). `base: ZERO` here means the gate never actually
+            // shuts, so this only proves a valid token works while the bucket
+            // stays clean/ungated — don't read more into it than that.
             let state = throttled_state("abcdefghijklmnop", Duration::ZERO);
             let app = app_from(state, "10.0.0.1:5555");
             for _ in 0..40 {
@@ -744,9 +748,11 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        /// A policy that gates immediately and stays shut for the whole test: `free: 0`
-        /// means the first failure closes the slot, and a 1-hour base means it does not
-        /// reopen. Lets the gate be observed without modelling time.
+        /// A policy that gates immediately: `free: 0` means the first evaluation closes
+        /// the slot. The 1-hour base is immediately clamped down to the (default) 30s
+        /// cap — it does NOT mean the gate stays shut for an hour, only that spacing
+        /// saturates the cap on the very first closure. Every test using this fixture
+        /// runs in well under 30s, so the gate never gets a chance to reopen mid-test.
         fn gated_state(token: &str) -> ServerState {
             let mut state = token_state(token);
             state.login_throttle = std::sync::Arc::new(crate::throttle::LoginThrottle::new(
@@ -850,19 +856,52 @@ mod tests {
 
         #[tokio::test]
         async fn a_successful_credential_reopens_the_gate_for_that_source() {
+            // The two peers below MUST share one throttle (`state.clone()`, not a
+            // fresh `ServerState` per peer) — two independent throttles would let
+            // a correct token through no matter what `record_success` does, and
+            // prove nothing.
             let state = gated_state("abcdefghijklmnop");
-            let app = app_from(state, "10.0.0.1:5555");
-            send(
-                app.clone(),
+            let a = app_from(state.clone(), "10.0.0.1:5555");
+            let b = app_from(state, "10.0.0.2:5555");
+
+            // With `free: 0`, even a SUCCESSFUL evaluation reserves a slot — so
+            // this alone shuts A's gate unless `record_success` clears it.
+            let first = send(
+                a.clone(),
                 "GET",
                 "/api/queue",
-                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                &[
+                    ("Host", "localhost"),
+                    ("Authorization", "Bearer abcdefghijklmnop"),
+                ],
                 None,
             )
             .await;
-            // Gate is shut; a different source proves the shut gate is per-source.
+            assert_eq!(first.status(), StatusCode::OK);
+
+            // The SAME source, immediately again: only succeeds if the gate
+            // reopened for it.
+            let second = send(
+                a,
+                "GET",
+                "/api/queue",
+                &[
+                    ("Host", "localhost"),
+                    ("Authorization", "Bearer abcdefghijklmnop"),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(
+                second.status(),
+                StatusCode::OK,
+                "the gate did not reopen for the source that just succeeded"
+            );
+
+            // B never touched the shared throttle — proves it still isolates
+            // sources rather than smearing one global gate across both.
             let other = send(
-                app_from(token_state("abcdefghijklmnop"), "10.0.0.2:5555"),
+                b,
                 "GET",
                 "/api/queue",
                 &[
