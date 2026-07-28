@@ -32,3 +32,5 @@ input model (watched-folders + web file browser vs. upload) and auth posture
 during the spec.
 
 **Next step:** brainstorm → spec → implementation plan (not started).
+
+**Status:** core extraction landed (workspace split, Plan 1); server head is Plan 2.

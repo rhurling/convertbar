@@ -1,6 +1,6 @@
 //! Queue control: start/pause/resume/cancel, the pause-after-current fallback, and low-disk
-//! status. Moved from the Tauri command layer (Task 7) so a future server head can drive the
-//! same queue lifecycle without going through `#[tauri::command]`.
+//! status. Moved from the desktop command layer so a future server head can drive the
+//! same queue lifecycle through `Ctx` instead.
 //!
 //! Mid-encode pause (SIGSTOP/SIGCONT) is `#[cfg(unix)]`, not `#[cfg(target_os = "macos")]`:
 //! desktop Linux (and a future Linux server head) get true mid-encode pause too. Windows keeps

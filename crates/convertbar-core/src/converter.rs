@@ -2457,7 +2457,7 @@ mod tests {
     // source trashed) returns, and every one of those fake-script tests stays green regardless,
     // because none of them ever touch real HandBrake output. This is the only test that can
     // catch that. Needs ffmpeg to synthesize a clip and a real HandBrakeCLI on PATH. Run with:
-    //   cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored real_handbrake_flags_a_truncated_source
+    //   cargo test -p convertbar-core --lib -- --ignored real_handbrake_flags_a_truncated_source
     #[test]
     #[ignore]
     fn real_handbrake_flags_a_truncated_source_and_spares_the_original() {
