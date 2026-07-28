@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { useUpdate } from "./useUpdate";
 import { commands } from "../lib/tauri";
@@ -240,5 +240,35 @@ describe("useUpdate", () => {
 
     expect(result.current.state?.status).toBe("available");
     expect(result.current.state?.available?.version).toBe("2.0.0");
+  });
+});
+
+describe("useUpdate (server head)", () => {
+  // isServerHead is a module-level const (../lib/head), so the env must be stubbed and the
+  // whole module graph reloaded fresh — same resetModules/stubEnv pattern as
+  // src/lib/events.test.ts's "server head" suite and SettingsPage.test.tsx's version test.
+  beforeEach(() => {
+    vi.resetModules();
+    // ../lib/events (imported by useUpdate) opens `new EventSource("/api/events")` at module
+    // load time on the server head; jsdom has no EventSource, so it must be stubbed even though
+    // this test never expects it to be used.
+    vi.stubGlobal(
+      "EventSource",
+      class {
+        addEventListener() {}
+        removeEventListener() {}
+      },
+    );
+    vi.stubEnv("VITE_HEAD", "server");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("does not throw on mount — getUpdateState() is a synchronous-throw notAvailable stub there (transport/http.ts), not a rejected promise, so an unguarded call crashes the effect", async () => {
+    const { useUpdate: freshUseUpdate } = await import("./useUpdate");
+    expect(() => renderHook(() => freshUseUpdate())).not.toThrow();
   });
 });

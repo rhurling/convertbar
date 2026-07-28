@@ -65,11 +65,6 @@ beforeEach(() => {
         return Promise.resolve(META);
       case "resolve_suffix_template":
         return Promise.resolve(".RESOLVED"); // sentinel proving the preview is backend-computed
-      case "get_platform_capabilities":
-        // getAppInfo() (used for the version display) composes this with getVersion() on
-        // desktop — without a case here it fell to the default rejection, appVersion silently
-        // never populated, and no assertion caught it.
-        return Promise.resolve({ can_pause_process: true });
       case "update_setting":
       case "set_preset_suffix":
         return Promise.resolve(undefined);
