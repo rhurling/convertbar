@@ -1244,25 +1244,28 @@ pub fn get_bad_sources(ctx: &Ctx) -> Result<Vec<JobInfo>, String> {
 /// `purge_one_locked` additionally releases the DB mutex around each scan so a slow purge can't
 /// stall the converter thread too.
 pub fn purge_bad_sources(ctx: &Arc<Ctx>, ids: Vec<String>) -> Result<Vec<PurgeResult>, String> {
-    let (action, configured_handbrake_path) = {
+    let action: String = {
         let conn = ctx.db.lock().map_err(|e| e.to_string())?;
-        let action: String = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'bad_source_action'",
-                params![],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|_| "trash".to_string());
-        (action, read_configured_handbrake_path(&conn))
-    };
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'bad_source_action'",
+            params![],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "trash".to_string())
+    }; // guard dropped here: `require_handbrake_path` takes `ctx.db` itself, and it is not
+       // reentrant. The two settings are no longer read in one acquisition — they are
+       // independent, and nothing here depends on seeing a consistent snapshot of both.
     let action = PurgeAction::from_setting(&action);
     // R3: resolved ONCE for the whole batch, OUTSIDE the lock, and passed to every
     // `purge_one_locked` call below — the fallback can spawn a blocking `which`/`where`
     // subprocess (`PathLocator`), and this used to run per id, under the DB mutex, in both
     // purge phases, i.e. up to 2N blocking spawns under the lock for a batch of N ids.
-    let handbrake_path =
-        handbrake::resolve_with_locator(configured_handbrake_path.as_deref(), &*ctx.handbrake)
-            .ok_or_else(|| "HandBrakeCLI not found".to_string());
+    // `require_handbrake_path` locks only to read the setting, releases, then runs the locator
+    // unlocked, so R3 still holds — at the cost of one extra acquisition per batch, not per id.
+    // A lock failure inside it now lands in this `Err` and reaches `purge_one_locked` per id
+    // (which maps any `Err` to `Unverifiable`, destroying nothing) rather than failing the whole
+    // call; on a poisoned mutex the `action` read above would already have returned `Err` first.
+    let handbrake_path = handbrake::require_handbrake_path(ctx);
     Ok(ids
         .iter()
         .map(|id| PurgeResult {
