@@ -469,7 +469,6 @@ For `detect_handbrake_smoke_returns_200_with_valid_json`: this test currently to
 answer (its own comment concedes "CI has no HandBrakeCLI, but the test host might"). Replace that
 vagueness with two precise tests:
 
-```rust
 **The route returns `Json(Option<String>)`** — a bare JSON `null` or a bare JSON string, with **no
 `path` field** (`crates/convertbar-server/src/routes/handbrake.rs`, `detect_handbrake`). Assert on
 the bare value; an assertion like `body.get("path")` would be vacuously true and pass in both worlds:
