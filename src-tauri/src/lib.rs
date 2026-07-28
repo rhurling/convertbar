@@ -8,6 +8,7 @@ mod media_skip;
 mod probe;
 mod probe_cache;
 mod types;
+mod updater;
 mod watcher;
 
 use converter::{ConverterState, MenuBarUpdate};

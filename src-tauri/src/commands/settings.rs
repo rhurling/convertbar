@@ -50,6 +50,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
     let mut watch_skip_marker = String::new();
     let mut low_disk_min_gb: f64 = 0.0;
     let mut bad_source_action = String::from("trash");
+    let mut update_mode = String::from("automatic");
 
     let rows = stmt
         .query_map([], |row| {
@@ -81,6 +82,11 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
             "bad_source_action" => {
                 bad_source_action = normalize_bad_source_action(&value).to_string()
             }
+            "update_mode" => {
+                update_mode = crate::updater::normalize_update_mode(&value)
+                    .as_str()
+                    .to_string()
+            }
             _ => {}
         }
     }
@@ -106,6 +112,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
         watch_skip_marker,
         low_disk_min_gb,
         bad_source_action,
+        update_mode,
     })
 }
 
@@ -127,6 +134,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "watch_skip_marker",
     "low_disk_min_gb",
     "bad_source_action",
+    "update_mode",
 ];
 
 /// Coerce a stored `bad_source_action` to a known value. Anything other than an exact
@@ -254,5 +262,15 @@ mod tests {
         assert_eq!(normalize_bad_source_action(""), "trash");
         assert_eq!(normalize_bad_source_action("DELETE"), "trash");
         assert_eq!(normalize_bad_source_action("nonsense"), "trash");
+    }
+
+    #[test]
+    fn update_mode_is_writable_and_unknown_values_fall_back_to_automatic() {
+        // The Settings UI writes this key via update_setting; the three internal updater keys
+        // deliberately are NOT writable this way, so the frontend cannot forge update policy.
+        assert!(ALLOWED_KEYS.contains(&"update_mode"));
+        assert!(!ALLOWED_KEYS.contains(&"update_skipped_version"));
+        assert!(!ALLOWED_KEYS.contains(&"update_notified_version"));
+        assert!(!ALLOWED_KEYS.contains(&"update_installed"));
     }
 }
