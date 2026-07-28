@@ -1,4 +1,4 @@
-import { useUpdate } from "../hooks/useUpdate";
+import { MANUAL_CHECK_BLOCKED_STATUSES, useUpdate } from "../hooks/useUpdate";
 import { commands, type AvailableUpdate, type UpdateMode } from "../lib/tauri";
 
 const MODES: { value: UpdateMode; label: string }[] = [
@@ -6,16 +6,6 @@ const MODES: { value: UpdateMode; label: string }[] = [
   { value: "notify", label: "Notify me" },
   { value: "off", label: "Manual only" },
 ];
-
-// Statuses where the backend would refuse a manual check anyway (`manual_check_block` in
-// updater.rs: an install is downloading, waiting for the queue, or already installed and
-// awaiting restart) — disabled here so the button doesn't produce a guaranteed actionError.
-const CHECK_BLOCKED: ReadonlySet<string> = new Set([
-  "checking",
-  "downloading",
-  "waitingForIdle",
-  "readyToRestart",
-]);
 
 function relativeTime(unixSeconds: number): string {
   const mins = Math.max(0, Math.round((Date.now() / 1000 - unixSeconds) / 60));
@@ -75,7 +65,7 @@ export default function UpdatePanel() {
         <button
           className="btn btn-small"
           onClick={() => checkNow()}
-          disabled={CHECK_BLOCKED.has(state.status)}
+          disabled={MANUAL_CHECK_BLOCKED_STATUSES.has(state.status)}
         >
           Check now
         </button>

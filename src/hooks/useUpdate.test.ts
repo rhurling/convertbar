@@ -114,6 +114,75 @@ describe("useUpdate", () => {
     expect(result.current.actionError).toBeNull();
   });
 
+  it("clears actionError once a pushed event shows the situation has settled", async () => {
+    // Reproduces the exact bug this guards: an offline manual check sets actionError to
+    // "network unreachable" (and, via the backend, the identical state.last_error). The user
+    // then flips the update mode, which triggers an unrelated background check that succeeds —
+    // status becomes "available" and last_error clears. Nothing about that push touches
+    // actionError directly; if it isn't cleared, the "network unreachable" banner keeps showing
+    // directly above the now-available update, contradicting the state right beside it.
+    vi.spyOn(commands, "checkForUpdate").mockRejectedValue("network unreachable");
+    const { result } = renderHook(() => useUpdate());
+    await waitFor(() => expect(result.current.state).not.toBeNull());
+
+    await act(async () => { await result.current.checkNow(); });
+    expect(result.current.actionError).toBe("network unreachable");
+
+    act(() => {
+      emit?.({
+        ...baseState,
+        status: "available",
+        available: { version: "1.1.0", date: null, notes: null },
+        last_error: null,
+      });
+    });
+
+    await waitFor(() => expect(result.current.state?.status).toBe("available"));
+    expect(result.current.actionError).toBeNull();
+  });
+
+  it("does not let a push clear actionError while the blocking situation is still unfolding", async () => {
+    // The refusal "an update is already waiting to install" is rejected synchronously by the
+    // backend before any state mutation, so no event accompanies it — but the pending install it
+    // names keeps emitting its own progress (downloading -> waitingForIdle) around the same time.
+    // None of those pushes may race the refusal off screen: the reason the check was refused is
+    // still true for as long as status stays in a "blocked" state.
+    vi.spyOn(commands, "checkForUpdate").mockRejectedValue(
+      "an update is already waiting to install once the queue is idle",
+    );
+    const { result } = renderHook(() => useUpdate());
+    await waitFor(() => expect(result.current.state).not.toBeNull());
+
+    await act(async () => { await result.current.checkNow(); });
+    expect(result.current.actionError).toBe(
+      "an update is already waiting to install once the queue is idle",
+    );
+
+    act(() => {
+      emit?.({ ...baseState, status: "downloading" });
+    });
+    await waitFor(() => expect(result.current.state?.status).toBe("downloading"));
+    expect(result.current.actionError).toBe(
+      "an update is already waiting to install once the queue is idle",
+    );
+
+    act(() => {
+      emit?.({ ...baseState, status: "waitingForIdle" });
+    });
+    await waitFor(() => expect(result.current.state?.status).toBe("waitingForIdle"));
+    expect(result.current.actionError).toBe(
+      "an update is already waiting to install once the queue is idle",
+    );
+
+    // Only once status leaves the blocked set (the install finished and the app is idle again)
+    // has the situation genuinely settled, and the stale refusal is safe to drop.
+    act(() => {
+      emit?.({ ...baseState, status: "idle" });
+    });
+    await waitFor(() => expect(result.current.state?.status).toBe("idle"));
+    expect(result.current.actionError).toBeNull();
+  });
+
   it("does not let a stale initial getUpdateState response clobber a fresher push event", async () => {
     // If the update-state event arrives before the seeding getUpdateState() call resolves,
     // the late-resolving seed is older data and must not overwrite the newer pushed state.

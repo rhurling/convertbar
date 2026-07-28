@@ -12,7 +12,13 @@ const mockUpdate = {
   restart: vi.fn(),
 };
 
-vi.mock("../hooks/useUpdate", () => ({ useUpdate: () => mockUpdate }));
+vi.mock("../hooks/useUpdate", () => ({
+  useUpdate: () => mockUpdate,
+  // Real set from the hook (checking/downloading/waitingForIdle/readyToRestart) — kept in sync
+  // by hand since this mock replaces the whole module; UpdatePanel imports it to disable
+  // "Check now" in exactly the statuses the backend's manual_check_block would refuse.
+  MANUAL_CHECK_BLOCKED_STATUSES: new Set(["checking", "downloading", "waitingForIdle", "readyToRestart"]),
+}));
 vi.mock("../lib/tauri", () => ({
   commands: { updateSetting: vi.fn().mockResolvedValue(undefined) },
 }));
@@ -87,10 +93,22 @@ describe("UpdatePanel", () => {
     expect(mockUpdate.restart).toHaveBeenCalled();
   });
 
-  it("keeps an error visible instead of clearing it on a timer", async () => {
-    mockUpdate.state = { ...base, status: "error", last_error: "network unreachable" };
-    render(<UpdatePanel />);
-    expect(await screen.findByText(/network unreachable/i)).toBeInTheDocument();
+  it("keeps an error visible instead of clearing it on a timer", () => {
+    // The old "Check for updates" button cleared its status via setTimeout after 3-5s.
+    // Advancing well past that window and re-asserting is what actually proves nothing
+    // clears this error anymore — without the advance, this would pass even if a timer
+    // had been added back in.
+    vi.useFakeTimers();
+    try {
+      mockUpdate.state = { ...base, status: "error", last_error: "network unreachable" };
+      render(<UpdatePanel />);
+      expect(screen.getByText(/network unreachable/i)).toBeInTheDocument();
+
+      vi.advanceTimersByTime(10 * 60 * 1000);
+      expect(screen.getByText(/network unreachable/i)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders a rejected manual action even though it never touched last_error", async () => {

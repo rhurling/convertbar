@@ -1,6 +1,25 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { commands, type UpdateState } from "../lib/tauri";
+import { commands, type UpdateState, type UpdateStatus } from "../lib/tauri";
+
+// Statuses where the backend's `manual_check_block` (updater.rs) would refuse a fresh manual
+// check: an install is downloading, waiting for the queue to drain, or installed and awaiting
+// restart. Exported so the panel's "Check now" button reads the identical set, rather than a
+// second hand-copied list that could quietly drift out of sync with the rule below.
+//
+// Also governs when a stale `actionError` is safe to clear on an incoming `update-state` push:
+// while status stays in this set, the situation that produced the error (most often the very
+// refusal above) may still be actively unfolding — e.g. the pending install the refusal named
+// keeps emitting its own progress events — and one of those must not race the error off screen
+// before the user reads it. Only once status leaves this set (back to idle, available, or error)
+// has the situation genuinely settled, and any earlier actionError is guaranteed stale rather
+// than merely old — see the "network unreachable" -> mode change -> "available" case this fixes.
+export const MANUAL_CHECK_BLOCKED_STATUSES: ReadonlySet<UpdateStatus> = new Set([
+  "checking",
+  "downloading",
+  "waitingForIdle",
+  "readyToRestart",
+]);
 
 export function useUpdate() {
   const [state, setState] = useState<UpdateState | null>(null);
@@ -29,6 +48,12 @@ export function useUpdate() {
       if (!alive) return;
       sawEvent = true;
       setState(e.payload);
+      // A push landing while status is still "blocked" doesn't mean the situation has settled —
+      // see the comment on MANUAL_CHECK_BLOCKED_STATUSES. Clearing unconditionally here would
+      // wipe an actionError that's still the live explanation for what's happening.
+      if (!MANUAL_CHECK_BLOCKED_STATUSES.has(e.payload.status)) {
+        setActionError(null);
+      }
     });
 
     return () => {
