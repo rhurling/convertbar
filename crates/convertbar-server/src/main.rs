@@ -2,6 +2,7 @@ mod config;
 mod embed;
 mod routes;
 mod sink;
+mod startup;
 
 use std::sync::Arc;
 
@@ -40,15 +41,18 @@ async fn main() {
         Arc::new(ServerSink(events_tx.clone())),
         Arc::new(DeleteDisposer),
     );
-    // The sender is unused until a later task wires it into the shutdown-signal path
-    // (SIGTERM/SIGINT handler flips it to `true`). It must stay alive for the server's
-    // lifetime regardless: dropping it here would flip every SSE stream's shutdown watch
-    // to "sender gone" immediately, ending them right away instead of on real shutdown.
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Server-only settings correction, then the desktop setup block's auto-resume sequence
+    // (recover interrupted jobs, resume the queue if warranted, arm watchers) — both must
+    // run before the app starts serving requests.
+    startup::normalize_server_settings(&ctx);
+    startup::boot(&ctx);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let bind = config.bind;
 
     let state = ServerState {
-        ctx,
+        ctx: ctx.clone(),
         config: Arc::new(config),
         events_tx,
         shutdown_rx,
@@ -61,5 +65,23 @@ async fn main() {
         .unwrap_or_else(|err| panic!("bind {bind}: {err}"));
     tracing::info!("convertbar-server listening on {bind}");
 
-    axum::serve(listener, app).await.expect("server error");
+    let shutdown_ctx = ctx.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            startup::shutdown_signal().await;
+            // Kill the active child AT signal time (not after `serve` returns): this is
+            // what flips every SSE stream's shutdown watch (via the send below) after the
+            // child is already down, so the graceful drain doesn't wait on an in-flight
+            // encode as well as the open connections.
+            convertbar_core::converter::kill_active_child(&shutdown_ctx.converter);
+            let _ = shutdown_tx.send(true);
+        })
+        .await
+        .expect("server error");
+
+    // Belt: harmless even if the signal-time kill above already ran (kill_active_child is
+    // idempotent — a no-op when no child is active, and a second kill()/wait() on an
+    // already-reaped child is a fast no-op error, never a hang). Covers any shutdown path
+    // that reaches here without going through the graceful-shutdown future above.
+    convertbar_core::converter::kill_active_child(&ctx.converter);
 }
