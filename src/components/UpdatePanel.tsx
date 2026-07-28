@@ -45,6 +45,27 @@ function AvailableDetails({ update }: { update: AvailableUpdate }) {
 export default function UpdatePanel() {
   const { state, actionError, checkNow, install, skip, restart, dismissError } = useUpdate();
   const [lastAction, setLastAction] = useState<ActionKind | null>(null);
+  const [pending, setPending] = useState(false);
+
+  // `lastAction` only names the right action if at most one action is outstanding: it is set on
+  // click, while `actionError` is set whenever an action settles, so two overlapping actions
+  // could pair the later click's name with the earlier action's failure ("Couldn't skip that
+  // version: …" for a skip that worked). Rather than reconciling that afterwards, the action
+  // buttons are disabled for the duration, which also leaves `actionError` a single writer at a
+  // time. The re-entry guard mirrors QueueItem/HistoryPage: the disabled attribute is the user
+  // affordance, this is the invariant.
+  const startAction = async (kind: ActionKind, action: () => Promise<void>) => {
+    if (pending) return;
+    setLastAction(kind);
+    setPending(true);
+    try {
+      await action();
+    } finally {
+      // Always re-enables — a rejected action leaves the panel usable, not inert.
+      setPending(false);
+    }
+  };
+
   if (!state) return null;
 
   // `actionError` (a rejected checkNow/install/skip) and `state.last_error` (the scheduler's
@@ -84,8 +105,8 @@ export default function UpdatePanel() {
       <div className="setting-row">
         <button
           className="btn btn-small"
-          onClick={() => { setLastAction("check"); checkNow(); }}
-          disabled={MANUAL_CHECK_BLOCKED_STATUSES.has(state.status)}
+          onClick={() => startAction("check", checkNow)}
+          disabled={pending || MANUAL_CHECK_BLOCKED_STATUSES.has(state.status)}
         >
           Check now
         </button>
@@ -113,10 +134,18 @@ export default function UpdatePanel() {
         <div className="update-available">
           <AvailableDetails update={state.available} />
           <div className="setting-row">
-            <button className="btn btn-small" onClick={() => { setLastAction("install"); install(); }}>
+            <button
+              className="btn btn-small"
+              onClick={() => startAction("install", install)}
+              disabled={pending}
+            >
               Install and restart
             </button>
-            <button className="btn btn-small" onClick={() => { setLastAction("skip"); skip(); }}>
+            <button
+              className="btn btn-small"
+              onClick={() => startAction("skip", skip)}
+              disabled={pending}
+            >
               Skip this version
             </button>
           </div>

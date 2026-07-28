@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import UpdatePanel from "./UpdatePanel";
 
@@ -39,6 +39,10 @@ const base = {
 describe("UpdatePanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks only drops call history; a mockImplementation set by one test would
+    // otherwise leak into the next (the in-flight tests below install a deliberately
+    // never-settling install()).
+    mockUpdate.install.mockReset();
     mockUpdate.state = base;
     mockUpdate.actionError = null;
   });
@@ -211,5 +215,83 @@ describe("UpdatePanel", () => {
     mockUpdate.state = { ...base, status: "downloading", available: { version: "1.1.0", date: null, notes: null } };
     render(<UpdatePanel />);
     expect(screen.getByRole("button", { name: /check now/i })).toBeDisabled();
+  });
+
+  // Makes install() hang until the returned settle() is called, and have it land the message
+  // the real hook would have caught into actionError — i.e. a rejection that arrives *after*
+  // the user has had time to press something else.
+  function deferInstall(message: string) {
+    let settle!: () => void;
+    mockUpdate.install.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          settle = () => {
+            mockUpdate.actionError = message;
+            resolve();
+          };
+        }),
+    );
+    return () => settle();
+  }
+
+  it("does not pin one action's failure on another when a second click overlaps the first", async () => {
+    // The trace: Install is clicked; before it settles the user clicks Skip, which succeeds;
+    // Install's promise then rejects late. `lastAction` (panel state, set on click) and
+    // `actionError` (hook state, set when an action settles) are separate, so with overlapping
+    // actions the panel would read "skip" alongside Install's message and print "Couldn't skip
+    // that version: an update operation is already running" — naming the one action that
+    // actually worked. Preventing the overlap is what makes the pairing unbreakable: at most
+    // one action can be outstanding, so only that action can be the one to set actionError.
+    mockUpdate.state = {
+      ...base,
+      status: "available",
+      available: { version: "1.1.0", date: null, notes: null },
+    };
+    const settleInstall = deferInstall("an update operation is already running");
+
+    const { rerender } = render(<UpdatePanel />);
+    await userEvent.click(screen.getByRole("button", { name: /install/i }));
+    await userEvent.click(screen.getByRole("button", { name: /skip/i }));
+
+    await act(async () => { settleInstall(); });
+    rerender(<UpdatePanel />);
+
+    expect(
+      screen.getByText("Couldn't start the install: an update operation is already running"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/couldn't skip that version/i)).toBeNull();
+    expect(mockUpdate.skip).not.toHaveBeenCalled();
+  });
+
+  it("disables every action button while an action is in flight, rather than silently dropping clicks", async () => {
+    // The overlap is prevented by disabling the controls, not by swallowing the second click:
+    // .btn:disabled (App.css) dims them and shows a not-allowed cursor, same as every other
+    // in-flight button in this app. Check now stays disabled for its own backend reason too —
+    // the in-flight condition is additional, not a replacement.
+    mockUpdate.state = {
+      ...base,
+      status: "available",
+      available: { version: "1.1.0", date: null, notes: null },
+    };
+    const settleInstall = deferInstall("an update operation is already running");
+
+    render(<UpdatePanel />);
+    const buttons = () => ({
+      check: screen.getByRole("button", { name: /check now/i }),
+      install: screen.getByRole("button", { name: /install/i }),
+      skip: screen.getByRole("button", { name: /skip/i }),
+    });
+    expect(buttons().check).toBeEnabled();
+
+    await userEvent.click(buttons().install);
+    expect(buttons().check).toBeDisabled();
+    expect(buttons().install).toBeDisabled();
+    expect(buttons().skip).toBeDisabled();
+
+    // …and re-enabled once it settles, so a failed action never leaves the panel inert.
+    await act(async () => { settleInstall(); });
+    expect(buttons().check).toBeEnabled();
+    expect(buttons().install).toBeEnabled();
+    expect(buttons().skip).toBeEnabled();
   });
 });
