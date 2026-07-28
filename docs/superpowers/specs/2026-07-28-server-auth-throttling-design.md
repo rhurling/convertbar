@@ -183,37 +183,46 @@ pub enum Gate {
 }
 
 pub struct ThrottlePolicy {
-    pub free: u32,         // 3     — failures before gating begins
-    pub base: Duration,    // 500ms — spacing after the first gated failure
+    pub free: u32,         // 8     — evaluations before gating begins
+    pub base: Duration,    // 500ms — spacing after the first gated evaluation
     pub cap: Duration,     // 30s   — spacing ceiling
-    pub window: Duration,  // 15min — failures older than this are forgotten
+    pub window: Duration,  // 15min — attempts older than this are forgotten
 }
 
 impl LoginThrottle {
-    /// Reserves this source's evaluation slot. MUST be called BEFORE comparing
-    /// the credential — that ordering is the entire defense.
+    /// Counts and reserves this source's evaluation slot. MUST be called
+    /// BEFORE comparing the credential — that ordering is the entire defense.
     pub fn check(&self, id: ClientId, now: Instant) -> Gate;
-    /// Records that an allowed evaluation rejected the credential.
-    pub fn record_failure(&self, id: ClientId, now: Instant);
     /// Clears the bucket. Called when an allowed evaluation accepted it.
     pub fn record_success(&self, id: ClientId);
 }
 ```
 
-`spacing(n) = 0` for `n < free`, else `min(base << (n - free), cap)` — so
-failures 1-3 are ungated, then 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, and pinned at
-the 30 s cap from the 9th failure on. The shift is clamped so a long-lived
-bucket cannot overflow.
+`spacing(n) = 0` for `n <= free`, else `min(base << (n - free - 1), cap)` — so
+attempts 1-8 are ungated, then 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, and pinned at
+the 30 s cap from the 15th attempt on. The shift is clamped so a long-lived
+bucket cannot overflow, and the curve stays correct for a zero `base`.
 
-**`check` reserves; it does not merely observe.** Under the lock it compares
-`now` against the bucket's `next_at` and, when it allows, immediately sets
-`next_at = now + spacing(count)`. Reserving inside the same critical section is
-what stops a parallel attacker: N concurrent requests do not all observe the
-same open window, because the first one closes it before the second reads it.
+**`check` counts and reserves; it does not merely observe.** Under the lock it
+compares `now` against the bucket's `next_at` and, when it allows, increments the
+attempt count and sets `next_at = now + spacing(count)` before releasing.
 
-**The first `free` failures are ungated** so that ordinary use is untouched: a
-mistyped token, a stale cookie, and the web UI's concurrent page-load fan-out
-all stay under the threshold and never see a denial.
+The increment lives in `check`, not on the failure path, and that placement is
+load-bearing. Counting only failures leaves every concurrent request inside the
+free window observing the same open slot — measured at 5-8 evaluations against a
+budget of 4 on an 8-core machine, and 64/64 with a barrier. Counting the attempt
+when it is *allowed* makes the budget exact: on a virgin bucket at one instant,
+exactly `free + 1` requests are admitted and the next is denied, whatever the
+concurrency. A legitimate client's increments are undone by `record_success`,
+which clears the bucket outright.
+
+**The first `free` attempts are ungated** so that ordinary use is untouched: a
+mistyped token, a stale cookie, and the web UI's concurrent page-load fan-out all
+stay under the threshold and never see a denial. `free` is 8 rather than the
+fan-out's measured 4 because `check` now counts successful attempts too, and a
+threshold sitting exactly on the measured fan-out has no headroom for a fifth
+concurrent call. Eight free guesses per window is irrelevant against a
+16-character token.
 
 Time is always an explicit `now: Instant` parameter, so every property above is
 testable without a single `sleep` — the suite gained determinism as a side
@@ -245,10 +254,10 @@ bucket and one rate.
 | 3 | **no credential presented at all** | plain 401, no gate, no counter — *terminal* |
 | 4 | `check` returns `Deny` | 401 **without comparing the credential** |
 | 5 | credential matches | `record_success`, `next.run(req)` |
-| 6 | credential mismatch | `record_failure`, 401 |
+| 6 | credential mismatch | 401 (the attempt was already counted by `check`) |
 
 **`login`:** open mode → 204; `Deny` → 401 without comparing; matches →
-`record_success`, set cookie, 204; mismatch → `record_failure`, 401.
+`record_success`, set cookie, 204; mismatch → 401.
 
 Three properties that carry the design:
 
@@ -308,31 +317,41 @@ the log a flood amplifier.
   high counts; window rollover resets; `record_success` clears; distinct ids are
   independent buckets; pruning drops expired and keeps live entries.
 
-**Integration through `app()` (the real guard composition, with `MockConnectInfo`):**
+**Integration through `app()` (the real guard composition, with an
+`Extension(ConnectInfo(addr))` layer — never `MockConnectInfo`, which inserts a
+different extension type that the guard cannot see):**
 
-1. An uncredentialed request returns the **plain, undelayed** 401 and does not
-   advance the counter — repeat it many times, then confirm a valid credential
-   still works immediately.
-2. Failures at `POST /api/login` and at `/api/queue` accumulate in the **same**
-   bucket (fail N at one, assert the delay continues escalating at the other).
-3. A successful login clears the counter.
-4. **A correct token always succeeds, no matter how many failures precede it** —
-   the goal-3 regression test, and the one that would have caught revision 1.
-5. A different source address is unaffected by another's failures.
-6. The delay is actually applied and actually escalates: with a small non-zero
-   `base`, assert elapsed time grows between successive failures, so a dropped
-   `sleep` or a delay computed pre-increment cannot pass silently.
-7. Open mode never engages the throttle.
+No test asserts elapsed wall-clock time. Gating is observed by *status*, using a
+policy with `free: 0` and a long `base` so the gate shuts on the first attempt
+and stays shut for the test's duration.
+
+1. An uncredentialed request returns the plain 401 and never consumes a slot —
+   repeat it well past `free`, then confirm a valid credential still works.
+2. Attempts at `POST /api/login` and at `/api/queue` share one gate: shut it via
+   one route, then confirm the other refuses a **correct** token.
+3. A successful evaluation reopens the gate for that source — and the test must
+   share one `ServerState`, since a second `test_state()` builds its own
+   `LoginThrottle` and would pass regardless.
+4. **A shut gate refuses even a correct token.** This is the rate limit; a gate
+   that still honoured a correct token would still answer every guess, which is
+   exactly how revision 2 failed.
+5. A `Deny` and a wrong-credential rejection are byte-identical — same status,
+   same body, no `Set-Cookie` on either.
+6. Exactly `free + 1` evaluations are admitted at a single instant on a virgin
+   bucket, and the next is denied — the property that a read-then-write gap in
+   `check` would break.
+7. A different source address is unaffected by another's shut gate.
+8. Open mode never gates.
 
 **Real-listener test:** bind `127.0.0.1:0`, serve with
 `into_make_service_with_connect_info`, and connect real clients. It must
-*discriminate*, not merely return 401 — a 401 arrives either way, since the
-`Unknown` bucket at a zero delay is behaviourally identical. Trust `127.0.0.1`
-as a proxy, use a non-zero base delay, and drive two requests bearing different
+*discriminate*, not merely return 401 — a 401 arrives either way. Trust
+`127.0.0.1` as a proxy and drive two requests bearing different
 `X-Forwarded-For` clients: with the wiring intact they occupy separate buckets
-and the second is fast; without it both collapse into `Unknown` and the second is
-delayed. This covers the one line `oneshot` cannot reach, and whose silent
-regression would turn a per-source throttle into a global one.
+and the second client is still evaluated; without it both collapse into
+`Unknown` and the second is refused. This covers the one line `oneshot` cannot
+reach, and whose silent regression would turn a per-source limiter into a global
+one.
 
 **Config:** weak token rejected; weak token + `NO_AUTH=1` still rejected;
 `NO_AUTH=1` alone unaffected; trusted-proxy parsing (CIDR, bare IP, invalid →
