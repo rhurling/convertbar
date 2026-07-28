@@ -159,15 +159,25 @@ fn in_place_apply_is_fatal(kept: KeptFile, apply_failed: bool) -> bool {
 }
 
 pub struct ConverterState {
-    pub(crate) current_pid: Mutex<Option<u32>>,
-    pub(crate) current_child: Mutex<Option<Child>>,
+    // `current_pid`/`current_child`/`is_running`/`pause_after_current` stay `pub` (not
+    // `pub(crate)`): the desktop-only updater (src-tauri/src/updater.rs, commands/updater.rs)
+    // reaches across the crate boundary to lock/read them directly — `try_install_now` claims
+    // the same `is_running` mutex `run_queue`/`claim_queue_slot` use so the two atomically
+    // exclude each other, and `restart_after_killing_encoder`'s test seeds a live child via
+    // `current_pid`/`current_child`. Fields not touched cross-crate stay narrowed below.
+    pub current_pid: Mutex<Option<u32>>,
+    pub current_child: Mutex<Option<Child>>,
     pub(crate) current_job_id: Mutex<Option<String>>,
     pub(crate) is_paused: Mutex<bool>,
-    pub(crate) is_running: Mutex<bool>,
-    pub(crate) pause_after_current: Mutex<bool>,
+    pub is_running: Mutex<bool>,
+    pub pause_after_current: Mutex<bool>,
     /// One-way app-teardown latch: armed by `kill_active_child`, checked by
     /// `process_queue` so the queue thread never spawns another encoder mid-quit.
     pub(crate) shutdown: std::sync::atomic::AtomicBool,
+    /// Latched while an update is installing, so the queue cannot start a job underneath it.
+    /// Claimed and released under the `is_running` lock, making the gate atomic against
+    /// `run_queue` rather than a check-then-act race.
+    pub installing: std::sync::atomic::AtomicBool,
     /// Reason the queue is currently paused for low disk space, if any. Set when the low-disk
     /// gate trips, cleared at the start of every `process_queue` run so a resume (or a run that
     /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
@@ -185,6 +195,7 @@ impl ConverterState {
             is_running: Mutex::new(false),
             pause_after_current: Mutex::new(false),
             shutdown: std::sync::atomic::AtomicBool::new(false),
+            installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
         }
     }
@@ -211,8 +222,10 @@ impl ConverterState {
         self.pause_after_current.lock().map(|g| *g).unwrap_or(false)
     }
 
-    /// Whether the queue is currently processing jobs. The head-agnostic read of `is_running`
-    /// (e.g. the desktop tray listener), so callers outside this crate never touch the raw field.
+    /// Whether the queue is currently processing jobs. The convenience read of `is_running`
+    /// for callers that only need the bool (e.g. the desktop tray listener) — the updater
+    /// (src-tauri/src/updater.rs) still locks the raw field directly where it needs the mutex
+    /// itself, to claim it atomically alongside `installing`.
     pub fn is_running(&self) -> bool {
         self.is_running.lock().map(|g| *g).unwrap_or(false)
     }
@@ -462,12 +475,103 @@ fn get_low_disk_min_gb(db: &Connection) -> f64 {
 /// Persisted "the user deliberately stopped the queue" flag, stored in the settings table.
 /// Read-with-default (no seed) so existing databases need no migration and the settings-count
 /// guard test is untouched. It is backend runtime state — NOT in ALLOWED_KEYS, NOT in the UI.
-pub(crate) fn set_queue_paused(db: &Connection, paused: bool) {
+// `pub` (not `pub(crate)`): the desktop-only updater's test suite (src-tauri/src/updater.rs)
+// calls this directly across the crate boundary to set up queue-pause scenarios.
+pub fn set_queue_paused(db: &Connection, paused: bool) {
+    // Lifting a stop that is actually in force means somebody — Start, Resume, Cancel, a cleared
+    // queue, a watched file, or the launch-time lift itself — has taken ownership of the pause
+    // state. The updater's `update_drain_pause` breadcrumb records only that it caused *a* pause,
+    // never which one, so it must not outlive that: otherwise a later, unrelated pause the user
+    // set deliberately would be lifted at the next launch. Guarded on the queue really being
+    // paused, so a no-op clear (the watcher's, while a drain is armed but has not landed yet)
+    // does not spend a breadcrumb that refers to a stop still to come.
+    if !paused && is_queue_paused(db) {
+        forget_drain_pause(db);
+    }
     let _ = db.execute(
         "INSERT INTO settings (key, value) VALUES ('queue_paused', ?1)
          ON CONFLICT(key) DO UPDATE SET value = ?1",
         params![if paused { "true" } else { "false" }],
     );
+}
+
+/// Persists a stop the *user* asked for: the paused flag, plus the release of any updater claim
+/// on it.
+///
+/// One function so the two cannot drift apart. A user pause that left the updater's breadcrumb
+/// standing would be lifted by a failed install or by the next launch — and on unix the two are
+/// otherwise indistinguishable, because SIGSTOP leaves the queue thread alive so `is_running`
+/// never clears.
+pub fn set_user_queue_pause(db: &Connection) {
+    set_queue_paused(db, true);
+    forget_drain_pause(db);
+}
+
+/// Backend-only settings row recording that a persisted queue pause was the *updater's* doing —
+/// it drained a busy queue for a user-requested "Install and restart". Read-with-default (no
+/// seed) so existing databases need no migration and the settings-count guard is untouched. NOT
+/// in ALLOWED_KEYS, NOT in the UI — same discipline as `queue_paused`.
+///
+/// Lives here rather than in the desktop shell's `updater` module because `set_queue_paused`
+/// below must release the claim, and core cannot reach into the shell.
+pub fn read_drain_pause(db: &Connection) -> bool {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = 'update_drain_pause'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .map(|v| v == "true")
+    .unwrap_or(false)
+}
+
+pub fn set_drain_pause(db: &Connection, armed: bool) {
+    let _ = db.execute(
+        "INSERT INTO settings (key, value) VALUES ('update_drain_pause', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        params![if armed { "true" } else { "" }],
+    );
+}
+
+/// Drops the updater's claim on the persisted queue pause.
+///
+/// The breadcrumb is a bare boolean — it records that the updater caused *a* pause, not *which*
+/// one — so it is only sound for as long as nobody else has touched the pause state. Called by
+/// `set_queue_paused` whenever a real stop is being lifted, and by `pause_conversion` when the
+/// user stops the queue themselves: after either, the pause in force is somebody else's and
+/// lifting it at the next launch would override a deliberate decision.
+pub fn forget_drain_pause(db: &Connection) {
+    set_drain_pause(db, false);
+}
+
+/// The launch-time decision: whether to start the queue, after lifting any pause the updater
+/// itself caused. Composed here rather than inline in `setup()` so the "consult the breadcrumb
+/// before honouring the pause" step is pinned by a test — `setup()` itself is not reachable from
+/// one.
+pub fn should_resume_queue_at_launch(db: &Connection, has_queued: bool) -> bool {
+    let queue_paused = take_drain_pause(db, is_queue_paused(db));
+    should_auto_resume(has_queued, queue_paused)
+}
+
+/// Lifts a queue pause the updater itself caused, exactly once, and reports the queue's real
+/// paused state.
+///
+/// A user-initiated "Install and restart" against a busy queue drains it by arming
+/// `pause_after_current`, which `process_queue` consumes into a *persisted* `queue_paused = true`
+/// plus a `break` with jobs still queued. The user never pressed Pause — the updater did — so
+/// leaving that pause in force after the update restart would strand the rest of their batch
+/// indefinitely. The breadcrumb marks the pause as the updater's doing.
+///
+/// Consumed whether or not it is used, so a breadcrumb left behind by an install that never got
+/// as far as pausing anything cannot resurface against an unrelated pause later.
+pub fn take_drain_pause(db: &Connection, queue_paused: bool) -> bool {
+    // Read before any write: `set_queue_paused(false)` below re-enters `forget_drain_pause`.
+    let was_update_drain = read_drain_pause(db);
+    set_drain_pause(db, false);
+    if was_update_drain && queue_paused {
+        set_queue_paused(db, false);
+        return false;
+    }
+    queue_paused
 }
 
 pub fn is_queue_paused(db: &Connection) -> bool {
@@ -1307,21 +1411,31 @@ fn process_queue(ctx: &Ctx) {
     // is_running is reset by RunningGuard on return (and on an unwinding panic).
 }
 
+/// Atomically claims the right to run the queue. Returns false when the queue is already
+/// running or an update install holds the interlock. Poison-tolerant: if a prior queue thread
+/// panicked while briefly holding this lock, recover the flag rather than propagating the
+/// poison and permanently wedging starts.
+pub fn claim_queue_slot(converter: &ConverterState) -> bool {
+    let mut running = converter
+        .is_running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if *running
+        || converter
+            .installing
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return false;
+    }
+    *running = true;
+    true
+}
+
 /// Starts queue processing in a new background thread.
 /// Sets `is_running` to true atomically before spawning.
 pub fn run_queue(ctx: Arc<Ctx>) {
-    {
-        // Poison-tolerant: if a prior queue thread panicked while briefly holding this lock,
-        // recover the flag rather than propagating the poison and permanently wedging starts.
-        let mut running = ctx
-            .converter
-            .is_running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if *running {
-            return;
-        }
-        *running = true;
+    if !claim_queue_slot(&ctx.converter) {
+        return;
     }
 
     std::thread::spawn(move || {
@@ -3487,6 +3601,31 @@ HandBrake has exited.";
                 .iter()
                 .any(|(_, body)| body.contains("in.mp4")),
             "a successful encode must notify with the file name, got: {notifications:?}"
+        );
+    }
+
+    #[test]
+    fn claim_queue_slot_refuses_while_an_update_is_installing() {
+        // Both sides serialize on the same is_running mutex, so the gate is atomic rather
+        // than check-then-act.
+        let converter = ConverterState::new();
+        converter
+            .installing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!claim_queue_slot(&converter));
+        assert!(
+            !*converter.is_running.lock().unwrap(),
+            "a refused claim must not leave is_running set"
+        );
+
+        converter
+            .installing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(claim_queue_slot(&converter));
+        assert!(*converter.is_running.lock().unwrap());
+        assert!(
+            !claim_queue_slot(&converter),
+            "second claim is refused while running"
         );
     }
 }

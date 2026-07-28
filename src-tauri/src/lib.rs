@@ -2,6 +2,7 @@ pub(crate) use convertbar_core::{converter, db, handbrake, types, watcher};
 
 mod commands;
 mod sink;
+mod updater;
 
 use convertbar_core::ctx::Ctx;
 use convertbar_core::events::EventSink;
@@ -11,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Listener, Manager};
-use tauri_plugin_updater::UpdaterExt;
 
 /// Truncate a filename for the tray title on a char boundary — byte slicing panics
 /// mid-codepoint on multi-byte names (umlauts, CJK, emoji), crashing the tray updater.
@@ -20,17 +20,6 @@ fn truncate_tray_title(name: &str) -> String {
         format!("{}…", name.chars().take(19).collect::<String>())
     } else {
         name.to_string()
-    }
-}
-
-/// Body for the startup-updater notification. Both outcomes notify (D5/D15): a silent install
-/// failure would leave the user invisibly stuck on an old version, so failure is surfaced too —
-/// an offline *check* (no update found) stays quiet at the call site and never reaches here.
-fn update_install_notification(version: &str, installed: bool) -> String {
-    if installed {
-        format!("Updated to {version} — restart ConvertBar to apply")
-    } else {
-        format!("Update to {version} failed to install — still on the current version")
     }
 }
 
@@ -44,6 +33,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .manage(Arc::new(updater::UpdaterRuntime::default()))
         .invoke_handler(tauri::generate_handler![
             commands::settings::get_settings,
             commands::settings::update_setting,
@@ -87,6 +77,11 @@ pub fn run() {
             commands::files::check_paths_exist,
             commands::files::open_path,
             commands::files::reveal_in_dir,
+            commands::updater::get_update_state,
+            commands::updater::check_for_update,
+            commands::updater::install_update,
+            commands::updater::skip_update_version,
+            commands::updater::restart_app,
         ])
         .setup(|app| {
             let db_path = db::get_db_path();
@@ -329,12 +324,16 @@ pub fn run() {
                             }
                         }
                     }
+
+                    // Outside the tray block on purpose: a deferred install must still be
+                    // retried when the queue drains, even if the tray icon has gone away.
+                    updater::on_queue_status(&app_handle, &update.status);
                 }
             });
 
             // Task 8: Auto-resume on launch
             let has_queued;
-            let queue_paused;
+            let should_resume;
             {
                 let db = ctx.db.lock().unwrap();
 
@@ -347,41 +346,22 @@ pub fn run() {
                     [],
                     |row| row.get::<_, bool>(0),
                 ).unwrap_or(false);
-                queue_paused = crate::converter::is_queue_paused(&db);
+                // Honours a remembered pause, except one the *updater* caused by draining a busy
+                // queue for a user-requested "Install and restart" — the user never pressed
+                // Pause, so keeping it past the restart that applied the update would leave the
+                // rest of their batch stopped indefinitely. Lifted once, then forgotten.
+                should_resume = crate::converter::should_resume_queue_at_launch(&db, has_queued);
             }
 
-            if converter::should_auto_resume(has_queued, queue_paused) {
+            if should_resume {
                 converter::run_queue(ctx.clone());
             }
 
             // Arm directory watchers and ingest any files already present in enabled folders.
             watcher::start(ctx.clone());
 
-            // Check for updates on startup. Install stays automatic (decision D5),
-            // but the user is told an update landed instead of it being invisible;
-            // a check/download failure is normal offline behavior and stays quiet.
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let Ok(updater) = handle.updater() else {
-                    return;
-                };
-                if let Ok(Some(update)) = updater.check().await {
-                    let version = update.version.clone();
-                    let result = update.download_and_install(|_, _| {}, || {}).await;
-                    if let Err(e) = &result {
-                        // An update was found and the install began but failed — unlike an
-                        // offline check, this silently strands the user on the old version.
-                        eprintln!("updater: install of {version} failed: {e}");
-                    }
-                    use tauri_plugin_notification::NotificationExt;
-                    let _ = handle
-                        .notification()
-                        .builder()
-                        .title("ConvertBar")
-                        .body(update_install_notification(&version, result.is_ok()))
-                        .show();
-                }
-            });
+            // All update policy lives in `updater` — mode, scheduling, skip, and the idle gate.
+            updater::start(app.handle().clone());
 
             Ok(())
         })
@@ -420,21 +400,5 @@ mod tests {
         // A 20-char name must NOT be truncated (the old code cut at >20 bytes).
         let exactly_20 = "a".repeat(20);
         assert_eq!(truncate_tray_title(&exactly_20), exactly_20);
-    }
-
-    #[test]
-    fn update_install_notification_surfaces_both_outcomes() {
-        let ok = update_install_notification("1.2.3", true);
-        assert!(ok.contains("Updated to 1.2.3"));
-
-        // A failed install must NOT be silent (D15): the body names the failure and the
-        // version so the user knows they're stranded on the old one.
-        let failed = update_install_notification("1.2.3", false);
-        assert!(failed.contains("1.2.3"));
-        assert!(
-            failed.to_lowercase().contains("failed"),
-            "install failure must be surfaced, got: {failed}"
-        );
-        assert_ne!(ok, failed, "success and failure must read differently");
     }
 }

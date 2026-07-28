@@ -76,6 +76,16 @@ body {
   border-bottom-color: var(--accent);
 }
 
+.tab-badge {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: super;
+}
+
 /* Page Container */
 .page {
   flex: 1;
@@ -773,6 +783,61 @@ select.setting-input {
   font-weight: 400;
   color: var(--text-dim);
   font-size: 11px;
+}
+
+.update-available {
+  margin-top: 8px;
+  padding: 8px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.update-version {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.update-date {
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
+/* Bounded so a long release body can never push the Quit button off this 400x500 window. */
+.update-notes {
+  max-height: 140px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  margin: 6px 0;
+  padding: 6px;
+  background: rgba(127, 127, 127, 0.1);
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+}
+
+.update-error {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--red);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.update-error .btn-icon {
+  font-size: 13px;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+
+.update-deferred {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
 }
 
 /* Clear history dropdown */

@@ -9,6 +9,7 @@ import { commands, type HandbrakeStatus } from "./lib/tauri";
 import { isServerHead } from "./lib/head";
 import { useAddProgress } from "./hooks/useAddProgress";
 import { useFileIntake } from "./hooks/useFileIntake";
+import { useUpdate } from "./hooks/useUpdate";
 import "./App.css";
 
 type Tab = "queue" | "history" | "watch" | "settings";
@@ -19,6 +20,7 @@ function App() {
   const [unauthorized, setUnauthorized] = useState(false);
   const { isAdding, activity } = useAddProgress();
   const intake = useFileIntake({ onDrop: () => setActiveTab("queue") });
+  const { state: updateState } = useUpdate();
 
   // Server head only: desktop never dispatches this event.
   useEffect(() => {
@@ -53,7 +55,12 @@ function App() {
 
   return (
     <div className="app">
-      <TabBar activeTab={activeTab} onTabChange={setActiveTab} isAdding={isAdding} />
+      <TabBar
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
+        isAdding={isAdding}
+        updateAvailable={updateState?.status === "available"}
+      />
       <div className="page">
         {activeTab === "queue" && (
           <QueuePage hbStatus={hbStatus} adding={activity} isAdding={isAdding} intake={intake} />

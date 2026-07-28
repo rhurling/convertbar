@@ -118,6 +118,13 @@ export const httpCommands = {
   purgeBadSources: (ids: string[]): Promise<PurgeResult[]> =>
     api("POST", "/api/bad-sources/purge", { ids }),
   getAppInfo: (): Promise<AppInfo> => api("GET", "/api/info"),
+  // Desktop-only: the updater (auto-update, restart) has no server-head equivalent — the
+  // server build is updated by redeploying the container/binary, not by an in-app updater.
+  getUpdateState: notAvailable,
+  checkForUpdate: notAvailable,
+  installUpdate: notAvailable,
+  skipUpdateVersion: notAvailable,
+  restartApp: notAvailable,
 
   // Extras beyond Transport (server-only):
   login: (token: string): Promise<void> => api("POST", "/api/login", { token }),

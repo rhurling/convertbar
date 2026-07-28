@@ -1,15 +1,11 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => Promise.resolve(() => {})),
 }));
-vi.mock("@tauri-apps/api/app", () => ({
-  getVersion: () => Promise.resolve("1.2.3"),
-}));
-vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn() }));
-vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn() }));
+vi.mock("../components/UpdatePanel", () => ({ default: () => null }));
 
 import { invoke } from "@tauri-apps/api/core";
 import SettingsPage from "./SettingsPage";
@@ -36,6 +32,7 @@ function makeSettings(): AppSettings {
     watch_skip_marker: ".downloading",
     low_disk_min_gb: 0,
     bad_source_action: "trash",
+    update_mode: "automatic",
   };
 }
 
@@ -46,6 +43,13 @@ const META: PresetMetadata = {
   preset: "Fast 1080p30",
   device: "apple",
 };
+
+afterEach(() => {
+  // Only ever armed by the server-head version test below (stubEnv/stubGlobal/resetModules) —
+  // a no-op otherwise, so it is safe to run unconditionally after every test in this file.
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -82,8 +86,53 @@ function updateCallsFor(key: string) {
 }
 
 describe("SettingsPage", () => {
-  it("renders the app version from getAppInfo() (composed from getVersion() + get_platform_capabilities on desktop)", async () => {
-    render(<SettingsPage />);
+  // Desktop's own "Updates" version label was replaced by `<UpdatePanel />` (mocked to null
+  // above), which sources the version from useUpdate()/getUpdateState() instead — that path is
+  // pinned by UpdatePanel.test.tsx, not here. getAppInfo() still drives SettingsPage's OWN
+  // version display, but only on the server head (no UpdatePanel there), so that's what this
+  // pins now. Same resetModules/stubEnv approach as events.test.ts's server-head suite: isServerHead
+  // is a module-level const, so the env must be stubbed and the module graph reloaded fresh.
+  it("renders the app version from getAppInfo() on the server head (its only version display, since there's no UpdatePanel there)", async () => {
+    vi.stubEnv("VITE_HEAD", "server");
+    const fetchMock = vi.fn((path: string) => {
+      if (path === "/api/info") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              version: "1.2.3",
+              head: "server",
+              can_pause_process: true,
+              auth_required: false,
+              browse_roots: [],
+            }),
+        });
+      }
+      if (path === "/api/settings") {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(makeSettings()) });
+      }
+      if (path === "/api/handbrake/presets") {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(["Fast 1080p30"]) });
+      }
+      if (path.includes("/suffix/generate")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(META) });
+      }
+      if (path.includes("/suffix")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(".{resolution}-{codec}"),
+        });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({ error: "not mocked" }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.resetModules();
+
+    const { default: FreshSettingsPage } = await import("./SettingsPage");
+    render(<FreshSettingsPage />);
+
     expect(await screen.findByText("v1.2.3")).toBeInTheDocument();
   });
 

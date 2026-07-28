@@ -16,6 +16,7 @@ import type {
   PlatformCapabilities,
   PresetMetadata,
   PurgeResult,
+  UpdateState,
   WatchedDirectory,
 } from "./types";
 
@@ -99,6 +100,12 @@ export const tauriCommands = {
   getBadSources: () => invoke<JobInfo[]>("get_bad_sources"),
   purgeBadSources: (ids: string[]) =>
     invoke<PurgeResult[]>("purge_bad_sources", { ids }),
+  getUpdateState: () => invoke<UpdateState>("get_update_state"),
+  checkForUpdate: () => invoke<void>("check_for_update"),
+  installUpdate: () => invoke<void>("install_update"),
+  skipUpdateVersion: (version: string) =>
+    invoke<void>("skip_update_version", { version }),
+  restartApp: () => invoke<void>("restart_app"),
   // Synthesized desktop-side: the server transport gets this straight from its own
   // /api/app-info endpoint, but desktop has no single command for it, so we compose it
   // from the app's own version plus the existing platform-capabilities probe.

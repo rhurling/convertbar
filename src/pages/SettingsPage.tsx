@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { listen } from "../lib/events";
+import UpdatePanel from "../components/UpdatePanel";
 import { isServerHead } from "../lib/head";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
@@ -39,7 +37,8 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   } = useSettings();
 
   const inputRef = useRef<HTMLInputElement>(null);
-  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  // Desktop's version display now lives inside UpdatePanel (via useUpdate/getUpdateState); this
+  // is only rendered on the server head, which has no updater UI of its own.
   const [appVersion, setAppVersion] = useState<string>("");
 
   // Local drafts so text inputs echo keystrokes instantly and commit once (on blur/Enter),
@@ -51,9 +50,12 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [resolvedSuffix, setResolvedSuffix] = useState("");
 
   // getAppInfo() works on both heads (desktop composes it from getVersion() internally, server
-  // hits /api/info) — version display is runtime data, not a build-time UI-presence gate.
+  // hits /api/info), but only the server head's render path uses the result — desktop's version
+  // display lives inside UpdatePanel instead.
   useEffect(() => {
-    commands.getAppInfo().then((info) => setAppVersion(info.version)).catch(() => {});
+    if (isServerHead) {
+      commands.getAppInfo().then((info) => setAppVersion(info.version)).catch(() => {});
+    }
   }, []);
   useEffect(() => {
     if (settings) setHbDraft(settings.handbrake_path);
@@ -468,57 +470,18 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         </div>
       </div>
 
-      <div className="setting-group">
-        <label className="setting-label">
-          {isServerHead ? "Version" : "Updates"}{" "}
-          {appVersion && <span className="version-label">v{appVersion}</span>}
-        </label>
-        {/* The auto-updater is a desktop-only concept (downloads and relaunches the app bundle);
-            the server head just shows its running version above, updated by redeploying. */}
-        {!isServerHead && (
-          <div className="setting-row">
-            <button
-              className="btn btn-small"
-              onClick={async () => {
-                setUpdateStatus("Checking...");
-                try {
-                  const update = await check();
-                  if (update) {
-                    setUpdateStatus(`Downloading v${update.version}...`);
-                    await update.downloadAndInstall();
-
-                    const queue = await commands.getQueue();
-                    const isEncoding = queue.some(j => j.status === "encoding" || j.status === "paused");
-
-                    if (!isEncoding) {
-                      await relaunch();
-                    } else {
-                      await commands.pauseAfterCurrent();
-                      setUpdateStatus("Update ready, restarting after current job...");
-                      const unlisten = await listen<{ status: string }>("menu-bar-update", async (event) => {
-                        if (event.payload.status === "idle" || event.payload.status === "error") {
-                          unlisten();
-                          await relaunch();
-                        }
-                      });
-                    }
-                  } else {
-                    setUpdateStatus("You're up to date");
-                    setTimeout(() => setUpdateStatus(null), 3000);
-                  }
-                } catch (e) {
-                  setUpdateStatus(`Error: ${e}`);
-                  setTimeout(() => setUpdateStatus(null), 5000);
-                }
-              }}
-              disabled={updateStatus === "Checking..." || updateStatus?.startsWith("Downloading") || updateStatus?.startsWith("Update ready")}
-            >
-              Check for updates
-            </button>
-            {updateStatus && <span className="update-status">{updateStatus}</span>}
-          </div>
-        )}
-      </div>
+      {/* The auto-updater (UpdatePanel) is a desktop-only concept — it downloads and relaunches
+          the app bundle. The server head has no equivalent; it just shows its running version,
+          updated by redeploying. */}
+      {isServerHead ? (
+        <div className="setting-group">
+          <label className="setting-label">
+            Version {appVersion && <span className="version-label">v{appVersion}</span>}
+          </label>
+        </div>
+      ) : (
+        <UpdatePanel />
+      )}
 
       {/* quitApp() has no server equivalent (there's no local app process for the user to quit). */}
       {!isServerHead && (

@@ -29,6 +29,7 @@ function makeSettings(preset: string): AppSettings {
     watch_skip_marker: ".downloading",
     low_disk_min_gb: 0,
     bad_source_action: "trash",
+    update_mode: "automatic",
   };
 }
 

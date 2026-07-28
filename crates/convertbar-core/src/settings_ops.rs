@@ -53,6 +53,7 @@ pub const ALLOWED_KEYS: &[&str] = &[
     "watch_skip_marker",
     "low_disk_min_gb",
     "bad_source_action",
+    "update_mode",
 ];
 
 /// Coerce a stored `bad_source_action` to a known value. Anything other than an exact
@@ -93,6 +94,9 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
     let mut watch_skip_marker = String::new();
     let mut low_disk_min_gb: f64 = 0.0;
     let mut bad_source_action = String::from("trash");
+    // Stored raw: the coercion of an unknown value to Automatic is desktop-updater policy and
+    // lives in the shell (`commands::settings::get_settings`), like `launch_at_login`.
+    let mut update_mode = String::from("automatic");
 
     let rows = stmt
         .query_map([], |row| {
@@ -124,6 +128,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
             "bad_source_action" => {
                 bad_source_action = normalize_bad_source_action(&value).to_string()
             }
+            "update_mode" => update_mode = value,
             _ => {}
         }
     }
@@ -146,6 +151,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
         watch_skip_marker,
         low_disk_min_gb,
         bad_source_action,
+        update_mode,
     })
 }
 
@@ -196,6 +202,54 @@ mod tests {
         let disposer = Arc::new(RecordingDisposer::default());
         let ctx = Ctx::new(conn, sink.clone(), disposer.clone());
         (ctx, sink, disposer)
+    }
+
+    #[test]
+    fn update_setting_hands_the_connection_back_before_the_hooks_run() {
+        // 1.0.0 hung here: `update_setting` held the db guard for its whole body while the
+        // `watch_skip_marker` hook re-entered the same mutex via `watcher::refresh_skip_marker`
+        // -> `read_skip_marker`. std's Mutex is not reentrant, so that is a self-deadlock rather
+        // than a wait. The desktop shell adds more hooks after this returns (autostart sync,
+        // `updater::on_mode_changed` -> `emit_state`), all of which re-acquire it too.
+        //
+        // Run on a worker thread with a bounded join so a regression fails loud instead of
+        // hanging the suite — the sibling test below would simply never return.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (ctx, _sink, _d) = test_ctx(test_conn());
+            let result = update_setting(&ctx, "watch_skip_marker", ".uploading");
+            let _ = tx.send((result, ctx.db.try_lock().is_ok()));
+        });
+        let (result, lock_free) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("update_setting deadlocked against its own post-write hook");
+        result.unwrap();
+        assert!(
+            lock_free,
+            "a hook running after the write would deadlock on a still-held connection"
+        );
+
+        // A failed write must not strand the connection either, or one bad write would hang every
+        // later setting change for the rest of the process's life.
+        let (ctx, _sink, _d) = test_ctx(Connection::open_in_memory().unwrap());
+        assert!(
+            update_setting(&ctx, "preset", "Fast 1080p30").is_err(),
+            "no settings table: the write must fail"
+        );
+        assert!(
+            ctx.db.try_lock().is_ok(),
+            "a rejected write must still release the connection"
+        );
+    }
+
+    #[test]
+    fn update_mode_is_writable_but_the_internal_updater_keys_are_not() {
+        // The Settings UI writes this key via update_setting; the three internal updater keys
+        // deliberately are NOT writable this way, so the frontend cannot forge update policy.
+        assert!(ALLOWED_KEYS.contains(&"update_mode"));
+        assert!(!ALLOWED_KEYS.contains(&"update_skipped_version"));
+        assert!(!ALLOWED_KEYS.contains(&"update_notified_version"));
+        assert!(!ALLOWED_KEYS.contains(&"update_installed"));
     }
 
     #[test]
