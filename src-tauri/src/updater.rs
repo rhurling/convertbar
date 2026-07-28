@@ -144,7 +144,19 @@ pub struct UpdateState {
 #[derive(Debug)]
 pub enum CheckOutcome {
     Nothing,
-    Notify(AvailableUpdate),
+    /// Show the update. `announce` carries the *once-per-version* rule and nothing else: it is
+    /// false for a version already recorded in `update_notified_version`, and for every manual
+    /// check. The spec is explicit that the rule suppresses the notification, not the display —
+    /// "the badge and panel persist until acted on; the OS notification fires only when the
+    /// available version differs from the one already recorded" (design.md:159). Folding both
+    /// into one variant is what stops the two from drifting apart again: an already-notified
+    /// version used to return `Nothing`, whose arm clears `available` and drops the status to
+    /// `Idle`, so the banner and badge vanished at the next scheduled check or within seconds
+    /// of the next launch — for a user who had missed the single notification, permanently.
+    Notify {
+        update: AvailableUpdate,
+        announce: bool,
+    },
     Install(AvailableUpdate),
 }
 
@@ -163,24 +175,44 @@ pub fn decide(
         UpdateMode::Automatic => CheckOutcome::Install(update),
         UpdateMode::Off => CheckOutcome::Nothing,
         UpdateMode::Notify => {
+            // Skip DOES retract the display — the user dismissed this version explicitly.
+            // Having merely been told about it is not the same act.
             if skipped == Some(update.version.as_str()) {
                 return CheckOutcome::Nothing;
             }
-            if notified == Some(update.version.as_str()) {
-                return CheckOutcome::Nothing;
-            }
-            CheckOutcome::Notify(update)
+            let announce = notified != Some(update.version.as_str());
+            CheckOutcome::Notify { update, announce }
         }
     }
 }
 
 /// A user-initiated check. Always reports, never installs (U7), and deliberately ignores
 /// both the skip list and the once-per-version marker: the user just asked, so hiding the
-/// answer would make "Check now" look broken.
+/// answer would make "Check now" look broken. `announce` is false because the user is looking
+/// at the panel — an OS notification would be redundant, and burning the marker here would
+/// rob the next scheduled check of the one notification it owes.
 pub fn decide_manual(found: Option<AvailableUpdate>) -> CheckOutcome {
     match found {
-        Some(update) => CheckOutcome::Notify(update),
+        Some(update) => CheckOutcome::Notify {
+            update,
+            announce: false,
+        },
         None => CheckOutcome::Nothing,
+    }
+}
+
+/// The status to fall back to when a check could not complete at all.
+///
+/// An already-announced update must survive a transient failure. The Settings-tab badge and the
+/// panel's whole Available block (version, notes, Install, Skip) are keyed on
+/// `status == Available`, so demoting to `Error` retracts an update the user has not acted on —
+/// and a Wi-Fi blip at the 24h mark is exactly when that happens. The error text renders on its
+/// own line either way, so nothing is hidden by staying on `Available`.
+pub fn status_after_failed_check(has_available: bool) -> UpdateStatus {
+    if has_available {
+        UpdateStatus::Available
+    } else {
+        UpdateStatus::Error
     }
 }
 
@@ -584,7 +616,11 @@ pub async fn run_cycle<R: tauri::Runtime>(app: AppHandle<R>, manual: bool) -> Re
             if let Ok(mut t) = runtime.last_checked.lock() {
                 *t = Some(now_secs());
             }
-            set_status(&app, UpdateStatus::Error);
+            // `available` is deliberately left alone: a check that never completed says nothing
+            // about whether the update it already found still exists. See
+            // `status_after_failed_check` for why the status follows it.
+            let has_available = runtime.available.lock().ok().is_some_and(|a| a.is_some());
+            set_status(&app, status_after_failed_check(has_available));
             return Err(e.to_string());
         }
     };
@@ -620,13 +656,17 @@ pub async fn run_cycle<R: tauri::Runtime>(app: AppHandle<R>, manual: bool) -> Re
             }
             set_status(&app, UpdateStatus::Idle);
         }
-        CheckOutcome::Notify(u) => {
+        CheckOutcome::Notify {
+            update: u,
+            announce,
+        } => {
             if let Ok(mut a) = runtime.available.lock() {
                 *a = Some(u.clone());
             }
-            if !manual {
-                // Only a scheduled check burns the once-per-version marker; a manual check
-                // must stay repeatable.
+            // The display happens unconditionally; only the noise is rationed. `announce` is
+            // already false for a manual check and for a version previously notified, so this
+            // is the whole of the once-per-version rule (design.md:159).
+            if announce {
                 if let Some(app_state) = app.try_state::<crate::AppState>() {
                     if let Ok(conn) = app_state.db.lock() {
                         set_notified_version(&conn, &u.version);
@@ -1161,7 +1201,7 @@ mod tests {
         assert!(matches!(skipped, CheckOutcome::Nothing));
 
         let newer = decide(UpdateMode::Notify, Some(upd("2.1.0")), Some("2.0.0"), None);
-        assert!(matches!(newer, CheckOutcome::Notify(u) if u.version == "2.1.0"));
+        assert!(matches!(newer, CheckOutcome::Notify { update, .. } if update.version == "2.1.0"));
     }
 
     #[test]
@@ -1169,13 +1209,58 @@ mod tests {
         // `notified` comes from the persisted update_notified_version row, so this holds
         // across process restarts — an in-memory marker would re-notify on every launch.
         let first = decide(UpdateMode::Notify, Some(upd("2.0.0")), None, None);
-        assert!(matches!(first, CheckOutcome::Notify(_)));
+        assert!(matches!(first, CheckOutcome::Notify { announce: true, .. }));
 
+        // Once per version means one *notification* per version. The update itself stays on
+        // screen — see `a_second_sighting_of_a_notified_version_stays_on_screen_without_re_notifying`.
         let repeat = decide(UpdateMode::Notify, Some(upd("2.0.0")), None, Some("2.0.0"));
-        assert!(matches!(repeat, CheckOutcome::Nothing));
+        assert!(matches!(
+            repeat,
+            CheckOutcome::Notify {
+                announce: false,
+                ..
+            }
+        ));
 
         let next_release = decide(UpdateMode::Notify, Some(upd("2.2.0")), None, Some("2.0.0"));
-        assert!(matches!(next_release, CheckOutcome::Notify(u) if u.version == "2.2.0"));
+        assert!(
+            matches!(next_release, CheckOutcome::Notify { update, announce: true } if update.version == "2.2.0")
+        );
+    }
+
+    #[test]
+    fn a_second_sighting_of_a_notified_version_stays_on_screen_without_re_notifying() {
+        // LOAD-BEARING, and the spec is the authority: "the badge and panel persist until acted
+        // on; the OS notification fires only when the available version differs from the one
+        // already recorded" (design.md:159).
+        //
+        // Returning `Nothing` here — as this did — routes run_cycle into the arm that clears
+        // `available` and sets `Idle`, so the banner and the Settings-tab badge disappeared at
+        // the next scheduled check, and again within seconds of every launch. A user who missed
+        // the one OS notification then had no way to learn the update existed.
+        let repeat = decide(UpdateMode::Notify, Some(upd("2.0.0")), None, Some("2.0.0"));
+        match repeat {
+            CheckOutcome::Notify { update, announce } => {
+                assert_eq!(update.version, "2.0.0", "the update must still be shown");
+                assert!(!announce, "but it must not be announced a second time");
+            }
+            other => panic!("an already-notified version must still be displayed, got {other:?}"),
+        }
+
+        // A version the user actively dismissed is different: Skip does retract the display.
+        assert!(matches!(
+            decide(UpdateMode::Notify, Some(upd("2.0.0")), Some("2.0.0"), None),
+            CheckOutcome::Nothing
+        ));
+    }
+
+    #[test]
+    fn a_failed_check_does_not_retract_an_update_already_on_screen() {
+        // The badge and the panel's whole Available block key off status == Available, so
+        // dropping to Error at the 24h mark because the Wi-Fi blipped would silently withdraw
+        // an update the user has not acted on. `last_error` still renders, so nothing is hidden.
+        assert_eq!(status_after_failed_check(true), UpdateStatus::Available);
+        assert_eq!(status_after_failed_check(false), UpdateStatus::Error);
     }
 
     #[test]
@@ -1192,7 +1277,12 @@ mod tests {
         assert!(matches!(decide_manual(None), CheckOutcome::Nothing));
 
         let outcome = decide_manual(Some(upd("2.0.0")));
-        assert!(matches!(outcome, CheckOutcome::Notify(u) if u.version == "2.0.0"));
+        // `announce: false` — the user is looking at the panel, so an OS notification would be
+        // redundant, and burning the once-per-version marker here would rob the next scheduled
+        // check of the one notification it owes.
+        assert!(
+            matches!(outcome, CheckOutcome::Notify { update, announce: false } if update.version == "2.0.0")
+        );
     }
 
     use crate::converter::ConverterState;
