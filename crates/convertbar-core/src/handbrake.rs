@@ -368,8 +368,9 @@ fn slugify(name: &str) -> String {
     slug
 }
 
-/// The user-configured path if it points at an existing file, otherwise PATH
-/// detection. The DB lock is released before `which`/`where` shells out.
+/// The user-configured path if it points at an existing file, otherwise the injected locator's
+/// answer. The DB lock is released before the locator runs, because `PathLocator` shells out to
+/// `which`/`where`.
 pub fn resolve_handbrake_path(ctx: &Ctx) -> Result<Option<String>, String> {
     let configured: Option<String> = {
         let conn = ctx.db.lock().map_err(|e| e.to_string())?;
@@ -381,13 +382,7 @@ pub fn resolve_handbrake_path(ctx: &Ctx) -> Result<Option<String>, String> {
         .ok()
     };
 
-    if let Some(ref path) = configured {
-        if !path.is_empty() && std::path::Path::new(path).exists() {
-            return Ok(Some(path.clone()));
-        }
-    }
-
-    Ok(detect_handbrake_path())
+    Ok(resolve_with_locator(configured.as_deref(), &*ctx.handbrake))
 }
 
 /// Preset metadata via the shared cache. The cache mutex is deliberately NOT held

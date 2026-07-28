@@ -404,10 +404,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn purge_bad_sources_with_no_ids_returns_an_empty_array() {
-        // ids=[] never touches HandBrake resolution's outcome (the map iterator is empty),
-        // so this is deterministic regardless of whether HandBrakeCLI is on the test host.
+        // purge_bad_sources resolves HandBrake once up front even for an empty batch, so the
+        // world has to be declared; ids=[] then never consumes the answer, which is why either
+        // world would do and AbsentLocator (the CI world) is the honest one to name.
+        let (state, _tx) =
+            test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
         let (status, json) = request_json(
-            api_router(test_state()),
+            api_router(state),
             "POST",
             "/api/bad-sources/purge",
             Some(json!({"ids": []})),
@@ -612,19 +615,33 @@ pub(crate) mod tests {
         assert_eq!(json, json!(".custom"));
     }
 
+    // The route returns `Json(Option<String>)` — a bare JSON null or a bare JSON string, with no
+    // wrapper object. These two tests replace a single smoke test that asserted only "string or
+    // null", i.e. it reported whatever the host happened to have installed and could not fail.
+
     #[tokio::test]
-    async fn detect_handbrake_smoke_returns_200_with_valid_json() {
-        // CI has no HandBrakeCLI, but the test host might: assert only status + shape, never
-        // the specific value (a real path vs null both satisfy Option<String>'s JSON encoding).
-        let (status, json) = request_json(
-            api_router(test_state()),
-            "GET",
-            "/api/handbrake/detect",
-            None,
-        )
-        .await;
+    async fn detect_handbrake_reports_absent_when_handbrake_is_not_installed() {
+        // Pins the CI world: 200 with a null body, not a 500.
+        let (state, _tx) =
+            test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
+        let (status, json) =
+            request_json(api_router(state), "GET", "/api/handbrake/detect", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(json.is_string() || json.is_null());
+        assert!(
+            json.is_null(),
+            "absent HandBrake must report null, got {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_handbrake_reports_the_located_path_when_handbrake_is_installed() {
+        let (state, _tx) = test_state_with_locator(Arc::new(
+            convertbar_core::handbrake::StubLocator("/opt/fake/HandBrakeCLI".into()),
+        ));
+        let (status, json) =
+            request_json(api_router(state), "GET", "/api/handbrake/detect", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json.as_str(), Some("/opt/fake/HandBrakeCLI"));
     }
 
     #[tokio::test]

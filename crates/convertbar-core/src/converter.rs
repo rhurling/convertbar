@@ -434,7 +434,13 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
     .ok()
 }
 
-fn get_handbrake_path(db: &Connection) -> Option<String> {
+/// Takes the locator as a parameter rather than a `&Ctx`: this runs *under* the DB guard at its
+/// `process_queue` call site, and a `&Ctx`-taking resolver would invite re-locking the
+/// non-reentrant `ctx.db` mutex there.
+fn get_handbrake_path(
+    db: &Connection,
+    locator: &dyn crate::handbrake::HandbrakeLocator,
+) -> Option<String> {
     let configured: Option<String> = db
         .query_row(
             "SELECT value FROM settings WHERE key = 'handbrake_path'",
@@ -443,13 +449,7 @@ fn get_handbrake_path(db: &Connection) -> Option<String> {
         )
         .ok();
 
-    if let Some(ref path) = configured {
-        if !path.is_empty() && std::path::Path::new(path).exists() {
-            return Some(path.clone());
-        }
-    }
-
-    crate::handbrake::detect_handbrake_path()
+    crate::handbrake::resolve_with_locator(configured.as_deref(), locator)
 }
 
 fn get_cleanup_mode(db: &Connection) -> String {
@@ -804,7 +804,7 @@ fn process_queue(ctx: &Ctx) {
                 Some(j) => j,
                 None => break,
             };
-            handbrake_path_opt = get_handbrake_path(&db);
+            handbrake_path_opt = get_handbrake_path(&db, &*ctx.handbrake);
             cleanup_mode = get_cleanup_mode(&db);
             low_disk_min_gb = get_low_disk_min_gb(&db);
             // The job is flipped to 'encoding' below, AFTER the low-disk gate — a gated job
@@ -1508,14 +1508,18 @@ mod tests {
     }
 
     fn test_ctx(conn: Connection) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
+        test_ctx_with_locator(conn, Arc::new(crate::handbrake::PanickingLocator))
+    }
+
+    /// `test_ctx` for tests that actually reach HandBrake resolution and must therefore say
+    /// which world they are in, rather than inheriting whatever the host has installed.
+    fn test_ctx_with_locator(
+        conn: Connection,
+        locator: Arc<dyn crate::handbrake::HandbrakeLocator>,
+    ) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
         let sink = Arc::new(TestSink::default());
         let disposer = Arc::new(RecordingDisposer::default());
-        let ctx = Ctx::new(
-            conn,
-            sink.clone(),
-            disposer.clone(),
-            Arc::new(crate::handbrake::PanickingLocator),
-        );
+        let ctx = Ctx::new(conn, sink.clone(), disposer.clone(), locator);
         (ctx, sink, disposer)
     }
 
@@ -2497,7 +2501,10 @@ mod tests {
     #[test]
     #[ignore]
     fn process_queue_drives_a_real_encode_from_queued_to_done() {
-        let (ctx, sink, _disposer) = test_ctx(test_conn());
+        // PathLocator, not the fixture default: this test never pins `handbrake_path` and
+        // genuinely wants the host's real HandBrakeCLI to perform the encode.
+        let (ctx, sink, _disposer) =
+            test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::PathLocator));
         // 'delete' keeps the cleanup assertion filesystem-local (no Trash involved).
         set_setting(&ctx.db, "cleanup_mode", "delete");
 
