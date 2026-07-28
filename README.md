@@ -152,10 +152,15 @@ openssl rand -base64 24
 
 **Failed-attempt throttling.** Each failed credential — at `/api/login` or via
 an `Authorization` header — makes the *next* failure from that source slower:
-500 ms, then 1 s, 2 s, 4 s, and so on to a 30-second ceiling. A successful login
-clears it. There is deliberately no lockout, so no amount of guessing by anyone
-else can stop you getting in with the right token; the ramp only ever delays
-attempts that are already wrong.
+500 ms, then 1 s, 2 s, 4 s, and so on to a 30-second ceiling. A source's count
+is forgotten after 15 minutes without a failure, and a successful login clears
+it immediately. There is deliberately no lockout, so no amount of guessing by
+anyone else can stop you getting in with the right token. This deters casual,
+sequential scanning; it does not bound a determined attacker who parallelises
+guesses or doesn't wait for the response. **A randomly generated token is what
+actually protects the server** — the floor above permits a memorable
+passphrase like `Sommer2026!Berlin`, which is not comfortable at high guess
+rates.
 
 Rotating the token means changing the variable and restarting the container.
 Open browser tabs will be signed out and can log in again immediately. A script

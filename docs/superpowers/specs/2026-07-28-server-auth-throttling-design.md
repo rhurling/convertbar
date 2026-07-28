@@ -192,17 +192,21 @@ pinned at the 30 s cap from the 7th failure on. The shift must be guarded
 (`checked_shl` or an early `n > 20 → cap`) so a long-running bucket cannot
 overflow.
 
-Sustained guessing therefore costs ~2 attempts/minute per bucket. Against a
-16-character floor that is not an attack, and the owner is never locked out —
+Sustained *sequential* guessing — one guess, wait for the response, repeat —
+therefore costs ~2 attempts/minute per bucket. The owner is never locked out —
 their worst case is a 30-second wait, after which a correct token succeeds and
-resets the bucket to zero.
+resets the bucket to zero. **This figure does not hold for a concurrent or
+response-abandoning attacker; see the correction filed under "Why no lockout"
+below.**
 
 **The counter increments under the lock *before* the sleep, and the delay is
-computed from the post-increment count.** This is what stops a parallel
-attacker: 100 concurrent attempts do not each get 500 ms, they get 500 ms, 1 s,
-2 s … 30 s, 30 s, 30 s. Without this ordering the whole escalation is
-bypassable by opening more connections, which is the single most important
-implementation detail in this file.
+computed from the post-increment count.** This prevents an attacker from
+resetting the ramp by opening more connections: concurrent attempts still draw
+escalating counter values (500 ms, 1 s, 2 s … 30 s, 30 s, 30 s) rather than N
+copies of the first delay. **It does not bound the attacker's throughput** —
+evaluation happens before the sleep, so those escalating delays run
+concurrently rather than serializing the guesses. See the correction below for
+what this ordering does and does not achieve.
 
 State per bucket: `count` and `first_at`. A failure with `now - first_at >
 window` starts a fresh window at `count = 1`. `record_success` removes the entry.
@@ -218,10 +222,15 @@ every request including static assets — so a poisoned mutex would turn one pan
 into a 500 on every request forever. A possibly-stale counter is the better
 failure mode.
 
-The map is pruned lazily inside `record_failure` when it exceeds 4096 keys,
-dropping entries whose window has expired. The map is attacker-influenced
-(one key per source), so it does not grow unbounded; 4096 entries is a few
-hundred KB.
+The map is pruned lazily inside `record_failure` once it exceeds 4096 keys:
+first by dropping entries whose window has expired, then — if a live flood of
+distinct sources leaves it still over the threshold, since nothing expired —
+by evicting the lowest-`count` entries until it is back at 4096. Eviction
+prefers count over age because a hot attacker's bucket is the one worth
+keeping, and count-based eviction is harder to game: flooding fresh sources to
+force an eviction only spends the flood's own low-count buckets. The map is
+therefore bounded at ~4096 entries (a few hundred KB) regardless of how many
+distinct sources attack concurrently.
 
 ### 5. Enforcement — `routes/login.rs` and `auth.rs::auth_guard`
 
@@ -374,8 +383,45 @@ nothing." That reasoning was backwards: a lockout exists to stop *guessing*, and
 a guesser does not hold the correct token. Honoring a correct token costs
 essentially zero anti-guessing value and removes 100% of the DoS.
 
-The escalating delay achieves the actual goal — making guesses expensive — with
-no denial state to abuse. It is also less code.
+The escalating delay deters casual, sequential guessing with no denial state
+to abuse, and is less code than a lockout. It does **not** make guessing
+expensive in the sense originally claimed here — see the correction below,
+filed after empirical review of the shipped implementation.
+
+### Correction, filed after the fix shipped (empirical review)
+
+The dichotomy above is false. It considers only two lockout behaviours and
+misses a third: **gate evaluation behind the delay**, checking a per-bucket
+`next_allowed_at` *before* `token_matches` runs, instead of sleeping after a
+verdict is already known. That option rate-limits genuinely — no answer is
+produced until the wait elapses, so an attacker cannot get a faster verdict by
+opening more connections or abandoning ones it doesn't want to wait on — while
+still never permanently denying the owner, since the wait is bounded by the
+same 30 s cap. This option was not identified during design, is not what
+shipped, and is a deliberate future decision rather than part of this
+correction — see `docs/RECOMMENDATIONS.md` item 15.
+
+**What the shipped delay (evaluate-then-sleep) actually achieves:** it deters
+a *sequential, response-waiting* client — one that sends a guess, waits for
+the 401, and only then sends the next. That client is genuinely held to
+~2 attempts/minute once ramped.
+
+**What it does not do:** rate-limit a client that parallelises or abandons the
+connection. Because `token_matches` runs before the sleep, the verdict exists
+immediately; the sleep only delays *when* the 401 is written, and nothing
+forces the attacker to wait for it. Measured against this implementation: 20
+simultaneous wrong guesses cost one delay, not twenty — throughput is
+`concurrency / cap`, not `1 / cap`. A correct token is also served immediately
+even at the cap, so response latency is a perfect oracle: send a guess, wait
+~50 ms, abandon the socket if nothing came back. Measured: 8 guesses in 0.63 s
+(versus ~64 s had the client waited out each delay sequentially); a tighter
+loop reached ~18,000 guesses/sec.
+
+**Consequence:** the escalating delay deters naive/sequential scanners and is
+worth keeping for that reason — it is cheap and harmless to a legitimate
+owner — but it is not the server's rate limit. **The 16-character/8-distinct
+token floor (§1) is the actual defense**; at that length, throughput against
+the delay is irrelevant to whether guessing is viable at all.
 
 ## Changed after review
 
@@ -421,3 +467,10 @@ the ten existing tests that break (Testing).
 - **`MalformedChain` is one shared bucket**, so clients sending garbage headers
   slow each other. They are already misbehaving, and the alternative (trusting
   the garbage) is worse.
+- **A stale cookie after a token rotation shares the bucket's ramp.** The old
+  cookie is a credential like any other, so a rejected one is throttled the
+  same as a guessed token. If the owner's source address also belongs to an
+  attacker who has driven that bucket to the cap, the owner's login screen can
+  take up to 30 s to render — the frontend only shows it once the 401 arrives
+  (`convertbar:unauthorized`). Recovery is fast once they type the new token:
+  a successful `POST /api/login` never sleeps.
