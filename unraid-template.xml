@@ -1,0 +1,119 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>ConvertBar</Name>
+  <Repository>ghcr.io/rhurling/convertbar:latest</Repository>
+  <Registry>https://github.com/rhurling/convertbar/pkgs/container/convertbar</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/rhurling/convertbar/issues</Support>
+  <Project>https://github.com/rhurling/convertbar</Project>
+  <Overview>
+    Batch video conversion with HandBrakeCLI, driven from a browser UI.
+
+    Drop files into a watched folder and ConvertBar re-encodes them with the preset you
+    choose, replacing or renaming the originals according to your cleanup settings.
+    Queue, history, progress and settings are all live in the web UI.
+
+    IMPORTANT &#8212; two Unraid-specific notes:
+
+    1. Watched folders should point at a disk or cache share (/mnt/diskN/... or
+    /mnt/cache/...), NOT a /mnt/user user share. /mnt/user is a FUSE overlay (shfs) and
+    does not deliver inotify events reliably, so files dropped there may not be picked up
+    until the container restarts and rescans. Ad-hoc adds through the web file browser
+    work on any path.
+
+    2. ConvertBar modifies and deletes source files by design (that is the point &#8212; it
+    replaces originals with smaller re-encodes). Give it read/write access only to the
+    media you actually want it to touch, and set Browse Roots to confine the file browser.
+
+    This server build always deletes replaced files rather than moving them to a trash
+    folder, and its Settings page hides the desktop-only options (menu bar, notifications,
+    auto-update, launch at login).
+  </Overview>
+  <Category>MediaApp:Video Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/rhurling/convertbar/main/unraid-template.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/rhurling/convertbar/main/src-tauri/icons/128x128.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+
+  <Config
+    Name="WebUI Port"
+    Target="8080"
+    Default="8080"
+    Mode="tcp"
+    Description="Port for the ConvertBar web UI."
+    Type="Port"
+    Display="always"
+    Required="true"
+    Mask="false">8080</Config>
+
+  <Config
+    Name="Config Storage"
+    Target="/config"
+    Default="/mnt/user/appdata/convertbar"
+    Mode="rw"
+    Description="Holds the SQLite database (queue, history, settings) and the probe cache. Small; keep it on appdata."
+    Type="Path"
+    Display="always"
+    Required="true"
+    Mask="false">/mnt/user/appdata/convertbar</Config>
+
+  <Config
+    Name="Media"
+    Target="/media"
+    Default="/mnt/user/media"
+    Mode="rw"
+    Description="Your video library. Must be read/write: ConvertBar writes the re-encoded file next to the source and then removes the file it replaced. For watched folders, prefer a disk or cache path (/mnt/cache/media) over /mnt/user &#8212; inotify does not work reliably on user shares."
+    Type="Path"
+    Display="always"
+    Required="true"
+    Mask="false">/mnt/user/media</Config>
+
+  <Config
+    Name="Auth Token"
+    Target="CONVERTBAR_AUTH_TOKEN"
+    Default=""
+    Description="Token required on every request. Pick a long random string &#8212; the login page and API both accept it. The container refuses to start unless this or No Auth is set. There is no rate limiting on login, so a short token is a weak token."
+    Type="Variable"
+    Display="always"
+    Required="true"
+    Mask="true"/>
+
+  <Config
+    Name="Browse Roots"
+    Target="CONVERTBAR_BROWSE_ROOTS"
+    Default="/media"
+    Description="Colon-separated paths the web file browser may navigate. Leave as /media to confine it to your library. Note: the browser opens at the first root, so put your main library first."
+    Type="Variable"
+    Display="always"
+    Required="false"
+    Mask="false">/media</Config>
+
+  <Config
+    Name="Allowed Hosts"
+    Target="CONVERTBAR_ALLOWED_HOSTS"
+    Default=""
+    Description="Comma-separated hostnames to accept in the Host header, e.g. tower.local or tower. IP addresses always work without this; set it if you reach the UI by name or through a reverse proxy, otherwise those requests are rejected with HTTP 421."
+    Type="Variable"
+    Display="always"
+    Required="false"
+    Mask="false"/>
+
+  <Config
+    Name="Disable Auth"
+    Target="CONVERTBAR_NO_AUTH"
+    Default=""
+    Description="Set to 1 to run with no authentication at all. Only for a trusted LAN or behind a reverse proxy that already authenticates. Leave empty when using an Auth Token."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false"/>
+</Container>

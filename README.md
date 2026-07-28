@@ -109,6 +109,20 @@ docker pull ghcr.io/rhurling/convertbar:latest
 See [`docker-compose.example.yml`](docker-compose.example.yml) for a ready-to-copy
 compose file.
 
+### Unraid
+
+[`unraid-template.xml`](unraid-template.xml) is a container template for Unraid's
+Docker tab (Add Container → Template → paste the raw URL). Two Unraid-specific
+caveats it also documents inline:
+
+- **Watched folders need a disk or cache path**, not a `/mnt/user` share. User
+  shares are a FUSE overlay and don't deliver inotify events reliably, so files
+  dropped there may not be noticed until the container restarts and rescans.
+  Ad-hoc adds via the web file browser work on any path.
+- **Reaching the UI by hostname requires `CONVERTBAR_ALLOWED_HOSTS`** (e.g.
+  `tower.local`); IP addresses always work. Without it those requests are
+  rejected with HTTP 421.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
