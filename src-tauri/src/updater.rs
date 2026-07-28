@@ -103,6 +103,35 @@ pub(crate) fn clear_installed(db: &Connection) {
     write_key(db, "update_installed", "");
 }
 
+fn read_drain_pause(db: &Connection) -> bool {
+    read_key(db, "update_drain_pause").is_some_and(|v| v == "true")
+}
+
+fn set_drain_pause(db: &Connection, armed: bool) {
+    write_key(db, "update_drain_pause", if armed { "true" } else { "" });
+}
+
+/// Lifts a queue pause the updater itself caused, exactly once, and reports the queue's real
+/// paused state.
+///
+/// A user-initiated "Install and restart" against a busy queue drains it by arming
+/// `pause_after_current`, which `process_queue` consumes into a *persisted* `queue_paused = true`
+/// plus a `break` with jobs still queued (converter.rs:1277-1290). The user never pressed Pause —
+/// the updater did — so leaving that pause in force after the update restart would strand the
+/// rest of their batch indefinitely. The breadcrumb marks the pause as the updater's doing.
+///
+/// Consumed whether or not it is used, so a breadcrumb left behind by an install that never got
+/// as far as pausing anything cannot resurface against an unrelated pause later.
+pub(crate) fn take_drain_pause(db: &Connection, queue_paused: bool) -> bool {
+    let was_update_drain = read_drain_pause(db);
+    set_drain_pause(db, false);
+    if was_update_drain && queue_paused {
+        crate::converter::set_queue_paused(db, false);
+        return false;
+    }
+    queue_paused
+}
+
 /// An update the endpoint is offering. `notes` is `Update::body` — the GitHub release body,
 /// copied verbatim into latest.json by tauri-action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +371,19 @@ pub enum InstallAttempt {
     /// The queue was busy; the caller keeps the update pending and retries when it drains.
     Deferred,
     Failed(String),
+}
+
+/// What a whole download-and-install sequence left behind, for a caller that armed a queue drain
+/// before it started and needs to know whether that drain is still going to be used.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// The install ran. On Windows this is never observed — `install()` exits the process.
+    Installed,
+    /// Still deferred behind a live pending install; a drain armed for it must stay armed.
+    AwaitingIdle,
+    /// Cancelled, or the download or the install failed. Nothing is waiting on the queue, so a
+    /// drain armed for it must be undone.
+    Abandoned,
 }
 
 /// Clears `installing` on every exit from an install attempt, including an unwinding panic
@@ -715,7 +757,7 @@ async fn perform_install<R: tauri::Runtime>(
     _cycle: &CycleGuard,
     meta: AvailableUpdate,
     raw: tauri_plugin_updater::Update,
-) {
+) -> InstallOutcome {
     set_status(app, UpdateStatus::Downloading);
 
     let bytes = match raw.download(|_, _| {}, || {}).await {
@@ -731,7 +773,7 @@ async fn perform_install<R: tauri::Runtime>(
             // next scheduled check re-decides.
             set_pending(app, None);
             set_status(app, UpdateStatus::Error);
-            return;
+            return InstallOutcome::Abandoned;
         }
     };
 
@@ -740,7 +782,7 @@ async fn perform_install<R: tauri::Runtime>(
     // download started.
     if !pending_matches(app, &meta.version) {
         set_status(app, UpdateStatus::Idle);
-        return;
+        return InstallOutcome::Abandoned;
     }
 
     // LOAD-BEARING ORDERING: written BEFORE the install. On Windows `Update::install` launches
@@ -755,11 +797,17 @@ async fn perform_install<R: tauri::Runtime>(
     }
 
     let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
-        return;
+        return InstallOutcome::Abandoned;
     };
     let installer = PluginInstaller { update: raw, bytes };
 
-    match try_install_now(&conv, &installer, &meta) {
+    let attempt = try_install_now(&conv, &installer, &meta);
+    // Dropped before anything below can start the queue: `claim_queue_slot` takes the same
+    // `is_running` lock this borrows the state for, and holding a Tauri `State` past the point it
+    // is needed is what this module's lock discipline exists to avoid.
+    drop(conv);
+
+    match attempt {
         InstallAttempt::Installed => {
             set_pending(app, None);
             notify(
@@ -767,6 +815,13 @@ async fn perform_install<R: tauri::Runtime>(
                 format!("Updated to {} — restart ConvertBar to apply", meta.version),
             );
             set_status(app, UpdateStatus::ReadyToRestart);
+            // Nothing else will. `claim_queue_slot` refused every `run_queue` for the length of
+            // the install — `start_queue` and the watcher both bail out during that window — so a
+            // file that landed meanwhile is sitting in a queue that is neither running nor
+            // paused. On macOS and Linux `install()` returns and this process keeps running the
+            // old binary until the user restarts, which may be hours.
+            resume_queue_after_install(app);
+            InstallOutcome::Installed
         }
         InstallAttempt::Deferred => {
             // Nothing was installed, so the pre-written marker must not survive: a restart for
@@ -778,8 +833,10 @@ async fn perform_install<R: tauri::Runtime>(
             // there would be no further mode change to clear it again.
             if pending_matches(app, &meta.version) {
                 set_status(app, UpdateStatus::WaitingForIdle);
+                InstallOutcome::AwaitingIdle
             } else {
                 set_status(app, UpdateStatus::Idle);
+                InstallOutcome::Abandoned
             }
         }
         InstallAttempt::Failed(e) => {
@@ -799,6 +856,7 @@ async fn perform_install<R: tauri::Runtime>(
                 ),
             );
             set_status(app, UpdateStatus::Error);
+            InstallOutcome::Abandoned
         }
     }
 }
@@ -808,6 +866,138 @@ fn rollback_installed<R: tauri::Runtime>(app: &AppHandle<R>) {
         if let Ok(conn) = app_state.db.lock() {
             clear_installed(&conn);
         }
+    }
+}
+
+/// Fires `run_queue` with the app's managed state. Split out so its two callers below read as
+/// policy rather than plumbing.
+fn start_queue_now<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let Some(app_state) = app.try_state::<crate::AppState>() else {
+        return;
+    };
+    let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
+        return;
+    };
+    crate::converter::run_queue(app.clone(), app_state.db.clone(), (*conv).clone());
+}
+
+/// Re-triggers the queue once an install has finished holding the interlock.
+///
+/// A remembered pause is still honoured — including one this very install caused by draining a
+/// busy queue, which `take_drain_pause` lifts on the next launch instead. An empty queue makes
+/// this a no-op, so it costs nothing on the ordinary path.
+fn resume_queue_after_install<R: tauri::Runtime>(app: &AppHandle<R>) {
+    resume_queue_after_install_with(app, start_queue_now);
+}
+
+/// The rule above with the queue start injected, so a test can assert on the decision without a
+/// real install. Same seam as `restart_after_killing_encoder` (commands/updater.rs).
+fn resume_queue_after_install_with<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    run: impl FnOnce(&AppHandle<R>),
+) {
+    let Some(app_state) = app.try_state::<crate::AppState>() else {
+        return;
+    };
+    let paused = match app_state.db.lock() {
+        Ok(conn) => crate::converter::is_queue_paused(&conn),
+        Err(_) => return,
+    };
+    if paused {
+        return;
+    }
+    run(app);
+}
+
+/// Undoes a queue drain armed for an install that then did not happen.
+///
+/// `install_pending` arms `pause_after_current` before the network round trip, so by the time a
+/// failure is known the running job may already be finishing. Nothing used to disarm it — not the
+/// `build_updater` miss, not the check's `Err`/`Ok(None)`, not a failed download — and
+/// `process_queue` consumes the flag into a *persisted* `queue_paused = true` plus a `break` with
+/// jobs still queued (converter.rs:1277-1290). A Wi-Fi blip during a user's "Install and restart",
+/// or an unattended hourly backstop retry of a deferral, therefore halted the user's batch and
+/// kept it halted across restarts.
+///
+/// Undoing is the default and `keep` the exception, so a failure exit added later cannot
+/// reintroduce the leak by forgetting anything. Mirrors `InstallingGuard`/`RunningGuard`.
+struct DrainGuard<R: tauri::Runtime> {
+    app: AppHandle<R>,
+    conv: Arc<crate::converter::ConverterState>,
+    /// True only when this guard is the one that raised the flag.
+    armed: bool,
+    keep: bool,
+}
+
+impl<R: tauri::Runtime> DrainGuard<R> {
+    fn new(app: AppHandle<R>, conv: Arc<crate::converter::ConverterState>) -> Self {
+        Self {
+            app,
+            conv,
+            armed: false,
+            keep: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        {
+            let Ok(mut flag) = self.conv.pause_after_current.lock() else {
+                return;
+            };
+            if *flag {
+                // Somebody else already asked the queue to stop after this job — the non-macOS
+                // Pause button is the other writer. Not ours to raise, so not ours to lower.
+                return;
+            }
+            *flag = true;
+        }
+        self.armed = true;
+        // Marks the pause `process_queue` is about to persist as the updater's doing, so the
+        // launch after the update restart can lift it once instead of leaving the rest of the
+        // batch stopped for good. Written after the flag lock is released — no site in this
+        // module holds two of the db / pending / queue locks at once.
+        if let Some(app_state) = self.app.try_state::<crate::AppState>() {
+            if let Ok(conn) = app_state.db.lock() {
+                set_drain_pause(&conn, true);
+            }
+        }
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl<R: tauri::Runtime> Drop for DrainGuard<R> {
+    fn drop(&mut self) {
+        if !self.armed || self.keep {
+            return;
+        }
+        if let Ok(mut flag) = self.conv.pause_after_current.lock() {
+            *flag = false;
+        }
+        // Lowering the one-shot flag is too late if the running job already finished and consumed
+        // it while the download ran: the batch is stopped and the stop is persisted. Lift it.
+        undo_drain_pause(&self.app);
+    }
+}
+
+/// Lifts a persisted pause this install caused, now that the install is not going to happen.
+/// Version-matched by the breadcrumb rather than by blanket unpausing, so a pause the *user* asked
+/// for is left exactly where it is.
+fn undo_drain_pause<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let Some(app_state) = app.try_state::<crate::AppState>() else {
+        return;
+    };
+    let lifted = match app_state.db.lock() {
+        Ok(conn) => {
+            let was_paused = crate::converter::is_queue_paused(&conn);
+            was_paused && !take_drain_pause(&conn, was_paused)
+        }
+        Err(_) => false,
+    };
+    if lifted {
+        start_queue_now(app);
     }
 }
 
@@ -837,21 +1027,29 @@ pub async fn install_pending<R: tauri::Runtime>(
         },
     };
 
+    // Cloned out of the managed state rather than borrowed: a Tauri `State` must not be held
+    // across the `.await`s below, and the drain guard has to outlive this scope.
+    let conv = {
+        let Some(state) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
+            return Err("converter unavailable".into());
+        };
+        (*state).clone()
+    };
+
+    // Every exit from here on drops `drain`, which undoes the drain unless it was kept — see
+    // DrainGuard for why undoing has to be the default.
+    let mut drain = DrainGuard::new(app.clone(), conv.clone());
+
     // Decided before the network round trip: a scheduler-decided retry against a still-busy
     // queue must cost nothing, or a long batch would re-fetch the whole bundle on every tick.
     {
-        let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
-            return Err("converter unavailable".into());
-        };
         let queue_running = *conv.is_running.lock().unwrap_or_else(|e| e.into_inner());
         match retry_action(user_requested, queue_running) {
             RetryAction::StayPending => return Err("the queue is busy".into()),
             RetryAction::DrainThenInstall => {
                 // Drain rather than interrupt: the running job finishes, then `on_queue_status`
                 // retries the install.
-                if let Ok(mut flag) = conv.pause_after_current.lock() {
-                    *flag = true;
-                }
+                drain.arm();
             }
             RetryAction::InstallNow => {}
         }
@@ -912,7 +1110,11 @@ pub async fn install_pending<R: tauri::Runtime>(
         }),
     );
 
-    perform_install(&app, &cycle, meta, raw).await;
+    match perform_install(&app, &cycle, meta, raw).await {
+        // The drain either did its job or is still waiting for the queue to finish unwinding.
+        InstallOutcome::Installed | InstallOutcome::AwaitingIdle => drain.keep(),
+        InstallOutcome::Abandoned => {}
+    }
     Ok(())
 }
 
@@ -1618,6 +1820,198 @@ mod tests {
         assert!(
             pending_of(&handle).is_none(),
             "a retry must never recreate a deferral the user cancelled"
+        );
+    }
+
+    fn db_of(app: &tauri::AppHandle<tauri::test::MockRuntime>) -> Arc<StdMutex<Connection>> {
+        app.state::<crate::AppState>().inner().db.clone()
+    }
+
+    #[test]
+    fn a_drain_armed_for_an_install_that_never_happens_is_undone() {
+        // LOAD-BEARING. `install_pending` arms pause_after_current BEFORE the network round trip,
+        // and process_queue consumes that flag into a *persisted* queue_paused=true plus a break
+        // with jobs still queued (converter.rs:1277-1290). Without the undo, a Wi-Fi blip during
+        // "Install and restart" — or an unattended hourly retry of a deferral — halts the user's
+        // batch and keeps it halted across restarts, for an update that never arrives.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        let conv = handle
+            .state::<std::sync::Arc<ConverterState>>()
+            .inner()
+            .clone();
+        let db = db_of(&handle);
+
+        {
+            let mut drain = DrainGuard::new(handle.clone(), conv.clone());
+            drain.arm();
+            assert!(*conv.pause_after_current.lock().unwrap());
+
+            // The running job finishes while the download is still going: process_queue consumes
+            // the one-shot flag and persists the stop.
+            *conv.pause_after_current.lock().unwrap() = false;
+            crate::converter::set_queue_paused(&db.lock().unwrap(), true);
+        } // the install fails here — the guard drops without ever being kept
+
+        assert!(
+            !*conv.pause_after_current.lock().unwrap(),
+            "the one-shot drain flag must not survive an install that failed"
+        );
+        assert!(
+            !crate::converter::is_queue_paused(&db.lock().unwrap()),
+            "the batch must not stay halted for an install that is not coming"
+        );
+    }
+
+    #[test]
+    fn a_drain_that_is_still_going_to_be_used_is_left_alone() {
+        // The deferral case: the download succeeded and the install is waiting for the queue to
+        // finish unwinding. Undoing here would restart the batch the install is waiting on.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        let conv = handle
+            .state::<std::sync::Arc<ConverterState>>()
+            .inner()
+            .clone();
+
+        {
+            let mut drain = DrainGuard::new(handle.clone(), conv.clone());
+            drain.arm();
+            drain.keep();
+        }
+
+        assert!(
+            *conv.pause_after_current.lock().unwrap(),
+            "a drain the install still needs must stay armed"
+        );
+    }
+
+    #[test]
+    fn a_pause_the_user_asked_for_is_not_the_updaters_to_undo() {
+        // pause_after_current has another writer: the non-macOS Pause button. A guard that lowered
+        // a flag it never raised would silently cancel the user's own pause.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        let conv = handle
+            .state::<std::sync::Arc<ConverterState>>()
+            .inner()
+            .clone();
+        let db = db_of(&handle);
+        *conv.pause_after_current.lock().unwrap() = true;
+
+        {
+            let mut drain = DrainGuard::new(handle.clone(), conv.clone());
+            drain.arm();
+        }
+
+        assert!(
+            *conv.pause_after_current.lock().unwrap(),
+            "the user's own pause must survive a failed install"
+        );
+        assert!(
+            !read_drain_pause(&db.lock().unwrap()),
+            "and it must not be mislabelled as the updater's doing"
+        );
+    }
+
+    #[test]
+    fn install_pending_routes_its_drain_through_the_guard() {
+        // Pins the WIRING, not just the guard: predicate-only coverage is how this branch shipped
+        // four call sites that could be deleted with the suite still green.
+        //
+        // A mock app has no updater plugin, so `build_updater` panics on the very next line after
+        // the drain is armed — which is exactly the shape of failure this fix is about (an exit
+        // between arming and installing) and lets the unwind exercise the real Drop. Remove
+        // `drain.arm()`'s guard, or the `DrainGuard` binding, and this goes red.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        arm_pending(&handle, true);
+        let conv = handle
+            .state::<std::sync::Arc<ConverterState>>()
+            .inner()
+            .clone();
+        *conv.is_running.lock().unwrap() = true;
+
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tauri::async_runtime::block_on(install_pending(
+                handle.clone(),
+                InstallTrigger::UserRequested,
+            ))
+        }));
+        std::panic::set_hook(prev_hook);
+
+        assert!(
+            result.is_err(),
+            "the mock app has no updater plugin, so the check must blow up mid-flight"
+        );
+        assert!(
+            !*conv.pause_after_current.lock().unwrap(),
+            "install_pending must not leave the queue's drain flag armed for an install that died"
+        );
+    }
+
+    #[test]
+    fn a_queue_the_updater_paused_resumes_once_on_the_next_launch() {
+        // The pause is the updater's, not the user's: they pressed "Install and restart", not
+        // Pause. `should_auto_resume` honours queue_paused, so without the breadcrumb the rest of
+        // the batch sits stopped forever after the very restart that applied the update.
+        let conn = test_conn();
+
+        // No breadcrumb: a pause the user asked for is untouched.
+        assert!(take_drain_pause(&conn, true), "an ordinary pause survives");
+
+        set_drain_pause(&conn, true);
+        crate::converter::set_queue_paused(&conn, true);
+        assert!(
+            !take_drain_pause(&conn, true),
+            "a pause the updater caused is lifted"
+        );
+        assert!(
+            !crate::converter::is_queue_paused(&conn),
+            "and the lift is persisted, so should_auto_resume actually starts the queue"
+        );
+
+        // Once. A second launch must not lift a pause the user set in the meantime.
+        crate::converter::set_queue_paused(&conn, true);
+        assert!(
+            take_drain_pause(&conn, true),
+            "the breadcrumb is consumed, not sticky"
+        );
+
+        // Consumed even when it went unused, so it cannot resurface against an unrelated pause.
+        set_drain_pause(&conn, true);
+        assert!(!take_drain_pause(&conn, false));
+        assert!(take_drain_pause(&conn, true));
+    }
+
+    #[test]
+    fn the_queue_is_re_triggered_after_an_install_unless_it_is_paused() {
+        // `claim_queue_slot` refuses every run_queue while `installing` is latched, and both
+        // start_queue and the watcher bail out during that window — so a file that landed
+        // mid-install sits in a queue that is neither running nor paused, and on macOS/Linux this
+        // process keeps running until the user restarts. Nothing else picks it up.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        let db = db_of(&handle);
+
+        let started = StdMutex::new(0);
+        resume_queue_after_install_with(&handle, |_| *started.lock().unwrap() += 1);
+        assert_eq!(
+            *started.lock().unwrap(),
+            1,
+            "an idle, unpaused queue must be re-triggered"
+        );
+
+        // A remembered pause still wins — including the one a user-requested install just caused
+        // by draining the queue, which the next launch lifts instead.
+        crate::converter::set_queue_paused(&db.lock().unwrap(), true);
+        resume_queue_after_install_with(&handle, |_| *started.lock().unwrap() += 1);
+        assert_eq!(
+            *started.lock().unwrap(),
+            1,
+            "a remembered pause must not be overridden by an install finishing"
         );
     }
 

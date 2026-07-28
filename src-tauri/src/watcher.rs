@@ -454,6 +454,18 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     }
     let db = app_state.db.clone();
     let converter = (*app.state::<Arc<ConverterState>>()).clone();
+    // An update install holds the queue interlock, so `run_queue` below would refuse — after the
+    // paused flag had already been cleared, leaving the queue neither running nor paused. Bail
+    // before touching it, exactly as `start_queue` does; the install re-triggers the queue when
+    // it finishes (`resume_queue_after_install`). The files themselves are already enqueued, so
+    // the UI still needs telling.
+    if converter
+        .installing
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let _ = app.emit("queue-updated", ());
+        return;
+    }
     // A watched-folder file arriving is an add; per the design, adding files starts the queue,
     // so clear any remembered pause before running.
     if let Ok(conn) = app_state.db.lock() {

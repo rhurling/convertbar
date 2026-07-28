@@ -365,7 +365,12 @@ pub fn run() {
                     [],
                     |row| row.get::<_, bool>(0),
                 ).unwrap_or(false);
-                queue_paused = crate::converter::is_queue_paused(&db);
+                // A pause the *updater* caused — draining a busy queue so a user-requested
+                // "Install and restart" could run — is lifted here, once. The user never pressed
+                // Pause, so honouring it past the restart that applied the update would leave the
+                // rest of their batch stopped indefinitely.
+                queue_paused =
+                    crate::updater::take_drain_pause(&db, crate::converter::is_queue_paused(&db));
             }
 
             if converter::should_auto_resume(has_queued, queue_paused) {
