@@ -93,6 +93,9 @@ export interface AppSettings {
   watch_skip_marker: string;
   low_disk_min_gb: number;
   bad_source_action: "trash" | "delete";
+  // Narrowed like bad_source_action: get_settings runs the raw stored string through
+  // `normalize_update_mode` before returning it, so only these three ever reach the frontend.
+  update_mode: UpdateMode;
 }
 
 export interface PathsExist {
