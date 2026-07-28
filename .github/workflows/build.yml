@@ -72,7 +72,7 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          workspaces: "./src-tauri -> target"
+          workspaces: ". -> target"
           # Restore-only, never save. Releases are infrequent (tag pushes), but save-if:true
           # stacked a fresh ~500MB cache per platform on every version bump, pushing the repo
           # past GitHub's 10GB cache limit and LRU-evicting the test.yml caches — which then

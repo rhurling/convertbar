@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+authors = ["Rouven Hurling"]
+license = "MIT"
+repository = "https://github.com/rhurling/convertbar"

@@ -12,6 +12,9 @@ on:
   pull_request:
     paths:
       - "src-tauri/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/test-windows.yml"
 
 # cargo test runs untrusted lockfile code — keep the token read-only.
@@ -30,7 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          workspaces: "./src-tauri -> target"
+          workspaces: ". -> target"
           # Match test.yml's key so this PR-only job restores the warm Windows cache
           # main builds, instead of cold-building. save-if: false → never writes a
           # PR-scoped cache that would be orphaned on merge (the old ~628MB/PR leak).
@@ -40,6 +43,7 @@ jobs:
       # the test exe dies at load (STATUS_ENTRYPOINT_NOT_FOUND, tauri-apps/tauri#11028).
       # --lib keeps the app binary out of this cargo invocation, which would otherwise
       # get a second manifest on top of tauri-build's. All tests live in the lib.
-      - run: cargo test --lib --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --lib -p convertbar && cargo test --lib -p convertbar-core
+        shell: bash
         env:
           RUSTFLAGS: -Clink-arg=/MANIFEST:EMBED -Clink-arg=/MANIFESTINPUT:${{ github.workspace }}\src-tauri\windows-test-manifest.xml
