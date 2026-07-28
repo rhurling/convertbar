@@ -97,7 +97,7 @@ fn get_handbrake_path(
     locator: &dyn handbrake::HandbrakeLocator,
 ) -> Result<String, String> {
     handbrake::resolve_with_locator(read_configured_handbrake_path(conn).as_deref(), locator)
-        .ok_or_else(|| "HandBrakeCLI not found".to_string())
+        .ok_or_else(|| handbrake::HANDBRAKE_NOT_FOUND.to_string())
 }
 
 /// Whether a row's verdict should be re-verified with a fresh scan before its file is
@@ -837,7 +837,7 @@ pub fn add_files_inner(
 
     // Resolve template if needed
     let suffix = if suffix_template.contains('{') {
-        let hb = hb_path.clone().ok_or("HandBrakeCLI not found")?;
+        let hb = hb_path.clone().ok_or(handbrake::HANDBRAKE_NOT_FOUND)?;
         let metadata = crate::handbrake::cached_preset_metadata(ctx, &hb, &preset)?;
         handbrake::resolve_suffix_template(&suffix_template, &metadata)
     } else {
@@ -1658,7 +1658,10 @@ mod tests {
         let err = add_files_inner(&ctx, &["/tmp/whatever.mkv".to_string()], None).expect_err(
             "intake must fail when the suffix template needs HandBrake and it is absent",
         );
-        assert!(err.contains("HandBrakeCLI not found"), "got: {err}");
+        assert!(
+            err.contains(crate::handbrake::HANDBRAKE_NOT_FOUND),
+            "got: {err}"
+        );
     }
 
     #[test]

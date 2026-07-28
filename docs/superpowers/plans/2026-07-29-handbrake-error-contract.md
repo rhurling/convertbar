@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Every task ends green on: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets`.
+- Every task ends green on: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets   # see "Verifying lints" in Global Constraints`.
 - **Never hold `ctx.db`'s lock across an event emit.** `std::sync::Mutex` is not reentrant and the desktop tray listener re-locks synchronously on the same thread. Two shipped deadlocks came from violating this.
 - **`ctx.db` is not reentrant, full stop.** `require_handbrake_path` locks it. It must never be called while a `ctx.db` guard is held.
 - **Test fixtures default to `PanickingLocator`.** A test that reaches HandBrake resolution without declaring its world must fail loud. Use `AbsentLocator` for the CI world, `StubLocator` for the installed world, never `PathLocator` outside `#[ignore]`d tests.
@@ -314,7 +314,7 @@ helper unilaterally.
 ```bash
 cargo test --workspace
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets   # see "Verifying lints" in Global Constraints
 ```
 
 Expected: all green, zero warnings introduced.
@@ -346,7 +346,7 @@ Expected: `crates/convertbar-core/src/queue_ops.rs`, `crates/convertbar-core/src
 ```bash
 cargo test --workspace
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets   # see "Verifying lints" in Global Constraints
 ```
 
 Paste the actual test summary line into the task report. Do not claim green without it.
@@ -618,7 +618,7 @@ After:
 
 ```bash
 cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets   # see "Verifying lints" in Global Constraints
 ```
 
 Expected: green. In particular, `validate_handbrake` in both heads is deliberately untouched — it
@@ -726,7 +726,7 @@ Expected: all pass, and none hang. A hang here means the guard was not dropped b
 
 ```bash
 cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets   # see "Verifying lints" in Global Constraints
 ```
 
 Expected: green.
@@ -879,7 +879,7 @@ never parse an error.)
 ```bash
 cargo test --workspace
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets   # see "Verifying lints" in Global Constraints
 ```
 
 Expected: green.
@@ -955,7 +955,7 @@ already taken; if it is, use the next free number and adjust the heading.
 ```bash
 cargo test --workspace
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets   # see "Verifying lints" in Global Constraints
 ```
 
 Paste the actual test summary line into the report. Do not claim green without it.
