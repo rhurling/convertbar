@@ -35,7 +35,9 @@ other=$(printf '%s\n' "$subjects" \
   | grep -vE '^(feat|fix|perf)(\([^)]*\))?!?: ' \
   | grep -c . || true)
 if [ "${other:-0}" -gt 0 ]; then
-  printf '%s maintenance changes (dependencies, docs, tests, internals).\n\n' "$other"
+  noun="changes"
+  [ "$other" -eq 1 ] && noun="change"
+  printf '%s maintenance %s (dependencies, docs, tests, internals).\n\n' "$other" "$noun"
 fi
 
 printf '**Full changelog**: %s/compare/%s...%s\n' "$REPO_URL" "$PREV" "$CURRENT"

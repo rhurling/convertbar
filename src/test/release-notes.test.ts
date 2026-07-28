@@ -111,11 +111,28 @@ describe("release-notes.sh", () => {
 
   it("emits no bare line that GitHub Actions would reject as an output", () => {
     // $GITHUB_OUTPUT parses `key=value`; a heredoc protects multi-line values, but a line
-    // equal to the delimiter would terminate it early.
-    const dir = repoWithCommits(["feat: add dark mode"], 0);
+    // equal to the delimiter would terminate it early. A commit subject that happens to
+    // collide with the delimiter after prefix-stripping must render as a bulleted line
+    // ("- CONVERTBAR_NOTES_EOF"), never as a bare one — otherwise this would silently
+    // truncate the release body in CI and nothing in PR CI would catch it.
+    const dir = repoWithCommits(["feat: add dark mode", "fix: CONVERTBAR_NOTES_EOF"], 0);
     try {
       const out = run(dir, "v0.1.0", "v0.2.0");
       expect(out.split("\n")).not.toContain("CONVERTBAR_NOTES_EOF");
+      expect(out).toContain("- CONVERTBAR_NOTES_EOF");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("pluralizes the maintenance count correctly for exactly one commit", () => {
+    // This line is read by every user in the update panel before deciding to install —
+    // "1 maintenance changes" is an agreement error worth its own regression test.
+    const dir = repoWithCommits(["feat: add dark mode", "chore(deps): bump react"], 0);
+    try {
+      const out = run(dir, "v0.1.0", "v0.2.0");
+      expect(out).toContain("1 maintenance change (");
+      expect(out).not.toContain("1 maintenance changes");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
