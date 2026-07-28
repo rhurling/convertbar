@@ -198,6 +198,21 @@ pub enum InstallAttempt {
     Failed(String),
 }
 
+/// Clears `installing` on every exit from an install attempt, including an unwinding panic
+/// from `installer.install()`. Without this, a panicking installer would leave `installing`
+/// stuck true forever — `claim_queue_slot` would then refuse to start the queue for the rest
+/// of the process's life. Mirrors `RunningGuard` (converter.rs), the same fix for the sibling
+/// `is_running` flag.
+struct InstallingGuard<'a>(&'a crate::converter::ConverterState);
+
+impl Drop for InstallingGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .installing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Installs only when the queue is genuinely idle, holding `installing` for the whole
 /// operation so no job can start underneath. Claims under the same `is_running` lock
 /// `run_queue` uses, so the two cannot interleave.
@@ -219,8 +234,11 @@ pub fn try_install_now(
         conv.installing.store(true, Ordering::SeqCst);
     }
 
-    let result = installer.install(update);
-    conv.installing.store(false, Ordering::SeqCst);
+    let result = {
+        // Clears `installing` when this scope ends, whether install() returns or panics.
+        let _installing = InstallingGuard(conv);
+        installer.install(update)
+    };
 
     match result {
         Ok(()) => InstallAttempt::Installed,
@@ -495,6 +513,40 @@ mod tests {
         assert!(
             crate::converter::claim_queue_slot(&conv),
             "queue must be startable again"
+        );
+    }
+
+    #[test]
+    fn installing_is_released_even_if_the_installer_panics() {
+        // Same failure mode RunningGuard (converter.rs) protects is_running against, for the
+        // sibling `installing` flag. Without InstallingGuard, a panicking installer would leave
+        // `installing` latched forever and claim_queue_slot would refuse the queue for the rest
+        // of the process's life.
+        struct PanickingInstaller;
+        impl Installer for PanickingInstaller {
+            fn install(&self, _update: &AvailableUpdate) -> Result<(), String> {
+                panic!("simulated installer crash");
+            }
+        }
+
+        let conv = ConverterState::new();
+
+        // Suppress the expected panic's default stderr print so test output stays pristine.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            try_install_now(&conv, &PanickingInstaller, &upd("2.0.0"))
+        }));
+        std::panic::set_hook(prev_hook);
+
+        assert!(result.is_err(), "the installer did panic");
+        assert!(
+            !conv.installing.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard must clear installing even though install() panicked"
+        );
+        assert!(
+            crate::converter::claim_queue_slot(&conv),
+            "queue must be startable again after a panicking install"
         );
     }
 }
