@@ -3,4 +3,5 @@ pub mod files;
 pub mod handbrake;
 pub mod queue;
 pub mod settings;
+pub mod updater;
 pub mod watch;

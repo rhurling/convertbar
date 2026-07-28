@@ -165,6 +165,10 @@ pub fn update_setting(
     )
     .map_err(|e| e.to_string())?;
 
+    // Release the settings connection before any hook below: they read the same
+    // `AppState::db` mutex, and std's Mutex is not reentrant.
+    drop(conn);
+
     // Sync autostart state with the plugin
     if key == "launch_at_login" {
         let autostart = app.autolaunch();
@@ -178,6 +182,18 @@ pub fn update_setting(
     // Let the running watcher pick up a changed skip-marker name without a restart.
     if key == "watch_skip_marker" {
         crate::watcher::refresh_skip_marker(&app);
+    }
+
+    // Let a mode change take effect immediately: a user who sees "update available" and
+    // switches to Automatic should not wait for the next hourly tick.
+    if key == "update_mode" {
+        crate::updater::emit_state(&app);
+        if value == "automatic" {
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::updater::run_cycle(handle, false).await;
+            });
+        }
     }
 
     Ok(())

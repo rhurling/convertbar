@@ -18,6 +18,16 @@ pub fn start_queue<R: tauri::Runtime>(
         return Ok(());
     }
 
+    // An update install holds the queue interlock, so `run_queue`'s claim would refuse below —
+    // after the paused flag had already been cleared, leaving the queue neither running nor
+    // paused. Bail before touching it; the user can start again once the install is done.
+    if converter_state
+        .installing
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok(());
+    }
+
     let db = state.db.clone();
     let conv = (*converter_state).clone();
 
@@ -544,5 +554,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(paused, "false", "Resume clears the remembered pause");
+    }
+
+    #[test]
+    fn start_queue_leaves_the_persisted_pause_alone_while_an_update_installs() {
+        // `run_queue`'s claim refuses while the update interlock is latched. Clearing the
+        // remembered pause anyway would leave the queue neither running nor paused: the UI
+        // would report "not paused" while nothing runs and no event ever restarts it.
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('queue_paused', 'true')
+             ON CONFLICT(key) DO UPDATE SET value = 'true'",
+            [],
+        )
+        .unwrap();
+        app.manage(crate::AppState {
+            db: Arc::new(Mutex::new(conn)),
+            preset_cache: Mutex::new(Default::default()),
+        });
+        let converter = Arc::new(ConverterState::new());
+        converter
+            .installing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        app.manage(converter.clone());
+
+        start_queue(app.handle().clone(), app.state(), app.state()).unwrap();
+
+        let state: State<'_, AppState> = app.state();
+        let paused: String = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='queue_paused'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            paused, "true",
+            "the remembered pause must survive a Start that the install interlock refuses"
+        );
+        assert!(
+            !*converter.is_running.lock().unwrap(),
+            "no queue may start underneath an install"
+        );
     }
 }
