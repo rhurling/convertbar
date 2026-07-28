@@ -740,6 +740,22 @@ mod throttle_tests {
     }
 
     #[test]
+    fn a_zero_base_policy_never_delays_no_matter_how_high_the_count_climbs() {
+        // Tasks 5 and 6 use a zero-base policy so the suite does not sleep. A
+        // guard that returns the cap once the shift saturates would silently
+        // reintroduce 30-second sleeps into exactly those tests.
+        let t = LoginThrottle::new(ThrottlePolicy {
+            base: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        for _ in 0..100 {
+            assert_eq!(t.record_failure(a, now), Duration::ZERO);
+        }
+    }
+
+    #[test]
     fn pruning_drops_expired_entries_and_keeps_live_ones() {
         let t = LoginThrottle::new(policy());
         let start = Instant::now();
@@ -855,16 +871,16 @@ impl LoginThrottle {
         self.lock().remove(&id);
     }
 
-    /// `base << (n-1)`, capped. The shift is guarded: without it a long-lived
-    /// bucket overflows and the delay wraps to something tiny.
+    /// `base << (n-1)`, capped. The shift is CLAMPED rather than special-cased:
+    /// `1u32 << shift` panics once shift reaches 32, and returning the cap
+    /// directly at that point would be wrong for a zero `base` — doubling zero
+    /// is still zero, and a zero-base policy means "no throttling" (the tests
+    /// rely on it). Clamping keeps one code path correct for every policy.
     fn delay_for(&self, count: u32) -> Duration {
-        let shift = count.saturating_sub(1);
-        if shift >= 32 {
-            return self.policy.cap;
-        }
+        let shift = count.saturating_sub(1).min(31);
         match self.policy.base.checked_mul(1u32 << shift) {
-            Some(d) if d < self.policy.cap => d,
-            _ => self.policy.cap,
+            Some(d) => d.min(self.policy.cap),
+            None => self.policy.cap,
         }
     }
 
