@@ -81,7 +81,7 @@
     Name="Auth Token"
     Target="CONVERTBAR_AUTH_TOKEN"
     Default=""
-    Description="Token required on every request. Must be at least 16 characters with at least 8 distinct characters, or the container refuses to start. Generate one with: openssl rand -base64 24. Failed login attempts from the same source are throttled with an escalating delay (up to 30s); there is no lockout, so the correct token always works."
+    Description="Token required on every request. Must be at least 16 characters with at least 8 distinct characters, or the container refuses to start. Generate one with: openssl rand -base64 24. After 8 failed attempts from the same source, further attempts are refused with increasing spacing up to 30s &#8212; even the correct token, while gated, so wait rather than retrying. A successful login clears it immediately."
     Type="Variable"
     Display="always"
     Required="true"

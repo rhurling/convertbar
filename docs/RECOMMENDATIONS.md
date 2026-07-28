@@ -71,51 +71,29 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   in `src/App.css`, plus `:active` states on `.btn-icon` / `.btn-quit`
 - `cursor: pointer` applied consistently across interactive classes
 
+### 15. Server Head — Close the Login-Throttle Throughput Gap — *shipped, branch `feature/server-auth-throttling`*
+- The gap this closes: the original throttle evaluated the credential before
+  sleeping (`token_matches`, then `sleep`, then 401), so concurrent and
+  abandon-early guesses paid nothing — a tight loop reached ~18,000
+  guesses/sec against it. Fixed by gating the *comparison*, not the response:
+  `LoginThrottle::check` (`crates/convertbar-server/src/throttle.rs`) reserves
+  a source's evaluation slot — inside the one lock that reads it — before the
+  credential is compared. A denied source gets 401 with no comparison at all,
+  and nothing sleeps; every response is immediate.
+- Also shipped: the 16-character/8-distinct-character token strength floor
+  (`config.rs`) and `CONVERTBAR_TRUSTED_PROXIES` support for identifying real
+  clients behind a reverse proxy.
+- Policy (`ThrottlePolicy::default()`): 8 free evaluations per source, then
+  one evaluation per interval doubling 500ms → 30s cap, 15-minute forget
+  window, cleared immediately on a successful sign-in.
+- **Accepted trade-off:** while a source is gated, even the correct token is
+  refused — there is no exception for the legitimate owner. This is
+  deliberate (a mechanism that always honoured a correct token would still
+  answer every guess); the operator-facing guidance is to wait, not retry.
+
 ---
 
 ## Open — High Impact
-
-### 15. Server Head — Close the Login-Throttle Throughput Gap
-**Why:** the whole-branch review of the login-throttling branch (see
-`docs/superpowers/specs/2026-07-28-server-auth-throttling-design.md`, "Why no
-lockout" → correction) found the shipped throttle evaluates the credential
-before sleeping: `token_matches` runs, *then* `tokio::time::sleep(delay)`,
-*then* the 401 is written. The counter increments correctly under the lock, so
-concurrent guesses still draw escalating delays — but those delays run
-concurrently rather than serializing the attacker, so throughput is
-`concurrency / cap`, not `1 / cap`. Worse, a correct token is answered
-immediately even at the cap, so response latency is a perfect oracle: fire a
-guess, wait ~50 ms, abandon the socket if nothing comes back. Measured against
-the shipped code: 20 concurrent wrong guesses cost one delay, not twenty; 8
-abandon-early guesses completed in 0.63s versus ~64s waited out sequentially;
-a tight loop reached ~18,000 guesses/sec. The ramp therefore deters only a
-sequential, response-waiting scanner — not a determined one.
-
-**What:** already shipped on this branch, and NOT part of this item: the
-16-character/8-distinct-character token strength floor (`config.rs`),
-`CONVERTBAR_TRUSTED_PROXIES` support, and the escalating per-source delay
-itself (500ms → 30s cap, 15-minute forget window, enforced in `auth_guard` and
-`login`). Those shipped as intended and stay as-is; the token floor is
-currently the server's real defense. What remains open: make the delay a
-genuine throughput bound instead of a deterrent.
-
-**How:** gate *evaluation* behind the delay instead of gating the response.
-Add a per-bucket `next_allowed_at: Instant`; check it in `auth_guard`/`login`
-*before* `token_matches` runs. While the bucket is cooling down, return 401
-immediately without evaluating the credential at all. Only once
-`next_allowed_at` has passed does the attempt get evaluated; only a wrong
-answer pushes `next_allowed_at` forward again by the (still-escalating)
-delay. This bounds guess throughput for real — no verdict exists until the
-wait elapses, so parallelising or abandoning the connection buys nothing —
-while still never permanently denying the owner, since the wait stays bounded
-by the same 30s cap. This option was identified during the whole-branch
-review and deliberately deferred rather than folded into the same PR.
-
-**Files:** `crates/convertbar-server/src/throttle.rs` (add `next_allowed_at`
-to `Failures`, add the pre-evaluation check), `crates/convertbar-server/src/auth.rs`
-(`auth_guard`), `crates/convertbar-server/src/routes/login.rs` (`login`).
-
----
 
 ### 3. Keyboard Shortcuts
 **Why:** Power users want to control the app without clicking.

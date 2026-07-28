@@ -150,22 +150,28 @@ startup rather than warned about. Generate one with:
 openssl rand -base64 24
 ```
 
-**Failed-attempt throttling.** Each failed credential — at `/api/login` or via
-an `Authorization` header — makes the *next* failure from that source slower:
-500 ms, then 1 s, 2 s, 4 s, and so on to a 30-second ceiling. A source's count
-is forgotten after 15 minutes without a failure, and a successful login clears
-it immediately. There is deliberately no lockout, so no amount of guessing by
-anyone else can stop you getting in with the right token. This deters casual,
-sequential scanning; it does not bound a determined attacker who parallelises
-guesses or doesn't wait for the response. **A randomly generated token is what
-actually protects the server** — the floor above permits a memorable
-passphrase like `Sommer2026!Berlin`, which is not comfortable at high guess
-rates.
+**Failed-attempt throttling.** Each source — identified at `/api/login` or via
+an `Authorization` header — gets 8 free attempts. After that it may be
+evaluated only once per interval: 500 ms, then 1 s, 2 s, 4 s, and so on to a
+30-second ceiling. Every attempt outside that interval is refused with 401
+**without comparing the credential at all — even a correct token is refused
+while a source is gated.** That refusal is the rate limit working as intended,
+not a bug: if you're locked out, wait for the next interval, since retrying
+faster does not help. A successful sign-in clears the source immediately, and
+a source's history is forgotten 15 minutes after its first attempt. Nothing
+sleeps — every response, allowed or refused, is immediate.
+
+This bounds a single source; it does not stop an attacker spread across many
+source addresses, since each gets its own free allowance. **A randomly
+generated token is what actually protects the server** — the floor above
+permits a memorable passphrase like `Sommer2026!Berlin`, which is not
+comfortable at any guess rate.
 
 Rotating the token means changing the variable and restarting the container.
 Open browser tabs will be signed out and can log in again immediately. A script
-looping on an outdated token will ramp itself to the 30-second delay — that is
-working as intended, and is indistinguishable from an attacker.
+looping on an outdated token will quickly ramp itself into the same gating any
+attacker gets — refused outright, not merely slowed — which is working as
+intended and indistinguishable from one.
 
 **Behind a reverse proxy**, every request appears to come from the proxy, so all
 clients share one throttling ramp. Set `CONVERTBAR_TRUSTED_PROXIES` to the
