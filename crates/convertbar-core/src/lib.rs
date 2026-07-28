@@ -9,5 +9,6 @@ pub mod handbrake;
 pub mod media_skip;
 pub mod probe;
 pub mod probe_cache;
+pub mod queue_ops;
 pub mod settings_ops;
 pub mod types;

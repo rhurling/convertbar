@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Head-agnostic shared state for the converter engine. Desktop and server heads each
@@ -8,6 +9,10 @@ pub struct Ctx {
     pub converter: Arc<crate::converter::ConverterState>,
     pub events: Arc<dyn crate::events::EventSink>,
     pub disposer: Arc<dyn crate::dispose::FileDisposer>,
+    /// Preset metadata cache, shared by `handbrake::cached_preset_metadata` across every caller
+    /// (settings preview, add_files' suffix resolution) so a preset's metadata is fetched from
+    /// HandBrakeCLI at most once per process lifetime.
+    pub preset_cache: Mutex<HashMap<String, crate::handbrake::PresetMetadata>>,
 }
 
 impl Ctx {
@@ -21,6 +26,7 @@ impl Ctx {
             converter: Arc::new(crate::converter::ConverterState::new()),
             events,
             disposer,
+            preset_cache: Mutex::new(HashMap::new()),
         })
     }
 }

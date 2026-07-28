@@ -6,7 +6,6 @@ use std::time::{Duration, Instant, SystemTime};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::commands::queue;
 use crate::AppState;
 
 /// Download tools write to a temporary name and rename to the final name only when complete.
@@ -107,7 +106,7 @@ pub(crate) struct WatchedDirConfig {
 /// the watched directories (respecting each directory's recursive flag), or `None` if the path
 /// should be ignored. Temp/partial download files are always ignored.
 pub(crate) fn delay_for_path(configs: &[WatchedDirConfig], path: &Path) -> Option<Duration> {
-    if !queue::is_video_file(path) || is_temp_file(path) {
+    if !convertbar_core::queue_ops::is_video_file(path) || is_temp_file(path) {
         return None;
     }
     let parent = path.parent()?;
@@ -436,12 +435,22 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
         return;
     }
     let app_state = app.state::<AppState>();
+    // Fetched once, up front: add_files_inner now takes &Ctx, and run_queue below needs the
+    // same ctx — no reason to fetch it from state twice.
+    let ctx = app
+        .state::<std::sync::Arc<convertbar_core::ctx::Ctx>>()
+        .inner()
+        .clone();
     let result = {
         let sink: std::sync::Arc<dyn convertbar_core::events::EventSink> =
             std::sync::Arc::new(crate::sink::TauriSink(app.clone()));
         let op = convertbar_core::add_progress::AddOp::new(sink, batch_label(&paths));
         let reporter = |done: u32, total: u32| op.report(done, total);
-        match queue::add_files_inner(&app_state, &paths, Some(&reporter as &dyn Fn(u32, u32))) {
+        match convertbar_core::queue_ops::add_files_inner(
+            &ctx,
+            &paths,
+            Some(&reporter as &dyn Fn(u32, u32)),
+        ) {
             Ok(result) => result,
             Err(err) => {
                 eprintln!("watcher: failed to enqueue {paths:?}: {err}");
@@ -458,10 +467,6 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     if let Ok(conn) = app_state.db.lock() {
         crate::converter::set_queue_paused(&conn, false);
     }
-    let ctx = app
-        .state::<std::sync::Arc<convertbar_core::ctx::Ctx>>()
-        .inner()
-        .clone();
     convertbar_core::converter::run_queue(ctx);
     let _ = app.emit("queue-updated", ());
 }
@@ -528,14 +533,14 @@ pub fn refresh_skip_marker(app: &AppHandle) {
 /// files. Reuses the queue module's scanner so the recursive walk stays in one place.
 fn collect_video_paths(dir: &Path, recursive: bool) -> Vec<String> {
     let paths: Vec<PathBuf> = if recursive {
-        queue::scan_video_files(dir)
+        convertbar_core::queue_ops::scan_video_files(dir)
     } else {
         std::fs::read_dir(dir)
             .map(|entries| {
                 entries
                     .flatten()
                     .map(|e| e.path())
-                    .filter(|p| p.is_file() && queue::is_video_file(p))
+                    .filter(|p| p.is_file() && convertbar_core::queue_ops::is_video_file(p))
                     .collect()
             })
             .unwrap_or_default()
