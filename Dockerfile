@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends handbrake-cli c
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/convertbar-server /usr/local/bin/convertbar-server
 ENV CONVERTBAR_DATA_DIR=/config
+RUN mkdir -m 0777 /config
 VOLUME /config
 EXPOSE 8080
 ENTRYPOINT ["convertbar-server"]

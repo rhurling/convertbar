@@ -43,14 +43,24 @@ async fn main() {
         Arc::new(DeleteDisposer),
     );
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bind = config.bind;
+
+    // Bind FIRST, before anything that can spawn a HandBrake child: `boot` below can
+    // auto-resume the queue, and nothing serves until `axum::serve` runs anyway, so binding
+    // early is free. If the port is taken (e.g. another instance already running on a NAS),
+    // this must exit before any encoder is spawned — otherwise a bind failure would orphan a
+    // just-started HandBrake process with no listener left to ever kill it.
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .unwrap_or_else(|err| panic!("bind {bind}: {err}"));
+    tracing::info!("convertbar-server listening on {bind}");
+
     // Server-only settings correction, then the desktop setup block's auto-resume sequence
     // (recover interrupted jobs, resume the queue if warranted, arm watchers) — both must
     // run before the app starts serving requests.
     startup::normalize_server_settings(&ctx);
     startup::boot(&ctx);
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bind = config.bind;
 
     let state = ServerState {
         ctx: ctx.clone(),
@@ -60,11 +70,6 @@ async fn main() {
     };
 
     let app = routes::app(state);
-
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .unwrap_or_else(|err| panic!("bind {bind}: {err}"));
-    tracing::info!("convertbar-server listening on {bind}");
 
     let shutdown_ctx = ctx.clone();
     axum::serve(listener, app)

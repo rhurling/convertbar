@@ -85,7 +85,15 @@ pub async fn host_guard(State(s): State<ServerState>, req: Request, next: Next) 
         .is_some_and(|h| host_allowed(h, &s.config.allowed_hosts));
 
     if !allowed {
-        return json_err(StatusCode::MISDIRECTED_REQUEST, "host not allowed");
+        let rejected = host.as_deref().unwrap_or("<none>");
+        tracing::warn!(
+            host = rejected,
+            "rejected request: host not allowed (set CONVERTBAR_ALLOWED_HOSTS to permit it)"
+        );
+        return json_err(
+            StatusCode::MISDIRECTED_REQUEST,
+            &format!("host not allowed: {rejected} — set CONVERTBAR_ALLOWED_HOSTS to permit it"),
+        );
     }
 
     next.run(req).await
@@ -462,6 +470,33 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn host_rejection_body_names_the_host_and_the_env_var() {
+            // The 421 body must be actionable: a NAS user browsing by hostname (not IP) needs
+            // to see which host was rejected and which env var fixes it, not a bare error.
+            let response = send(
+                app(open_state()),
+                "GET",
+                "/api/queue",
+                &[("Host", "nas.local")],
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+            let body = json_body(response).await;
+            let message = body["error"]
+                .as_str()
+                .expect("error field must be a string");
+            assert!(
+                message.contains("nas.local"),
+                "message must name the rejected host: {message}"
+            );
+            assert!(
+                message.contains("CONVERTBAR_ALLOWED_HOSTS"),
+                "message must point at the fix: {message}"
+            );
         }
 
         #[tokio::test]

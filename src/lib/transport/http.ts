@@ -62,7 +62,7 @@ export const httpCommands = {
       "GET",
       `/api/history?limit=${limit}&offset=${offset}` +
         (search ? `&search=${encodeURIComponent(search)}` : "") +
-        (sortBy ? `&sortBy=${sortBy}` : ""),
+        (sortBy ? `&sortBy=${encodeURIComponent(sortBy)}` : ""),
     ),
   getHistorySummary: (search?: string): Promise<HistorySummary> =>
     api("GET", `/api/history/summary${search ? `?search=${encodeURIComponent(search)}` : ""}`),

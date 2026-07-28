@@ -6,6 +6,7 @@ services:
     environment:
       CONVERTBAR_AUTH_TOKEN: "change-me"     # always set a token
       # CONVERTBAR_BROWSE_ROOTS: "/media"    # optional: restrict the file browser
+      # CONVERTBAR_ALLOWED_HOSTS: "nas.local"   # needed if you browse by hostname instead of IP
     volumes:
       - ./config:/config                     # SQLite db + probe cache
       - /path/to/media:/media                # bind-mount LOCAL disks for watched folders:

@@ -57,11 +57,13 @@ impl ServerConfig {
         // Comma-separated ONLY: a colon split would mangle `host:port` entries and IPv6.
         let allowed_hosts = vars
             .get("CONVERTBAR_ALLOWED_HOSTS")
+            .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(str::to_string).collect())
             .unwrap_or_default();
 
         let browse_roots = vars
             .get("CONVERTBAR_BROWSE_ROOTS")
+            .filter(|s| !s.is_empty())
             .map(|s| s.split(':').map(PathBuf::from).collect::<Vec<_>>())
             .filter(|roots| !roots.is_empty())
             .unwrap_or_else(|| vec![PathBuf::from("/")]);
@@ -154,6 +156,26 @@ mod tests {
             cfg.browse_roots,
             vec![PathBuf::from("/data"), PathBuf::from("/media")]
         );
+    }
+
+    #[test]
+    fn empty_browse_roots_falls_back_to_default() {
+        let cfg = ServerConfig::from_vars(&vars(&[
+            ("CONVERTBAR_AUTH_TOKEN", "t"),
+            ("CONVERTBAR_BROWSE_ROOTS", ""),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.browse_roots, vec![PathBuf::from("/")]);
+    }
+
+    #[test]
+    fn empty_allowed_hosts_falls_back_to_default() {
+        let cfg = ServerConfig::from_vars(&vars(&[
+            ("CONVERTBAR_AUTH_TOKEN", "t"),
+            ("CONVERTBAR_ALLOWED_HOSTS", ""),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.allowed_hosts, Vec::<String>::new());
     }
 
     #[test]

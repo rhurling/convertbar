@@ -117,7 +117,7 @@ compose file.
 | `CONVERTBAR_NO_AUTH` | *(none)* | Set to `1` to disable auth entirely. Only do this behind a trusted network or a reverse proxy that already handles auth. |
 | `CONVERTBAR_BIND` | `0.0.0.0` | Address to listen on. |
 | `CONVERTBAR_PORT` | `8080` | Port to listen on. |
-| `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; add a reverse-proxy hostname here (e.g. `nas.local`) if you use one. |
+| `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; needed if you browse by hostname instead of IP (e.g. `nas.local`) or use a reverse proxy. |
 | `CONVERTBAR_BROWSE_ROOTS` | `/` | Colon-separated paths the web file browser may navigate. Restrict it to your media mount(s), e.g. `/media`. |
 
 ### Auth
