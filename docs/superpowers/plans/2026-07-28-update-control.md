@@ -432,14 +432,12 @@ Append to the `tests` module in `src-tauri/src/updater.rs`:
         let outcome = decide_manual(Some(upd("2.0.0")));
         assert!(matches!(outcome, CheckOutcome::Notify(u) if u.version == "2.0.0"));
     }
-
-    #[test]
-    fn a_manual_check_reports_a_version_already_skipped_or_notified() {
-        // The user explicitly asked, so neither the skip list nor the once-per-version
-        // marker may hide the answer — otherwise "Check now" silently reports nothing.
-        assert!(matches!(decide_manual(Some(upd("2.0.0"))), CheckOutcome::Notify(_)));
-    }
 ```
+
+`decide_manual` takes no `skipped`/`notified` arguments at all — the signature is what
+guarantees a manual check cannot be silenced by the skip list or the once-per-version marker.
+Do not add a test that passes those values in; there is no parameter to pass them to, and a
+test asserting a behaviour its own call cannot vary is worse than no test.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -827,7 +825,18 @@ pub fn try_install_now(
 Run: `cd src-tauri && cargo test`
 Expected: PASS — 243 + 5 = 248 passed, 4 ignored.
 
-- [ ] **Step 6: Mutation-check the idle gate**
+- [ ] **Step 6: Commit the green state — required before the mutation check**
+
+The mutation check in Step 7 restores the file with `git checkout`, which reverts to the
+**last commit**. Committing here is what makes that restore safe; neutering first would
+silently destroy every uncommitted change in this task.
+
+```bash
+git add src-tauri/src/converter.rs src-tauri/src/updater.rs
+git commit -m "feat: gate update installs on an idle queue with an atomic interlock"
+```
+
+- [ ] **Step 7: Mutation-check the idle gate**
 
 Temporarily delete the gate from `try_install_now`:
 
@@ -842,18 +851,20 @@ Temporarily delete the gate from `try_install_now`:
 ```
 
 Run: `cd src-tauri && cargo test an_install_never_runs_while_a_job_is_encoding`
-Expected: **FAIL**. If it passes, the test is not exercising the real path — fix the test before restoring.
+Expected: **FAIL**. If it passes, the test is not exercising the real path — fix the test and
+re-run this step before moving on.
 
-Restore the gate with `git checkout src-tauri/src/updater.rs`, then re-run to confirm green.
-
-> **Warning:** commit Step 5's green state BEFORE neutering, or `git checkout` discards the work.
-
-- [ ] **Step 7: Commit**
+Restore the gate:
 
 ```bash
-git add src-tauri/src/converter.rs src-tauri/src/updater.rs
-git commit -m "feat: gate update installs on an idle queue with an atomic interlock"
+git checkout src-tauri/src/updater.rs
+cd src-tauri && cargo test
 ```
+
+Expected: green again, and `git status` clean (Step 6 already committed the work).
+
+Report the mutation-check result — "deleted the gate, test went red, restored, green" — in
+the task report. A mutation check whose outcome is not reported did not happen.
 
 ---
 
