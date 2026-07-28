@@ -1,0 +1,73 @@
+name: docker
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths: [Dockerfile, ".dockerignore", "crates/convertbar-server/**", ".github/workflows/docker.yml"]
+
+# Cancel superseded PR runs; let a tag push (or a manual dispatch) run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Default to no permissions; each job opts into the minimum scopes it needs.
+permissions: {}
+
+jobs:
+  # Runs on a v* tag push or a manual dispatch; not on pull_request (the paths: filter
+  # above only gates which PRs trigger the workflow at all, it can't gate a job's `if:`).
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Resolve image tags
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # No tag to derive a version from on a manual run.
+            echo "tags=ghcr.io/rhurling/convertbar:latest" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "tags=ghcr.io/rhurling/convertbar:${VERSION},ghcr.io/rhurling/convertbar:latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.version.outputs.tags }}
+
+  # PR-only build-and-discard: proves the image still builds without publishing anything.
+  # Gated on the pull_request event, not a required check (see the paths: filter above).
+  build-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64

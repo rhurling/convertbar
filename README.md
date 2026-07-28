@@ -97,6 +97,55 @@ the destination volume.
 Encoding is deliberately sequential: hardware encoders would just contend for the
 same silicon if run in parallel, so two at once is usually slower overall.
 
+## Server (Docker)
+
+ConvertBar also ships as a headless server image with a browser UI, for running
+on a NAS or home server instead of (or alongside) the desktop app.
+
+```sh
+docker pull ghcr.io/rhurling/convertbar:latest
+```
+
+See [`docker-compose.example.yml`](docker-compose.example.yml) for a ready-to-copy
+compose file.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONVERTBAR_AUTH_TOKEN` | *(none)* | Bearer/cookie token required on every `/api/*` request. Set this **or** `CONVERTBAR_NO_AUTH=1` — see [Auth](#auth) below. |
+| `CONVERTBAR_NO_AUTH` | *(none)* | Set to `1` to disable auth entirely. Only do this behind a trusted network or a reverse proxy that already handles auth. |
+| `CONVERTBAR_BIND` | `0.0.0.0` | Address to listen on. |
+| `CONVERTBAR_PORT` | `8080` | Port to listen on. |
+| `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; add a reverse-proxy hostname here (e.g. `nas.local`) if you use one. |
+| `CONVERTBAR_BROWSE_ROOTS` | `/` | Colon-separated paths the web file browser may navigate. Restrict it to your media mount(s), e.g. `/media`. |
+
+### Auth
+
+The server refuses to start unless `CONVERTBAR_AUTH_TOKEN` or
+`CONVERTBAR_NO_AUTH=1` is set — there is no unauthenticated-by-default mode.
+Always set a real token in the compose example; `CONVERTBAR_NO_AUTH=1` is only
+for a trusted LAN or a deployment where a reverse proxy already gates access.
+
+### Reverse proxy / HTTPS
+
+The server itself speaks plain HTTP only. Put a reverse proxy (Caddy, nginx,
+Traefik, …) in front of it for TLS termination if you expose it beyond your LAN.
+
+### Volumes and permissions
+
+`/config` holds the SQLite database and probe cache — mount it to persist state
+across container restarts (see `docker-compose.example.yml`). The image can run
+as any `--user <uid>:<gid>`; make sure `/config` and any mounted media
+directories are writable by that uid/gid.
+
+### Watched folders on network shares
+
+Watched folders rely on `inotify`, which doesn't fire for changes made over NFS
+or SMB mounts. A watched directory on a network filesystem only picks up new
+files when the container restarts — bind-mount local disks instead for live
+intake.
+
 ## Development
 
 ```sh
