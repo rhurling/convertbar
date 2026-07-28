@@ -478,7 +478,7 @@ pub fn set_queue_paused(db: &Connection, paused: bool) {
 /// on it.
 ///
 /// One function so the two cannot drift apart. A user pause that left the updater's breadcrumb
-/// standing would be lifted by a failed install or by the next launch — and on macOS the two are
+/// standing would be lifted by a failed install or by the next launch — and on unix the two are
 /// otherwise indistinguishable, because SIGSTOP leaves the queue thread alive so `is_running`
 /// never clears.
 pub fn set_user_queue_pause(db: &Connection) {

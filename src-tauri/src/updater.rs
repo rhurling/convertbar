@@ -979,8 +979,9 @@ impl<R: tauri::Runtime> DrainGuard<R> {
                 return;
             };
             if *flag {
-                // Somebody else already asked the queue to stop after this job — the non-macOS
-                // Pause button is the other writer. Not ours to raise, so not ours to lower.
+                // Somebody else already asked the queue to stop after this job — the non-unix
+                // (Windows-only) Pause button is the other writer. Not ours to raise, so not
+                // ours to lower.
                 return;
             }
             *flag = true;
