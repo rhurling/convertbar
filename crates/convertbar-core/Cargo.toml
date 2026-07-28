@@ -22,5 +22,13 @@ dunce = "1.0.5"
 notify = "8"
 fs4 = { version = "0.13", features = ["sync"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+# geteuid() for the converter no-read-permission test (skipped as root). The production
+# entry above widens to cfg(unix) in the pause task, which then subsumes this one.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

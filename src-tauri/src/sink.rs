@@ -19,6 +19,13 @@ impl<R: tauri::Runtime> EventSink for TauriSink<R> {
     }
 }
 
+pub struct TrashDisposer;
+impl convertbar_core::dispose::FileDisposer for TrashDisposer {
+    fn dispose(&self, path: &str) -> bool {
+        trash::delete(path).is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

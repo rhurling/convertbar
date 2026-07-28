@@ -1,12 +1,13 @@
 pub(crate) use convertbar_core::{
-    add_progress, db, failure_class, handbrake, media_skip, probe, probe_cache, types,
+    add_progress, converter, db, failure_class, handbrake, media_skip, probe, probe_cache, types,
 };
 
 mod commands;
-mod converter;
 mod sink;
 mod watcher;
 
+use convertbar_core::ctx::Ctx;
+use convertbar_core::events::EventSink;
 use converter::{ConverterState, MenuBarUpdate};
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -44,12 +45,6 @@ fn update_install_notification(version: &str, installed: bool) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let db_path = db::get_db_path();
-    let conn = Connection::open(&db_path).expect("Failed to open database");
-    db::init_db(&conn).expect("Failed to initialize database");
-
-    let converter_state = Arc::new(ConverterState::new());
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -58,11 +53,6 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
-        .manage(AppState {
-            db: Arc::new(Mutex::new(conn)),
-            preset_cache: Mutex::new(HashMap::new()),
-        })
-        .manage(converter_state)
         .manage(watcher::WatcherState::new())
         .invoke_handler(tauri::generate_handler![
             commands::settings::get_settings,
@@ -109,6 +99,20 @@ pub fn run() {
             commands::files::reveal_in_dir,
         ])
         .setup(|app| {
+            let db_path = db::get_db_path();
+            let conn = Connection::open(&db_path).expect("Failed to open database");
+            db::init_db(&conn).expect("Failed to initialize database");
+
+            let events: Arc<dyn EventSink> = Arc::new(sink::TauriSink(app.handle().clone()));
+            let ctx = Ctx::new(conn, events, Arc::new(sink::TrashDisposer));
+            app.manage(ctx.clone());
+            // Transitional dual-manage — same Arcs, so there is one db and one ConverterState:
+            app.manage(AppState {
+                db: ctx.db.clone(),
+                preset_cache: Mutex::new(HashMap::new()),
+            });
+            app.manage(ctx.converter.clone());
+
             // Shared error flag for tray icon state
             let has_error: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
@@ -347,12 +351,10 @@ pub fn run() {
             });
 
             // Task 8: Auto-resume on launch
-            let app_state = app.state::<AppState>();
-            let conv_state = app.state::<Arc<ConverterState>>();
             let has_queued;
             let queue_paused;
             {
-                let db = app_state.db.lock().unwrap();
+                let db = ctx.db.lock().unwrap();
 
                 // Reset interrupted jobs to queued, deleting only their partial output (never the
                 // source — critical for in-place jobs where output_path == source_path).
@@ -367,10 +369,7 @@ pub fn run() {
             }
 
             if converter::should_auto_resume(has_queued, queue_paused) {
-                let db_arc = app_state.db.clone();
-                let conv_arc = (*conv_state).clone();
-                let app_handle = app.handle().clone();
-                converter::run_queue(app_handle, db_arc, conv_arc);
+                converter::run_queue(ctx.clone());
             }
 
             // Arm directory watchers and ingest any files already present in enabled folders.
@@ -413,8 +412,8 @@ pub fn run() {
             // auto-resume would delete that file and start a second encoder against
             // the same path while the orphan still holds it.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                let conv = app.state::<Arc<ConverterState>>();
-                converter::kill_active_child(&conv);
+                let ctx = app.state::<Arc<Ctx>>();
+                converter::kill_active_child(&ctx.converter);
             }
         });
 }

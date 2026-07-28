@@ -1,5 +1,8 @@
 pub mod add_progress;
+pub mod converter;
+pub mod ctx;
 pub mod db;
+pub mod dispose;
 pub mod events;
 pub mod failure_class;
 pub mod handbrake;

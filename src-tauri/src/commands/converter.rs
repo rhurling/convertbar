@@ -1,3 +1,4 @@
+use convertbar_core::ctx::Ctx;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
@@ -5,29 +6,19 @@ use crate::converter::{self, ConverterState};
 use crate::AppState;
 
 #[tauri::command]
-pub fn start_queue<R: tauri::Runtime>(
-    app: AppHandle<R>,
-    state: State<'_, AppState>,
-    converter_state: State<'_, Arc<ConverterState>>,
-) -> Result<(), String> {
-    let is_running = *converter_state
-        .is_running
-        .lock()
-        .map_err(|e| e.to_string())?;
+pub fn start_queue(ctx: State<'_, Arc<Ctx>>) -> Result<(), String> {
+    let is_running = *ctx.converter.is_running.lock().map_err(|e| e.to_string())?;
     if is_running {
         return Ok(());
     }
 
-    let db = state.db.clone();
-    let conv = (*converter_state).clone();
-
     // A user (re)starting the queue — Resume button, or a drag-drop add which routes through
     // startQueue — clears any remembered pause.
-    if let Ok(conn) = state.db.lock() {
+    if let Ok(conn) = ctx.db.lock() {
         crate::converter::set_queue_paused(&conn, false);
     }
 
-    converter::run_queue(app, db, conv);
+    converter::run_queue(ctx.inner().clone());
     Ok(())
 }
 
@@ -523,17 +514,17 @@ mod tests {
             [],
         )
         .unwrap();
-        app.manage(crate::AppState {
-            db: Arc::new(Mutex::new(conn)),
-            preset_cache: Mutex::new(Default::default()),
-        });
-        app.manage(Arc::new(ConverterState::new()));
+        let ctx = Ctx::new(
+            conn,
+            Arc::new(convertbar_core::events::TestSink::default()),
+            Arc::new(convertbar_core::dispose::DeleteDisposer),
+        );
+        app.manage(ctx.clone());
 
         // Resume: clears the remembered pause (synchronously, before spawning the queue thread).
-        start_queue(app.handle().clone(), app.state(), app.state()).unwrap();
+        start_queue(app.state()).unwrap();
 
-        let state: State<'_, AppState> = app.state();
-        let paused: String = state
+        let paused: String = ctx
             .db
             .lock()
             .unwrap()

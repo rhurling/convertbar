@@ -549,6 +549,7 @@ dependencies = [
  "dirs 6.0.0",
  "dunce",
  "fs4",
+ "libc",
  "notify",
  "regex",
  "rusqlite",
