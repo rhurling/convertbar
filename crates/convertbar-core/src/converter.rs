@@ -10,21 +10,21 @@ use crate::types::JobInfo;
 
 /// Filename marker for an in-flight in-place encode. A recognizable, non-suffix token so
 /// `is_video_file` can exclude it — a folder scan or watched folder must never enqueue a temp.
-pub const IN_PLACE_TEMP_MARKER: &str = ".convertbar-tmp.";
+pub(crate) const IN_PLACE_TEMP_MARKER: &str = ".convertbar-tmp.";
 
 /// A job re-encodes a file onto itself exactly when its stored output path equals its source.
 /// Compared as `Path` (not raw strings) so this predicate matches the add-time detection in
 /// `add_files_to_db` (`output_path.as_path() == path`), which normalizes `//` and `/.` segments.
 /// A mismatch here would route an in-place job through the distinct-file path and overwrite/delete
 /// the user's source — so the two predicates MUST stay identical.
-pub fn is_in_place(source_path: &str, output_path: &str) -> bool {
+pub(crate) fn is_in_place(source_path: &str, output_path: &str) -> bool {
     std::path::Path::new(source_path) == std::path::Path::new(output_path)
 }
 
 /// Temp output path for an in-place encode: a hidden, marked sibling in the SAME directory so the
 /// final `rename` is atomic (same filesystem). Keeps `.mp4` so HandBrake's container matches the
 /// distinct-file path.
-pub fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
+pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(source_path);
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
     let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -137,6 +137,11 @@ fn apply_in_place_action(
         InPlaceAction::TrashSourceThenRename => {
             if let Some(s) = source.to_str() {
                 let _ = disposer.dispose(s);
+            } else {
+                // Source paths are read from the DB as UTF-8 `String`s (rusqlite TEXT
+                // columns), so this is unreachable in practice — pinned rather than
+                // silently skipping the dispose call and falling through to the rename.
+                debug_assert!(false, "source paths come from the DB as UTF-8 Strings");
             }
             std::fs::rename(temp, source)
         }
@@ -154,20 +159,20 @@ fn in_place_apply_is_fatal(kept: KeptFile, apply_failed: bool) -> bool {
 }
 
 pub struct ConverterState {
-    pub current_pid: Mutex<Option<u32>>,
-    pub current_child: Mutex<Option<Child>>,
-    pub current_job_id: Mutex<Option<String>>,
-    pub is_paused: Mutex<bool>,
-    pub is_running: Mutex<bool>,
-    pub pause_after_current: Mutex<bool>,
+    pub(crate) current_pid: Mutex<Option<u32>>,
+    pub(crate) current_child: Mutex<Option<Child>>,
+    pub(crate) current_job_id: Mutex<Option<String>>,
+    pub(crate) is_paused: Mutex<bool>,
+    pub(crate) is_running: Mutex<bool>,
+    pub(crate) pause_after_current: Mutex<bool>,
     /// One-way app-teardown latch: armed by `kill_active_child`, checked by
     /// `process_queue` so the queue thread never spawns another encoder mid-quit.
-    pub shutdown: std::sync::atomic::AtomicBool,
+    pub(crate) shutdown: std::sync::atomic::AtomicBool,
     /// Reason the queue is currently paused for low disk space, if any. Set when the low-disk
     /// gate trips, cleared at the start of every `process_queue` run so a resume (or a run that
     /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
     /// backend state on mount, not just the live `queue-paused-low-disk` event.
-    pub low_disk_pause: Mutex<Option<LowDiskPause>>,
+    pub(crate) low_disk_pause: Mutex<Option<LowDiskPause>>,
 }
 
 impl ConverterState {
@@ -204,6 +209,12 @@ impl ConverterState {
     /// the "Pause after this" button, which reads it on mount rather than mirroring locally.
     pub fn is_pause_after_current(&self) -> bool {
         self.pause_after_current.lock().map(|g| *g).unwrap_or(false)
+    }
+
+    /// Whether the queue is currently processing jobs. The head-agnostic read of `is_running`
+    /// (e.g. the desktop tray listener), so callers outside this crate never touch the raw field.
+    pub fn is_running(&self) -> bool {
+        self.is_running.lock().map(|g| *g).unwrap_or(false)
     }
 }
 
@@ -352,18 +363,18 @@ const LOW_DISK_HEADROOM_FACTOR: u64 = 2;
 /// Bytes that must remain free on a job's destination filesystem before its encode may start:
 /// the user's configured floor plus headroom for the encode itself. Saturating so an enormous
 /// configured floor (or source size) can't wrap.
-pub fn required_free_bytes(reserve_floor: u64, source_size: u64) -> u64 {
+pub(crate) fn required_free_bytes(reserve_floor: u64, source_size: u64) -> u64 {
     reserve_floor.saturating_add(source_size.saturating_mul(LOW_DISK_HEADROOM_FACTOR))
 }
 
 /// Whether `available` free bytes clear the reserve floor plus the encode headroom.
-pub fn has_enough_disk(available: u64, reserve_floor: u64, source_size: u64) -> bool {
+pub(crate) fn has_enough_disk(available: u64, reserve_floor: u64, source_size: u64) -> bool {
     available >= required_free_bytes(reserve_floor, source_size)
 }
 
 /// GiB (1024³ bytes), as configured in settings, to bytes. `f64 as u64` saturates at `u64::MAX`
 /// and clamps negatives/zero to 0, so a garbage or huge stored value can't panic or wrap.
-pub fn gb_to_bytes(gb: f64) -> u64 {
+pub(crate) fn gb_to_bytes(gb: f64) -> u64 {
     if gb <= 0.0 {
         return 0;
     }
@@ -451,7 +462,7 @@ fn get_low_disk_min_gb(db: &Connection) -> f64 {
 /// Persisted "the user deliberately stopped the queue" flag, stored in the settings table.
 /// Read-with-default (no seed) so existing databases need no migration and the settings-count
 /// guard test is untouched. It is backend runtime state — NOT in ALLOWED_KEYS, NOT in the UI.
-pub fn set_queue_paused(db: &Connection, paused: bool) {
+pub(crate) fn set_queue_paused(db: &Connection, paused: bool) {
     let _ = db.execute(
         "INSERT INTO settings (key, value) VALUES ('queue_paused', ?1)
          ON CONFLICT(key) DO UPDATE SET value = ?1",
@@ -494,7 +505,7 @@ fn source_is_confirmed_missing(probe: std::io::Result<bool>) -> bool {
 /// therefore never destroys. That is the opposite polarity from
 /// [`source_is_confirmed_missing`], which fails open because there the safe answer is
 /// "let HandBrake try".
-pub fn source_is_readable(path: &str) -> bool {
+pub(crate) fn source_is_readable(path: &str) -> bool {
     use std::io::Read;
     match std::fs::File::open(path) {
         Ok(mut f) => {
@@ -3114,6 +3125,36 @@ HandBrake has exited.";
     }
 
     #[test]
+    fn in_place_trash_mode_disposes_source_then_renames_temp() {
+        // Re-encode won (KeptFile::Converted) in trash mode: the decision fn must route to
+        // TrashSourceThenRename, and applying it must dispose of the SOURCE (not delete it
+        // directly, and not the temp) before renaming the temp over it.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        let temp = dir.path().join(".clip.convertbar-tmp.mp4");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::write(&temp, b"reencoded").unwrap();
+        let disposer = RecordingDisposer::default();
+
+        let action = in_place_action(KeptFile::Converted, "trash");
+        assert_eq!(action, InPlaceAction::TrashSourceThenRename);
+
+        apply_in_place_action(action, &temp, &source, &disposer).unwrap();
+
+        assert_eq!(
+            disposer.0.lock().unwrap().as_slice(),
+            [source.to_str().unwrap().to_string()],
+            "the disposer must be called with the SOURCE path, not the temp"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"reencoded",
+            "the temp was renamed over the (now-disposed) source"
+        );
+        assert!(!temp.exists(), "temp was consumed by the rename");
+    }
+
+    #[test]
     fn apply_remove_temp_keeps_source_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("clip.mp4");
@@ -3411,6 +3452,41 @@ HandBrake has exited.";
         assert!(
             is_queue_paused(&ctx.db.lock().unwrap()),
             "pause-after-current firing must persist the paused state"
+        );
+    }
+
+    #[test]
+    fn successful_encode_notifies_with_the_file_name_when_notifications_are_enabled() {
+        // `test_conn` disables per-file notifications so unrelated tests aren't distracted by
+        // them; this test turns the setting back on to pin the positive case a sibling of
+        // `pause_after_current_firing_persists_queue_paused` doesn't cover: a successful encode
+        // notifies, and the notification body names the file.
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
+        set_setting(&ctx.db, "notifications_per_file", "true");
+        set_setting(&ctx.db, "cleanup_mode", "delete"); // keep cleanup filesystem-local (no Trash)
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let src = dir.path().join("in.mp4");
+        std::fs::write(&src, b"0123456789").unwrap(); // real source (10 bytes) so cleanup/metadata work
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            10,
+        );
+
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done", "the job completes");
+        let notifications = sink.notifications.lock().unwrap();
+        assert!(
+            notifications
+                .iter()
+                .any(|(_, body)| body.contains("in.mp4")),
+            "a successful encode must notify with the file name, got: {notifications:?}"
         );
     }
 }

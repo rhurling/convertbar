@@ -1,4 +1,4 @@
-pub(crate) use convertbar_core::{converter, db, handbrake, probe, types, watcher};
+pub(crate) use convertbar_core::{converter, db, handbrake, types, watcher};
 
 mod commands;
 mod sink;
@@ -127,8 +127,7 @@ pub fn run() {
                                 if *err {
                                     *err = false;
                                     let conv = &app.state::<Arc<Ctx>>().converter;
-                                    let is_running = *conv.is_running.lock().unwrap();
-                                    if !is_running {
+                                    if !conv.is_running() {
                                         if let Some(tray) = app.tray_by_id("main") {
                                             let _ = tray.set_title(Some(""));
                                             let _ = tray.set_tooltip(Some("ConvertBar — No active conversions"));
@@ -201,8 +200,7 @@ pub fn run() {
                                         if *err {
                                             *err = false;
                                             let conv = &app.state::<Arc<Ctx>>().converter;
-                                            let is_running = *conv.is_running.lock().unwrap();
-                                            if !is_running {
+                                            if !conv.is_running() {
                                                 let _ = tray_icon.set_title(Some(""));
                                                 let _ = tray_icon.set_tooltip(Some("ConvertBar — No active conversions"));
                                             }

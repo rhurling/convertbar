@@ -1,5 +1,4 @@
 use convertbar_core::ctx::Ctx;
-use rusqlite::params;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
@@ -51,11 +50,5 @@ pub fn set_preset_suffix(
     preset: String,
     suffix: String,
 ) -> Result<(), String> {
-    let conn = ctx.db.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO preset_suffixes (preset_name, suffix) VALUES (?1, ?2) ON CONFLICT(preset_name) DO UPDATE SET suffix = ?2",
-        params![preset, suffix],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    convertbar_core::settings_ops::set_preset_suffix(&ctx, &preset, &suffix)
 }

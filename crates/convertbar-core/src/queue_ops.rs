@@ -95,7 +95,7 @@ fn read_configured_handbrake_path(conn: &rusqlite::Connection) -> Option<String>
 /// this is meant to run OUTSIDE the DB mutex (see R3 in `purge_bad_sources`'s doc comment: this
 /// used to run per id, under the lock, in both purge phases — up to 2N blocking spawns for a
 /// batch of N ids).
-fn resolve_handbrake_path(configured: Option<&str>) -> Result<String, String> {
+fn resolve_from_configured(configured: Option<&str>) -> Result<String, String> {
     if let Some(path) = configured {
         if !path.is_empty() && std::path::Path::new(path).exists() {
             return Ok(path.to_string());
@@ -105,7 +105,7 @@ fn resolve_handbrake_path(configured: Option<&str>) -> Result<String, String> {
 }
 
 fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
-    resolve_handbrake_path(read_configured_handbrake_path(conn).as_deref())
+    resolve_from_configured(read_configured_handbrake_path(conn).as_deref())
 }
 
 /// Whether a row's verdict should be re-verified with a fresh scan before its file is
@@ -371,7 +371,7 @@ fn mark_recovered(conn: &rusqlite::Connection, id: &str) {
 /// passed `"delete"` literally, so the DEFAULT `"trash"` arm, sold to users as recoverable, was
 /// never distinguished from a permanent delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PurgeAction {
+pub(crate) enum PurgeAction {
     Trash,
     Delete,
 }
@@ -1256,11 +1256,11 @@ pub fn purge_bad_sources(ctx: &Arc<Ctx>, ids: Vec<String>) -> Result<Vec<PurgeRe
     };
     let action = PurgeAction::from_setting(&action);
     // R3: resolved ONCE for the whole batch, OUTSIDE the lock, and passed to every
-    // `purge_one_locked` call below. `resolve_handbrake_path`'s fallback spawns a blocking
+    // `purge_one_locked` call below. `resolve_from_configured`'s fallback spawns a blocking
     // `which`/`where` subprocess (`detect_handbrake_path`) — this used to run per id, under
     // the DB mutex, in both purge phases, i.e. up to 2N blocking spawns under the lock for a
     // batch of N ids.
-    let handbrake_path = resolve_handbrake_path(configured_handbrake_path.as_deref());
+    let handbrake_path = resolve_from_configured(configured_handbrake_path.as_deref());
     Ok(ids
         .iter()
         .map(|id| PurgeResult {
@@ -1631,6 +1631,35 @@ mod tests {
             without_flag.added.len(),
             1,
             "without the flag, a done source is re-added"
+        );
+    }
+
+    // Pins the RAII bracketing Plan 1 preserved by hand: `AddOp`'s `add-finished` fires on Drop
+    // (before the `queue-updated` emit that follows it in `add_files`), so the UI spinner always
+    // clears before the queue refetch signal — even for a trivially empty add.
+    #[test]
+    fn add_files_emits_finished_before_queue_updated() {
+        let (ctx, sink, _d) = test_ctx(test_conn());
+        // an empty add still brackets: add-started → add-finished → queue-updated
+        let _ = add_files(&ctx, &[]);
+        let names: Vec<String> = sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        let fin = names
+            .iter()
+            .position(|n| n == "add-finished")
+            .expect("add-finished emitted");
+        let upd = names
+            .iter()
+            .position(|n| n == "queue-updated")
+            .expect("queue-updated emitted");
+        assert!(
+            fin < upd,
+            "spinner must clear before the queue refetch signal"
         );
     }
 
