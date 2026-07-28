@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { httpCommands } from "../lib/transport/http";
 import type { FsEntry } from "../lib/transport/types";
 
-const ROOT = "/";
+const FALLBACK_ROOT = "/";
 
 interface FileBrowserModalProps {
   /** "files": multi-select files to add to the queue. "directory": pick one directory to watch. */
@@ -11,13 +11,32 @@ interface FileBrowserModalProps {
   onClose: () => void;
 }
 
+/** The configured root that contains `path`, so breadcrumb up-navigation never offers an
+ * ancestor above it (the server 403s anything outside `browse_roots` — see `routes::fs`). */
+function containingRoot(path: string, roots: string[]): string {
+  return roots.find((root) => path === root || path.startsWith(root.endsWith("/") ? root : `${root}/`)) ?? roots[0];
+}
+
+/** Joins a root with the relative segments under it, without producing a doubled slash when
+ * root is "/" itself. */
+function joinUnderRoot(root: string, segments: string[]): string {
+  if (segments.length === 0) return root;
+  const base = root === "/" ? "" : root;
+  return `${base}/${segments.join("/")}`;
+}
+
 /**
  * Server-head-only file/folder browser, backed by the http transport's `fsList` (a server-only
  * extra outside `Transport` — imported directly from `transport/http`, same seam LoginScreen
  * uses for `login`). Replaces Tauri's native dialog, which has no equivalent in a browser tab.
+ *
+ * Starts at the first configured `browse_roots` entry (fetched via `getAppInfo()` on mount)
+ * rather than always guessing "/" — a deployment that restricts `CONVERTBAR_BROWSE_ROOTS` (e.g.
+ * to `/media`) would otherwise 403 on the very first listing with no way to navigate anywhere.
  */
 export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowserModalProps) {
-  const [path, setPath] = useState(ROOT);
+  const [roots, setRoots] = useState<string[]>([FALLBACK_ROOT]);
+  const [path, setPath] = useState<string | null>(null);
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
@@ -38,8 +57,26 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
     }
   }, []);
 
+  // Resolve the configured root(s) before the first listing, so the modal starts inside
+  // whatever the deployment actually allows browsing rather than an unconditional "/".
   useEffect(() => {
-    load(ROOT);
+    let active = true;
+    httpCommands
+      .getAppInfo()
+      .then((info) => {
+        if (!active) return;
+        const resolvedRoots = info.browse_roots.length > 0 ? info.browse_roots : [FALLBACK_ROOT];
+        setRoots(resolvedRoots);
+        return load(resolvedRoots[0]);
+      })
+      .catch(() => {
+        // getAppInfo itself failing is unexpected (it's the same endpoint that gated this
+        // component's very presence) — fall back to "/" rather than leaving the modal stuck.
+        if (active) load(FALLBACK_ROOT);
+      });
+    return () => {
+      active = false;
+    };
   }, [load]);
 
   const toggleSelect = (entryPath: string) => {
@@ -60,13 +97,16 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   };
 
   const handleConfirm = () => {
-    onSelect(mode === "directory" ? [path] : [...selected]);
+    onSelect(mode === "directory" ? [path!] : [...selected]);
   };
 
-  // Breadcrumb: "/" plus one crumb per path segment, each jumping straight to that ancestor.
-  const segments = path === ROOT ? [] : path.split("/").filter(Boolean);
+  // Breadcrumb: a crumb for the containing configured root (its own label, not always "/"),
+  // then one crumb per path segment beneath it — never a crumb above the root itself.
+  const root = path === null ? roots[0] : containingRoot(path, roots);
+  const relativeSegments =
+    path === null || path === root ? [] : path.slice(root.length).split("/").filter(Boolean);
 
-  const confirmDisabled = mode === "files" && selected.size === 0;
+  const confirmDisabled = path === null || (mode === "files" && selected.size === 0);
   const confirmLabel =
     mode === "directory"
       ? "Choose this folder"
@@ -83,13 +123,13 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
         </div>
 
         <div className="file-browser-breadcrumb">
-          <button type="button" onClick={() => load(ROOT)}>
-            /
+          <button type="button" onClick={() => load(root)}>
+            {root}
           </button>
-          {segments.map((seg, i) => (
+          {relativeSegments.map((seg, i) => (
             <span key={i}>
               <span className="breadcrumb-sep"> / </span>
-              <button type="button" onClick={() => load("/" + segments.slice(0, i + 1).join("/"))}>
+              <button type="button" onClick={() => load(joinUnderRoot(root, relativeSegments.slice(0, i + 1)))}>
                 {seg}
               </button>
             </span>

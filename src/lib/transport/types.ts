@@ -173,6 +173,9 @@ export interface AppInfo {
   head: "desktop" | "server";
   can_pause_process: boolean;
   auth_required: boolean;
+  // Confines the file-browser modal's starting path and up-navigation. Always empty on
+  // desktop (no browse roots there); on server it mirrors ServerConfig::browse_roots.
+  browse_roots: string[];
 }
 
 // Server-only (file browser; desktop never calls these):

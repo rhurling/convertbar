@@ -605,7 +605,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn get_api_info_returns_the_four_fields() {
+    async fn get_api_info_returns_the_five_fields() {
         let app = api_router(test_state());
 
         let response = app
@@ -630,6 +630,8 @@ pub(crate) mod tests {
         assert_eq!(json["can_pause_process"], cfg!(unix));
         // AuthMode::Open in test_state() -> auth is not required.
         assert_eq!(json["auth_required"], false);
+        // test_state() sets no CONVERTBAR_BROWSE_ROOTS, so ServerConfig defaults to ["/"].
+        assert_eq!(json["browse_roots"], json!(["/"]));
     }
 
     /// Regression: a nested router with no `.fallback()` of its own inherits the OUTER

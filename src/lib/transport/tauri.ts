@@ -112,6 +112,7 @@ export const tauriCommands = {
       head: "desktop",
       can_pause_process: caps.can_pause_process,
       auth_required: false,
+      browse_roots: [], // no browse roots on desktop — it uses the native file picker instead
     };
   },
 };
