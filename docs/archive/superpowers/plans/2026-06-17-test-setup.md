@@ -398,10 +398,15 @@ with `vi.mock`.
 
 ## Phase 4 — Process orchestration (optional) *(outline)*
 
-> **Status (2026-06-17): intentionally skipped.** Phases 0–3 are complete and merged to `main`.
+> **Status (2026-07-28): DONE — this note is superseded.** It was skipped on 2026-06-17 as
+> high-effort, but PR #78 later added a mock-runtime harness: `process_queue` is generic over
+> `tauri::Runtime` and is now covered directly, alongside cancel-ordering tests. `converter.rs`
+> carries ~67 `#[test]`s. Nothing in this phase remains outstanding.
+
+> ~~**Status (2026-06-17): intentionally skipped.** Phases 0–3 are complete and merged to `main`.
 > This phase is gated on "only if orchestration keeps regressing" — no regressions observed, and the
 > integration test of `process_queue` is high-effort (live `AppHandle`, spawned processes/threads).
-> Revisit if orchestration starts regressing.
+> Revisit if orchestration starts regressing.~~
 
 Integration test of `process_queue` against a fake `HandBrakeCLI` shell script emitting canned progress lines
 and a known-size output. High effort; only if orchestration keeps regressing. Do **not** test `libc::kill`

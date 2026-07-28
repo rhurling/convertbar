@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cut a ConvertBar release: bump → build → commit → push → PR → merge → tag.
-# See docs/superpowers/specs/2026-06-18-release-script-design.md
+# See docs/archive/superpowers/specs/2026-06-18-release-script-design.md
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 

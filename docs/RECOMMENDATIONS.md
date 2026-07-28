@@ -1,24 +1,35 @@
-# ConvertBar — Improvement Recommendations (written at v0.6.0; statuses refreshed 2026-07-08)
+# ConvertBar — Improvement Recommendations (written at v0.6.0; statuses refreshed 2026-07-28 at v1.0.0)
+
+This is the live backlog. Everything below the "Open" headings was verified against
+shipped v1.0.0 code on 2026-07-28; items found already implemented were moved into
+"Implemented". Historical design docs live in `docs/archive/`.
 
 ## Current State Summary
 
-The app covers ~95% of the original spec. Core functionality works: drag-and-drop queuing, HandBrakeCLI encoding with progress parsing (stdout, `\r`-delimited), SIGSTOP/SIGCONT pause/resume, template-based suffix generation from preset metadata, configurable menu bar display, history with search/sort and space savings tracking, draggable popup with position memory, screen confinement, macOS notifications, tray context menu, and queue drag reordering.
+Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress parsing (stdout, `\r`-delimited), SIGSTOP/SIGCONT pause/resume (macOS) with queue-level pause elsewhere, template-based suffix generation from preset metadata, configurable menu bar display, history with search/sort and space savings tracking, draggable popup with position memory, screen confinement, native notifications, tray context menu, and queue drag reordering. Cross-platform: macOS, Windows, Linux.
 
 ### Known Working
 - Queue management (add files/folders, remove, clear queue, pause after current, drag reorder)
 - Progress display in UI and menu bar (percent, ETA, fps, queue count, filename — all configurable)
-- History with search, sort, "Clear All" / "Clear Errors Only" dropdown
-- macOS native notifications (per-file, errors-only, queue complete — all configurable)
+- History with search, sort, "Clear All" / "Clear Errors Only" dropdown, context menu
+- Native notifications (per-file, errors-only, queue complete — all configurable)
 - HandBrakeCLI startup validation with warning banner
 - Settings: preset, suffix template with variables, cleanup mode, launch at login, HandBrakeCLI path, menu bar display, notifications
 - Template tray icon (auto dark/light mode) with right-click context menu
 - Close/Quit buttons, draggable window with position memory
+- Watched folders with serialized intake and an add-progress indicator (v0.14–v0.16)
+- True in-place re-encode (temp file + atomic rename), skip-by-source-media, probe-once cache
+- Low-disk auto-pause with a Resume affordance (v0.17)
+- Queue-pause persistence across restarts (v0.18)
+- Bad-source detection, review list, and truncation guard (v0.19)
+- Auto-update check and install with notification
 
 ### Known Limitations
 - HandBrakeCLI already prevents macOS sleep during encoding (verified via `pmset -g assertions`) — no wrapper needed
 - Progress output goes to stdout (not stderr) when piped — fixed in v0.3.0
 - `window.confirm()` doesn't work in Tauri popup — replaced with in-app confirmation UI
 - Folders with 1-5 files auto-add, >5 files prompt for confirmation
+- One encode at a time by design (parallel encodes contend for the same GPU encoder)
 
 ---
 
@@ -49,6 +60,17 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 - HTML5 drag-and-drop with visual drop target indicator
 - Calls `reorderQueue` on drop to persist new order
 
+### 10. Better Empty States — *verified shipped at 1.0.0*
+- Queue: "Drag video files or folders here to get started" (`src/pages/QueuePage.tsx`)
+- History: "Completed conversions will appear here" (`src/pages/HistoryPage.tsx`)
+- Partial: `brew install handbrake` appears in the Queue warning banner, not in Settings,
+  and is not click-to-copy. Remaining polish tracked under "Open — Polish" below.
+
+### 11. Button Press Feedback — *verified shipped at 1.0.0*
+- `.btn:active { transform: scale(0.96) }` and `.btn:disabled { opacity: .5; cursor: not-allowed }`
+  in `src/App.css`, plus `:active` states on `.btn-icon` / `.btn-quit`
+- `cursor: pointer` applied consistently across interactive classes
+
 ---
 
 ## Open — High Impact
@@ -57,14 +79,13 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 **Why:** Power users want to control the app without clicking.
 
 **What:**
-- `Space` — pause/resume active conversion
-- `Escape` — close/hide popover
-- `Cmd+Q` — quit app
+- ~~`Escape` — close/hide popover~~ — **shipped**, `src/App.tsx` keydown handler → `commands.hideWindow()`
+- `Space` — pause/resume active conversion — still open
+- `Cmd+Q` — quit app — still open (no `metaKey`/`ctrlKey` handling anywhere in `src/`)
 - ~~`Cmd+Shift+C` (global) — toggle popover visibility from anywhere~~ — **dropped at 1.0**, see the
   spec-compliance table below
 
-**How:**
-- In-app shortcuts: add `onKeyDown` handler to the App component
+**How:** add two cases to the existing keydown handler in `src/App.tsx`.
 
 **Files:** `src/App.tsx` (keydown handler)
 
@@ -95,7 +116,9 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 - Play a different sound on error
 - Settings toggle + sound selector
 
-**How:** Use `NSSound` via Rust FFI, or simpler: spawn `afplay /System/Library/Sounds/Glass.aiff` as a subprocess.
+**How:** spawn `afplay /System/Library/Sounds/Glass.aiff` as a subprocess. Note the app is
+cross-platform as of 1.0 — `afplay` is macOS-only, so this needs a per-platform arm
+(or a no-op) for Windows and Linux.
 
 **Files:** `src-tauri/src/converter.rs` (play sound after job completion), `src-tauri/src/db.rs` (add setting), `src/pages/SettingsPage.tsx` (toggle)
 
@@ -105,31 +128,33 @@ The app covers ~95% of the original spec. Core functionality works: drag-and-dro
 **Why:** Typing a file path manually is error-prone. A native file browser is more user-friendly.
 
 **What:**
-- "Browse" button next to the HandBrakeCLI path field
-- Opens native macOS file picker filtered to executables
+- "Browse" button next to the HandBrakeCLI path field (Settings currently has **Detect** only)
+- Opens the native file picker filtered to executables
 
-**How:** Use `tauri-plugin-dialog` for native file selection (the plugin is already
-registered in `src-tauri/src/lib.rs` — only the button and a dialog invocation are missing).
+**How:** *(corrected 2026-07-28 — the original "use `tauri-apps/plugin-dialog` from the
+frontend" advice no longer applies: that npm package was removed; only the Rust half of the
+plugin is still registered.)* Add a `pick_file` command mirroring `pick_folder` in
+`src-tauri/src/commands/watch.rs` and invoke it from the button. Two constraints carried by
+that existing command: it **must** be `async` (a sync command runs on the main thread, and
+`blocking_pick_*` dispatches the panel to the main thread and then blocks — deadlocking the
+event loop), and being Rust-invoked it needs **no** frontend `dialog` ACL grant.
 
-**Files:** `src/pages/SettingsPage.tsx` (browse button)
+**Files:** `src-tauri/src/commands/watch.rs` (new `pick_file`), `src-tauri/src/lib.rs`
+(register), `src/pages/SettingsPage.tsx` (browse button)
 
 ---
 
 ## Open — Polish
 
-### 10. Better Empty States
-- Queue: "Drag video files or folders here to get started" with a subtle icon
-- History: "Completed conversions will appear here"
-- Settings preset error: "Install HandBrakeCLI: `brew install handbrake`" with copyable command
-
-### 11. Button Press Feedback
-- Add `:active` pseudo-state to all `.btn` classes (slight scale or darken)
-- Add `cursor: pointer` consistently on all interactive elements
-- Add disabled state styling (opacity 0.5, cursor: not-allowed)
+### 10b. Empty-State Remainder
+- Settings preset error: "Install HandBrakeCLI: `brew install handbrake`" with copyable command.
+  The command currently appears only in the Queue warning banner and is not copyable.
+  (The Queue and History empty states themselves shipped — see "Implemented".)
 
 ### 12. Accessibility
-- Add `role` and `aria-label` attributes to buttons (Pause, Resume, Cancel)
-- Visible focus indicators (`:focus-visible` outline)
+- Add `role` and `aria-label` attributes to buttons (Pause, Resume, Cancel) — `src/components/ActiveJob.tsx`
+  uses `title=` only, and `aria-label` appears exactly once in all of `src/` (`TabBar.tsx`)
+- Visible focus indicators (`:focus-visible` outline) — zero occurrences in `src/App.css`
 - Ensure tab order is logical through all pages
 - Test with VoiceOver
 
@@ -160,6 +185,8 @@ registered in `src-tauri/src/lib.rs` — only the button and a dialog invocation
 
 ## Technical Debt
 
-- Debug log file (`debug_progress.log`) may still exist in app data dir from testing — can be manually deleted
-- CSS has some hardcoded colors instead of using CSS variables consistently
 - Tray context menu is static (Show + Quit) — dynamic Pause/Resume items deferred due to complexity
+
+*(Removed 2026-07-28: the `debug_progress.log` entry — zero references remain anywhere in
+`src-tauri/src/`. The "hardcoded CSS colors" entry — `src/App.css` is now ~140 `var(--…)`
+uses against 17 raw hex values, which is convergence rather than debt.)*

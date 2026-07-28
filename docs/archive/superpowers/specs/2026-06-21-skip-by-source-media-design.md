@@ -78,12 +78,18 @@ old device" (e.g. AV1 → h265) would be skipped. The escape hatch is the toggle
 turn **Skip files already at/below target** off (globally or for that batch). We are
 **not** building a separate "force codec" override — one toggle, YAGNI.
 
-## Default ON — conscious behavior change
+## ~~Default ON — conscious behavior change~~ — **REVERSED IN IMPLEMENTATION**
 
-The setting defaults to `"true"`. After an update, existing users' adds — including
+> **[Superseded — the shipped default is OFF.]** `db.rs` seeds
+> `("skip_by_source_media", "false")`, and the test at `db.rs` documents the reasoning:
+> the check shells out to HandBrake once per file, so it is opt-in rather than a cost
+> every user pays silently on every add. The paragraph below records the original
+> intent only; it is not what shipped.
+
+~~The setting defaults to `"true"`. After an update, existing users' adds — including
 watched-folder auto-adds — begin probing and skipping automatically, and a
 compatibility-driven user must actively turn it off. Accepted as the right default for a
-space-saving app.
+space-saving app.~~
 
 ## Architecture & data flow
 
