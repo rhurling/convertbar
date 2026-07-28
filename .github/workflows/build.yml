@@ -46,11 +46,14 @@ jobs:
         run: |
           PREV=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
           CURRENT=$(git describe --tags --abbrev=0)
-          if [ -n "$PREV" ]; then
-            echo "body=**Full changelog**: https://github.com/rhurling/convertbar/compare/${PREV}...${CURRENT}" >> $GITHUB_OUTPUT
-          else
-            echo "body=Initial release." >> $GITHUB_OUTPUT
-          fi
+          # Heredoc, not `echo "body=..."`: a multi-line value written as key=value makes the
+          # runner fail the step with "Invalid format", and any notes line containing `=`
+          # would be parsed as a further output.
+          {
+            echo "body<<CONVERTBAR_NOTES_EOF"
+            ./scripts/release-notes.sh "$PREV" "$CURRENT"
+            echo "CONVERTBAR_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
