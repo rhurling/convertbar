@@ -1421,7 +1421,15 @@ mod tests {
         // Drives the real `run_cycle`, so deleting its `if manual { manual_check_block(..) }`
         // guard turns this red: without it the check proceeds, walks the status off
         // WaitingForIdle and orphans the deferral.
-        let app = mock_app();
+        //
+        // Deliberately built WITHOUT `AppState`: the refusal fires before `run_cycle` reads the
+        // mode, so the correct code never needs it, while the mutated code falls straight through
+        // to that read and returns a different error. The mutation therefore fails on the message
+        // assertion rather than panicking further down the check path.
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(std::sync::Arc::new(UpdaterRuntime::default()));
         let handle = app.handle().clone();
         arm_pending(&handle, true);
 
