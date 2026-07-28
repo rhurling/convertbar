@@ -6,6 +6,10 @@ Menu bar app for batch video conversion using HandBrakeCLI. Built with Tauri 2 +
 
 Cargo workspace: `crates/convertbar-core` (head-agnostic engine: converter, watcher, queue_ops, control, settings_ops, db — zero tauri deps, enforced by the crate graph) + `src-tauri` (desktop shell: thin `#[tauri::command]` adapters, tray, updater, dialogs, `TauriSink`/`TrashDisposer`). The version lives in the root `Cargo.toml` `[workspace.package]`; `release.sh` bumps it there. Run tests with `cargo test --workspace`.
 
+## Emitting Events Under the DB Lock
+
+Never emit a Tauri event while holding `ctx.db`'s lock (`crates/convertbar-core/src/control.rs:80-82` and sibling call sites): the desktop tray listener re-locks `ctx.db` synchronously on the same thread to read settings, and `std::sync::Mutex` is not reentrant, so holding the guard across an emit self-deadlocks. Pause/resume/cancel drop the `db` guard before emitting; `LockProbeSink` (a test double in `control.rs`) fails loud instead of hanging if this regresses. Two shipped deadlocks came from violating it.
+
 ## Version Bump Workflow
 
 `main` is protected (changes via PR, no merge commits, signed commits). Use the `/release` skill, or run the script it wraps:
