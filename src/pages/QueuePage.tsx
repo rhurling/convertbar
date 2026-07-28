@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../lib/events";
 import { useQueue } from "../hooks/useQueue";
 import DropZone from "../components/DropZone";
 import ActiveJob from "../components/ActiveJob";
