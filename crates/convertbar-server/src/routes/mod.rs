@@ -8,10 +8,14 @@ use tokio::sync::broadcast;
 
 use crate::config::ServerConfig;
 
+pub mod converter;
 pub mod events;
+pub mod handbrake;
 pub mod history;
 pub mod info;
 pub mod queue;
+pub mod settings;
+pub mod watch;
 
 /// Maps a core `Err(String)` to the `500 {"error": ...}` shape shared by every route.
 pub fn core_err(e: String) -> (axum::http::StatusCode, Json<Value>) {
@@ -56,6 +60,46 @@ pub fn api_router(state: ServerState) -> Router {
         .route("/history/summary", get(history::get_history_summary))
         .route("/history/{id}", delete(history::remove_history_entry))
         .route("/history/clear", post(history::clear_completed))
+        .route("/converter/start", post(converter::start_queue))
+        .route("/converter/pause", post(converter::pause_conversion))
+        .route("/converter/resume", post(converter::resume_conversion))
+        .route("/converter/cancel", post(converter::cancel_conversion))
+        .route(
+            "/converter/pause-after-current",
+            post(converter::pause_after_current)
+                .delete(converter::cancel_pause_after_current)
+                .get(converter::get_pause_after_current),
+        )
+        .route(
+            "/converter/low-disk-pause",
+            get(converter::get_low_disk_pause),
+        )
+        .route("/settings", get(settings::get_settings))
+        .route("/settings/{key}", put(settings::update_setting))
+        .route(
+            "/presets/{preset}/suffix",
+            get(settings::get_preset_suffix).put(settings::set_preset_suffix),
+        )
+        .route(
+            "/presets/{preset}/suffix/generate",
+            post(handbrake::generate_preset_suffix),
+        )
+        .route("/suffix/resolve", post(handbrake::resolve_suffix_template))
+        .route("/handbrake/detect", get(handbrake::detect_handbrake))
+        .route("/handbrake/presets", get(handbrake::list_handbrake_presets))
+        .route("/handbrake/validate", get(handbrake::validate_handbrake))
+        .route(
+            "/watched",
+            get(watch::get_watched_directories).post(watch::add_watched_directory),
+        )
+        .route(
+            "/watched/{id}",
+            put(watch::update_watched_directory).delete(watch::remove_watched_directory),
+        )
+        .route(
+            "/watched/{id}/enabled",
+            put(watch::set_watched_directory_enabled),
+        )
         .fallback(api_not_found);
 
     Router::new().nest("/api", api).with_state(state)
@@ -369,6 +413,173 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(json, json!({"error": "Path is not a directory"}));
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_persists_and_reads_back_a_value() {
+        let app = api_router(test_state());
+
+        let (status, _) = request_json(
+            app.clone(),
+            "PUT",
+            "/api/settings/preset",
+            Some(json!({"value": "My Custom Preset"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, json) = request_json(app, "GET", "/api/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["preset"], "My Custom Preset");
+    }
+
+    #[tokio::test]
+    async fn update_setting_with_an_invalid_key_returns_the_core_error_message() {
+        // settings_ops::update_setting rejects anything outside ALLOWED_KEYS with this exact
+        // message; the route must surface it verbatim in the 500 body, not a generic string.
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "PUT",
+            "/api/settings/not_a_real_key",
+            Some(json!({"value": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            json,
+            json!({"error": "Invalid setting key: not_a_real_key"})
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_after_current_lifecycle_flips_the_flag() {
+        let app = api_router(test_state());
+
+        let (status, _) = request_json(
+            app.clone(),
+            "POST",
+            "/api/converter/pause-after-current",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, json) = request_json(
+            app.clone(),
+            "GET",
+            "/api/converter/pause-after-current",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!(true));
+
+        let (status, _) = request_json(
+            app.clone(),
+            "DELETE",
+            "/api/converter/pause-after-current",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, json) =
+            request_json(app, "GET", "/api/converter/pause-after-current", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!(false));
+    }
+
+    #[tokio::test]
+    async fn watched_directory_crud_round_trips_on_a_tempdir() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let app = api_router(test_state());
+
+        let (status, added) = request_json(
+            app.clone(),
+            "POST",
+            "/api/watched",
+            Some(json!({
+                "path": dir.path().to_str().unwrap(),
+                "recursive": false,
+                "stabilityDelaySecs": 5,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(added["recursive"], false);
+        assert_eq!(added["stability_delay_secs"], 5);
+        assert_eq!(added["enabled"], true);
+        let id = added["id"].as_str().expect("watched dir id").to_string();
+
+        let (status, list) = request_json(app.clone(), "GET", "/api/watched", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        let (status, _) = request_json(
+            app.clone(),
+            "PUT",
+            &format!("/api/watched/{id}"),
+            Some(json!({"recursive": true, "stabilityDelaySecs": 10})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = request_json(
+            app.clone(),
+            "PUT",
+            &format!("/api/watched/{id}/enabled"),
+            Some(json!({"enabled": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, list) = request_json(app.clone(), "GET", "/api/watched", None).await;
+        assert_eq!(list[0]["recursive"], true, "update must have persisted");
+        assert_eq!(
+            list[0]["enabled"], false,
+            "enabled toggle must have persisted"
+        );
+
+        let (status, _) =
+            request_json(app.clone(), "DELETE", &format!("/api/watched/{id}"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, list) = request_json(app, "GET", "/api/watched", None).await;
+        assert_eq!(list, json!([]), "removed directory must be gone");
+    }
+
+    #[tokio::test]
+    async fn preset_suffix_round_trip_persists_and_reads_back() {
+        let app = api_router(test_state());
+
+        let (status, _) = request_json(
+            app.clone(),
+            "PUT",
+            "/api/presets/My%20Preset/suffix",
+            Some(json!({"suffix": ".custom"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, json) =
+            request_json(app, "GET", "/api/presets/My%20Preset/suffix", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!(".custom"));
+    }
+
+    #[tokio::test]
+    async fn detect_handbrake_smoke_returns_200_with_valid_json() {
+        // CI has no HandBrakeCLI, but the test host might: assert only status + shape, never
+        // the specific value (a real path vs null both satisfy Option<String>'s JSON encoding).
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "GET",
+            "/api/handbrake/detect",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json.is_string() || json.is_null());
     }
 
     #[tokio::test]
