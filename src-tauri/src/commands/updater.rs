@@ -10,14 +10,14 @@ pub fn get_update_state(app: AppHandle) -> Result<UpdateState, String> {
 
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> Result<(), String> {
-    // Manual: forced regardless of mode, and never installs (U7).
-    updater::run_cycle(app, true).await;
-    Ok(())
+    // Manual: forced regardless of mode, and never installs (U7). Refused outright while an
+    // install is pending or installed — see `updater::manual_check_block`.
+    updater::run_cycle(app, true).await
 }
 
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
-    updater::install_pending(app).await
+    updater::install_pending(app, true).await
 }
 
 #[tauri::command]
@@ -35,6 +35,9 @@ pub fn skip_update_version(app: AppHandle, version: String) -> Result<(), String
             *a = None;
         }
     }
+    // A skipped version must not stay queued behind the idle gate — the retry paths install a
+    // pending update without re-consulting the skip list.
+    updater::cancel_pending_version(&app, &version);
     // Emits the cleared state, so the panel drops the banner without a round trip.
     updater::clear_status(&app);
     Ok(())

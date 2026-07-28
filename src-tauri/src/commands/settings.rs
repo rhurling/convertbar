@@ -148,6 +148,28 @@ pub(crate) fn normalize_bad_source_action(value: &str) -> &'static str {
     }
 }
 
+/// Persists one setting and hands the connection straight back.
+///
+/// Deliberately a separate function rather than an inline write: `update_setting`'s post-write
+/// hooks re-enter the same `AppState::db` mutex (`watcher::refresh_skip_marker` →
+/// `read_skip_marker`, `updater::on_mode_changed` → `emit_state`) and std's `Mutex` is not
+/// reentrant, so holding the guard across them self-deadlocks — which is what shipped in 1.0.0.
+/// Keeping the write in here means there is no guard in `update_setting`'s scope at all, so a
+/// future hook cannot be added underneath one.
+fn write_setting(
+    db: &std::sync::Mutex<rusqlite::Connection>,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+        params![key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn update_setting(
     app: AppHandle,
@@ -158,16 +180,10 @@ pub fn update_setting(
     if !ALLOWED_KEYS.contains(&key.as_str()) {
         return Err(format!("Invalid setting key: {}", key));
     }
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
-        params![key, value],
-    )
-    .map_err(|e| e.to_string())?;
+    write_setting(&state.db, &key, &value)?;
 
-    // Release the settings connection before any hook below: they read the same
-    // `AppState::db` mutex, and std's Mutex is not reentrant.
-    drop(conn);
+    // --- Post-write hooks. The settings connection is released above and no hook may assume
+    // --- it is held: each of these re-acquires it.
 
     // Sync autostart state with the plugin
     if key == "launch_at_login" {
@@ -184,16 +200,11 @@ pub fn update_setting(
         crate::watcher::refresh_skip_marker(&app);
     }
 
-    // Let a mode change take effect immediately: a user who sees "update available" and
-    // switches to Automatic should not wait for the next hourly tick.
+    // Let a mode change take effect immediately: a user who sees "update available" and switches
+    // to Automatic should not wait for the next hourly tick, and one who switches to Off must
+    // have any scheduler-decided install cancelled rather than left to land on the next drain.
     if key == "update_mode" {
-        crate::updater::emit_state(&app);
-        if value == "automatic" {
-            let handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                crate::updater::run_cycle(handle, false).await;
-            });
-        }
+        crate::updater::on_mode_changed(&app, crate::updater::normalize_update_mode(&value));
     }
 
     Ok(())
@@ -278,6 +289,50 @@ mod tests {
         assert_eq!(normalize_bad_source_action(""), "trash");
         assert_eq!(normalize_bad_source_action("DELETE"), "trash");
         assert_eq!(normalize_bad_source_action("nonsense"), "trash");
+    }
+
+    #[test]
+    fn writing_a_setting_hands_the_connection_back_before_the_hooks_run() {
+        // 1.0.0 hung here: `update_setting` held the `AppState::db` guard for its whole body
+        // while the `watch_skip_marker` hook re-entered the same mutex via
+        // `watcher::refresh_skip_marker` -> `read_skip_marker` (watcher.rs:502-504). std's Mutex
+        // is not reentrant, so that is a self-deadlock rather than a wait. The updater hooks
+        // added in this task (`on_mode_changed` -> `emit_state`) re-enter it too.
+        //
+        // The write is isolated in `write_setting` precisely so `update_setting` has no guard in
+        // scope for a future hook to be added underneath. This pins the half that can regress:
+        // that the write releases the connection, and does so even on the error path.
+        let db = std::sync::Mutex::new(test_conn());
+
+        write_setting(&db, "update_mode", "notify").unwrap();
+        assert!(
+            db.try_lock().is_ok(),
+            "a hook running after the write would deadlock on a still-held connection"
+        );
+
+        // The value actually landed, and a second write upserts rather than duplicating.
+        write_setting(&db, "update_mode", "off").unwrap();
+        assert!(db.try_lock().is_ok());
+        let conn = db.lock().unwrap();
+        let (value, rows): (String, i64) = conn
+            .query_row(
+                "SELECT value, COUNT(*) FROM settings WHERE key = 'update_mode'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(value, "off");
+        assert_eq!(rows, 1);
+        drop(conn);
+
+        // A failed write must not strand the connection either, or one bad write would hang
+        // every later setting change for the rest of the process's life.
+        let uninitialised = std::sync::Mutex::new(Connection::open_in_memory().unwrap());
+        assert!(write_setting(&uninitialised, "update_mode", "off").is_err());
+        assert!(
+            uninitialised.try_lock().is_ok(),
+            "a rejected write must still release the connection"
+        );
     }
 
     #[test]

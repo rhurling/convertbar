@@ -184,6 +184,106 @@ pub fn decide_manual(found: Option<AvailableUpdate>) -> CheckOutcome {
     }
 }
 
+/// An install that has been decided on but is waiting for the queue to drain, and *who* decided
+/// it. The `WaitingForIdle` status alone cannot carry this: every consumer would have to infer
+/// intent from a bare status bit, and they infer it differently — the retry needs to know whether
+/// pausing a running queue is permitted, and a mode change needs to drop a scheduler-decided
+/// install without touching one the user explicitly asked for.
+#[derive(Debug, Clone)]
+pub struct PendingInstall {
+    pub update: AvailableUpdate,
+    /// True when the user pressed "Install and restart", false when the scheduler decided in
+    /// Automatic mode.
+    pub user_requested: bool,
+}
+
+/// What a retry of a pending install should do given the queue's current state.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetryAction {
+    /// The queue is idle — install straight away.
+    InstallNow,
+    /// The user asked to install now, so the running job may be drained to make room.
+    DrainThenInstall,
+    /// The queue is busy and nobody asked to interrupt it. Stay pending and wait for a drain.
+    StayPending,
+}
+
+/// Whether a retry may stop a running queue to make room for the install.
+///
+/// Only a user who pressed "Install and restart" gets that. `pause_after_current` is consumed by
+/// `process_queue` (converter.rs:1277-1290) into a *persisted* `set_queue_paused(true)` plus a
+/// `break` with jobs still queued — so arming it on the scheduler's behalf would stop a user's
+/// batch mid-run and leave it paused across the update restart. The scheduler's job is to install
+/// when the machine is free, never to free it.
+pub fn retry_action(user_requested: bool, queue_running: bool) -> RetryAction {
+    match (queue_running, user_requested) {
+        (false, _) => RetryAction::InstallNow,
+        (true, true) => RetryAction::DrainThenInstall,
+        (true, false) => RetryAction::StayPending,
+    }
+}
+
+/// Whether an already-pending install survives a change of update mode.
+///
+/// A deferral the scheduler decided on in Automatic mode must not outlive the user turning
+/// automatic installs off: the retry paths install a pending update regardless of mode, so
+/// keeping it would install the update on the next queue drain — exactly what Off exists to
+/// prevent. A deferral the user asked for survives any mode change; they pressed the button.
+pub fn pending_survives_mode(pending: &PendingInstall, mode: UpdateMode) -> bool {
+    mode == UpdateMode::Automatic || pending.user_requested
+}
+
+/// Whether an already-pending install survives the user skipping `skipped_version`.
+///
+/// Version-matched rather than a blanket cancel: the retry paths install a pending update without
+/// re-consulting the skip list, so skipping the pending version has to cancel it — but skipping an
+/// older version must not cancel a pending install of a newer one.
+pub fn pending_survives_skip(pending: &PendingInstall, skipped_version: &str) -> bool {
+    pending.update.version != skipped_version
+}
+
+/// Why a user-initiated check is refused, if it is.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManualCheckBlock {
+    /// An install is downloaded and waiting for the queue to drain.
+    InstallPending,
+    /// An install completed and the app is waiting to be restarted.
+    AwaitingRestart,
+}
+
+impl ManualCheckBlock {
+    pub fn message(&self) -> &'static str {
+        match self {
+            ManualCheckBlock::InstallPending => {
+                "an update is already waiting to install once the queue is idle"
+            }
+            ManualCheckBlock::AwaitingRestart => {
+                "an update is installed — restart ConvertBar to apply it"
+            }
+        }
+    }
+}
+
+/// Whether a manual "Check now" may run.
+///
+/// It must not while an install is pending or already installed. A check walks the status through
+/// `Checking` and out to `Available`/`Idle`, and that status is what the panel reads — so a check
+/// would replace "restart to apply" with "update available" for a version already installed, and
+/// would hide a pending install behind a banner. In Notify mode it would silently demote a user's
+/// explicit "Install and restart" into a notification, which the spec forbids.
+pub fn manual_check_block(
+    status: Option<UpdateStatus>,
+    pending: Option<&PendingInstall>,
+) -> Option<ManualCheckBlock> {
+    if status == Some(UpdateStatus::ReadyToRestart) {
+        return Some(ManualCheckBlock::AwaitingRestart);
+    }
+    if pending.is_some() {
+        return Some(ManualCheckBlock::InstallPending);
+    }
+    None
+}
+
 /// The install action, injected so tests drive the real decision-to-action path with a
 /// recorder. `Update` cannot be constructed in a test (private fields, updater.rs:602-644)
 /// and `check()` needs the network, so without this seam the idle-gate mutation check would
@@ -256,6 +356,9 @@ pub struct UpdaterRuntime {
     pub available: std::sync::Mutex<Option<AvailableUpdate>>,
     pub last_checked: std::sync::Mutex<Option<i64>>,
     pub last_error: std::sync::Mutex<Option<String>>,
+    /// The install waiting for an idle queue, if any. Held separately from `status` because the
+    /// retry paths need the requester's intent, not just the fact of a deferral.
+    pub pending: std::sync::Mutex<Option<PendingInstall>>,
     /// Single-flight latch over the whole check → download → install sequence.
     /// `try_install_now` only samples `is_running` on entry, so two concurrent callers could
     /// both clear its gate; this makes every path that can reach it mutually exclusive.
@@ -288,6 +391,18 @@ fn try_begin_cycle(runtime: &Arc<UpdaterRuntime>) -> Option<CycleGuard> {
 fn runtime_of(app: &AppHandle) -> Option<Arc<UpdaterRuntime>> {
     app.try_state::<Arc<UpdaterRuntime>>()
         .map(|s| s.inner().clone())
+}
+
+fn pending_of(app: &AppHandle) -> Option<PendingInstall> {
+    runtime_of(app).and_then(|r| r.pending.lock().ok().and_then(|p| p.clone()))
+}
+
+fn set_pending(app: &AppHandle, value: Option<PendingInstall>) {
+    if let Some(runtime) = runtime_of(app) {
+        if let Ok(mut p) = runtime.pending.lock() {
+            *p = value;
+        }
+    }
 }
 
 fn now_secs() -> i64 {
@@ -403,33 +518,42 @@ fn set_status(app: &AppHandle, status: UpdateStatus) {
 
 /// One full check-and-act cycle. `manual` forces the check regardless of mode and never
 /// installs (U7): a button labelled "check" must not commit the user to anything.
-pub async fn run_cycle(app: AppHandle, manual: bool) {
+pub async fn run_cycle(app: AppHandle, manual: bool) -> Result<(), String> {
     let Some(runtime) = runtime_of(&app) else {
-        return;
+        return Err("updater unavailable".into());
     };
     let Some(cycle) = try_begin_cycle(&runtime) else {
-        return;
+        return Err("an update operation is already running".into());
     };
+
+    // Checked under the latch, so no concurrent cycle can be mutating either input. A manual
+    // check that walked the status past WaitingForIdle / ReadyToRestart would orphan the pending
+    // install: both wake paths key off exactly those states.
+    if manual {
+        if let Some(block) = manual_check_block(current_status(&app), pending_of(&app).as_ref()) {
+            return Err(block.message().to_string());
+        }
+    }
 
     let mode = {
         let Some(app_state) = app.try_state::<crate::AppState>() else {
-            return;
+            return Err("app state unavailable".into());
         };
         let Ok(conn) = app_state.db.lock() else {
-            return;
+            return Err("settings unavailable".into());
         };
         normalize_update_mode(&read_key(&conn, "update_mode").unwrap_or_else(|| "automatic".into()))
     };
 
     if !manual && mode == UpdateMode::Off {
-        return;
+        return Ok(());
     }
 
     set_status(&app, UpdateStatus::Checking);
 
     let Some(updater) = build_updater(&app) else {
         set_status(&app, UpdateStatus::Idle);
-        return;
+        return Err("updater unavailable".into());
     };
 
     let found = match updater.check().await {
@@ -444,7 +568,7 @@ pub async fn run_cycle(app: AppHandle, manual: bool) {
                 *t = Some(now_secs());
             }
             set_status(&app, UpdateStatus::Error);
-            return;
+            return Err(e.to_string());
         }
     };
 
@@ -457,10 +581,10 @@ pub async fn run_cycle(app: AppHandle, manual: bool) {
 
     let (skipped, notified) = {
         let Some(app_state) = app.try_state::<crate::AppState>() else {
-            return;
+            return Err("app state unavailable".into());
         };
         let Ok(conn) = app_state.db.lock() else {
-            return;
+            return Err("settings unavailable".into());
         };
         (read_skipped_version(&conn), read_notified_version(&conn))
     };
@@ -500,10 +624,13 @@ pub async fn run_cycle(app: AppHandle, manual: bool) {
                 *a = Some(u.clone());
             }
             if let Some((_, raw)) = found {
-                perform_install(&app, &cycle, u, raw).await;
+                // The scheduler decided this, not the user: it may never pause a running queue.
+                perform_install(&app, &cycle, u, raw, false).await;
             }
         }
     }
+
+    Ok(())
 }
 
 /// Downloads, then installs behind the idle gate. Persists `update_installed` BEFORE the
@@ -518,6 +645,7 @@ async fn perform_install(
     _cycle: &CycleGuard,
     meta: AvailableUpdate,
     raw: tauri_plugin_updater::Update,
+    user_requested: bool,
 ) {
     set_status(app, UpdateStatus::Downloading);
 
@@ -552,6 +680,7 @@ async fn perform_install(
 
     match try_install_now(&conv, &installer, &meta) {
         InstallAttempt::Installed => {
+            set_pending(app, None);
             notify(
                 app,
                 format!("Updated to {} — restart ConvertBar to apply", meta.version),
@@ -562,10 +691,21 @@ async fn perform_install(
             // Nothing was installed, so the pre-written marker must not survive: a restart for
             // any other reason would otherwise show "What's new" for a version not running.
             rollback_installed(app);
+            // Record WHO wanted this, not just that something is waiting — the retry paths need
+            // the intent to decide whether draining the queue is allowed, and a mode change
+            // needs it to decide whether the deferral survives.
+            set_pending(
+                app,
+                Some(PendingInstall {
+                    update: meta.clone(),
+                    user_requested,
+                }),
+            );
             set_status(app, UpdateStatus::WaitingForIdle);
         }
         InstallAttempt::Failed(e) => {
             rollback_installed(app);
+            set_pending(app, None);
             if let Some(runtime) = runtime_of(app) {
                 if let Ok(mut err) = runtime.last_error.lock() {
                     *err = Some(e.clone());
@@ -595,13 +735,33 @@ fn rollback_installed(app: &AppHandle) {
 /// Installs the update the last check found. Backs the panel's "Install and restart" and the
 /// idle retry. With a busy queue: pause after the current job, then let `on_queue_status` retry
 /// once it drains.
-pub async fn install_pending(app: AppHandle) -> Result<(), String> {
+pub async fn install_pending(app: AppHandle, user_requested: bool) -> Result<(), String> {
     let Some(runtime) = runtime_of(&app) else {
         return Err("updater unavailable".into());
     };
     let Some(cycle) = try_begin_cycle(&runtime) else {
         return Err("an update operation is already running".into());
     };
+
+    // Decided before the network round trip: a scheduler-decided retry against a still-busy
+    // queue must cost nothing, or a long batch would re-fetch the whole bundle on every tick.
+    {
+        let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
+            return Err("converter unavailable".into());
+        };
+        let queue_running = *conv.is_running.lock().unwrap_or_else(|e| e.into_inner());
+        match retry_action(user_requested, queue_running) {
+            RetryAction::StayPending => return Err("the queue is busy".into()),
+            RetryAction::DrainThenInstall => {
+                // Drain rather than interrupt: the running job finishes, then `on_queue_status`
+                // retries the install.
+                if let Ok(mut flag) = conv.pause_after_current.lock() {
+                    *flag = true;
+                }
+            }
+            RetryAction::InstallNow => {}
+        }
+    }
 
     let Some(updater) = build_updater(&app) else {
         return Err("updater unavailable".into());
@@ -613,21 +773,7 @@ pub async fn install_pending(app: AppHandle) -> Result<(), String> {
     };
     let meta = describe(&raw);
 
-    {
-        let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
-            return Err("converter unavailable".into());
-        };
-        let busy = *conv.is_running.lock().unwrap_or_else(|e| e.into_inner());
-        if busy {
-            // Drain rather than interrupt: the running job finishes, then `on_queue_status`
-            // retries the install.
-            if let Ok(mut flag) = conv.pause_after_current.lock() {
-                *flag = true;
-            }
-        }
-    }
-
-    perform_install(&app, &cycle, meta, raw).await;
+    perform_install(&app, &cycle, meta, raw, user_requested).await;
     Ok(())
 }
 
@@ -656,9 +802,18 @@ pub fn clear_status(app: &AppHandle) {
     set_status(app, UpdateStatus::Idle);
 }
 
+/// Cancels a pending install of `version`, if that is the one pending.
+pub fn cancel_pending_version(app: &AppHandle, version: &str) {
+    if let Some(pending) = pending_of(app) {
+        if !pending_survives_skip(&pending, version) {
+            set_pending(app, None);
+        }
+    }
+}
+
 fn spawn_cycle(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        run_cycle(app, false).await;
+        let _ = run_cycle(app, false).await;
     });
 }
 
@@ -666,13 +821,47 @@ fn current_status(app: &AppHandle) -> Option<UpdateStatus> {
     runtime_of(app).and_then(|r| r.status.lock().ok().and_then(|s| *s))
 }
 
-fn spawn_install_retry(app: AppHandle) {
+fn spawn_install_retry(app: AppHandle, user_requested: bool) {
     tauri::async_runtime::spawn(async move {
-        // `install_pending`, not `run_cycle`: WaitingForIdle is only ever reached from a
-        // decided install, and re-running the mode policy here would demote a user's explicit
-        // "Install and restart" in Notify mode back into a notification.
-        let _ = install_pending(app).await;
+        // `install_pending`, not `run_cycle`: a pending install is already decided, and
+        // re-running the mode policy here would demote a user's explicit "Install and restart"
+        // in Notify mode back into a notification.
+        let _ = install_pending(app, user_requested).await;
     });
+}
+
+/// Applies a change of update mode to whatever the updater is currently doing.
+///
+/// Owns the whole policy so `commands::settings` does not have to know any of it.
+pub fn on_mode_changed(app: &AppHandle, mode: UpdateMode) {
+    if let Some(pending) = pending_of(app) {
+        if !pending_survives_mode(&pending, mode) {
+            // Dropped, not just hidden: the retry paths install a pending update regardless of
+            // mode, so leaving it would install on the next queue drain — the exact thing the
+            // user just switched away from Automatic to prevent.
+            set_pending(app, None);
+            set_status(
+                app,
+                if mode == UpdateMode::Off {
+                    UpdateStatus::Idle
+                } else {
+                    UpdateStatus::Available
+                },
+            );
+            return;
+        }
+    }
+
+    emit_state(app);
+
+    // A check would find the version already pending or installed and redo work that is already
+    // decided — and, for ReadyToRestart, knock the panel out of "restart to apply".
+    if mode == UpdateMode::Automatic
+        && pending_of(app).is_none()
+        && current_status(app) != Some(UpdateStatus::ReadyToRestart)
+    {
+        spawn_cycle(app.clone());
+    }
 }
 
 /// Startup check plus an hourly tick that only acts once 24h of wall clock have passed.
@@ -686,18 +875,19 @@ pub fn start(app: AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(TICK_INTERVAL_SECS));
 
-        match current_status(&app) {
-            // Installed, waiting on the user to restart. Checking again would find the same
-            // version (this process still reports the old one) and reinstall it, dropping the
-            // panel out of its "restart to apply" state and re-downloading for nothing.
-            Some(UpdateStatus::ReadyToRestart) => continue,
-            // Backstop for an install whose drain event never arrived — the queue picked up
-            // another job before it went idle — so a pending install can't sit forever.
-            Some(UpdateStatus::WaitingForIdle) => {
-                spawn_install_retry(app.clone());
-                continue;
-            }
-            _ => {}
+        // Installed, waiting on the user to restart. Checking again would find the same version
+        // (this process still reports the old one) and reinstall it, dropping the panel out of
+        // its "restart to apply" state and re-downloading for nothing.
+        if current_status(&app) == Some(UpdateStatus::ReadyToRestart) {
+            continue;
+        }
+
+        // Backstop for an install whose drain event never arrived — the queue picked up another
+        // job before it went idle — so a pending install can't sit forever. Carries the original
+        // requester's intent, so a scheduler-decided install still refuses to pause the queue.
+        if let Some(pending) = pending_of(&app) {
+            spawn_install_retry(app.clone(), pending.user_requested);
+            continue;
         }
 
         let last = runtime_of(&app).and_then(|r| r.last_checked.lock().ok().and_then(|t| *t));
@@ -714,9 +904,11 @@ pub fn on_queue_status(app: &AppHandle, status: &str) {
     if status != "idle" && status != "error" {
         return;
     }
-    if current_status(app) != Some(UpdateStatus::WaitingForIdle) {
+    // Keyed on the pending install itself, not on the status: a manual check or a mode change
+    // can legitimately move the status while the deferral is still outstanding.
+    let Some(pending) = pending_of(app) else {
         return;
-    }
+    };
 
     let app = app.clone();
     std::thread::spawn(move || {
@@ -727,7 +919,7 @@ pub fn on_queue_status(app: &AppHandle, status: &str) {
         if !wait_for_idle_queue(&app) {
             return;
         }
-        spawn_install_retry(app);
+        spawn_install_retry(app, pending.user_requested);
     });
 }
 
@@ -1015,6 +1207,89 @@ mod tests {
             crate::converter::claim_queue_slot(&conv),
             "queue must be startable again"
         );
+    }
+
+    fn pending(user_requested: bool) -> PendingInstall {
+        PendingInstall {
+            update: upd("2.0.0"),
+            user_requested,
+        }
+    }
+
+    #[test]
+    fn a_scheduled_install_never_pauses_a_running_queue() {
+        // LOAD-BEARING. The hourly backstop retries a pending install while the queue may still
+        // be running. Arming pause_after_current there stops the user's batch mid-run and
+        // converter.rs:1277-1290 persists queue_paused=true, so the queue is still paused after
+        // the update restart — an Automatic-mode update would silently halt their work.
+        // Only an explicit "Install and restart" may drain the queue.
+        assert_eq!(
+            retry_action(false, true),
+            RetryAction::StayPending,
+            "the scheduler waits for the queue; it never clears it"
+        );
+        assert_eq!(retry_action(true, true), RetryAction::DrainThenInstall);
+
+        // Idle queue: intent is irrelevant, install either way.
+        assert_eq!(retry_action(false, false), RetryAction::InstallNow);
+        assert_eq!(retry_action(true, false), RetryAction::InstallNow);
+    }
+
+    #[test]
+    fn turning_updates_off_cancels_an_install_the_scheduler_decided_on() {
+        // LOAD-BEARING. The retry paths install a pending update without re-reading the mode, so
+        // a deferral created in Automatic mode would land on the next queue drain even after the
+        // user set updates to Off — defeating the entire point of the setting.
+        assert!(!pending_survives_mode(&pending(false), UpdateMode::Off));
+        assert!(!pending_survives_mode(&pending(false), UpdateMode::Notify));
+        assert!(pending_survives_mode(
+            &pending(false),
+            UpdateMode::Automatic
+        ));
+
+        // A user who pressed "Install and restart" asked for this one explicitly; changing the
+        // policy for *future* updates must not cancel the install they already requested.
+        assert!(pending_survives_mode(&pending(true), UpdateMode::Off));
+        assert!(pending_survives_mode(&pending(true), UpdateMode::Notify));
+    }
+
+    #[test]
+    fn skipping_the_pending_version_cancels_it_but_skipping_another_does_not() {
+        // Same reason: the retry does not re-consult the skip list, so the skip has to reach the
+        // pending install directly — and only the one it names.
+        assert!(!pending_survives_skip(&pending(false), "2.0.0"));
+        assert!(pending_survives_skip(&pending(false), "1.9.0"));
+    }
+
+    #[test]
+    fn a_manual_check_cannot_orphan_a_pending_or_installed_update() {
+        // LOAD-BEARING. A manual check walks the status Checking -> Available/Idle. Both wake
+        // paths for a deferral used to key off the status being exactly WaitingForIdle, so a
+        // "Check now" stranded the install with nothing left to retry it — in Notify mode that
+        // turned the user's explicit "Install and restart" into a mere banner. It also replaced
+        // "restart to apply" with "update available" for a version already installed.
+        assert_eq!(
+            manual_check_block(Some(UpdateStatus::WaitingForIdle), Some(&pending(true))),
+            Some(ManualCheckBlock::InstallPending)
+        );
+        assert_eq!(
+            manual_check_block(Some(UpdateStatus::ReadyToRestart), None),
+            Some(ManualCheckBlock::AwaitingRestart)
+        );
+        // ReadyToRestart wins even with a pending install, because it is the more specific state.
+        assert_eq!(
+            manual_check_block(Some(UpdateStatus::ReadyToRestart), Some(&pending(false))),
+            Some(ManualCheckBlock::AwaitingRestart)
+        );
+
+        // Nothing outstanding: a manual check is exactly what the button is for.
+        assert_eq!(manual_check_block(None, None), None);
+        assert_eq!(manual_check_block(Some(UpdateStatus::Idle), None), None);
+        assert_eq!(
+            manual_check_block(Some(UpdateStatus::Available), None),
+            None
+        );
+        assert_eq!(manual_check_block(Some(UpdateStatus::Error), None), None);
     }
 
     #[test]
