@@ -188,6 +188,16 @@ event loop), and being Rust-invoked it needs **no** frontend `dialog` ACL grant.
 - Requires modifying the Tauri tray event handler to accept drag-drop events
 - Note: Tauri v2 may not support this natively — would need a native macOS plugin
 
+### 16. Server: panics masquerade as deliberate errors
+- All ten `spawn_blocking` join-error sites in `crates/convertbar-server/src/routes/`
+  (`queue.rs:29,44,53,67,129`, `fs.rs:89`, `handbrake.rs:24,38,63,88`) map to
+  `core_err(format!("task panicked: {join}"))` — HTTP 500 with an `error` string, identical in
+  shape to an ordinary core failure.
+- A client cannot distinguish a server bug from an expected condition such as a missing
+  HandBrakeCLI, and tests can only tell them apart by matching on the message text.
+- Consider a distinct status or body shape for join failures. Surfaced 2026-07-29 while giving
+  the HandBrake-missing error one definition (`handbrake::HANDBRAKE_NOT_FOUND`).
+
 ---
 
 ## Spec Compliance Gaps

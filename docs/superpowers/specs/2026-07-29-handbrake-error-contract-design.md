@@ -316,7 +316,8 @@ panic inside `spawn_blocking` are indistinguishable by status: all ten join-erro
 `crates/convertbar-server/src/routes/` — `queue.rs:29,44,53,67,129`, `fs.rs:89`,
 `handbrake.rs:24,38,63,88` — map to `core_err(format!("task panicked: {join}"))`, i.e. the
 same 500 as any ordinary failure. A client cannot tell a bug from an expected failure. (A
-naive `grep` reports eleven; the extra hit is a comment inside a test in `routes/mod.rs`.)
+naive `grep` over-reports: the surplus hits are comments inside tests in `routes/mod.rs` that
+mention the panic body. Count the `core_err(format!(...))` call sites, not the phrase.)
 
 That is a third, larger idea — a transport error taxonomy touching every route — and it is
 out of scope here. It is added to `docs/RECOMMENDATIONS.md` under **Open — Polish** as:
