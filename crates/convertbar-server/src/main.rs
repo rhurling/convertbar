@@ -26,6 +26,21 @@ async fn main() {
             );
             std::process::exit(1);
         }
+        Err(ConfigError::WeakToken) => {
+            eprintln!(
+                "convertbar-server: CONVERTBAR_AUTH_TOKEN is too weak — it must be at least 16 \
+                 characters long and use at least 8 distinct characters.\n\
+                 Generate one with:  openssl rand -base64 24"
+            );
+            std::process::exit(1);
+        }
+        Err(ConfigError::BadTrustedProxy(entry)) => {
+            eprintln!(
+                "convertbar-server: invalid CONVERTBAR_TRUSTED_PROXIES entry: {entry} \
+                 (expected an IP address or CIDR range, e.g. 172.18.0.5 or 10.0.0.0/8)"
+            );
+            std::process::exit(1);
+        }
         Err(ConfigError::BadBind(value)) => {
             eprintln!("convertbar-server: invalid bind address or port: {value}");
             std::process::exit(1);
