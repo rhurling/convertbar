@@ -93,6 +93,9 @@ export interface AppSettings {
   watch_skip_marker: string;
   low_disk_min_gb: number;
   bad_source_action: "trash" | "delete";
+  // Narrowed like bad_source_action: get_settings runs the raw stored string through
+  // `normalize_update_mode` before returning it, so only these three ever reach the frontend.
+  update_mode: UpdateMode;
 }
 
 export interface PathsExist {
@@ -162,6 +165,39 @@ export interface WatchedDirectory {
   stability_delay_secs: number;
   enabled: boolean;
   created_at: string;
+}
+
+export type UpdateMode = "automatic" | "notify" | "off";
+
+export type UpdateStatus =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "waitingForIdle"
+  | "readyToRestart"
+  | "error";
+
+export interface AvailableUpdate {
+  version: string;
+  date: string | null;
+  notes: string | null;
+}
+
+export interface InstalledUpdate {
+  version: string;
+  notes: string | null;
+}
+
+// Mirrors src-tauri/src/updater.rs UpdateState exactly.
+export interface UpdateState {
+  mode: UpdateMode;
+  status: UpdateStatus;
+  current_version: string;
+  available: AvailableUpdate | null;
+  just_installed: InstalledUpdate | null;
+  last_checked: number | null;
+  last_error: string | null;
 }
 
 export const commands = {
@@ -244,4 +280,10 @@ export const commands = {
   getBadSources: () => invoke<JobInfo[]>("get_bad_sources"),
   purgeBadSources: (ids: string[]) =>
     invoke<PurgeResult[]>("purge_bad_sources", { ids }),
+  getUpdateState: () => invoke<UpdateState>("get_update_state"),
+  checkForUpdate: () => invoke<void>("check_for_update"),
+  installUpdate: () => invoke<void>("install_update"),
+  skipUpdateVersion: (version: string) =>
+    invoke<void>("skip_update_version", { version }),
+  restartApp: () => invoke<void>("restart_app"),
 };

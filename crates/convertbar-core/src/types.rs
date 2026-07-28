@@ -37,6 +37,7 @@ pub struct Settings {
     pub watch_skip_marker: String,
     pub low_disk_min_gb: f64,
     pub bad_source_action: String,
+    pub update_mode: String,
 }
 
 /// Existence of a history entry's two paths, checked when its context menu opens.

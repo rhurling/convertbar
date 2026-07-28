@@ -6,6 +6,7 @@ interface TabBarProps {
   activeTab: Tab;
   onTabChange: (tab: Tab) => void;
   isAdding: boolean;
+  updateAvailable: boolean;
 }
 
 const tabs: { id: Tab; label: string }[] = [
@@ -15,7 +16,7 @@ const tabs: { id: Tab; label: string }[] = [
   { id: "settings", label: "Settings" },
 ];
 
-export default function TabBar({ activeTab, onTabChange, isAdding }: TabBarProps) {
+export default function TabBar({ activeTab, onTabChange, isAdding, updateAvailable }: TabBarProps) {
   return (
     <div className="tab-bar" data-tauri-drag-region>
       {tabs.map((tab) => (
@@ -25,6 +26,9 @@ export default function TabBar({ activeTab, onTabChange, isAdding }: TabBarProps
           onClick={() => onTabChange(tab.id)}
         >
           {tab.label}
+          {tab.id === "settings" && updateAvailable && (
+            <span className="tab-badge" aria-label="Update available" />
+          )}
         </button>
       ))}
       <div className="tab-spacer" data-tauri-drag-region />

@@ -5,11 +5,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => Promise.resolve(() => {})),
 }));
-vi.mock("@tauri-apps/api/app", () => ({
-  getVersion: () => Promise.resolve("1.2.3"),
-}));
-vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn() }));
-vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn() }));
+vi.mock("../components/UpdatePanel", () => ({ default: () => null }));
 
 import { invoke } from "@tauri-apps/api/core";
 import SettingsPage from "./SettingsPage";
@@ -36,6 +32,7 @@ function makeSettings(): AppSettings {
     watch_skip_marker: ".downloading",
     low_disk_min_gb: 0,
     bad_source_action: "trash",
+    update_mode: "automatic",
   };
 }
 

@@ -207,6 +207,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("watch_skip_marker", ".downloading"),
         ("low_disk_min_gb", "0"),
         ("bad_source_action", "trash"),
+        ("update_mode", "automatic"),
     ];
 
     for (key, value) in defaults {
@@ -269,7 +270,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 17);
+        assert_eq!(count, 18);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -297,6 +298,7 @@ mod tests {
             setting(&conn, "notifications_per_file").as_deref(),
             Some("true")
         );
+        assert_eq!(setting(&conn, "update_mode").as_deref(), Some("automatic"));
 
         // The default preset and its suffix template are seeded together.
         assert_eq!(setting(&conn, "preset").as_deref(), Some(default_preset()));
@@ -329,7 +331,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 17);
+        assert_eq!(count, 18);
     }
 
     #[test]

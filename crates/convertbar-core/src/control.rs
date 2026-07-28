@@ -23,6 +23,17 @@ pub fn start_queue(ctx: &Arc<Ctx>) -> Result<(), String> {
         return Ok(());
     }
 
+    // An update install holds the queue interlock, so `run_queue`'s claim would refuse below —
+    // after the paused flag had already been cleared, leaving the queue neither running nor
+    // paused. Bail before touching it; the user can start again once the install is done.
+    if ctx
+        .converter
+        .installing
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok(());
+    }
+
     // A user (re)starting the queue — Resume button, or a drag-drop add which routes through
     // startQueue — clears any remembered pause.
     if let Ok(conn) = ctx.db.lock() {
@@ -76,7 +87,12 @@ pub fn pause_conversion(ctx: &Ctx) -> Result<(), String> {
                         "UPDATE jobs SET status = 'paused' WHERE id = ?1",
                         params![job_id],
                     );
-                    converter::set_queue_paused(&db, true);
+                    // Not `set_queue_paused`: this pause is the user's, so the updater's claim on
+                    // the pause state has to be released with it. A drain armed for an "Install
+                    // and restart" can still be outstanding here, and on unix the queue thread
+                    // stays alive under SIGSTOP so the two persisted stops are indistinguishable —
+                    // an install that later failed would lift the pause the user just set.
+                    converter::set_user_queue_pause(&db);
                 } // db must be dropped before these emits: the tray listener re-locks ctx.db
                   // synchronously on this same thread, and std::sync::Mutex is not reentrant —
                   // holding the guard here self-deadlocks.
@@ -543,6 +559,46 @@ mod tests {
         assert_eq!(paused, "false", "Resume clears the remembered pause");
     }
 
+    #[test]
+    fn start_queue_leaves_the_persisted_pause_alone_while_an_update_installs() {
+        // `run_queue`'s claim refuses while the update interlock is latched. Clearing the
+        // remembered pause anyway would leave the queue neither running nor paused: the UI
+        // would report "not paused" while nothing runs and no event ever restarts it.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('queue_paused', 'true')
+             ON CONFLICT(key) DO UPDATE SET value = 'true'",
+            [],
+        )
+        .unwrap();
+        let ctx = test_ctx(conn);
+        ctx.converter
+            .installing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        start_queue(&ctx).unwrap();
+
+        let paused: String = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='queue_paused'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            paused, "true",
+            "the remembered pause must survive a Start that the install interlock refuses"
+        );
+        assert!(
+            !*ctx.converter.is_running.lock().unwrap(),
+            "no queue may start underneath an install"
+        );
+    }
+
     // Regression test for the resume/pause self-deadlock: the desktop tray listener's
     // "menu-bar-update" handler re-locks ctx.db synchronously on the emitting thread (see
     // src-tauri/src/lib.rs), so pause/resume must drop the db guard before emitting.
@@ -600,5 +656,62 @@ mod tests {
         let events = sink.events.lock().unwrap();
         assert!(events.contains(&"job-status-changed".to_string()));
         assert!(events.contains(&"menu-bar-update".to_string()));
+    }
+
+    // Regression test: a user pause must release the updater's drain claim, not just record the
+    // pause. `set_queue_paused` alone would leave `update_drain_pause` standing, and a failed
+    // install (or the next launch) would then lift a pause the user set deliberately.
+    #[cfg(unix)]
+    #[test]
+    fn pause_conversion_releases_the_updaters_drain_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.mp4");
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j1', ?1, ?1, 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            params![source.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let ctx = test_ctx(conn);
+
+        // Stand in for an "Install and restart" drain armed before the user's own Pause.
+        {
+            let db = ctx.db.lock().unwrap();
+            converter::set_drain_pause(&db, true);
+        }
+
+        // Stand-in for the paused encode's process, same as the tray-emit test above.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".to_string());
+
+        pause_conversion(&ctx).unwrap();
+
+        // Clean up: the child is SIGSTOPed from pause_conversion above, so CONT before kill.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGCONT);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let db = ctx.db.lock().unwrap();
+        assert!(
+            converter::is_queue_paused(&db),
+            "the user's pause must be recorded"
+        );
+        assert!(
+            !converter::read_drain_pause(&db),
+            "pause_conversion must release the updater's drain claim (set_user_queue_pause), or \
+             a failed install / the next launch would lift the pause the user just set"
+        );
     }
 }

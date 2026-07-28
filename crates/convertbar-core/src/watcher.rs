@@ -447,6 +447,24 @@ fn enqueue_and_start(ctx: &Arc<Ctx>, paths: Vec<String>) {
     if result.added.is_empty() {
         return;
     }
+    // An update install holds the queue interlock, so `run_queue` below would refuse — after the
+    // paused flag had already been cleared, leaving the queue neither running nor paused. Bail
+    // before touching it, exactly as `start_queue` does; the install re-triggers the queue when
+    // it finishes (`resume_queue_after_install`). The files themselves are already enqueued, so
+    // the UI still needs telling.
+    //
+    // Deliberately checked BEFORE clearing the pause rather than after, which is the opposite
+    // order to `set_queue_paused`'s own breadcrumb guard: leaving a remembered pause untouched
+    // during an install is recoverable with one click, whereas clearing it and then being refused
+    // leaves the queue in a state with no affordance to fix it.
+    if ctx
+        .converter
+        .installing
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        ctx.events.emit_t("queue-updated", ());
+        return;
+    }
     // A watched-folder file arriving is an add; per the design, adding files starts the queue,
     // so clear any remembered pause before running.
     if let Ok(conn) = ctx.db.lock() {
@@ -1120,6 +1138,67 @@ mod tests {
             "a multi-directory batch has no single name"
         );
         assert_eq!(super::batch_label(&[]), "", "empty batch → empty label");
+    }
+
+    // ---- enqueue_and_start's installing bail: sibling of control::start_queue's ----
+
+    #[test]
+    fn enqueue_and_start_leaves_the_persisted_pause_alone_while_an_update_installs() {
+        // Mirrors control::start_queue's own installing bail and its pinning test
+        // (start_queue_leaves_the_persisted_pause_alone_while_an_update_installs): an update
+        // install holds the queue interlock, so clearing the remembered pause here anyway would
+        // leave the queue neither running nor paused once `run_queue`'s own claim refuses it.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        // The seeded preset's suffix is templated ({resolution}/{codec}), which would make
+        // add_files_inner resolve it via a real HandBrakeCLI probe -- irrelevant to this test, so
+        // give it a literal suffix instead.
+        conn.execute("UPDATE preset_suffixes SET suffix = '.conv'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('queue_paused', 'true')
+             ON CONFLICT(key) DO UPDATE SET value = 'true'",
+            [],
+        )
+        .unwrap();
+
+        let sink = Arc::new(crate::events::TestSink::default());
+        let ctx = Ctx::new(conn, sink.clone(), Arc::new(crate::dispose::DeleteDisposer));
+        // Cover the fake path with a watch so it survives `filter_watched`; nothing else needs
+        // to exist on disk since add_files_inner's cheap skip checks are extension/DB-based.
+        ctx.watcher
+            .configs
+            .lock()
+            .unwrap()
+            .push(config("/watch", false, 1));
+        ctx.converter
+            .installing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        enqueue_and_start(&ctx, vec!["/watch/movie.mp4".to_string()]);
+
+        let paused: String = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='queue_paused'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            paused, "true",
+            "a watched-file arrival must not clear the persisted pause while an install is running"
+        );
+        assert!(
+            !*ctx.converter.is_running.lock().unwrap(),
+            "no queue may start underneath an install"
+        );
+        assert!(
+            !sink.payloads("queue-updated").is_empty(),
+            "the UI still needs telling that files were added, even though the queue can't start"
+        );
     }
 
     // ---- F8: the watcher must not re-ingest a classified bad source forever ----

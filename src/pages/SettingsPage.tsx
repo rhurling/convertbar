@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { getVersion } from "@tauri-apps/api/app";
-import { listen } from "../lib/events";
+import UpdatePanel from "../components/UpdatePanel";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
@@ -39,8 +36,6 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   } = useSettings();
 
   const inputRef = useRef<HTMLInputElement>(null);
-  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState<string>("");
 
   // Local drafts so text inputs echo keystrokes instantly and commit once (on blur/Enter),
   // instead of round-tripping an IPC write per character (which dropped/reordered characters).
@@ -50,7 +45,6 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [suffixDraft, setSuffixDraft] = useState(presetSuffix);
   const [resolvedSuffix, setResolvedSuffix] = useState("");
 
-  useEffect(() => { getVersion().then(setAppVersion); }, []);
   useEffect(() => {
     if (settings) setHbDraft(settings.handbrake_path);
   }, [settings?.handbrake_path]);
@@ -443,50 +437,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         </div>
       </div>
 
-      <div className="setting-group">
-        <label className="setting-label">Updates {appVersion && <span className="version-label">v{appVersion}</span>}</label>
-        <div className="setting-row">
-          <button
-            className="btn btn-small"
-            onClick={async () => {
-              setUpdateStatus("Checking...");
-              try {
-                const update = await check();
-                if (update) {
-                  setUpdateStatus(`Downloading v${update.version}...`);
-                  await update.downloadAndInstall();
-
-                  const queue = await commands.getQueue();
-                  const isEncoding = queue.some(j => j.status === "encoding" || j.status === "paused");
-
-                  if (!isEncoding) {
-                    await relaunch();
-                  } else {
-                    await commands.pauseAfterCurrent();
-                    setUpdateStatus("Update ready, restarting after current job...");
-                    const unlisten = await listen<{ status: string }>("menu-bar-update", async (event) => {
-                      if (event.payload.status === "idle" || event.payload.status === "error") {
-                        unlisten();
-                        await relaunch();
-                      }
-                    });
-                  }
-                } else {
-                  setUpdateStatus("You're up to date");
-                  setTimeout(() => setUpdateStatus(null), 3000);
-                }
-              } catch (e) {
-                setUpdateStatus(`Error: ${e}`);
-                setTimeout(() => setUpdateStatus(null), 5000);
-              }
-            }}
-            disabled={updateStatus === "Checking..." || updateStatus?.startsWith("Downloading") || updateStatus?.startsWith("Update ready")}
-          >
-            Check for updates
-          </button>
-          {updateStatus && <span className="update-status">{updateStatus}</span>}
-        </div>
-      </div>
+      <UpdatePanel />
 
       <div className="setting-group setting-group-quit">
         <button

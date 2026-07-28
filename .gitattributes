@@ -1,0 +1,6 @@
+# Shell scripts must check out LF on every platform. build.yml runs
+# scripts/release-notes.sh on the windows-latest runner, where Git for Windows'
+# installer default (core.autocrlf=true) would hand bash a CRLF copy — which dies on
+# `set -o pipefail` with "invalid option name" and, under `shell: bash` (errexit), fails
+# the Windows leg and so skips publish-release for every release.
+*.sh text eol=lf

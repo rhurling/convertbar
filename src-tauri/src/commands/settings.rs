@@ -14,6 +14,12 @@ pub fn get_settings(app: AppHandle, ctx: State<'_, Arc<Ctx>>) -> Result<Settings
         .autolaunch()
         .is_enabled()
         .unwrap_or(settings.launch_at_login);
+    // Update policy is a desktop-shell concept, so core stores the raw string and the coercion
+    // of an unknown/corrupt value to Automatic lives with the rest of the updater — same overlay
+    // shape as `launch_at_login` above.
+    settings.update_mode = crate::updater::normalize_update_mode(&settings.update_mode)
+        .as_str()
+        .to_string();
     Ok(settings)
 }
 
@@ -25,6 +31,10 @@ pub fn update_setting(
     value: String,
 ) -> Result<(), String> {
     convertbar_core::settings_ops::update_setting(&ctx, &key, &value)?;
+
+    // --- Post-write hooks. Core released the settings connection before returning and no hook
+    // --- may assume it is held: each of these re-acquires it.
+
     // Sync autostart state with the plugin
     if key == "launch_at_login" {
         let autostart = app.autolaunch();
@@ -34,6 +44,14 @@ pub fn update_setting(
             let _ = autostart.disable();
         }
     }
+
+    // Let a mode change take effect immediately: a user who sees "update available" and switches
+    // to Automatic should not wait for the next hourly tick, and one who switches to Off must
+    // have any scheduler-decided install cancelled rather than left to land on the next drain.
+    if key == "update_mode" {
+        crate::updater::on_mode_changed(&app, crate::updater::normalize_update_mode(&value));
+    }
+
     Ok(())
 }
 

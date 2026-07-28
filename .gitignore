@@ -15,6 +15,9 @@ dist-ssr
 # Git worktrees
 .worktrees/
 
+# Subagent-driven-development scratch (ledgers, briefs, review packages)
+.superpowers/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
