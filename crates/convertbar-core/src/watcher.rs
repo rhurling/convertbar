@@ -1150,11 +1150,6 @@ mod tests {
         // leave the queue neither running nor paused once `run_queue`'s own claim refuses it.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
-        // The seeded preset's suffix is templated ({resolution}/{codec}), which would make
-        // add_files_inner resolve it via a real HandBrakeCLI probe -- irrelevant to this test, so
-        // give it a literal suffix instead.
-        conn.execute("UPDATE preset_suffixes SET suffix = '.conv'", [])
-            .unwrap();
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('queue_paused', 'true')
              ON CONFLICT(key) DO UPDATE SET value = 'true'",
@@ -1163,11 +1158,35 @@ mod tests {
         .unwrap();
 
         let sink = Arc::new(crate::events::TestSink::default());
+        // The installed world: the seeded preset's suffix is templated, so intake resolves
+        // HandBrake. It must be `StubLocator` plus a pre-seeded metadata cache, not
+        // `AbsentLocator` — an intake error returns before the `queue-updated` emit this test
+        // asserts, and a bare stub path would make `cached_preset_metadata` shell out and fail.
         let ctx = Ctx::new(
             conn,
             sink.clone(),
             Arc::new(crate::dispose::DeleteDisposer),
-            Arc::new(crate::handbrake::PanickingLocator),
+            Arc::new(crate::handbrake::StubLocator(
+                "/opt/fake/HandBrakeCLI".into(),
+            )),
+        );
+        let preset: String = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        ctx.preset_cache.lock().unwrap().insert(
+            preset,
+            crate::handbrake::PresetMetadata {
+                codec: "h265".into(),
+                resolution: "1080p".into(),
+                quality: "22".into(),
+                preset: "Fast 1080p30".into(),
+                device: "VideoToolbox".into(),
+            },
         );
         // Cover the fake path with a watch so it survives `filter_watched`; nothing else needs
         // to exist on disk since add_files_inner's cheap skip checks are extension/DB-based.

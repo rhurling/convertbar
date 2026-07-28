@@ -1413,6 +1413,7 @@ mod tests {
     use super::*;
     use crate::dispose::{DeleteDisposer, RecordingDisposer};
     use crate::events::TestSink;
+    use crate::handbrake::{AbsentLocator, StubLocator};
     use rusqlite::Connection;
     use std::path::Path;
 
@@ -1636,15 +1637,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn add_files_inner_reports_handbrake_missing_when_the_suffix_needs_a_probe() {
+        // The default suffix template contains {...} placeholders, so intake must resolve HandBrake
+        // to expand them. With HandBrake absent the caller gets a named error — not a panic, and
+        // not a silent success that would write files with an unexpanded literal suffix.
+        let (ctx, _sink, _d) = test_ctx_with_locator(test_conn(), Arc::new(AbsentLocator));
+        let err = add_files_inner(&ctx, &["/tmp/whatever.mkv".to_string()], None).expect_err(
+            "intake must fail when the suffix template needs HandBrake and it is absent",
+        );
+        assert!(err.contains("HandBrakeCLI not found"), "got: {err}");
+    }
+
     // Pins the RAII bracketing Plan 1 preserved by hand: `AddOp`'s `add-finished` fires on Drop
     // (before the `queue-updated` emit that follows it in `add_files`), so the UI spinner always
     // clears before the queue refetch signal — even for a trivially empty add.
     #[test]
     fn add_files_emits_finished_before_queue_updated() {
-        let (ctx, sink, _d) = test_ctx(test_conn());
-        // Pin a literal suffix so add_files_inner never needs to resolve HandBrakeCLI
-        // (the default suffix template contains `{...}` placeholders, which would
-        // otherwise make this test depend on HandBrakeCLI being installed).
+        // The installed world, exercising the real default (templated) suffix — the pinned
+        // literal suffix this test used to carry meant it never expanded a template at all.
+        let (ctx, sink, _d) = test_ctx_with_locator(
+            test_conn(),
+            Arc::new(StubLocator("/opt/fake/HandBrakeCLI".into())),
+        );
+        // `StubLocator` alone is not the installed world: past resolution `add_files_inner` calls
+        // `cached_preset_metadata`, which on a miss *runs* the resolved binary and propagates the
+        // failure — the stub path would make intake return Err and swallow the queue-updated emit.
+        // Pre-seeding the cache short-circuits that shell-out.
         let preset: String = ctx
             .db
             .lock()
@@ -1653,7 +1672,16 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        crate::settings_ops::set_preset_suffix(&ctx, &preset, ".conv").unwrap();
+        ctx.preset_cache.lock().unwrap().insert(
+            preset,
+            crate::handbrake::PresetMetadata {
+                codec: "h265".into(),
+                resolution: "1080p".into(),
+                quality: "22".into(),
+                preset: "Fast 1080p30".into(),
+                device: "VideoToolbox".into(),
+            },
+        );
 
         // an empty add still brackets: add-started → add-finished → queue-updated
         let _ = add_files(&ctx, &[]);

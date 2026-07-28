@@ -186,19 +186,6 @@ pub(crate) mod tests {
             Arc::new(RecordingDisposer::default()),
             locator,
         );
-        // Pin a literal suffix for the default preset so any test that adds files
-        // through the routes never needs to resolve HandBrakeCLI (the default suffix
-        // template contains `{...}` placeholders, which would otherwise make these
-        // tests depend on HandBrakeCLI being installed on the host running them).
-        let default_preset: String = ctx
-            .db
-            .lock()
-            .unwrap()
-            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        convertbar_core::settings_ops::set_preset_suffix(&ctx, &default_preset, ".conv").unwrap();
         let (events_tx, _rx) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let state = ServerState {
@@ -213,6 +200,36 @@ pub(crate) mod tests {
             shutdown_rx,
         };
         (state, shutdown_tx)
+    }
+
+    /// `test_state` for route tests that add files and expect success: the "HandBrake installed"
+    /// world. A `StubLocator` alone is not that world — past resolution, intake fetches preset
+    /// metadata by *running* the resolved binary, so the cache is pre-seeded to short-circuit
+    /// that shell-out; without it every add would return the fetch's `Err` as a 500.
+    fn test_state_installed() -> ServerState {
+        let (state, _tx) = test_state_with_locator(Arc::new(
+            convertbar_core::handbrake::StubLocator("/opt/fake/HandBrakeCLI".into()),
+        ));
+        let preset: String = state
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        state.ctx.preset_cache.lock().unwrap().insert(
+            preset,
+            convertbar_core::handbrake::PresetMetadata {
+                codec: "h265".into(),
+                resolution: "1080p".into(),
+                quality: "22".into(),
+                preset: "Fast 1080p30".into(),
+                device: "VideoToolbox".into(),
+            },
+        );
+        state
     }
 
     /// Sends `body` as a JSON request to `method`/`uri` against `app`, returning the
@@ -259,8 +276,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn add_files_with_empty_paths_returns_empty_added_and_skipped() {
+        // Even an empty add resolves the suffix template first, so the world must be declared.
         let (status, json) = request_json(
-            api_router(test_state()),
+            api_router(test_state_installed()),
             "POST",
             "/api/queue/files",
             Some(json!({"paths": []})),
@@ -271,8 +289,45 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn add_files_route_reports_the_error_when_handbrake_is_absent() {
+        // The default suffix template needs HandBrake to expand. Absent, the route must return
+        // the core error deliberately. Asserting the exact body (not just the status) is what
+        // separates that from an accidental 500: a panicking locator would unwind inside
+        // `spawn_blocking` and surface as `{"error": "task panicked: ..."}` with the same 500.
+        let (state, _tx) =
+            test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
+        let (status, json) = request_json(
+            api_router(state),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/tmp/clip.mp4"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json, json!({"error": "HandBrakeCLI not found"}));
+    }
+
+    #[tokio::test]
+    async fn add_files_route_queues_with_the_expanded_suffix_when_handbrake_is_installed() {
+        // The mirror world. Asserting the expanded suffix (not merely a 200) is what proves the
+        // template round-tripped: `.{resolution}-{codec}` against the seeded metadata.
+        let (status, json) = request_json(
+            api_router(test_state_installed()),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/nonexistent/clip.mp4"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["added"][0]["output_path"],
+            "/nonexistent/clip.1080p-h265.mp4"
+        );
+    }
+
+    #[tokio::test]
     async fn remove_job_deletes_a_seeded_queued_row() {
-        let app = api_router(test_state());
+        let app = api_router(test_state_installed());
 
         // Seed via the real add_files route rather than raw SQL: a fake .mp4 path is
         // enough to insert a 'queued' row (add_files_inner only checks the extension and
@@ -304,7 +359,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn reorder_queue_accepts_camelcase_job_ids() {
-        let app = api_router(test_state());
+        let app = api_router(test_state_installed());
 
         let (_, added_a) = request_json(
             app.clone(),
@@ -436,8 +491,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn confirm_folder_add_on_an_empty_tempdir_adds_nothing() {
         let dir = tempfile::tempdir().expect("create tempdir");
+        // confirm_folder_add routes into the same intake, so it resolves the suffix template too.
         let (status, json) = request_json(
-            api_router(test_state()),
+            api_router(test_state_installed()),
             "POST",
             "/api/queue/folder",
             Some(json!({"path": dir.path().to_str().unwrap()})),
