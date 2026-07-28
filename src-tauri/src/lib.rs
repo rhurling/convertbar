@@ -352,7 +352,7 @@ pub fn run() {
             let app_state = app.state::<AppState>();
             let conv_state = app.state::<Arc<ConverterState>>();
             let has_queued;
-            let queue_paused;
+            let should_resume;
             {
                 let db = app_state.db.lock().unwrap();
 
@@ -365,15 +365,14 @@ pub fn run() {
                     [],
                     |row| row.get::<_, bool>(0),
                 ).unwrap_or(false);
-                // A pause the *updater* caused — draining a busy queue so a user-requested
-                // "Install and restart" could run — is lifted here, once. The user never pressed
-                // Pause, so honouring it past the restart that applied the update would leave the
-                // rest of their batch stopped indefinitely.
-                queue_paused =
-                    crate::updater::take_drain_pause(&db, crate::converter::is_queue_paused(&db));
+                // Honours a remembered pause, except one the *updater* caused by draining a busy
+                // queue for a user-requested "Install and restart" — the user never pressed
+                // Pause, so keeping it past the restart that applied the update would leave the
+                // rest of their batch stopped indefinitely. Lifted once, then forgotten.
+                should_resume = crate::updater::should_resume_queue_at_launch(&db, has_queued);
             }
 
-            if converter::should_auto_resume(has_queued, queue_paused) {
+            if should_resume {
                 let db_arc = app_state.db.clone();
                 let conv_arc = (*conv_state).clone();
                 let app_handle = app.handle().clone();

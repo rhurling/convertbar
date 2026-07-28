@@ -122,7 +122,16 @@ fn set_drain_pause(db: &Connection, armed: bool) {
 ///
 /// Consumed whether or not it is used, so a breadcrumb left behind by an install that never got
 /// as far as pausing anything cannot resurface against an unrelated pause later.
-pub(crate) fn take_drain_pause(db: &Connection, queue_paused: bool) -> bool {
+/// The launch-time decision: whether to start the queue, after lifting any pause the updater
+/// itself caused. Composed here rather than inline in `setup()` so the "consult the breadcrumb
+/// before honouring the pause" step is pinned by a test — `setup()` itself is not reachable from
+/// one.
+pub(crate) fn should_resume_queue_at_launch(db: &Connection, has_queued: bool) -> bool {
+    let queue_paused = take_drain_pause(db, crate::converter::is_queue_paused(db));
+    crate::converter::should_auto_resume(has_queued, queue_paused)
+}
+
+fn take_drain_pause(db: &Connection, queue_paused: bool) -> bool {
     let was_update_drain = read_drain_pause(db);
     set_drain_pause(db, false);
     if was_update_drain && queue_paused {
@@ -2184,6 +2193,40 @@ mod tests {
         set_drain_pause(&conn, true);
         assert!(!take_drain_pause(&conn, false));
         assert!(take_drain_pause(&conn, true));
+    }
+
+    #[test]
+    fn launch_resumes_a_queue_the_updater_paused_but_not_one_the_user_paused() {
+        // Pins the composition `setup()` performs, which no test can reach directly: the
+        // breadcrumb has to be consulted BEFORE `should_auto_resume` sees the paused flag, or the
+        // whole one-shot resume is inert.
+        let conn = test_conn();
+
+        crate::converter::set_queue_paused(&conn, true);
+        assert!(
+            !should_resume_queue_at_launch(&conn, true),
+            "a pause the user asked for is honoured"
+        );
+
+        crate::converter::set_queue_paused(&conn, true);
+        set_drain_pause(&conn, true);
+        assert!(
+            should_resume_queue_at_launch(&conn, true),
+            "a pause the updater caused by draining for an install is lifted"
+        );
+        assert!(
+            !crate::converter::is_queue_paused(&conn),
+            "and the lift is persisted, not just returned"
+        );
+
+        // Once — a later pause is the user's again.
+        crate::converter::set_queue_paused(&conn, true);
+        assert!(!should_resume_queue_at_launch(&conn, true));
+
+        // Nothing queued is still nothing to start.
+        crate::converter::set_queue_paused(&conn, false);
+        set_drain_pause(&conn, true);
+        assert!(!should_resume_queue_at_launch(&conn, false));
     }
 
     #[test]
