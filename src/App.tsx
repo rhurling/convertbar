@@ -4,6 +4,7 @@ import QueuePage from "./pages/QueuePage";
 import HistoryPage from "./pages/HistoryPage";
 import WatchedFoldersPage from "./pages/WatchedFoldersPage";
 import SettingsPage from "./pages/SettingsPage";
+import LoginScreen from "./components/LoginScreen";
 import { commands, type HandbrakeStatus } from "./lib/tauri";
 import { useAddProgress } from "./hooks/useAddProgress";
 import { useFileIntake } from "./hooks/useFileIntake";
@@ -14,8 +15,16 @@ type Tab = "queue" | "history" | "watch" | "settings";
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("queue");
   const [hbStatus, setHbStatus] = useState<HandbrakeStatus | null>(null);
+  const [unauthorized, setUnauthorized] = useState(false);
   const { isAdding, activity } = useAddProgress();
   const intake = useFileIntake({ onDrop: () => setActiveTab("queue") });
+
+  // Server head only: desktop never dispatches this event.
+  useEffect(() => {
+    const handler = () => setUnauthorized(true);
+    window.addEventListener("convertbar:unauthorized", handler);
+    return () => window.removeEventListener("convertbar:unauthorized", handler);
+  }, []);
 
   const refreshHbStatus = async () => {
     const status = await commands.validateHandbrake();
@@ -35,6 +44,8 @@ function App() {
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   }, []);
+
+  if (unauthorized) return <LoginScreen />;
 
   return (
     <div className="app">

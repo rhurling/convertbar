@@ -42,9 +42,14 @@ export function useQueue() {
       }),
     ];
 
+    // Server head only: after an SSE reconnect, refetch to heal any events missed while the
+    // connection was down. Never fires on desktop, so this listener is inert there.
+    window.addEventListener("convertbar:events-reconnected", refresh);
+
     return () => {
       mounted.current = false;
       unlisteners.forEach((p) => p.then((unlisten) => unlisten()));
+      window.removeEventListener("convertbar:events-reconnected", refresh);
     };
   }, [refresh]);
 
