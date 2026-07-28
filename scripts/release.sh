@@ -101,8 +101,9 @@ bump_manifests() {
   npm version "$target" --no-git-tag-version >/dev/null
   # tauri.conf.json: first "version" key is the top-level app version.
   perl -0pi -e 's/("version":\s*")[^"]*"/${1}'"$target"'"/' src-tauri/tauri.conf.json
-  # Cargo.toml: first line-anchored version is the [package] version.
-  perl -0pi -e 's/^version = "[^"]*"/version = "'"$target"'"/m' src-tauri/Cargo.toml
+  # Root Cargo.toml: first line-anchored version is [workspace.package] — the single
+  # Rust version source; src-tauri inherits it via version.workspace = true.
+  perl -0pi -e 's/^version = "[^"]*"/version = "'"$target"'"/m' Cargo.toml
   echo "Bumped manifests + lockfile to $target."
 }
 build_app() {
@@ -120,8 +121,8 @@ build_app() {
     # bump_manifests already dirtied the tree; restore it so the next run's clean-tree
     # preflight fails for the right reason (or not at all), not with an unrelated message.
     echo "Restoring bumped manifests to leave a clean tree..." >&2
-    git checkout -- package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock 2>/dev/null ||
-      echo "warning: restore FAILED — clean up manually with: git checkout -- package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock" >&2
+    git checkout -- package.json package-lock.json src-tauri/tauri.conf.json Cargo.toml Cargo.lock 2>/dev/null ||
+      echo "warning: restore FAILED — clean up manually with: git checkout -- package.json package-lock.json src-tauri/tauri.conf.json Cargo.toml Cargo.lock" >&2
     exit 1
   fi
 }

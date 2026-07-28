@@ -3,28 +3,28 @@ use rusqlite::{params, Connection};
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter};
 
+use crate::ctx::Ctx;
+use crate::events::EventSinkExt;
 use crate::types::JobInfo;
-use tauri_plugin_notification::NotificationExt;
 
 /// Filename marker for an in-flight in-place encode. A recognizable, non-suffix token so
 /// `is_video_file` can exclude it — a folder scan or watched folder must never enqueue a temp.
-pub(crate) const IN_PLACE_TEMP_MARKER: &str = ".convertbar-tmp.";
+pub const IN_PLACE_TEMP_MARKER: &str = ".convertbar-tmp.";
 
 /// A job re-encodes a file onto itself exactly when its stored output path equals its source.
 /// Compared as `Path` (not raw strings) so this predicate matches the add-time detection in
 /// `add_files_to_db` (`output_path.as_path() == path`), which normalizes `//` and `/.` segments.
 /// A mismatch here would route an in-place job through the distinct-file path and overwrite/delete
 /// the user's source — so the two predicates MUST stay identical.
-pub(crate) fn is_in_place(source_path: &str, output_path: &str) -> bool {
+pub fn is_in_place(source_path: &str, output_path: &str) -> bool {
     std::path::Path::new(source_path) == std::path::Path::new(output_path)
 }
 
 /// Temp output path for an in-place encode: a hidden, marked sibling in the SAME directory so the
 /// final `rename` is atomic (same filesystem). Keeps `.mp4` so HandBrake's container matches the
 /// distinct-file path.
-pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
+pub fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(source_path);
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
     let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -35,7 +35,7 @@ pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
 /// run, deleting only the partial output — NEVER the source. For an in-place job `output_path`
 /// equals `source_path`, so the partial to remove is the hidden temp sibling, not the original
 /// (mirrors `cancel_conversion`'s guard; deleting `output_path` here would destroy the user's file).
-pub(crate) fn recover_interrupted_jobs(db: &Connection) {
+pub fn recover_interrupted_jobs(db: &Connection) {
     let mut stmt = match db.prepare(
         "SELECT id, source_path, output_path FROM jobs WHERE status IN ('encoding', 'paused')",
     ) {
@@ -67,7 +67,7 @@ pub(crate) fn recover_interrupted_jobs(db: &Connection) {
 /// re-encode cascade) while a genuinely different file that later recycles the path still fails
 /// the identity check. Reuses `queue::file_identity` so the encoding stays identical to insert.
 fn record_source_identity(db: &Connection, job_id: &str, path: &str) {
-    if let Some(id) = crate::commands::queue::file_identity(path) {
+    if let Some(id) = crate::probe_cache::file_identity(path) {
         let _ = db.execute(
             "UPDATE jobs SET source_size = ?2, source_mtime = ?3 WHERE id = ?1",
             params![job_id, id.size, id.mtime],
@@ -89,7 +89,7 @@ fn record_source_identity(db: &Connection, job_id: &str, path: &str) {
 /// writes NULL: purge already refuses to destroy a row with a NULL fingerprint, and leaving the
 /// old, now-provably-wrong "healthy" fingerprint in place would be actively unsafe.
 fn record_condemned_identity(db: &Arc<Mutex<Connection>>, job_id: &str, path: &str) {
-    let id = crate::commands::queue::file_identity(path);
+    let id = crate::probe_cache::file_identity(path);
     let db = db.lock().unwrap();
     let _ = db.execute(
         "UPDATE jobs SET source_size = ?2, source_mtime = ?3 WHERE id = ?1",
@@ -130,11 +130,14 @@ fn apply_in_place_action(
     action: InPlaceAction,
     temp: &std::path::Path,
     source: &std::path::Path,
+    disposer: &dyn crate::dispose::FileDisposer,
 ) -> std::io::Result<()> {
     match action {
         InPlaceAction::RenameTempOverSource => std::fs::rename(temp, source),
         InPlaceAction::TrashSourceThenRename => {
-            let _ = trash::delete(source);
+            if let Some(s) = source.to_str() {
+                let _ = disposer.dispose(s);
+            }
             std::fs::rename(temp, source)
         }
         InPlaceAction::RemoveTemp => std::fs::remove_file(temp),
@@ -194,7 +197,7 @@ impl ConverterState {
 
     /// Returns true if the current platform supports real process pause/resume (SIGSTOP/SIGCONT).
     pub fn can_pause_process() -> bool {
-        cfg!(target_os = "macos")
+        cfg!(unix)
     }
 
     /// Whether the queue is armed to pause after the current job. The source of truth for
@@ -209,7 +212,7 @@ impl ConverterState {
 /// app can't orphan an encoder that would keep burning CPU for hours. The partial
 /// output is left alone: the next launch's auto-resume deletes it once no process
 /// holds it.
-pub(crate) fn kill_active_child(converter: &ConverterState) {
+pub fn kill_active_child(converter: &ConverterState) {
     // Arm shutdown BEFORE touching the child: without it the queue thread's next
     // iteration spawns a fresh encoder during teardown, and a spawn that raced this
     // call (child not yet stored in current_child) would be missed entirely —
@@ -217,7 +220,7 @@ pub(crate) fn kill_active_child(converter: &ConverterState) {
     converter
         .shutdown
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
         if let Ok(pid) = converter.current_pid.lock() {
             if let Some(pid) = *pid {
@@ -349,18 +352,18 @@ const LOW_DISK_HEADROOM_FACTOR: u64 = 2;
 /// Bytes that must remain free on a job's destination filesystem before its encode may start:
 /// the user's configured floor plus headroom for the encode itself. Saturating so an enormous
 /// configured floor (or source size) can't wrap.
-pub(crate) fn required_free_bytes(reserve_floor: u64, source_size: u64) -> u64 {
+pub fn required_free_bytes(reserve_floor: u64, source_size: u64) -> u64 {
     reserve_floor.saturating_add(source_size.saturating_mul(LOW_DISK_HEADROOM_FACTOR))
 }
 
 /// Whether `available` free bytes clear the reserve floor plus the encode headroom.
-pub(crate) fn has_enough_disk(available: u64, reserve_floor: u64, source_size: u64) -> bool {
+pub fn has_enough_disk(available: u64, reserve_floor: u64, source_size: u64) -> bool {
     available >= required_free_bytes(reserve_floor, source_size)
 }
 
 /// GiB (1024³ bytes), as configured in settings, to bytes. `f64 as u64` saturates at `u64::MAX`
 /// and clamps negatives/zero to 0, so a garbage or huge stored value can't panic or wrap.
-pub(crate) fn gb_to_bytes(gb: f64) -> u64 {
+pub fn gb_to_bytes(gb: f64) -> u64 {
     if gb <= 0.0 {
         return 0;
     }
@@ -448,7 +451,7 @@ fn get_low_disk_min_gb(db: &Connection) -> f64 {
 /// Persisted "the user deliberately stopped the queue" flag, stored in the settings table.
 /// Read-with-default (no seed) so existing databases need no migration and the settings-count
 /// guard test is untouched. It is backend runtime state — NOT in ALLOWED_KEYS, NOT in the UI.
-pub(crate) fn set_queue_paused(db: &Connection, paused: bool) {
+pub fn set_queue_paused(db: &Connection, paused: bool) {
     let _ = db.execute(
         "INSERT INTO settings (key, value) VALUES ('queue_paused', ?1)
          ON CONFLICT(key) DO UPDATE SET value = ?1",
@@ -456,7 +459,7 @@ pub(crate) fn set_queue_paused(db: &Connection, paused: bool) {
     );
 }
 
-pub(crate) fn is_queue_paused(db: &Connection) -> bool {
+pub fn is_queue_paused(db: &Connection) -> bool {
     db.query_row(
         "SELECT value FROM settings WHERE key = 'queue_paused'",
         [],
@@ -468,7 +471,7 @@ pub(crate) fn is_queue_paused(db: &Connection) -> bool {
 
 /// Whether launch should auto-start the queue: only when jobs are queued AND the user did not
 /// leave the queue deliberately paused. Pure so the launch decision is unit-testable.
-pub(crate) fn should_auto_resume(has_queued: bool, queue_paused: bool) -> bool {
+pub fn should_auto_resume(has_queued: bool, queue_paused: bool) -> bool {
     has_queued && !queue_paused
 }
 
@@ -491,7 +494,7 @@ fn source_is_confirmed_missing(probe: std::io::Result<bool>) -> bool {
 /// therefore never destroys. That is the opposite polarity from
 /// [`source_is_confirmed_missing`], which fails open because there the safe answer is
 /// "let HandBrake try".
-pub(crate) fn source_is_readable(path: &str) -> bool {
+pub fn source_is_readable(path: &str) -> bool {
     use std::io::Read;
     match std::fs::File::open(path) {
         Ok(mut f) => {
@@ -547,38 +550,6 @@ fn read_bounded_tail(mut reader: impl Read) -> String {
 
 const ERROR_TAIL_LINES: usize = 20;
 
-/// Substrings that mark a line as the actual failure reason. HandBrake opens its
-/// stderr with a build banner and host-info preamble (none of which match these), so
-/// the first hit is the diagnostic rather than the noise above it.
-const DIAGNOSTIC_MARKERS: [&str; 18] = [
-    "error",
-    "failed",
-    "fatal",
-    "aborted",
-    "not found",
-    "no such file",
-    "no title",
-    "unrecognized",
-    "unsupported",
-    "invalid",
-    "corrupt",
-    "no space",
-    "read-only",
-    "permission denied",
-    "not permitted",
-    "cannot",
-    "could not",
-    "unable",
-];
-
-/// The first line that reads like a failure reason, or None if nothing stands out.
-fn diagnostic_headline<'a>(lines: &[&'a str]) -> Option<&'a str> {
-    lines.iter().copied().find(|line| {
-        let lower = line.to_lowercase();
-        DIAGNOSTIC_MARKERS.iter().any(|m| lower.contains(m))
-    })
-}
-
 /// A failure prefix plus the informative end of HandBrake's stderr, so the history
 /// entry says WHY the encode failed instead of just that it did. The diagnostic line
 /// is promoted to the headline because the UI truncates the entry to a single line —
@@ -591,33 +562,10 @@ fn message_with_tail(prefix: &str, tail: &str) -> String {
     }
     let start = lines.len().saturating_sub(ERROR_TAIL_LINES);
     let tail_block = lines[start..].join("\n");
-    match diagnostic_headline(&lines) {
+    match crate::failure_class::diagnostic_headline(&lines) {
         Some(headline) => format!("{prefix}: {headline}\n{tail_block}"),
         None => format!("{prefix}:\n{tail_block}"),
     }
-}
-
-/// The bare failure prefixes written before the diagnostic headline was promoted. A
-/// stored message whose first line is exactly one of these predates the change and
-/// still leads with HandBrake's banner. Kept in sync with the `message_with_tail`
-/// callers below.
-const LEGACY_ERROR_PREFIXES: [&str; 2] = [
-    "Conversion failed:",
-    "Conversion produced an empty output file:",
-];
-
-/// Rewrite a previously-stored error message so its first line is the failure reason
-/// instead of HandBrake's build banner. Returns None when the message is already
-/// headlined, isn't one of our messages, or has no recognizable diagnostic — which
-/// makes the backfill that calls this idempotent (a rewritten first line no longer
-/// matches a legacy prefix).
-pub(crate) fn promote_stored_diagnostic(message: &str) -> Option<String> {
-    let (first_line, body) = message.split_once('\n')?;
-    if !LEGACY_ERROR_PREFIXES.contains(&first_line) {
-        return None;
-    }
-    let headline = diagnostic_headline(&body.lines().collect::<Vec<_>>())?;
-    Some(format!("{first_line} {headline}\n{body}"))
 }
 
 fn error_message_from_tail(tail: &str) -> String {
@@ -633,27 +581,26 @@ fn empty_output_error_message(tail: &str) -> String {
 /// Record a failed job WITHOUT notifying: status + error_message in the DB and the two
 /// frontend events. For failures the user already knows about because they caused them —
 /// a source file they moved or deleted — where a desktop notification is just noise.
-fn record_job_error_quiet<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    db: &Arc<Mutex<Connection>>,
+fn record_job_error_quiet(
+    ctx: &Ctx,
     job_id: &str,
     err_msg: &str,
     class: crate::failure_class::FailureClass,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
     {
-        let db = db.lock().unwrap();
+        let db = ctx.db.lock().unwrap();
         let _ = db.execute(
             "UPDATE jobs SET status = 'error', error_message = ?2, completed_at = ?3, \
              failure_class = ?4 WHERE id = ?1",
             params![job_id, err_msg, now, class.as_str()],
         );
     }
-    let _ = app.emit(
+    ctx.events.emit_t(
         "job-error",
         serde_json::json!({ "job_id": job_id, "error": err_msg }),
     );
-    let _ = app.emit(
+    ctx.events.emit_t(
         "job-status-changed",
         serde_json::json!({ "job_id": job_id, "status": "error" }),
     );
@@ -661,18 +608,17 @@ fn record_job_error_quiet<R: tauri::Runtime>(
 
 /// Record a failed job: everything `record_job_error_quiet` does, plus the per-file
 /// notification. The default for every failure path in process_queue.
-fn record_job_error<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    db: &Arc<Mutex<Connection>>,
+fn record_job_error(
+    ctx: &Ctx,
     job_id: &str,
     file_name: &str,
     err_msg: &str,
     class: crate::failure_class::FailureClass,
 ) {
-    record_job_error_quiet(app, db, job_id, err_msg, class);
+    record_job_error_quiet(ctx, job_id, err_msg, class);
 
     let notify_per_file = {
-        let db = db.lock().unwrap();
+        let db = ctx.db.lock().unwrap();
         db.query_row(
             "SELECT value FROM settings WHERE key='notifications_per_file'",
             params![],
@@ -682,12 +628,8 @@ fn record_job_error<R: tauri::Runtime>(
         .unwrap_or(true)
     };
     if notify_per_file {
-        let _ = app
-            .notification()
-            .builder()
-            .title("ConvertBar")
-            .body(&format!("{} failed", file_name))
-            .show();
+        ctx.events
+            .notify("ConvertBar", &format!("{} failed", file_name));
     }
 }
 
@@ -723,22 +665,18 @@ impl Drop for RunningGuard<'_> {
 
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
-fn process_queue<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    db: &Arc<Mutex<Connection>>,
-    converter: &ConverterState,
-) {
+fn process_queue(ctx: &Ctx) {
     // Clears is_running on every exit path (normal, early return, or panic).
-    let _running = RunningGuard(converter);
+    let _running = RunningGuard(&ctx.converter);
     // Every run/resume starts fresh: a stale reason from a prior pause must not linger once
     // the queue is running again (and be gone entirely if this run never hits the gate).
-    *converter.low_disk_pause.lock().unwrap() = None;
+    *ctx.converter.low_disk_pause.lock().unwrap() = None;
     let mut had_errors = false;
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
         // job — teardown would otherwise race a fresh HandBrakeCLI spawn and orphan it.
         // Return (not break) so no "Queue complete" notification fires mid-quit.
-        if converter.is_shutting_down() {
+        if ctx.converter.is_shutting_down() {
             return;
         }
         let job;
@@ -746,7 +684,7 @@ fn process_queue<R: tauri::Runtime>(
         let cleanup_mode;
         let low_disk_min_gb;
         {
-            let db = db.lock().unwrap();
+            let db = ctx.db.lock().unwrap();
             job = match get_next_job(&db) {
                 Some(j) => j,
                 None => break,
@@ -773,8 +711,7 @@ fn process_queue<R: tauri::Runtime>(
         if source_is_confirmed_missing(std::path::Path::new(&job.source_path).try_exists()) {
             had_errors = true;
             record_job_error_quiet(
-                app,
-                db,
+                ctx,
                 &job.id,
                 "Source file no longer exists",
                 crate::failure_class::FailureClass::Environment,
@@ -798,9 +735,9 @@ fn process_queue<R: tauri::Runtime>(
                         available_bytes: available,
                         required_bytes: required,
                     };
-                    *converter.low_disk_pause.lock().unwrap() = Some(pause.clone());
-                    let _ = app.emit("queue-paused-low-disk", &pause);
-                    let _ = app.emit(
+                    *ctx.converter.low_disk_pause.lock().unwrap() = Some(pause.clone());
+                    ctx.events.emit_t("queue-paused-low-disk", &pause);
+                    ctx.events.emit_t(
                         "menu-bar-update",
                         MenuBarUpdate {
                             // Reuse the end-of-run status so a prior job's failure in this run
@@ -826,8 +763,7 @@ fn process_queue<R: tauri::Runtime>(
             None => {
                 had_errors = true;
                 record_job_error(
-                    app,
-                    db,
+                    ctx,
                     &job.id,
                     &file_name,
                     "HandBrakeCLI not found",
@@ -846,7 +782,7 @@ fn process_queue<R: tauri::Runtime>(
         // claim + row-count check closes that window: 0 rows affected means the job is gone, so
         // skip it.
         let claim = {
-            let conn = db.lock().unwrap();
+            let conn = ctx.db.lock().unwrap();
             claim_job(&conn, &job.id)
         };
         match claim {
@@ -857,8 +793,7 @@ fn process_queue<R: tauri::Runtime>(
             ClaimOutcome::Failed(e) => {
                 had_errors = true;
                 record_job_error(
-                    app,
-                    db,
+                    ctx,
                     &job.id,
                     &file_name,
                     &format!("Failed to claim job: {e}"),
@@ -868,10 +803,10 @@ fn process_queue<R: tauri::Runtime>(
             }
         }
 
-        *converter.current_job_id.lock().unwrap() = Some(job.id.clone());
-        *converter.is_paused.lock().unwrap() = false;
+        *ctx.converter.current_job_id.lock().unwrap() = Some(job.id.clone());
+        *ctx.converter.is_paused.lock().unwrap() = false;
 
-        let _ = app.emit(
+        ctx.events.emit_t(
             "job-status-changed",
             serde_json::json!({
                 "job_id": job.id,
@@ -881,7 +816,7 @@ fn process_queue<R: tauri::Runtime>(
 
         // Count remaining queued jobs for tray info
         let queue_count: usize = {
-            let db = db.lock().unwrap();
+            let db = ctx.db.lock().unwrap();
             db.query_row(
                 "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
                 [],
@@ -890,7 +825,7 @@ fn process_queue<R: tauri::Runtime>(
             .unwrap_or(0) as usize
         };
 
-        let _ = app.emit(
+        ctx.events.emit_t(
             "menu-bar-update",
             MenuBarUpdate {
                 status: "encoding".to_string(),
@@ -931,20 +866,19 @@ fn process_queue<R: tauri::Runtime>(
             Err(e) => {
                 had_errors = true;
                 record_job_error(
-                    app,
-                    db,
+                    ctx,
                     &job.id,
                     &file_name,
                     &format!("Failed to start HandBrakeCLI: {}", e),
                     crate::failure_class::FailureClass::Environment,
                 );
-                *converter.current_job_id.lock().unwrap() = None;
+                *ctx.converter.current_job_id.lock().unwrap() = None;
                 continue;
             }
         };
 
         let pid = child.id();
-        *converter.current_pid.lock().unwrap() = Some(pid);
+        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
 
         // Read stdout for progress (HandBrakeCLI sends progress to stdout when piped)
         let progress_stream = child.stdout.take();
@@ -958,17 +892,17 @@ fn process_queue<R: tauri::Runtime>(
             .map(|stderr| std::thread::spawn(move || read_bounded_tail(stderr)));
 
         // Store child handle for cross-platform cancel support
-        *converter.current_child.lock().unwrap() = Some(child);
+        *ctx.converter.current_child.lock().unwrap() = Some(child);
 
         // Close the spawn→store window: if quit armed shutdown after the spawn but
         // before the handle was stored, kill_active_child found None — reap it here.
         // wait_for_active_child then sees the killed status and takes the error path.
-        if converter.is_shutting_down() {
-            kill_active_child(converter);
+        if ctx.converter.is_shutting_down() {
+            kill_active_child(&ctx.converter);
         }
 
         let job_id = job.id.clone();
-        let app_clone = app.clone();
+        let events_clone = ctx.events.clone();
         let file_name_clone = file_name.clone();
 
         let progress_thread = if let Some(stdout) = progress_stream {
@@ -988,7 +922,7 @@ fn process_queue<R: tauri::Runtime>(
                                     if let Some((percent, fps, avg_fps, eta)) =
                                         parse_progress(&line)
                                     {
-                                        let _ = app_clone.emit(
+                                        events_clone.emit_t(
                                             "conversion-progress",
                                             ConversionProgress {
                                                 job_id: job_id.clone(),
@@ -998,7 +932,7 @@ fn process_queue<R: tauri::Runtime>(
                                                 eta_seconds: eta,
                                             },
                                         );
-                                        let _ = app_clone.emit(
+                                        events_clone.emit_t(
                                             "menu-bar-update",
                                             MenuBarUpdate {
                                                 status: "encoding".to_string(),
@@ -1022,15 +956,15 @@ fn process_queue<R: tauri::Runtime>(
             None
         };
 
-        let exit_status = wait_for_active_child(converter);
+        let exit_status = wait_for_active_child(&ctx.converter);
 
         if let Some(handle) = progress_thread {
             let _ = handle.join();
         }
 
-        *converter.current_pid.lock().unwrap() = None;
-        *converter.current_child.lock().unwrap() = None;
-        *converter.current_job_id.lock().unwrap() = None;
+        *ctx.converter.current_pid.lock().unwrap() = None;
+        *ctx.converter.current_child.lock().unwrap() = None;
+        *ctx.converter.current_job_id.lock().unwrap() = None;
 
         // Joined here rather than inside individual arms: the child has already exited, so
         // the drain thread is at EOF and this returns promptly on every path. The success
@@ -1064,11 +998,10 @@ fn process_queue<R: tauri::Runtime>(
                     // `record_condemned_identity`. Never for Environment/Unknown: those aren't
                     // a verdict on the file at all.
                     if class == crate::failure_class::FailureClass::BadSource {
-                        record_condemned_identity(db, &job.id, &job.source_path);
+                        record_condemned_identity(&ctx.db, &job.id, &job.source_path);
                     }
                     record_job_error(
-                        app,
-                        db,
+                        ctx,
                         &job.id,
                         &file_name,
                         &empty_output_error_message(&tail),
@@ -1093,10 +1026,9 @@ fn process_queue<R: tauri::Runtime>(
                         // Same re-stamp as the classify()-based site below: the truncation is
                         // discovered right now, so the fingerprint recorded at queue time is
                         // stale the instant it's condemned. See `record_condemned_identity`.
-                        record_condemned_identity(db, &job.id, &job.source_path);
+                        record_condemned_identity(&ctx.db, &job.id, &job.source_path);
                         record_job_error(
-                            app,
-                            db,
+                            ctx,
                             &job.id,
                             &file_name,
                             &format!(
@@ -1131,6 +1063,7 @@ fn process_queue<R: tauri::Runtime>(
                         action,
                         &encode_target,
                         std::path::Path::new(&job.source_path),
+                        ctx.disposer.as_ref(),
                     )
                     .is_err()
                 } else {
@@ -1140,7 +1073,7 @@ fn process_queue<R: tauri::Runtime>(
                                 let _ = std::fs::remove_file(&job.source_path);
                             }
                             _ => {
-                                let _ = trash::delete(&job.source_path);
+                                let _ = ctx.disposer.dispose(&job.source_path);
                             }
                         },
                         KeptFile::Original => match cleanup_mode.as_str() {
@@ -1148,7 +1081,7 @@ fn process_queue<R: tauri::Runtime>(
                                 let _ = std::fs::remove_file(&job.output_path);
                             }
                             _ => {
-                                let _ = trash::delete(&job.output_path);
+                                let _ = ctx.disposer.dispose(&job.output_path);
                             }
                         },
                         KeptFile::Neither => {}
@@ -1170,8 +1103,7 @@ fn process_queue<R: tauri::Runtime>(
                         "In-place replacement failed; original may be in Trash"
                     };
                     record_job_error(
-                        app,
-                        db,
+                        ctx,
                         &job.id,
                         &file_name,
                         err_msg,
@@ -1192,7 +1124,7 @@ fn process_queue<R: tauri::Runtime>(
                 let now = chrono::Utc::now().to_rfc3339();
 
                 {
-                    let db = db.lock().unwrap();
+                    let db = ctx.db.lock().unwrap();
                     let _ = db.execute(
                         "UPDATE jobs SET status = ?2, converted_size = ?3, kept_file = ?4, space_saved = ?5, completed_at = ?6 WHERE id = ?1",
                         params![job.id, status_str, converted_size, kept_file, space_saved, now],
@@ -1204,7 +1136,7 @@ fn process_queue<R: tauri::Runtime>(
                     }
                 }
 
-                let _ = app.emit(
+                ctx.events.emit_t(
                     "job-completed",
                     serde_json::json!({
                         "job_id": job.id,
@@ -1214,7 +1146,7 @@ fn process_queue<R: tauri::Runtime>(
                     }),
                 );
 
-                let _ = app.emit(
+                ctx.events.emit_t(
                     "job-status-changed",
                     serde_json::json!({
                         "job_id": job.id,
@@ -1225,7 +1157,7 @@ fn process_queue<R: tauri::Runtime>(
                 // Notification logic for successful/skipped jobs
                 {
                     let (notify_per_file, errors_only) = {
-                        let db = db.lock().unwrap();
+                        let db = ctx.db.lock().unwrap();
                         let get = |k: &str, default: bool| -> bool {
                             db.query_row(
                                 "SELECT value FROM settings WHERE key=?1",
@@ -1257,21 +1189,16 @@ fn process_queue<R: tauri::Runtime>(
                                 }
                                 _ => format!("{} failed", file_name),
                             };
-                            let _ = app
-                                .notification()
-                                .builder()
-                                .title("ConvertBar")
-                                .body(&body)
-                                .show();
+                            ctx.events.notify("ConvertBar", &body);
                         }
                     }
                 }
 
                 // Pause after this job if the one-shot flag is armed (consumed here so the next
                 // queued job does not also pause).
-                if take_pause_after_current(converter) {
-                    set_queue_paused(&db.lock().unwrap(), true);
-                    let _ = app.emit(
+                if take_pause_after_current(&ctx.converter) {
+                    set_queue_paused(&ctx.db.lock().unwrap(), true);
+                    ctx.events.emit_t(
                         "menu-bar-update",
                         MenuBarUpdate {
                             status: "idle".to_string(),
@@ -1295,14 +1222,15 @@ fn process_queue<R: tauri::Runtime>(
                 // status='error' (auto-resume only picks up 'encoding'/'paused'),
                 // or notifying "failed" would let a scheduler race decide the
                 // job's fate. The loop head turns this continue into the return.
-                if converter.is_shutting_down() {
+                if ctx.converter.is_shutting_down() {
                     continue;
                 }
                 had_errors = true;
                 // Remove the partial encode output (the temp for in-place jobs), never the source.
                 let _ = std::fs::remove_file(&encode_target);
 
-                let current_status: Option<String> = db
+                let current_status: Option<String> = ctx
+                    .db
                     .lock()
                     .unwrap()
                     .query_row(
@@ -1321,11 +1249,10 @@ fn process_queue<R: tauri::Runtime>(
                         });
                     // See `record_condemned_identity`: never for Environment/Unknown.
                     if class == crate::failure_class::FailureClass::BadSource {
-                        record_condemned_identity(db, &job.id, &job.source_path);
+                        record_condemned_identity(&ctx.db, &job.id, &job.source_path);
                     }
                     record_job_error(
-                        app,
-                        db,
+                        ctx,
                         &job.id,
                         &file_name,
                         &error_message_from_tail(&tail),
@@ -1339,7 +1266,7 @@ fn process_queue<R: tauri::Runtime>(
     // No more jobs — queue done notification
     {
         let notify_queue_done = {
-            let db = db.lock().unwrap();
+            let db = ctx.db.lock().unwrap();
             db.query_row(
                 "SELECT value FROM settings WHERE key='notifications_queue_done'",
                 params![],
@@ -1349,17 +1276,12 @@ fn process_queue<R: tauri::Runtime>(
             .unwrap_or(true)
         };
         if notify_queue_done {
-            let _ = app
-                .notification()
-                .builder()
-                .title("ConvertBar")
-                .body("Queue complete")
-                .show();
+            ctx.events.notify("ConvertBar", "Queue complete");
         }
     }
 
     let final_status = final_run_status(had_errors);
-    let _ = app.emit(
+    ctx.events.emit_t(
         "menu-bar-update",
         MenuBarUpdate {
             status: final_status.to_string(),
@@ -1376,15 +1298,12 @@ fn process_queue<R: tauri::Runtime>(
 
 /// Starts queue processing in a new background thread.
 /// Sets `is_running` to true atomically before spawning.
-pub fn run_queue<R: tauri::Runtime>(
-    app: AppHandle<R>,
-    db: Arc<Mutex<Connection>>,
-    converter: Arc<ConverterState>,
-) {
+pub fn run_queue(ctx: Arc<Ctx>) {
     {
         // Poison-tolerant: if a prior queue thread panicked while briefly holding this lock,
         // recover the flag rather than propagating the poison and permanently wedging starts.
-        let mut running = converter
+        let mut running = ctx
+            .converter
             .is_running
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1395,7 +1314,7 @@ pub fn run_queue<R: tauri::Runtime>(
     }
 
     std::thread::spawn(move || {
-        process_queue(&app, &db, &converter);
+        process_queue(&ctx);
     });
 }
 
@@ -1444,28 +1363,30 @@ fn format_bytes_short(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauri::Listener;
+    use crate::dispose::RecordingDisposer;
+    use crate::events::TestSink;
 
-    // --- process_queue integration harness (mock runtime, in-memory DB) ---
+    // --- process_queue integration harness (Ctx + recording sink/disposer, in-memory DB) ---
 
-    fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
-        tauri::test::mock_builder()
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap()
-    }
-
-    fn test_db() -> Arc<Mutex<Connection>> {
+    fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
-        // Notifications route through the notification plugin, which isn't
-        // registered on the mock app — disable them so process_queue skips it.
+        // Notifications are recorded by TestSink regardless, but most tests don't care about
+        // them — disable so assertions on job-status-changed/menu-bar-update aren't a distraction.
         conn.execute(
             "UPDATE settings SET value = 'false'
              WHERE key IN ('notifications_per_file', 'notifications_queue_done')",
             [],
         )
         .unwrap();
-        Arc::new(Mutex::new(conn))
+        conn
+    }
+
+    fn test_ctx(conn: Connection) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
+        let sink = Arc::new(TestSink::default());
+        let disposer = Arc::new(RecordingDisposer::default());
+        let ctx = Ctx::new(conn, sink.clone(), disposer.clone());
+        (ctx, sink, disposer)
     }
 
     fn set_setting(db: &Arc<Mutex<Connection>>, key: &str, value: &str) {
@@ -1510,18 +1431,6 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap()
-    }
-
-    fn record_events(
-        app: &tauri::App<tauri::test::MockRuntime>,
-        name: &str,
-    ) -> Arc<Mutex<Vec<String>>> {
-        let store = Arc::new(Mutex::new(Vec::new()));
-        let sink = store.clone();
-        app.listen_any(name.to_string(), move |event| {
-            sink.lock().unwrap().push(event.payload().to_string());
-        });
-        store
     }
 
     #[test]
@@ -1596,34 +1505,30 @@ mod tests {
 
     #[test]
     fn record_job_error_persists_the_failure_class() {
-        let app = mock_app();
-        let db = test_db();
-        queue_job(&db, "j1", "/src.mkv", "/out.mp4", 1000);
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src.mkv", "/out.mp4", 1000);
         record_job_error(
-            app.handle(),
-            &db,
+            &ctx,
             "j1",
             "src.mkv",
             "Conversion failed",
             crate::failure_class::FailureClass::BadSource,
         );
-        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source"));
+        assert_eq!(class_of(&ctx.db, "j1").as_deref(), Some("bad_source"));
     }
 
     #[test]
     fn record_job_error_quiet_persists_environment_for_a_vanished_source() {
-        let app = mock_app();
-        let db = test_db();
-        queue_job(&db, "j2", "/gone.mkv", "/out.mp4", 1000);
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j2", "/gone.mkv", "/out.mp4", 1000);
         record_job_error_quiet(
-            app.handle(),
-            &db,
+            &ctx,
             "j2",
             "Source file no longer exists",
             crate::failure_class::FailureClass::Environment,
         );
         assert_eq!(
-            class_of(&db, "j2").as_deref(),
+            class_of(&ctx.db, "j2").as_deref(),
             Some("environment"),
             "a file that vanished is never the user's corrupt-download problem"
         );
@@ -1635,43 +1540,42 @@ mod tests {
         // Command::spawn fail. That branch must behave like all other failures:
         // job-status-changed fires (so the UI row updates) and the run ends with
         // the tray in "error", not a clean "idle" that hides every job failing.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("not-a-binary.txt");
         std::fs::write(&fake, "plain text").unwrap();
-        set_setting(&db, "handbrake_path", fake.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", fake.to_str().unwrap());
         let src = real_source(dir.path(), "in.mp4");
-        queue_job(&db, "j1", src.to_str().unwrap(), "/nowhere/out.mp4", 1000);
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            "/nowhere/out.mp4",
+            1000,
+        );
 
-        let status_events = record_events(&app, "job-status-changed");
-        let menubar_events = record_events(&app, "menu-bar-update");
+        process_queue(&ctx);
 
-        process_queue(app.handle(), &db, &converter);
-
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(status, "error");
         assert!(msg.unwrap().contains("Failed to start HandBrakeCLI"));
         assert_eq!(
-            class_of(&db, "j1").as_deref(),
+            class_of(&ctx.db, "j1").as_deref(),
             Some("environment"),
             "a spawn failure is an environment problem, never a bad-source verdict — \
              purge must not treat every queued file as clearable just because HandBrakeCLI \
              couldn't launch"
         );
         assert!(
-            status_events
-                .lock()
-                .unwrap()
+            sink.payloads("job-status-changed")
                 .iter()
-                .any(|p| p.contains("\"error\"")),
+                .any(|p| p["status"] == "error"),
             "spawn failure must emit job-status-changed like other failure paths"
         );
-        let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
+        let final_update = sink.payloads("menu-bar-update").last().cloned().unwrap();
         assert!(
-            final_update.contains("\"error\""),
+            final_update["status"] == "error",
             "a run where the only job failed must end 'error', got: {final_update}"
         );
     }
@@ -1683,11 +1587,10 @@ mod tests {
         // exercise ClaimOutcome::Failed without a real concurrent DB error. Without this test,
         // someone changing that call site's failure class to BadSource would pass the whole
         // suite, and a transient DB error would route a healthy file into the purge list.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
-        db.lock()
+        ctx.db
+            .lock()
             .unwrap()
             .execute(
                 "CREATE TRIGGER block_encoding_claim BEFORE UPDATE ON jobs \
@@ -1699,17 +1602,23 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let script = fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let src = real_source(dir.path(), "in.mp4");
-        queue_job(&db, "j1", src.to_str().unwrap(), "/nowhere/out.mp4", 1000);
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            "/nowhere/out.mp4",
+            1000,
+        );
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(status, "error");
         assert!(msg.unwrap().contains("Failed to claim job"));
         assert_eq!(
-            class_of(&db, "j1").as_deref(),
+            class_of(&ctx.db, "j1").as_deref(),
             Some("environment"),
             "a DB error while claiming the job is an environment problem, not a verdict on \
              the source file"
@@ -1720,33 +1629,28 @@ mod tests {
     fn low_disk_threshold_pauses_before_spawning_and_leaves_the_job_queued() {
         // An absurd threshold makes required-free exceed any real disk, so the gate always trips —
         // deterministic regardless of the test machine's free space.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         // A real fake HandBrake IS configured: if the gate failed to stop the run, the job would be
         // spawned and end 'error' (empty output). Staying 'queued' proves the gate blocked the spawn.
         let script = fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
-        set_setting(&db, "low_disk_min_gb", "1000000000"); // 1e9 GB
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "low_disk_min_gb", "1000000000"); // 1e9 GB
         let out = dir.path().join("out.mp4");
         let src = real_source(dir.path(), "a.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src.to_str().unwrap(),
             out.to_str().unwrap(),
             1000,
         );
 
-        let paused_events = record_events(&app, "queue-paused-low-disk");
-        let status_events = record_events(&app, "job-status-changed");
+        *ctx.converter.is_running.lock().unwrap() = true;
+        process_queue(&ctx);
 
-        *converter.is_running.lock().unwrap() = true;
-        process_queue(app.handle(), &db, &converter);
-
-        let (status, _msg) = job_row(&db, "j1");
+        let (status, _msg) = job_row(&ctx.db, "j1");
         assert_eq!(
             status, "queued",
             "a low-disk pause leaves the job queued, never encoding/error"
@@ -1755,19 +1659,15 @@ mod tests {
             !out.exists(),
             "the encode must never start, so no output is written"
         );
+        let paused_events = sink.payloads("queue-paused-low-disk");
         assert_eq!(
-            paused_events.lock().unwrap().len(),
+            paused_events.len(),
             1,
             "exactly one low-disk pause event fires"
         );
-        assert!(
-            paused_events.lock().unwrap()[0].contains("required_bytes"),
-            "the event carries the required-free figure for the UI"
-        );
         // Assert the actual payload VALUES, not just the presence of the key: an available/required
         // swap or the wrong path would still contain "required_bytes" but mislead the UI.
-        let payload = paused_events.lock().unwrap()[0].clone();
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let v = &paused_events[0];
         let available = v["available_bytes"]
             .as_u64()
             .expect("available_bytes is a number");
@@ -1784,15 +1684,13 @@ mod tests {
             "the pause event names the job's output path so the UI can point the user at it"
         );
         assert!(
-            status_events
-                .lock()
-                .unwrap()
+            sink.payloads("job-status-changed")
                 .iter()
-                .all(|p| !p.contains("\"encoding\"")),
+                .all(|p| p["status"] != "encoding"),
             "the job must never transition to encoding"
         );
         assert!(
-            !*converter.is_running.lock().unwrap(),
+            !*ctx.converter.is_running.lock().unwrap(),
             "the queue thread must have stopped"
         );
     }
@@ -1800,30 +1698,28 @@ mod tests {
     #[test]
     fn low_disk_check_is_skipped_when_threshold_is_zero() {
         // Threshold 0 = disabled: the gate is a no-op and the job runs through to the encode stage.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = fake_handbrake_script(dir.path()); // exits 0, writes nothing -> empty-output error
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
-        set_setting(&db, "low_disk_min_gb", "0");
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "low_disk_min_gb", "0");
         let out = dir.path().join("out.mp4");
         // i64::MAX source: a wrongly-running gate would saturate the requirement to ~u64::MAX and
         // trip (job stays 'queued'), so reaching the encode/error outcome proves the gate was
         // genuinely skipped, not that it ran and happened to pass on a tiny source.
         let src = real_source(dir.path(), "a.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src.to_str().unwrap(),
             out.to_str().unwrap(),
             i64::MAX,
         );
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(
             status, "error",
             "with the check disabled, the job is processed, not held 'queued'"
@@ -1844,32 +1740,28 @@ mod tests {
         // A configured threshold must NOT block a job whose destination free space can't be
         // read (nonexistent parent dir -> fs4::available_space errs -> None). Fail open: the
         // encode proceeds rather than the queue wedging on an unreadable volume.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = fake_handbrake_script(dir.path()); // exits 0, writes nothing -> empty-output error
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         // Absurd threshold: ANY real stat result would trip the gate (job stays 'queued'), so
         // reaching the encode/error outcome below proves a genuine None (fail open), not that
         // some other disk's ample free space slipped through.
-        set_setting(&db, "low_disk_min_gb", "1000000000"); // 1e9 GB
-                                                           // Output under a parent directory that does not exist -> available-space query fails -> None.
+        set_setting(&ctx.db, "low_disk_min_gb", "1000000000"); // 1e9 GB
+                                                               // Output under a parent directory that does not exist -> available-space query fails -> None.
         let src = real_source(dir.path(), "a.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src.to_str().unwrap(),
             "/no-such-dir-xyz/out.mp4",
             1000,
         );
 
-        let paused_events = record_events(&app, "queue-paused-low-disk");
+        process_queue(&ctx);
 
-        process_queue(app.handle(), &db, &converter);
-
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(
             status, "error",
             "fail-open: the job runs to the encode stage, not held 'queued'"
@@ -1879,7 +1771,7 @@ mod tests {
             "the disabled/unreadable-disk gate let the encode proceed"
         );
         assert!(
-            paused_events.lock().unwrap().is_empty(),
+            sink.payloads("queue-paused-low-disk").is_empty(),
             "no low-disk pause event fires when free space is unknown"
         );
     }
@@ -1888,26 +1780,25 @@ mod tests {
     fn low_disk_paused_job_is_resumable_after_the_threshold_is_lowered() {
         // Paused-for-disk jobs stay 'queued'; lowering the threshold (freeing space) and re-running
         // the queue must let them proceed — the "free up space, then Resume" contract.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
         let dir = tempfile::tempdir().unwrap();
         let script = fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
-        set_setting(&db, "low_disk_min_gb", "1000000000");
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "low_disk_min_gb", "1000000000");
         let out = dir.path().join("out.mp4");
         let src = real_source(dir.path(), "a.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src.to_str().unwrap(),
             out.to_str().unwrap(),
             1000,
         );
 
-        process_queue(app.handle(), &db, &converter);
-        assert_eq!(job_row(&db, "j1").0, "queued", "gate pauses the job");
-        let pause = converter
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "queued", "gate pauses the job");
+        let pause = ctx
+            .converter
             .low_disk_pause()
             .expect("the pause reason is persisted in backend state, not just emitted");
         assert_eq!(
@@ -1921,15 +1812,15 @@ mod tests {
         );
 
         // Free space (disable the gate) and run again: the job must now reach the encode stage.
-        set_setting(&db, "low_disk_min_gb", "0");
-        process_queue(app.handle(), &db, &converter);
+        set_setting(&ctx.db, "low_disk_min_gb", "0");
+        process_queue(&ctx);
         assert_eq!(
-            job_row(&db, "j1").0,
+            job_row(&ctx.db, "j1").0,
             "error",
             "after resume the job runs (fake HB -> empty output)"
         );
         assert!(
-            converter.low_disk_pause().is_none(),
+            ctx.converter.low_disk_pause().is_none(),
             "a resumed run that gets past the gate must clear the stale pause reason"
         );
     }
@@ -2031,43 +1922,39 @@ mod tests {
         // or firing a "failed" notification would make the job's fate depend on
         // whether the 100ms poll wakes before teardown finishes. The row stays
         // 'encoding' so the next launch resumes it.
-        let app = mock_app();
-        let db = test_db();
-        let converter = Arc::new(ConverterState::new());
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = slow_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let output = dir.path().join("out.mp4");
         let src = real_source(dir.path(), "a.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src.to_str().unwrap(),
             output.to_str().unwrap(),
             1000,
         );
 
-        let error_events = record_events(&app, "job-error");
-
-        run_queue(app.handle().clone(), db.clone(), converter.clone());
+        run_queue(ctx.clone());
         // The partial must exist BEFORE the kill, or the exists() assertion below
         // would pass vacuously against a file the script never got to write.
         wait_until(
             "the fake encode to be running with a partial on disk",
             || {
-                job_row(&db, "j1").0 == "encoding"
-                    && converter.current_child.lock().unwrap().is_some()
+                job_row(&ctx.db, "j1").0 == "encoding"
+                    && ctx.converter.current_child.lock().unwrap().is_some()
                     && output.exists()
             },
         );
 
-        kill_active_child(&converter);
+        kill_active_child(&ctx.converter);
         wait_until("the queue thread to exit", || {
-            !*converter.is_running.lock().unwrap()
+            !*ctx.converter.is_running.lock().unwrap()
         });
 
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(
             status, "encoding",
             "quit must leave the job for auto-resume, not record it as failed (msg: {msg:?})"
@@ -2077,9 +1964,9 @@ mod tests {
             "the partial output belongs to next-launch auto-resume cleanup, not the quit path"
         );
         assert!(
-            error_events.lock().unwrap().is_empty(),
+            sink.payloads("job-error").is_empty(),
             "no failure events/notifications may fire because the user quit: {:?}",
-            error_events.lock().unwrap()
+            sink.payloads("job-error")
         );
     }
 
@@ -2088,38 +1975,34 @@ mod tests {
         // Exit 0 with an empty/missing output must record an error carrying the
         // stderr tail (not a bare fixed string), and must not abort the run — the
         // next queued job still gets processed.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let out1 = dir.path().join("out1.mp4");
         let out2 = dir.path().join("out2.mp4");
         let src1 = real_source(dir.path(), "a.mp4");
         let src2 = real_source(dir.path(), "b.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src1.to_str().unwrap(),
             out1.to_str().unwrap(),
             1000,
         );
         queue_job(
-            &db,
+            &ctx.db,
             "j2",
             src2.to_str().unwrap(),
             out2.to_str().unwrap(),
             1000,
         );
 
-        let menubar_events = record_events(&app, "menu-bar-update");
-
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
         for id in ["j1", "j2"] {
-            let (status, msg) = job_row(&db, id);
+            let (status, msg) = job_row(&ctx.db, id);
             assert_eq!(status, "error", "{id} must fail, exit 0 notwithstanding");
             let msg = msg.unwrap();
             assert!(
@@ -2135,7 +2018,7 @@ mod tests {
             // against a regression that hardcodes/misreasons a class here instead of
             // consulting classify().
             assert_eq!(
-                class_of(&db, id).as_deref(),
+                class_of(&ctx.db, id).as_deref(),
                 Some("unknown"),
                 "{id}: an undiagnosable empty output must never be classified bad_source"
             );
@@ -2144,8 +2027,8 @@ mod tests {
             !out1.exists() && !out2.exists(),
             "empty outputs are removed"
         );
-        let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
-        assert!(final_update.contains("\"error\""));
+        let final_update = sink.payloads("menu-bar-update").last().cloned().unwrap();
+        assert!(final_update["status"] == "error");
     }
 
     /// A stand-in for HandBrakeCLI that writes a small non-empty output, emits a stderr tail
@@ -2197,29 +2080,25 @@ mod tests {
     // DEFAULT cleanup_mode='trash' — send the user's ORIGINAL to the Trash.
     #[test]
     fn truncated_encode_errors_and_leaves_the_source_on_disk() {
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = truncating_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
-        set_setting(&db, "cleanup_mode", "trash");
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "cleanup_mode", "trash");
         let source = real_source(dir.path(), "movie.mkv");
         let out = dir.path().join("movie.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             source.to_str().unwrap(),
             out.to_str().unwrap(),
             1000,
         );
 
-        let menubar_events = record_events(&app, "menu-bar-update");
+        process_queue(&ctx);
 
-        process_queue(app.handle(), &db, &converter);
-
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(
             status, "error",
             "a truncated source is a failure, not a success"
@@ -2228,15 +2107,18 @@ mod tests {
             msg.unwrap_or_default().contains("Source appears truncated"),
             "history must say WHY, not just that it failed"
         );
-        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source_truncated"));
+        assert_eq!(
+            class_of(&ctx.db, "j1").as_deref(),
+            Some("bad_source_truncated")
+        );
         assert!(
             source.exists(),
             "THE POINT OF THIS FEATURE: the user's original must still be on disk"
         );
         assert!(!out.exists(), "the short partial output must be removed");
-        let final_update = menubar_events.lock().unwrap().last().cloned().unwrap();
+        let final_update = sink.payloads("menu-bar-update").last().cloned().unwrap();
         assert!(
-            final_update.contains("\"error\""),
+            final_update["status"] == "error",
             "a run whose only job was truncated must end 'error', not a clean 'idle' that \
              hides the rejection — got: {final_update}"
         );
@@ -2246,21 +2128,19 @@ mod tests {
     // the original outright — the same defect class as the fixed auto-resume bug.
     #[test]
     fn truncated_in_place_encode_leaves_the_source_byte_identical() {
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = truncating_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
-        set_setting(&db, "cleanup_mode", "trash");
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "cleanup_mode", "trash");
         let source = real_source(dir.path(), "movie.mkv");
         let original_bytes = std::fs::read(&source).unwrap();
         // in-place: output_path == source_path
         let p = source.to_str().unwrap();
-        queue_job(&db, "j1", p, p, 1000);
+        queue_job(&ctx.db, "j1", p, p, 1000);
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
         assert_eq!(
             std::fs::read(&source).unwrap(),
@@ -2305,30 +2185,28 @@ mod tests {
         // {...}` wiring (converter.rs) — if that were ever collapsed to `None`, classify's
         // rule 4 (`exit_code == Some(2)`) could never fire and every such job would
         // silently fall through to Unknown with a still-green suite.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = bad_source_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let out = dir.path().join("out.mp4");
         let src = real_source(dir.path(), "a.mp4"); // genuinely exists and is readable
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src.to_str().unwrap(),
             out.to_str().unwrap(),
             1000,
         );
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(status, "error");
         assert!(msg.unwrap().contains("No title found"));
         assert_eq!(
-            class_of(&db, "j1").as_deref(),
+            class_of(&ctx.db, "j1").as_deref(),
             Some("bad_source"),
             "exit 2 + a source-marker diagnostic against a readable source must be bad_source"
         );
@@ -2348,35 +2226,33 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = bad_source_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let out = dir.path().join("out.mp4");
         let src = real_source(dir.path(), "a.mp4");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src.to_str().unwrap(),
             out.to_str().unwrap(),
             1000,
         );
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
         // Restore unconditionally so the tempdir's Drop cleanup can remove it.
         let _ = std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644));
 
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(status, "error");
         assert!(msg.unwrap().contains("No title found"));
         assert_eq!(
-            class_of(&db, "j1").as_deref(),
+            class_of(&ctx.db, "j1").as_deref(),
             Some("environment"),
             "we could not open the source ourselves, so HandBrake's IDENTICAL exit-2 \
              diagnostic must never be credited as a verdict on the file"
@@ -2403,17 +2279,15 @@ mod tests {
     #[test]
     fn bad_source_condemnation_restamps_identity_to_the_current_file_not_the_stale_add_time_value()
     {
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = bad_source_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let out = dir.path().join("out.mp4");
         let src = real_source(dir.path(), "a.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             src.to_str().unwrap(),
             out.to_str().unwrap(),
@@ -2421,7 +2295,8 @@ mod tests {
         );
         // Simulate a fingerprint captured when a DIFFERENT (larger, healthy) file lived at this
         // path at queue time.
-        db.lock()
+        ctx.db
+            .lock()
             .unwrap()
             .execute(
                 "UPDATE jobs SET source_size = 999999, source_mtime = 1 WHERE id = 'j1'",
@@ -2429,13 +2304,13 @@ mod tests {
             )
             .unwrap();
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
-        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source"));
-        let current = crate::commands::queue::file_identity(src.to_str().unwrap())
+        assert_eq!(class_of(&ctx.db, "j1").as_deref(), Some("bad_source"));
+        let current = crate::probe_cache::file_identity(src.to_str().unwrap())
             .expect("source is still on disk");
         assert_eq!(
-            source_size_mtime(&db, "j1"),
+            source_size_mtime(&ctx.db, "j1"),
             (Some(current.size), Some(current.mtime)),
             "the fingerprint must be re-stamped to the CURRENT file at condemnation time, not \
              left at the stale add-time value — otherwise a later repair landing back at the \
@@ -2447,23 +2322,22 @@ mod tests {
     // site — the same stale-fingerprint window applies there too.
     #[test]
     fn truncated_condemnation_restamps_identity_to_the_current_file_not_the_stale_add_time_value() {
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         let script = truncating_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let source = real_source(dir.path(), "movie.mkv");
         let out = dir.path().join("movie.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             source.to_str().unwrap(),
             out.to_str().unwrap(),
             1000,
         );
-        db.lock()
+        ctx.db
+            .lock()
             .unwrap()
             .execute(
                 "UPDATE jobs SET source_size = 999999, source_mtime = 1 WHERE id = 'j1'",
@@ -2471,13 +2345,16 @@ mod tests {
             )
             .unwrap();
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
-        assert_eq!(class_of(&db, "j1").as_deref(), Some("bad_source_truncated"));
-        let current = crate::commands::queue::file_identity(source.to_str().unwrap())
+        assert_eq!(
+            class_of(&ctx.db, "j1").as_deref(),
+            Some("bad_source_truncated")
+        );
+        let current = crate::probe_cache::file_identity(source.to_str().unwrap())
             .expect("source is still on disk");
         assert_eq!(
-            source_size_mtime(&db, "j1"),
+            source_size_mtime(&ctx.db, "j1"),
             (Some(current.size), Some(current.mtime)),
             "the truncation guard must also re-stamp the fingerprint at condemnation time"
         );
@@ -2490,11 +2367,9 @@ mod tests {
     #[test]
     #[ignore]
     fn process_queue_drives_a_real_encode_from_queued_to_done() {
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
         // 'delete' keeps the cleanup assertion filesystem-local (no Trash involved).
-        set_setting(&db, "cleanup_mode", "delete");
+        set_setting(&ctx.db, "cleanup_mode", "delete");
 
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("src.mp4");
@@ -2523,29 +2398,28 @@ mod tests {
 
         let output = dir.path().join("out.mkv");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             source.to_str().unwrap(),
             output.to_str().unwrap(),
             original_size,
         );
 
-        let status_events = record_events(&app, "job-status-changed");
-
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
         // The UI saw the full transition, not just the terminal state.
-        let events = status_events.lock().unwrap().clone();
+        let events = sink.payloads("job-status-changed");
         assert!(
-            events.iter().any(|p| p.contains("\"encoding\"")),
+            events.iter().any(|p| p["status"] == "encoding"),
             "missing encoding transition: {events:?}"
         );
         assert!(
-            events.last().unwrap().contains("\"done\""),
+            events.last().unwrap()["status"] == "done",
             "missing done transition: {events:?}"
         );
 
-        let (status, completed_at, converted_size, kept_file, space_saved) = db
+        let (status, completed_at, converted_size, kept_file, space_saved) = ctx
+            .db
             .lock()
             .unwrap()
             .query_row(
@@ -2583,18 +2457,16 @@ mod tests {
     // source trashed) returns, and every one of those fake-script tests stays green regardless,
     // because none of them ever touch real HandBrake output. This is the only test that can
     // catch that. Needs ffmpeg to synthesize a clip and a real HandBrakeCLI on PATH. Run with:
-    //   cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored real_handbrake_flags_a_truncated_source
+    //   cargo test -p convertbar-core --lib -- --ignored real_handbrake_flags_a_truncated_source
     #[test]
     #[ignore]
     fn real_handbrake_flags_a_truncated_source_and_spares_the_original() {
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
         let handbrake_path =
             crate::handbrake::detect_handbrake_path().expect("HandBrakeCLI must be on PATH");
-        set_setting(&db, "handbrake_path", &handbrake_path);
+        set_setting(&ctx.db, "handbrake_path", &handbrake_path);
         // 'delete' keeps the survival assertion filesystem-local (no Trash involved).
-        set_setting(&db, "cleanup_mode", "delete");
+        set_setting(&ctx.db, "cleanup_mode", "delete");
 
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("src.mp4");
@@ -2644,7 +2516,8 @@ mod tests {
         // HandBrake still emit a parseable marker" from "did our code correctly react to it",
         // so a HandBrake output-format change is diagnosed precisely as that, rather than the
         // vaguer "the guard didn't fire".
-        let preset: String = db
+        let preset: String = ctx
+            .db
             .lock()
             .unwrap()
             .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
@@ -2675,22 +2548,22 @@ mod tests {
 
         let output = dir.path().join("out.mkv");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             source.to_str().unwrap(),
             output.to_str().unwrap(),
             truncated_len as i64,
         );
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(
             status, "error",
             "a truncated source must fail, not succeed: {msg:?}"
         );
         assert_eq!(
-            class_of(&db, "j1").as_deref(),
+            class_of(&ctx.db, "j1").as_deref(),
             Some("bad_source_truncated"),
             "real HandBrake output must still trip the decode-shortfall guard"
         );
@@ -2952,52 +2825,6 @@ HandBrake has exited.";
     }
 
     #[test]
-    fn promote_stored_diagnostic_rewrites_old_banner_first_messages() {
-        let old = "Conversion failed:\n\
-                   [00:00:00] Compile-time hardening features are enabled\n\
-                   [mov] moov atom not found\n\
-                   No title found.";
-        let promoted =
-            promote_stored_diagnostic(old).expect("a banner-first legacy row should be rewritten");
-        assert_eq!(
-            promoted.lines().next().unwrap(),
-            "Conversion failed: [mov] moov atom not found"
-        );
-        assert!(promoted.contains("No title found."), "detail is preserved");
-        // Idempotent: a second pass over the rewritten message is a no-op.
-        assert_eq!(promote_stored_diagnostic(&promoted), None);
-    }
-
-    #[test]
-    fn promote_stored_diagnostic_leaves_foreign_messages_untouched() {
-        // Already headlined (space after the prefix, not a bare "prefix:").
-        assert_eq!(
-            promote_stored_diagnostic(
-                "Conversion failed: moov atom not found\nmoov atom not found"
-            ),
-            None
-        );
-        // Single-line generic fallback with no tail to promote from.
-        assert_eq!(promote_stored_diagnostic("Conversion failed"), None);
-        // Legacy shape but nothing diagnostic in the body — leave it rather than promote noise.
-        assert_eq!(
-            promote_stored_diagnostic("Conversion failed:\nScanning title 1\nOpening file"),
-            None
-        );
-        // The empty-output prefix is handled too.
-        assert_eq!(
-            promote_stored_diagnostic(
-                "Conversion produced an empty output file:\nbanner\nNo space left on device"
-            )
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap(),
-            "Conversion produced an empty output file: No space left on device"
-        );
-    }
-
-    #[test]
     fn kill_active_child_arms_shutdown_so_the_queue_spawns_no_new_jobs() {
         // Killing the current child is not enough on quit: the queue thread's next
         // iteration would spawn a fresh HandBrakeCLI during teardown and orphan it.
@@ -3109,7 +2936,7 @@ HandBrake has exited.";
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        let expected = crate::commands::queue::file_identity(&path_str).unwrap();
+        let expected = crate::probe_cache::file_identity(&path_str).unwrap();
         assert_eq!((size, mtime), (expected.size, expected.mtime));
     }
 
@@ -3270,7 +3097,13 @@ HandBrake has exited.";
         std::fs::write(&source, b"original").unwrap();
         std::fs::write(&temp, b"reencoded").unwrap();
 
-        apply_in_place_action(InPlaceAction::RenameTempOverSource, &temp, &source).unwrap();
+        apply_in_place_action(
+            InPlaceAction::RenameTempOverSource,
+            &temp,
+            &source,
+            &crate::dispose::DeleteDisposer,
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read(&source).unwrap(),
@@ -3288,7 +3121,13 @@ HandBrake has exited.";
         std::fs::write(&source, b"original").unwrap();
         std::fs::write(&temp, b"bigger-reencode").unwrap();
 
-        apply_in_place_action(InPlaceAction::RemoveTemp, &temp, &source).unwrap();
+        apply_in_place_action(
+            InPlaceAction::RemoveTemp,
+            &temp,
+            &source,
+            &crate::dispose::DeleteDisposer,
+        )
+        .unwrap();
 
         assert!(!temp.exists(), "temp was removed");
         assert_eq!(
@@ -3318,7 +3157,12 @@ HandBrake has exited.";
         let temp = dir.path().join(".clip.convertbar-tmp.mp4");
         std::fs::write(&source, b"original").unwrap();
 
-        let result = apply_in_place_action(InPlaceAction::RenameTempOverSource, &temp, &source);
+        let result = apply_in_place_action(
+            InPlaceAction::RenameTempOverSource,
+            &temp,
+            &source,
+            &crate::dispose::DeleteDisposer,
+        );
 
         assert!(
             result.is_err(),
@@ -3468,28 +3312,26 @@ HandBrake has exited.";
         // Handing the dead path to HandBrakeCLI produces a failure whose reason is buried in a
         // stderr dump, so the queue must stat the source first and fail the job with a message
         // that says what actually happened.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
         let dir = tempfile::tempdir().unwrap();
         // A fake that DOES write its output: if the guard let the spawn through, out.mp4 exists
         // and the job ends 'done' — so the assertions below can only pass if nothing was started.
         let script = successful_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let gone = dir.path().join("gone.mp4"); // deliberately never created
         let out = dir.path().join("out.mp4");
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             gone.to_str().unwrap(),
             out.to_str().unwrap(),
             1000,
         );
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
-        let (status, msg) = job_row(&db, "j1");
+        let (status, msg) = job_row(&ctx.db, "j1");
         assert_eq!(status, "error", "a vanished source fails the job");
         assert!(
             msg.unwrap().contains("Source file no longer exists"),
@@ -3504,39 +3346,40 @@ HandBrake has exited.";
     #[test]
     fn a_vanished_source_is_recorded_without_a_notification() {
         // The user removed the file themselves, so the history entry is the whole story — a
-        // desktop notification would just be noise. Observable because the mock app never
-        // registers the notification plugin: any code path that DOES notify panics with
-        // "state() called before manage()", failing this test.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
+        // desktop notification would just be noise. record_job_error_quiet (not record_job_error)
+        // is the vanished-source path, so TestSink must record zero notifications.
+        let (ctx, sink, _disposer) = test_ctx(test_conn());
         // Per-file notifications ON — the setting that makes every other failure path notify.
-        set_setting(&db, "notifications_per_file", "true");
+        set_setting(&ctx.db, "notifications_per_file", "true");
 
         let dir = tempfile::tempdir().unwrap();
         let script = successful_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let gone = dir.path().join("gone.mp4"); // deliberately never created
         queue_job(
-            &db,
+            &ctx.db,
             "j1",
             gone.to_str().unwrap(),
             dir.path().join("out.mp4").to_str().unwrap(),
             1000,
         );
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
         assert_eq!(
-            job_row(&db, "j1").0,
+            job_row(&ctx.db, "j1").0,
             "error",
             "the job still fails — it is only the notification that is suppressed"
         );
         assert_eq!(
-            class_of(&db, "j1").as_deref(),
+            class_of(&ctx.db, "j1").as_deref(),
             Some("environment"),
             "a vanished source is structurally known to be Environment — never BadSource, \
              since we never got the chance to read the file ourselves"
+        );
+        assert!(
+            sink.notifications.lock().unwrap().is_empty(),
+            "the vanished-source path must never notify, even with notifications_per_file on"
         );
     }
 
@@ -3544,25 +3387,29 @@ HandBrake has exited.";
     fn pause_after_current_firing_persists_queue_paused() {
         // When "Pause after this" is armed, the job completes and the queue stops — and that stop
         // must be REMEMBERED (queue_paused persisted) so the next launch does not auto-resume.
-        let app = mock_app();
-        let db = test_db();
-        let converter = ConverterState::new();
-        set_setting(&db, "cleanup_mode", "delete"); // keep cleanup filesystem-local (no Trash)
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        set_setting(&ctx.db, "cleanup_mode", "delete"); // keep cleanup filesystem-local (no Trash)
         let dir = tempfile::tempdir().unwrap();
         let script = successful_fake_handbrake_script(dir.path());
-        set_setting(&db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let src = dir.path().join("in.mp4");
         std::fs::write(&src, b"0123456789").unwrap(); // real source (10 bytes) so cleanup/metadata work
         let out = dir.path().join("out.mp4");
-        queue_job(&db, "j1", src.to_str().unwrap(), out.to_str().unwrap(), 10);
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            10,
+        );
         // Arm "pause after this" before the run.
-        *converter.pause_after_current.lock().unwrap() = true;
+        *ctx.converter.pause_after_current.lock().unwrap() = true;
 
-        process_queue(app.handle(), &db, &converter);
+        process_queue(&ctx);
 
-        assert_eq!(job_row(&db, "j1").0, "done", "the job completes");
+        assert_eq!(job_row(&ctx.db, "j1").0, "done", "the job completes");
         assert!(
-            is_queue_paused(&db.lock().unwrap()),
+            is_queue_paused(&ctx.db.lock().unwrap()),
             "pause-after-current firing must persist the paused state"
         );
     }

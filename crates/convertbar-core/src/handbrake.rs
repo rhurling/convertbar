@@ -1,3 +1,5 @@
+use crate::ctx::Ctx;
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -273,6 +275,53 @@ fn slugify(name: &str) -> String {
     slug
 }
 
+/// The user-configured path if it points at an existing file, otherwise PATH
+/// detection. The DB lock is released before `which`/`where` shells out.
+pub fn resolve_handbrake_path(ctx: &Ctx) -> Result<Option<String>, String> {
+    let configured: Option<String> = {
+        let conn = ctx.db.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'handbrake_path'",
+            params![],
+            |row| row.get(0),
+        )
+        .ok()
+    };
+
+    if let Some(ref path) = configured {
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            return Ok(Some(path.clone()));
+        }
+    }
+
+    Ok(detect_handbrake_path())
+}
+
+/// Preset metadata via the shared cache. The cache mutex is deliberately NOT held
+/// across the HandBrake shell-out: any command contending this lock would otherwise
+/// block for the whole subprocess run (lock convoy). Concurrent misses may fetch the
+/// same metadata twice; the duplicate insert is harmless.
+pub fn cached_preset_metadata(
+    ctx: &Ctx,
+    hb_path: &str,
+    preset: &str,
+) -> Result<PresetMetadata, String> {
+    {
+        let cache = ctx.preset_cache.lock().map_err(|e| e.to_string())?;
+        if let Some(m) = cache.get(preset) {
+            return Ok(m.clone());
+        }
+    }
+
+    let metadata = get_preset_metadata(hb_path, preset)?;
+
+    ctx.preset_cache
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(preset.to_string(), metadata.clone());
+    Ok(metadata)
+}
+
 pub fn resolve_suffix_template(template: &str, metadata: &PresetMetadata) -> String {
     let vars: &[(&str, &str)] = &[
         ("{codec}", &metadata.codec),
@@ -330,6 +379,16 @@ pub fn resolve_suffix_template(template: &str, metadata: &PresetMetadata) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_ctx() -> std::sync::Arc<Ctx> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        Ctx::new(
+            conn,
+            std::sync::Arc::new(crate::events::TestSink::default()),
+            std::sync::Arc::new(crate::dispose::DeleteDisposer),
+        )
+    }
 
     fn meta(codec: &str, resolution: &str, device: &str) -> PresetMetadata {
         PresetMetadata {
@@ -444,6 +503,31 @@ Matroska/
         assert_eq!(m.codec, "h265");
         assert_eq!(m.resolution, "1080p");
         assert_eq!(m.quality, "hq");
+    }
+
+    #[test]
+    fn cached_preset_metadata_serves_hits_without_shelling_out() {
+        let ctx = test_ctx();
+        ctx.preset_cache
+            .lock()
+            .unwrap()
+            .insert("My Preset".to_string(), meta("h265", "1080p", ""));
+
+        // The bogus binary path proves a cache hit never reaches the subprocess:
+        // if it did, this would error instead of returning the cached value.
+        let m = cached_preset_metadata(&ctx, "/nonexistent/HandBrakeCLI", "My Preset").unwrap();
+        assert_eq!(m.codec, "h265");
+    }
+
+    #[test]
+    fn cached_preset_metadata_miss_reaches_the_fetch_and_propagates_errors() {
+        let ctx = test_ctx();
+
+        let result = cached_preset_metadata(&ctx, "/nonexistent/HandBrakeCLI", "My Preset");
+        assert!(result.is_err(), "a cache miss must attempt the real fetch");
+
+        // A failed fetch must not poison the cache mutex or insert junk.
+        assert!(ctx.preset_cache.lock().unwrap().is_empty());
     }
 
     #[test]

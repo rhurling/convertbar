@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../lib/events";
 import type { AddStarted, AddProgress, AddFinished, AddActivity } from "../lib/tauri";
 
 /**

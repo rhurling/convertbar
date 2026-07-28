@@ -37,7 +37,10 @@ function collect(files: string[], re: RegExp): Set<string> {
 const frontendFiles = walk(join(root, "src"), [".ts", ".tsx"]).filter(
   (f) => !/\.(test|spec)\.tsx?$/.test(f) && !f.includes(join("src", "test")),
 );
-const rustFiles = walk(join(root, "src-tauri", "src"), [".rs"]);
+const rustFiles = [
+  ...walk(join(root, "src-tauri", "src"), [".rs"]),
+  ...walk(join(root, "crates", "convertbar-core", "src"), [".rs"]),
+];
 
 const invokedCommands = collect(
   frontendFiles,
@@ -63,7 +66,7 @@ function collectCommandNames(files: string[]): Set<string> {
 }
 
 const registeredCommands = collectCommandNames(rustFiles);
-const emittedEvents = collect(rustFiles, /\.emit(?:_to|_filter)?\s*\(\s*"([^"]+)"/g);
+const emittedEvents = collect(rustFiles, /\.emit(?:_t|_to|_filter)?\s*\(\s*"([^"]+)"/g);
 
 describe("IPC contract", () => {
   it("extracts a non-empty surface from both sides (guards against a broken scan)", () => {

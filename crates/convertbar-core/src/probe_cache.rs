@@ -14,6 +14,23 @@ pub struct FileIdentity {
     pub mtime: i64,
 }
 
+/// The cache key for a probe: the file's byte size + last-modified time (epoch millis).
+/// `None` when the file can't be stat'd or has no readable mtime — such a file has no
+/// stable identity and is probed every scan (handled by `resolve_media`'s forced-miss path).
+pub fn file_identity(path: &str) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some(FileIdentity {
+        size: meta.len() as i64,
+        mtime,
+    })
+}
+
 /// Split `candidates` into cache hits and misses. A hit is `(path, media)` whose stored row
 /// matches BOTH the supplied size and mtime; everything else (no row, or a stale row) is a
 /// miss carrying the identity to re-probe and re-store.

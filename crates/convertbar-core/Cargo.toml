@@ -1,0 +1,33 @@
+[package]
+name = "convertbar-core"
+description = "Head-agnostic core for ConvertBar: queue engine, watcher, db, probe"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "convertbar_core"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+dunce = "1.0.5"
+notify = "8"
+fs4 = { version = "0.13", features = ["sync"] }
+
+[target.'cfg(unix)'.dependencies]
+# SIGSTOP/SIGCONT (control::pause_conversion/resume_conversion/cancel_conversion,
+# converter::kill_active_child) and geteuid() for the converter no-read-permission test
+# (skipped as root). Widened from macOS-only: desktop Linux (and a future Linux server
+# head) get true mid-encode pause too.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

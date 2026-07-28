@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../lib/events";
 import { commands, type JobInfo, type PurgeResult } from "../lib/tauri";
 
 export function useBadSources() {

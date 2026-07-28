@@ -51,19 +51,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          workspaces: "./src-tauri -> target"
+          workspaces: ". -> target"
           # Fixed shared-key (not the per-job default) so test-windows.yml restores this
           # same Windows cache instead of cold-building and orphaning a PR-scoped cache.
           shared-key: "rust-tests"
           # Only main writes caches; PRs restore-only, so merged PRs leave no orphans.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --workspace
         if: runner.os != 'Windows'
       # --lib + RUSTFLAGS: the mock-runtime tests need a Common-Controls v6 manifest or
       # the test exe dies at load (STATUS_ENTRYPOINT_NOT_FOUND, tauri-apps/tauri#11028).
       # --lib keeps the app binary out of this cargo invocation, which would otherwise
       # get a second manifest on top of tauri-build's. All tests live in the lib.
-      - run: cargo test --lib --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --lib -p convertbar && cargo test --lib -p convertbar-core
+        shell: bash
         if: runner.os == 'Windows'
         env:
           RUSTFLAGS: -Clink-arg=/MANIFEST:EMBED -Clink-arg=/MANIFESTINPUT:${{ github.workspace }}\src-tauri\windows-test-manifest.xml

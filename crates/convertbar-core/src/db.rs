@@ -49,11 +49,20 @@ fn backfill_canonical_watch_paths(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the data dir: an explicit base (from CONVERTBAR_DATA_DIR) wins; otherwise the
+/// platform data dir + com.convertbar.app. Creates the directory either way.
+pub fn get_db_path_from(override_base: Option<PathBuf>) -> PathBuf {
+    let base = override_base.unwrap_or_else(|| {
+        dirs::data_dir()
+            .expect("Could not find Application Support directory")
+            .join("com.convertbar.app")
+    });
+    std::fs::create_dir_all(&base).expect("Could not create app data directory");
+    base.join("convertbar.db")
+}
+
 pub fn get_db_path() -> PathBuf {
-    let app_support = dirs::data_dir().expect("Could not find Application Support directory");
-    let db_dir = app_support.join("com.convertbar.app");
-    std::fs::create_dir_all(&db_dir).expect("Could not create app data directory");
-    db_dir.join("convertbar.db")
+    get_db_path_from(std::env::var_os("CONVERTBAR_DATA_DIR").map(PathBuf::from))
 }
 
 fn default_preset() -> &'static str {
@@ -137,7 +146,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         rows.collect::<Result<Vec<_>>>()?
     };
     for (id, message) in legacy_errors {
-        if let Some(promoted) = crate::converter::promote_stored_diagnostic(&message) {
+        if let Some(promoted) = crate::failure_class::promote_stored_diagnostic(&message) {
             conn.execute(
                 "UPDATE jobs SET error_message = ?2 WHERE id = ?1",
                 params![id, promoted],
@@ -798,5 +807,20 @@ mod tests {
             "the review list's bulk action defaults to the recoverable option; permanent \
              deletion must be chosen deliberately"
         );
+    }
+
+    #[test]
+    fn get_db_path_from_prefers_the_override_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = get_db_path_from(Some(dir.path().to_path_buf()));
+        assert_eq!(p, dir.path().join("convertbar.db"));
+        assert!(dir.path().exists(), "base dir is created");
+    }
+
+    #[test]
+    fn get_db_path_from_falls_back_to_platform_data_dir() {
+        let p = get_db_path_from(None);
+        let s = p.to_string_lossy();
+        assert!(s.contains("com.convertbar.app") && s.ends_with("convertbar.db"));
     }
 }
