@@ -305,7 +305,7 @@ git commit -m "feat(server): reject weak auth tokens and parse trusted proxies"
 
 - [ ] **Step 1: Register the module**
 
-Add `mod throttle;` to the module list at the top of `crates/convertbar-server/src/main.rs`, keeping alphabetical order (after `mod sink;`).
+Add `mod throttle;` to the module list at the top of `crates/convertbar-server/src/main.rs`, keeping alphabetical order — that is **after `mod startup;`** (line 6), which is the last entry.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -618,7 +618,15 @@ pub fn client_id(peer: Option<IpAddr>, headers: &HeaderMap, trusted: &[IpNet]) -
 Run: `cargo test -p convertbar-server client_id_tests 2>&1 | grep -E "^test result|^error"`
 Expected: `test result: ok. 13 passed`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Mutation-check the header bypass**
+
+These tests are the only defense against the `X-Forwarded-For` bypass, so prove they can catch it. Change the chain collection from `headers.get_all(XFF)` to `headers.get(XFF).into_iter()`. Run `cargo test -p convertbar-server client_id_tests`.
+
+`multiple_forwarded_header_lines_are_all_considered` MUST fail. Revert.
+
+Also change `.rev()` to a forward walk: `client_injected_prefix_is_skipped_by_the_rightmost_walk` MUST fail. Revert.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/convertbar-server/src/throttle.rs crates/convertbar-server/src/main.rs
@@ -852,7 +860,10 @@ impl LoginThrottle {
     }
 
     /// The lowest failure count whose delay is the cap — used so the cap warning
-    /// logs once per source instead of on every subsequent attempt.
+    /// logs once per ramp instead of on every subsequent attempt. Note "per ramp",
+    /// not "per source": after a window rollover or a successful login the source
+    /// starts over and will warn again if it climbs back to the cap. That is the
+    /// intended reading — a fresh ramp reaching the cap is a fresh event.
     fn cap_reached_at(&self) -> u32 {
         (1..=32).find(|n| self.delay_for(*n) == self.policy.cap).unwrap_or(u32::MAX)
     }
@@ -965,14 +976,22 @@ git commit -m "feat(server): thread the login throttle through ServerState"
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `guard_integration_tests` in `crates/convertbar-server/src/auth.rs`. Add these imports to that module: `use std::net::SocketAddr; use std::time::Duration; use axum::extract::connect_info::MockConnectInfo;`.
+Add to `guard_integration_tests` in `crates/convertbar-server/src/auth.rs`. Add these imports to that module: `use std::net::SocketAddr; use std::time::Duration; use axum::extract::ConnectInfo; use axum::Extension;`.
 
 ```rust
 /// Wraps `app` so requests carry a peer address, the way a real listener does.
 /// `oneshot` supplies no connect info, so without this every test would land in
 /// the single `Unknown` bucket and prove nothing about per-source behaviour.
+///
+/// NOT `MockConnectInfo` — that inserts an extension of type `MockConnectInfo<T>`,
+/// and only the `ConnectInfo` *extractor* falls back to it. Code reading
+/// `extensions().get::<ConnectInfo<_>>()` sees nothing, so every request would
+/// silently resolve to `Unknown` and these tests would pass for the wrong reason.
+/// `Extension(ConnectInfo(..))` inserts exactly what
+/// `into_make_service_with_connect_info` inserts in production. (Verified
+/// empirically; see the spec's §6.)
 fn app_from(state: ServerState, peer: &str) -> axum::Router {
-    app(state).layer(MockConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+    app(state).layer(Extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap())))
 }
 
 fn throttled_state(token: &str, base: Duration) -> ServerState {
@@ -994,9 +1013,36 @@ async fn uncredentialed_requests_are_never_throttled() {
     let state = throttled_state("abcdefghijklmnop", Duration::from_millis(80));
     let app = app_from(state, "10.0.0.1:5555");
     for _ in 0..12 {
+        // Assert the elapsed time of EACH uncredentialed request. Asserting only
+        // the status would let a "count them as failures" regression pass: the
+        // loop would just get slow, and a later authenticated request still
+        // returns fast because the success path never sleeps.
+        let start = std::time::Instant::now();
         let response = send(app.clone(), "GET", "/api/queue", &[("Host", "localhost")], None).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            start.elapsed() < Duration::from_millis(80),
+            "uncredentialed request was delayed: {:?}",
+            start.elapsed()
+        );
     }
+    // And the ramp must still be at zero: a wrong credential now should cost the
+    // FIRST step (80ms), not the thirteenth.
+    let start = std::time::Instant::now();
+    send(
+        app.clone(),
+        "GET",
+        "/api/queue",
+        &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+        None,
+    )
+    .await;
+    let first_real_failure = start.elapsed();
+    assert!(
+        first_real_failure < Duration::from_millis(300),
+        "counter advanced on uncredentialed requests: first real failure cost {first_real_failure:?}"
+    );
+
     // A correct credential must still be served immediately.
     let start = std::time::Instant::now();
     let response = send(
@@ -1073,9 +1119,14 @@ async fn wrong_credentials_are_delayed_and_the_delay_escalates() {
     .await;
     let second = second.elapsed();
 
+    // Absolute bounds, not `second >= first * 2`: that form doubles the first
+    // request's scheduling overhead into the bound and is flaky on a loaded
+    // machine. These are still discriminating — a delay computed BEFORE the
+    // increment gives second ~= 60ms and fails, and a dropped sleep fails the
+    // first assertion.
     assert!(first >= Duration::from_millis(60), "first not delayed: {first:?}");
     assert!(
-        second >= first * 2 - Duration::from_millis(20),
+        second >= Duration::from_millis(120),
         "delay did not escalate: {first:?} then {second:?}"
     );
 }
@@ -1129,10 +1180,21 @@ async fn rejection_body_and_headers_are_unchanged_and_carry_no_cookie() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run the tests and record which are red**
 
-Run: `cargo test -p convertbar-server guard_integration 2>&1 | tail -20`
-Expected: compile error on `crate::throttle::...` field assignment or failures on the timing assertions.
+Run: `cargo test -p convertbar-server guard_integration 2>&1 | tail -30`
+
+**Do not expect everything to be red — that would be a lie, and noticing it is the point.** Tasks 3 and 4 already added the types and the field, so this compiles. Only two of these are true red→green drivers; the rest are regression pins that are green from the start and are validated by the mutation checks in Step 5 instead.
+
+| Test | Pre-implementation | Why |
+|---|---|---|
+| `wrong_credentials_are_delayed_and_the_delay_escalates` | **RED** | No delay exists yet — the only true driver here |
+| `uncredentialed_requests_are_never_throttled` | green (pin) | Nothing throttles yet, so nothing is delayed |
+| `a_correct_token_always_succeeds...` | green (pin) | No lockout exists yet to break it |
+| `one_sources_failures_do_not_slow_another_source` | green (pin) | No ramp exists yet to leak |
+| `rejection_body_and_headers_are_unchanged_and_carry_no_cookie` | green (pin) | Asserts today's behaviour survives |
+
+Confirm `wrong_credentials_are_delayed_and_the_delay_escalates` is failing before continuing. If any *other* test is failing, stop — something from Tasks 1–4 is wrong.
 
 - [ ] **Step 3: Implement**
 
@@ -1178,10 +1240,16 @@ Replace the body of `auth_guard` after the exempt-path check (currently `auth.rs
 Run: `cargo test -p convertbar-server 2>&1 | grep -E "^test result|^error"`
 Expected: all pass.
 
-- [ ] **Step 5: Mutation-check the two most important guards**
+- [ ] **Step 5: Mutation-check the guards that are pins, not drivers**
 
-1. Delete the `let Some(provided) = ... else { return ... };` early return and instead treat a missing credential as a mismatch that records a failure. `uncredentialed_requests_are_never_throttled` MUST fail. Revert.
-2. Move the `token_matches` success check to AFTER `record_failure`. `a_correct_token_always_succeeds...` MUST still pass (there is no lockout) but `uncredentialed_requests_are_never_throttled`'s timing assertion MUST fail. If neither fails, strengthen the tests before continuing. Revert.
+Four of the five tests above were green before the implementation, so only a mutation proves they can fail at all. Run each, confirm the named test goes red, then revert.
+
+1. Delete the `let Some(provided) = ... else { return ... };` early return, treating a missing credential as a mismatch that records a failure. → `uncredentialed_requests_are_never_throttled` MUST fail (its per-request elapsed assertions, and its "first real failure" assertion).
+2. Change the bucket key in `auth_guard` to a constant (e.g. always `ClientId::Unknown`). → `one_sources_failures_do_not_slow_another_source` MUST fail. This is the test most at risk of passing vacuously, because a broken connect-info path collapses every source into one bucket and the test would never notice.
+3. Attach a `Set-Cookie` clearing header to the 401. → `rejection_body_and_headers_are_unchanged_and_carry_no_cookie` MUST fail.
+4. Add a lockout: after 5 failures return 401 without checking the token. → `a_correct_token_always_succeeds...` MUST fail. This is the goal-3 pin and the single most important test in the plan.
+
+If any mutation passes, the test is not doing its job — fix the test before continuing.
 
 - [ ] **Step 6: Commit**
 
@@ -1198,7 +1266,7 @@ git commit -m "feat(server): throttle failed credentials in auth_guard"
 - Modify: `crates/convertbar-server/src/routes/login.rs`
 
 **Interfaces:**
-- Consumes: `peer_ip` (Task 5), `client_id`, `LoginThrottle`.
+- Consumes: `client_id`, `LoginThrottle` (Tasks 2–4). Note it does **not** use `auth.rs`'s `peer_ip` — that helper takes a `&Request`, and this is a handler with an extractor signature.
 - Produces: nothing new.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1206,7 +1274,8 @@ git commit -m "feat(server): throttle failed credentials in auth_guard"
 Add to `mod tests` in `crates/convertbar-server/src/routes/login.rs`. The existing `post_login` helper uses `api_router`, which has no guards; these new tests need the full `app()` plus connect info, so add a second helper.
 
 ```rust
-use axum::extract::connect_info::MockConnectInfo;
+use axum::extract::ConnectInfo;
+use axum::Extension;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -1218,7 +1287,10 @@ fn login_app(token: &str, base: Duration) -> axum::Router {
             ..Default::default()
         },
     ));
-    crate::routes::app(state).layer(MockConnectInfo("10.0.0.1:5555".parse::<SocketAddr>().unwrap()))
+    // Extension(ConnectInfo(..)), NOT MockConnectInfo — see the note in Task 5.
+    crate::routes::app(state).layer(Extension(ConnectInfo(
+        "10.0.0.1:5555".parse::<SocketAddr>().unwrap(),
+    )))
 }
 
 async fn try_login(app: axum::Router, token: &str) -> axum::http::Response<Body> {
@@ -1305,18 +1377,26 @@ async fn a_failed_login_still_sets_no_cookie() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run the tests and record which are red**
 
-Run: `cargo test -p convertbar-server routes::login 2>&1 | tail -20`
-Expected: timing assertions fail (no throttling yet).
+Run: `cargo test -p convertbar-server routes::login 2>&1 | tail -30`
+
+As in Task 5, most of these are pins rather than drivers. Only `a_successful_login_resets_the_ramp` is a true driver here (nothing resets anything yet — though note it is also trivially green if nothing ramps either, so its real proof is the mutation in Step 5). `login_and_api_failures_share_one_bucket` is **RED** because Task 5's `auth_guard` now ramps but the login route does not yet feed the same bucket. The other two are green pins.
+
+Confirm `login_and_api_failures_share_one_bucket` is failing before continuing.
 
 - [ ] **Step 3: Implement**
 
 In `crates/convertbar-server/src/routes/login.rs`, add `headers` and an optional connect-info parameter to the handler.
 
-`Option<Extension<ConnectInfo<SocketAddr>>>` is the correct form here and **has been verified to compile against this repository's axum version**. It works because `Extension` implements `OptionalFromRequestParts` (`ConnectInfo` does not, which is why the bare `Option<ConnectInfo<..>>` fails), and both `into_make_service_with_connect_info` and `MockConnectInfo` store the value in request extensions where `Extension` finds it.
+`Option<Extension<ConnectInfo<SocketAddr>>>` is the correct form here and **has been verified to compile and to work at runtime against this repository's axum version**. It compiles because `Extension` implements `OptionalFromRequestParts` (`ConnectInfo` does not, which is why the bare `Option<ConnectInfo<..>>` fails to satisfy the trait bound). It resolves at runtime because `into_make_service_with_connect_info` — and the `Extension(ConnectInfo(..))` test layer — store a `ConnectInfo<SocketAddr>` extension, which is exactly what `Extension<ConnectInfo<SocketAddr>>` looks up.
+
+**`MockConnectInfo` does NOT work here** and must not be substituted: it stores a `MockConnectInfo<T>` extension, which only the `ConnectInfo` *extractor* knows to fall back to. Verified empirically — under `MockConnectInfo` this handler receives `None`.
+
+**Import note:** `login.rs:7` already has `use axum::extract::State;`. **Replace that line** rather than adding a second import — a duplicate `State` import is E0252, a hard error, not a warning.
 
 ```rust
+// REPLACES the existing `use axum::extract::State;` at line 7:
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use std::net::SocketAddr;
@@ -1369,7 +1449,41 @@ pub async fn login(
 Run: `cargo test -p convertbar-server 2>&1 | grep -E "^test result|^error"`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Mutation-check the reset**
+
+Delete the `s.login_throttle.record_success(id);` line. `a_successful_login_resets_the_ramp` MUST fail. Revert. Without this check that test is green in every world where the ramp is small, and proves nothing.
+
+- [ ] **Step 6: Add the open-mode test**
+
+The spec requires proving open mode never engages the throttle. Add:
+
+```rust
+#[tokio::test]
+async fn open_mode_never_engages_the_throttle() {
+    let mut state = state_with_auth(AuthMode::Open);
+    state.login_throttle = std::sync::Arc::new(crate::throttle::LoginThrottle::new(
+        crate::throttle::ThrottlePolicy {
+            base: Duration::from_millis(200),
+            ..Default::default()
+        },
+    ));
+    let app = crate::routes::app(state).layer(Extension(ConnectInfo(
+        "10.0.0.1:5555".parse::<SocketAddr>().unwrap(),
+    )));
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        let response = try_login(app.clone(), "any-token-at-all").await;
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "open mode was throttled: {:?}",
+            start.elapsed()
+        );
+    }
+}
+```
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/convertbar-server/src/routes/login.rs
@@ -1390,19 +1504,35 @@ git commit -m "feat(server): throttle failed logins and reset the ramp on succes
 
 - [ ] **Step 1: Write the failing test**
 
-`oneshot` cannot exercise the serve wiring, and its silent regression would put every client in the single `Unknown` bucket — a global throttle instead of a per-source one. Add to `mod tests` in `crates/convertbar-server/src/routes/mod.rs`:
+`oneshot` cannot exercise the serve wiring, and its silent regression would put every client in the single `Unknown` bucket — a global throttle instead of a per-source one.
+
+**The test must discriminate, and asserting a 401 does not.** A 401 comes back whether the request is bucketed by address or lands in `Unknown`; at a zero delay the two are indistinguishable. So: trust `127.0.0.1` as a proxy, use a non-zero delay, and send two requests bearing *different* forwarded clients. With the wiring intact each gets its own bucket and the second is fast. Without it, the peer is `None`, the forwarded header is never consulted (an untrusted peer's header is ignored), both collapse into `Unknown`, and the second inherits the first's ramp.
+
+Add to `mod tests` in `crates/convertbar-server/src/routes/mod.rs`:
 
 ```rust
-/// The one line `oneshot` cannot cover: without
-/// `into_make_service_with_connect_info`, `ConnectInfo` is absent and every
-/// client collapses into one shared bucket.
+/// The one line `oneshot` cannot cover. Without
+/// `into_make_service_with_connect_info` there is no `ConnectInfo`, so
+/// `client_id` cannot recognise 127.0.0.1 as a trusted proxy, never reads
+/// `X-Forwarded-For`, and every client collapses into one shared bucket.
 #[tokio::test]
-async fn served_requests_carry_connect_info() {
+async fn served_requests_are_bucketed_per_forwarded_client() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let (state, _shutdown_tx) = test_state_with_shutdown();
     let mut config = (*state.config).clone();
     config.auth = crate::config::AuthMode::Token("abcdefghijklmnop".to_string());
+    config.trusted_proxies = vec!["127.0.0.1".parse::<ipnet::IpNet>().unwrap_or_else(|_| {
+        ipnet::IpNet::from("127.0.0.1".parse::<std::net::IpAddr>().unwrap())
+    })];
     let mut state = state;
     state.config = Arc::new(config);
+    state.login_throttle = Arc::new(crate::throttle::LoginThrottle::new(
+        crate::throttle::ThrottlePolicy {
+            base: std::time::Duration::from_millis(150),
+            ..Default::default()
+        },
+    ));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1415,27 +1545,52 @@ async fn served_requests_carry_connect_info() {
         .unwrap();
     });
 
-    // A wrong credential from a real connection. If this panics or 500s, the
-    // connect-info wiring is broken; a 401 proves the guard ran end to end.
-    let body = format!(
-        "GET /api/queue HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\nConnection: close\r\n\r\n"
-    );
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream.write_all(body.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
+    async fn wrong_credential_from(addr: std::net::SocketAddr, forwarded: &str) -> String {
+        let request = format!(
+            "GET /api/queue HTTP/1.1\r\nHost: localhost\r\n\
+             Authorization: Bearer wrong\r\nX-Forwarded-For: {forwarded}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    // Ramp up one forwarded client.
+    for _ in 0..4 {
+        let response = wrong_credential_from(addr, "203.0.113.1").await;
+        assert!(response.starts_with("HTTP/1.1 401"), "unexpected: {response}");
+    }
+
+    // A DIFFERENT forwarded client must start at step 1 (~150ms), not inherit
+    // the first client's ramp (~1.2s at step 4).
+    let start = std::time::Instant::now();
+    let response = wrong_credential_from(addr, "203.0.113.2").await;
+    assert!(response.starts_with("HTTP/1.1 401"), "unexpected: {response}");
     assert!(
-        response.starts_with("HTTP/1.1 401"),
-        "unexpected response: {response}"
+        start.elapsed() < std::time::Duration::from_millis(600),
+        "second forwarded client inherited the first's ramp ({:?}) — connect info \
+         is missing, so every client shares the Unknown bucket",
+        start.elapsed()
     );
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+**Note:** `"127.0.0.1".parse::<IpNet>()` fails (no prefix), so the `unwrap_or_else` above converts the bare address. If Task 1's config parsing is reachable from this test, prefer building the config through `ServerConfig::from_vars` with `CONVERTBAR_TRUSTED_PROXIES=127.0.0.1` instead — it is the same code path production uses and avoids duplicating the parse logic.
 
-Run: `cargo test -p convertbar-server served_requests_carry_connect_info 2>&1 | tail -20`
-Expected: FAIL — `into_make_service_with_connect_info` is not yet used in `main.rs`, but note this test builds its own server, so it may pass immediately. If it does, that is fine: its purpose is to lock the wiring in. Confirm it fails if you change the test's own `serve` call to plain `app(state)` — that is the mutation that proves it works.
+- [ ] **Step 2: Verify the test can fail**
+
+This test builds its own server, so it passes as soon as it is written — `main.rs` is not what it exercises. Its value is entirely in the mutation, so run that now:
+
+Change the test's own `axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>())` to plain `axum::serve(listener, app(state))`. Run:
+
+`cargo test -p convertbar-server served_requests_are_bucketed_per_forwarded_client 2>&1 | tail -20`
+
+Expected: **FAIL** on the elapsed-time assertion — with no connect info the peer is `None`, so both forwarded clients land in `Unknown` and the second inherits the ramp. Revert the mutation and confirm it passes.
+
+If it passes under the mutation, the test is not discriminating and must be fixed before continuing.
 
 - [ ] **Step 3: Update `main.rs`**
 
@@ -1591,6 +1746,10 @@ Expected: identical results.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Watch for `clippy::useless_format` in the new tests: a `format!` with no
+interpolated arguments is a warn-by-default lint and therefore an error under
+`-D warnings`. Use a plain `&str` literal where there is nothing to interpolate.
 
 - [ ] **Step 4: Frontend suite (unchanged, but prove it)**
 

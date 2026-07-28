@@ -275,9 +275,15 @@ amplifier.
   middleware trait bounds and fails to compile (verified against this
   repository's axum version). `auth_guard` already owns the `Request`; the
   `login` handler takes the peer the same way.
-- Tests supply connect info with axum's `MockConnectInfo` layer (verified to
-  compile here), so integration tests exercise real, controllable addresses
-  rather than the `Unknown` bucket.
+- Tests supply connect info with an **`Extension(ConnectInfo(addr))` layer**, not
+  `MockConnectInfo`. `MockConnectInfo` inserts an extension of type
+  `MockConnectInfo<T>`, and only the `ConnectInfo` *extractor* knows to fall back
+  to it — so a middleware reading `extensions().get::<ConnectInfo<_>>()` sees
+  nothing and every mocked request would silently land in the `Unknown` bucket,
+  making the per-source tests pass for the wrong reason. `Extension(ConnectInfo(addr))`
+  inserts exactly what `into_make_service_with_connect_info` inserts in
+  production. Both behaviours verified empirically against this repository's axum
+  version.
 
 ## Testing
 
@@ -313,10 +319,14 @@ amplifier.
 7. Open mode never engages the throttle.
 
 **Real-listener test:** bind `127.0.0.1:0`, serve with
-`into_make_service_with_connect_info`, connect a real client, and assert the
-request does *not* land in the `Unknown` bucket. This covers the one line that
-`oneshot` cannot, and whose silent regression would collapse every client into
-one global bucket.
+`into_make_service_with_connect_info`, and connect real clients. It must
+*discriminate*, not merely return 401 — a 401 arrives either way, since the
+`Unknown` bucket at a zero delay is behaviourally identical. Trust `127.0.0.1`
+as a proxy, use a non-zero base delay, and drive two requests bearing different
+`X-Forwarded-For` clients: with the wiring intact they occupy separate buckets
+and the second is fast; without it both collapse into `Unknown` and the second is
+delayed. This covers the one line `oneshot` cannot reach, and whose silent
+regression would turn a per-source throttle into a global one.
 
 **Config:** weak token rejected; weak token + `NO_AUTH=1` still rejected;
 `NO_AUTH=1` alone unaffected; trusted-proxy parsing (CIDR, bare IP, invalid →
