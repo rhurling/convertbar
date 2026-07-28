@@ -691,4 +691,87 @@ pub(crate) mod tests {
             serde_json::from_slice(&body).expect("api fallback must return a JSON body");
         assert_eq!(json["error"], "not found");
     }
+
+    /// The one line `oneshot` cannot cover. Without
+    /// `into_make_service_with_connect_info` there is no `ConnectInfo`, so
+    /// `client_id` cannot recognise 127.0.0.1 as a trusted proxy, never reads
+    /// `X-Forwarded-For`, and every client collapses into one shared bucket.
+    #[tokio::test]
+    async fn served_requests_are_bucketed_per_forwarded_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut state, _shutdown_tx) = test_state_with_shutdown();
+        // Same code path production uses for CONVERTBAR_TRUSTED_PROXIES, rather than
+        // duplicating IpNet parsing here (a bare "127.0.0.1" has no prefix to parse).
+        state.config = Arc::new(
+            ServerConfig::from_vars(
+                &[
+                    (
+                        "CONVERTBAR_AUTH_TOKEN".to_string(),
+                        "abcdefghijklmnop".to_string(),
+                    ),
+                    (
+                        "CONVERTBAR_TRUSTED_PROXIES".to_string(),
+                        "127.0.0.1".to_string(),
+                    ),
+                ]
+                .into(),
+            )
+            .expect("valid test config"),
+        );
+        state.login_throttle = Arc::new(crate::throttle::LoginThrottle::new(
+            crate::throttle::ThrottlePolicy {
+                base: std::time::Duration::from_millis(150),
+                ..Default::default()
+            },
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        async fn wrong_credential_from(addr: std::net::SocketAddr, forwarded: &str) -> String {
+            let request = format!(
+                "GET /api/queue HTTP/1.1\r\nHost: localhost\r\n\
+                 Authorization: Bearer wrong\r\nX-Forwarded-For: {forwarded}\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        }
+
+        // Ramp up one forwarded client.
+        for _ in 0..4 {
+            let response = wrong_credential_from(addr, "203.0.113.1").await;
+            assert!(
+                response.starts_with("HTTP/1.1 401"),
+                "unexpected: {response}"
+            );
+        }
+
+        // A DIFFERENT forwarded client must start at step 1 (~150ms), not inherit
+        // the first client's ramp (~1.2s at step 4).
+        let start = std::time::Instant::now();
+        let response = wrong_credential_from(addr, "203.0.113.2").await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "unexpected: {response}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(600),
+            "second forwarded client inherited the first's ramp ({:?}) — connect info \
+             is missing, so every client shares the Unknown bucket",
+            start.elapsed()
+        );
+    }
 }

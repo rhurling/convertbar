@@ -28,3 +28,4 @@ ipnet = "2"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+tokio = { version = "1", features = ["io-util"] }

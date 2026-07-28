@@ -91,18 +91,21 @@ async fn main() {
     let app = routes::app(state);
 
     let shutdown_ctx = ctx.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            startup::shutdown_signal().await;
-            // Kill the active child AT signal time (not after `serve` returns): this is
-            // what flips every SSE stream's shutdown watch (via the send below) after the
-            // child is already down, so the graceful drain doesn't wait on an in-flight
-            // encode as well as the open connections.
-            convertbar_core::converter::kill_active_child(&shutdown_ctx.converter);
-            let _ = shutdown_tx.send(true);
-        })
-        .await
-        .expect("server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        startup::shutdown_signal().await;
+        // Kill the active child AT signal time (not after `serve` returns): this is
+        // what flips every SSE stream's shutdown watch (via the send below) after the
+        // child is already down, so the graceful drain doesn't wait on an in-flight
+        // encode as well as the open connections.
+        convertbar_core::converter::kill_active_child(&shutdown_ctx.converter);
+        let _ = shutdown_tx.send(true);
+    })
+    .await
+    .expect("server error");
 
     // Belt: harmless even if the signal-time kill above already ran (kill_active_child is
     // idempotent — a no-op when no child is active, and a second kill()/wait() on an
