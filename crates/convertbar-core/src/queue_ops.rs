@@ -1422,7 +1422,7 @@ mod tests {
     use super::*;
     use crate::dispose::{DeleteDisposer, RecordingDisposer};
     use crate::events::TestSink;
-    use crate::handbrake::{AbsentLocator, StubLocator};
+    use crate::handbrake::AbsentLocator;
     use rusqlite::Connection;
     use std::path::Path;
 

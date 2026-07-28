@@ -267,10 +267,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn add_files_with_empty_paths_returns_empty_added_and_skipped() {
-        // Even an empty add resolves the suffix template first, so the world must be declared.
+    async fn add_files_with_empty_paths_never_reaches_handbrake_resolution() {
+        // `test_state()`'s PanickingLocator is the assertion: an empty add must return before it
+        // reaches HandBrake resolution. Declaring an installed world here would hide a
+        // regression — the route would resolve, succeed, and return this same body either way.
+        // A panic inside `spawn_blocking` surfaces as a 500 with `{"error": "task panicked:
+        // ..."}`, so the status assertion below catches it.
         let (status, json) = request_json(
-            api_router(test_state_installed()),
+            api_router(test_state()),
             "POST",
             "/api/queue/files",
             Some(json!({"paths": []})),
@@ -481,11 +485,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_folder_add_on_an_empty_tempdir_adds_nothing() {
+    async fn confirm_folder_add_on_an_empty_tempdir_never_reaches_handbrake_resolution() {
+        // The scenario this fix exists for: a folder with no videos in it reaches intake with
+        // zero paths. It used to need an installed HandBrake to succeed, because intake expanded
+        // the suffix template before looking at `paths`. `test_state()`'s PanickingLocator now
+        // asserts that it does not.
         let dir = tempfile::tempdir().expect("create tempdir");
-        // confirm_folder_add routes into the same intake, so it resolves the suffix template too.
         let (status, json) = request_json(
-            api_router(test_state_installed()),
+            api_router(test_state()),
             "POST",
             "/api/queue/folder",
             Some(json!({"path": dir.path().to_str().unwrap()})),
