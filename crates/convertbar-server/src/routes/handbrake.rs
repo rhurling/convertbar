@@ -27,9 +27,9 @@ pub async fn detect_handbrake(State(s): State<ServerState>) -> Response {
 
 pub async fn list_handbrake_presets(State(s): State<ServerState>) -> Response {
     let ctx = s.ctx.clone();
-    match tokio::task::spawn_blocking(move || match hb::resolve_handbrake_path(&ctx)? {
-        Some(p) => hb::list_presets(&p),
-        None => Err("HandBrakeCLI not found".to_string()),
+    match tokio::task::spawn_blocking(move || {
+        let path = hb::require_handbrake_path(&ctx)?;
+        hb::list_presets(&path)
     })
     .await
     {
@@ -78,7 +78,7 @@ pub async fn generate_preset_suffix(
             }
         }
 
-        let handbrake_path = hb::resolve_handbrake_path(&ctx)?.ok_or("HandBrakeCLI not found")?;
+        let handbrake_path = hb::require_handbrake_path(&ctx)?;
         hb::cached_preset_metadata(&ctx, &handbrake_path, &preset)
     })
     .await
