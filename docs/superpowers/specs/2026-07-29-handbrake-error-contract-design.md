@@ -121,7 +121,7 @@ HandBrake is installed.
 work. No caller relies on that; none of the four call it as a probe.
 
 **The same shape exists in `purge_bad_sources` and is deliberately left alone.**
-`routes/mod.rs:441` documents it: a purge with `ids: []` still resolves HandBrake up front,
+`routes/mod.rs:449` documents it: a purge with `ids: []` still resolves HandBrake up front,
 spawning a `which` for a batch it will never consume. It is not fixed here, because the
 resolution there is genuinely per-batch state threaded into `purge_one_locked` for each id —
 a different shape from intake, where the suffix is a value computed for paths that do not
@@ -315,9 +315,14 @@ The reason the server test pinned the exact wording is that a deliberate core er
 panic inside `spawn_blocking` are indistinguishable by status: all ten join-error sites in
 `crates/convertbar-server/src/routes/` — `queue.rs:29,44,53,67,129`, `fs.rs:89`,
 `handbrake.rs:24,38,63,88` — map to `core_err(format!("task panicked: {join}"))`, i.e. the
-same 500 as any ordinary failure. A client cannot tell a bug from an expected failure. (A
-naive `grep` over-reports: the surplus hits are comments inside tests in `routes/mod.rs` that
-mention the panic body. Count the `core_err(format!(...))` call sites, not the phrase.)
+same 500 as any ordinary failure. A client cannot tell a bug from an expected failure.
+
+Counting these is fiddlier than it looks, and two plausible methods both give the wrong answer.
+Grepping the phrase `task panicked` over-reports — the surplus hits are comments inside
+`routes/mod.rs` tests. Grepping `core_err(format!(...))` under-reports at nine, because
+`fs.rs:89` routes through that module's own `json_err` helper instead. The real count is ten
+join-error sites, and the property they share is the response *shape* (500 +
+`{"error": ...}`), not the helper that builds it.
 
 That is a third, larger idea — a transport error taxonomy touching every route — and it is
 out of scope here. It is added to `docs/RECOMMENDATIONS.md` under **Open — Polish** as:
@@ -345,6 +350,12 @@ Two PRs, in order. Both touch `queue_ops.rs`, but in non-overlapping regions
 of `routes/handbrake.rs` and `queue_ops.rs` — its `queue_ops.rs:104` still calls
 `detect_handbrake_path` directly. PR 2 rewrites those exact regions. Whoever lands second
 rebases through conflicts. Not a blocker, but land that branch first if it is close.
+
+**Branch topology.** PR 2's branch was cut from PR 1's tip rather than from `main`, because
+`main` is protected and PR 1 could not be merged first. Consequence, which must not be
+forgotten: **after PR 1 squash-merges, PR 2 needs `git rebase --onto main fix/empty-intake-noop`**
+before it is opened. A squash rewrites history, so PR 1's commits will not drop out of PR 2's
+range on their own — without the rebase, PR 2's diff shows both changesets.
 
 1. **PR 1** — `fix: an empty intake is a no-op instead of an environment error`
    Touches `queue_ops.rs`, `types.rs`, one new core test, and three existing tests whose

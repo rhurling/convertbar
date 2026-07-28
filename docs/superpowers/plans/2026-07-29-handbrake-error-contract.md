@@ -26,8 +26,8 @@
   diff /tmp/base.txt /tmp/now.txt   # must be empty
   ```
   The explicit `grep` checks each task specifies are the real guard — run them.
-- **PR 2's line numbers are stale by design.** They are pre-PR-1 coordinates; Task 1 inserted 8
-  lines above most of them (`queue_ops.rs:831` → ~839, `:1236` → ~1245, `:1649` → ~1657;
+- **PR 2's line numbers are stale by design.** They are pre-PR-1 coordinates; Task 1 inserted 9
+  lines above most of them (`queue_ops.rs:831` → ~840, `:1236` → ~1246, `:1649` → ~1658;
   `routes/mod.rs:288` → ~292). **The quoted "Before:" snippets are authoritative, not the numbers** —
   each was verified character-exact and unique. Search for the snippet.
 - **Never hold `ctx.db`'s lock across an event emit.** `std::sync::Mutex` is not reentrant and the desktop tray listener re-locks synchronously on the same thread. Two shipped deadlocks came from violating this.
