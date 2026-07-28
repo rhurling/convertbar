@@ -183,6 +183,55 @@ describe("useUpdate", () => {
     expect(result.current.actionError).toBeNull();
   });
 
+  it("does not let a push clear an Install rejection while status stays available", async () => {
+    // install_pending's Err paths (updater.rs: "an update operation is already running", "no
+    // update available", a network-error string) never touch `status` — Install only renders
+    // while status is already "available", and none of those refusals move it. A later, wholly
+    // unrelated push (e.g. a concurrent cycle finishing and going idle) must not wipe this.
+    vi.spyOn(commands, "getUpdateState").mockResolvedValue({
+      ...baseState,
+      status: "available",
+      available: { version: "1.1.0", date: null, notes: null },
+    });
+    vi.spyOn(commands, "installUpdate").mockRejectedValue(
+      "an update operation is already running",
+    );
+    const { result } = renderHook(() => useUpdate());
+    await waitFor(() => expect(result.current.state?.status).toBe("available"));
+
+    await act(async () => { await result.current.install(); });
+    expect(result.current.actionError).toBe("an update operation is already running");
+
+    act(() => {
+      emit?.({ ...baseState, status: "idle" });
+    });
+    await waitFor(() => expect(result.current.state?.status).toBe("idle"));
+    expect(result.current.actionError).toBe("an update operation is already running");
+  });
+
+  it("does not let a push clear a Skip rejection while status stays available", async () => {
+    // skip_update_version's Err paths ("app state unavailable", a poisoned-lock message) both
+    // return before its only status-touching call (`clear_status`, reached only on success) —
+    // so a rejected Skip never moves status either, and the same protection applies.
+    vi.spyOn(commands, "getUpdateState").mockResolvedValue({
+      ...baseState,
+      status: "available",
+      available: { version: "1.1.0", date: null, notes: null },
+    });
+    vi.spyOn(commands, "skipUpdateVersion").mockRejectedValue("app state unavailable");
+    const { result } = renderHook(() => useUpdate());
+    await waitFor(() => expect(result.current.state?.status).toBe("available"));
+
+    await act(async () => { await result.current.skip(); });
+    expect(result.current.actionError).toBe("app state unavailable");
+
+    act(() => {
+      emit?.({ ...baseState, status: "idle" });
+    });
+    await waitFor(() => expect(result.current.state?.status).toBe("idle"));
+    expect(result.current.actionError).toBe("app state unavailable");
+  });
+
   it("does not let a stale initial getUpdateState response clobber a fresher push event", async () => {
     // If the update-state event arrives before the seeding getUpdateState() call resolves,
     // the late-resolving seed is older data and must not overwrite the newer pushed state.
