@@ -135,20 +135,65 @@ Run: `cargo test -p convertbar-core add_files_inner_with_no_paths_never_reaches_
 
 Expected: PASS.
 
-- [ ] **Step 6: Run the whole core suite**
+- [ ] **Step 6: Retire the installed-world scaffolding from `add_files_emits_finished_before_queue_updated`**
+
+This existing test at `crates/convertbar-core/src/queue_ops.rs:1683` calls `add_files(&ctx, &[])`
+— an empty intake. It declares an installed world and seeds the preset cache *only* because of
+the bug this task fixes. It stays green either way, but its comment now documents behavior that
+no longer exists, and the panicking default turns it into a second regression guard. Before:
+
+```rust
+    fn add_files_emits_finished_before_queue_updated() {
+        // The installed world, exercising the real default (templated) suffix — the pinned
+        // literal suffix this test used to carry meant it never expanded a template at all.
+        let (ctx, sink, _d) = test_ctx_with_locator(
+            test_conn(),
+            Arc::new(StubLocator("/opt/fake/HandBrakeCLI".into())),
+        );
+        // Without the seed the stub path would be shelled out to and intake would return Err,
+        // swallowing the queue-updated emit this test asserts on.
+        crate::handbrake::seed_preset_cache(&ctx);
+
+        // an empty add still brackets: add-started → add-finished → queue-updated
+        let _ = add_files(&ctx, &[]);
+```
+
+After:
+
+```rust
+    fn add_files_emits_finished_before_queue_updated() {
+        // The plain `test_ctx` (PanickingLocator) default is load-bearing here: an empty add
+        // returns before it reaches HandBrake resolution, so this asserts the event bracketing
+        // AND that the early return is intact. It previously needed a StubLocator plus a seeded
+        // preset cache purely because intake resolved the suffix template before looking at
+        // `paths` — scaffolding for a bug, not for this test's subject.
+        let (ctx, sink, _d) = test_ctx(test_conn());
+
+        // an empty add still brackets: add-started → add-finished → queue-updated
+        let _ = add_files(&ctx, &[]);
+```
+
+Check afterwards whether `StubLocator` and `seed_preset_cache` are still referenced elsewhere in
+this test module (`grep -n "StubLocator\|seed_preset_cache" crates/convertbar-core/src/queue_ops.rs`).
+If either import is now unused, remove the import — clippy will fail otherwise. If they are still
+used, change nothing.
+
+- [ ] **Step 7: Run the whole core suite**
 
 Run: `cargo test -p convertbar-core`
 
 Expected: all pass. If any existing test fails, stop and read it before changing anything — a test that expected an empty intake to error is a real signal, not noise, and must be reported rather than silently updated.
 
-- [ ] **Step 7: Mutation check — prove the test is load-bearing**
+- [ ] **Step 8: Mutation check — prove the tests are load-bearing**
 
 Delete the four-line `if paths.is_empty() { return Ok(AddResult::default()); }` block, run
-`cargo test -p convertbar-core add_files_inner_with_no_paths_never_reaches_handbrake_resolution`,
-and confirm it goes RED. Then restore the block and confirm it goes GREEN again. Record both
-outcomes in the task report. A test that stays green through this deletion is not a test.
+`cargo test -p convertbar-core`, and confirm BOTH
+`add_files_inner_with_no_paths_never_reaches_handbrake_resolution` and
+`add_files_emits_finished_before_queue_updated` go RED. Then restore the block and confirm both
+go GREEN again. Record all four outcomes in the task report. A test that stays green through
+this deletion is not a test.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add crates/convertbar-core/src/queue_ops.rs crates/convertbar-core/src/types.rs
@@ -160,10 +205,11 @@ Do not work around it — ask the user to run `! op signin`, then retry the comm
 
 ---
 
-### Task 2: The server's empty-add route test asserts the negative
+### Task 2: The server's two empty-intake route tests assert the negative
 
 **Files:**
-- Modify: `crates/convertbar-server/src/routes/mod.rs:250-269`
+- Modify: `crates/convertbar-server/src/routes/mod.rs:258-270`
+- Modify: `crates/convertbar-server/src/routes/mod.rs:471-484`
 
 **Interfaces:**
 - Consumes: `add_files_inner`'s new empty-intake behavior from Task 1.
@@ -212,19 +258,50 @@ After:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it passes**
+- [ ] **Step 2: Rewrite the empty-folder route test**
 
-Run: `cargo test -p convertbar-server add_files_with_empty_paths_never_reaches_handbrake_resolution`
+This is the exact user-facing scenario PR 1 fixes — "add a folder that turned out to hold no
+videos" — and it currently needs an installed HandBrake to pass. Before:
 
-Expected: PASS.
+```rust
+    #[tokio::test]
+    async fn confirm_folder_add_on_an_empty_tempdir_adds_nothing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // confirm_folder_add routes into the same intake, so it resolves the suffix template too.
+        let (status, json) = request_json(
+            api_router(test_state_installed()),
+```
 
-- [ ] **Step 3: Mutation check — prove the route-level test is load-bearing**
+After:
 
-Delete the early return in `add_files_inner` again, run this test, and confirm it goes RED with
-a 500 (`{"error": "task panicked: ..."}`) rather than the expected 200. Restore. This proves the
-route test independently covers the fix, not just the core unit test.
+```rust
+    #[tokio::test]
+    async fn confirm_folder_add_on_an_empty_tempdir_never_reaches_handbrake_resolution() {
+        // The scenario this fix exists for: a folder with no videos in it reaches intake with
+        // zero paths. It used to require an installed HandBrake to succeed, because intake
+        // expanded the suffix template before looking at `paths`. `test_state()`'s
+        // PanickingLocator now asserts that it does not.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let (status, json) = request_json(
+            api_router(test_state()),
+```
 
-- [ ] **Step 4: Check `test_state_installed` is still used**
+- [ ] **Step 3: Run both tests to verify they pass**
+
+```bash
+cargo test -p convertbar-server add_files_with_empty_paths_never_reaches_handbrake_resolution
+cargo test -p convertbar-server confirm_folder_add_on_an_empty_tempdir_never_reaches_handbrake_resolution
+```
+
+Expected: both PASS.
+
+- [ ] **Step 4: Mutation check — prove the route-level tests are load-bearing**
+
+Delete the early return in `add_files_inner` again, run both tests, and confirm each goes RED
+with a 500 (`{"error": "task panicked: ..."}`) rather than the expected 200. Restore, confirm
+green. This proves the route tests independently cover the fix, not just the core unit test.
+
+- [ ] **Step 5: Check `test_state_installed` is still used**
 
 Run: `grep -n "test_state_installed" crates/convertbar-server/src/routes/mod.rs`
 
@@ -232,7 +309,7 @@ Expected: several remaining callers (the non-empty add tests, `remove_job`, and 
 count is zero, the helper is now dead and clippy will fail — report it rather than deleting the
 helper unilaterally.
 
-- [ ] **Step 5: Run the full workspace suite and the lints**
+- [ ] **Step 6: Run the full workspace suite and the lints**
 
 ```bash
 cargo test --workspace
@@ -242,11 +319,11 @@ cargo clippy --workspace --all-targets
 
 Expected: all green, zero warnings introduced.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/convertbar-server/src/routes/mod.rs
-git commit -m "test: assert an empty add never reaches HandBrake resolution"
+git commit -m "test: assert an empty intake never reaches HandBrake resolution"
 ```
 
 ---
@@ -573,7 +650,7 @@ invariants must survive:
 1. **The guard must be dropped before `require_handbrake_path` is called** — it locks `ctx.db`,
    and the mutex is not reentrant. The existing `let (...) = { ... };` block already drops it at
    the closing brace; keep that shape.
-2. **R3** (the comment at `queue_ops.rs:1251-1255`): the path is resolved ONCE per batch,
+2. **R3** (the comment at `queue_ops.rs:1250-1253`): the path is resolved ONCE per batch,
    OUTSIDE the lock, because `PathLocator` spawns a blocking `which`/`where` and this used to run
    per id under the mutex. `require_handbrake_path` locks only to read the setting, releases, then
    runs the locator unlocked — so R3 holds, at the cost of one extra lock acquisition per batch
@@ -860,7 +937,8 @@ and before the `---` that closes the section:
 
 ```markdown
 ### 16. Server: panics masquerade as deliberate errors
-- All eleven `spawn_blocking` join-error sites in `crates/convertbar-server/src/routes/` map to
+- All ten `spawn_blocking` join-error sites in `crates/convertbar-server/src/routes/`
+  (`queue.rs:29,44,53,67,129`, `fs.rs:89`, `handbrake.rs:24,38,63,88`) map to
   `core_err(format!("task panicked: {join}"))` — HTTP 500 with an `error` string, identical in
   shape to an ordinary core failure.
 - A client cannot distinguish a server bug from an expected condition such as a missing

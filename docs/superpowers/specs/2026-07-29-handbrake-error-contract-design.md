@@ -120,10 +120,18 @@ HandBrake is installed.
 `add_files_inner` stops validating the environment as a side effect of being called with no
 work. No caller relies on that; none of the four call it as a probe.
 
+**The same shape exists in `purge_bad_sources` and is deliberately left alone.**
+`routes/mod.rs:441` documents it: a purge with `ids: []` still resolves HandBrake up front,
+spawning a `which` for a batch it will never consume. It is not fixed here, because the
+resolution there is genuinely per-batch state threaded into `purge_one_locked` for each id —
+a different shape from intake, where the suffix is a value computed for paths that do not
+exist. Recording the asymmetry so a later reader does not "finish the job" and assume it was
+an oversight. If it is worth fixing, it is its own change with its own argument.
+
 ### Testing
 
 **New core test** — the seam pays for itself; no new fixture is needed, because
-`test_ctx()`'s default locator is `PanickingLocator`:
+`queue_ops`'s `test_ctx` defaults to `PanickingLocator`:
 
 ```rust
 #[test]
@@ -131,7 +139,7 @@ fn add_files_inner_with_no_paths_never_reaches_handbrake_resolution() {
     // Asserts the negative directly. The fixture's default PanickingLocator means that if
     // the early return regresses, resolution is reached and this panics — rather than
     // quietly passing on any machine that happens to have HandBrakeCLI installed.
-    let ctx = test_ctx();
+    let (ctx, _sink, _disposer) = test_ctx(test_conn());
     let result = add_files_inner(&ctx, &[], None).expect("an empty intake cannot fail");
     assert!(result.added.is_empty());
     assert!(result.skipped.is_empty());
@@ -142,12 +150,21 @@ fn add_files_inner_with_no_paths_never_reaches_handbrake_resolution() {
 confirm the test goes red with the locator's "Declare the world explicitly" message,
 restore.
 
-**Existing server test to update.** `add_files_with_empty_paths_returns_empty_added_and_skipped`
-(`crates/convertbar-server/src/routes/mod.rs:250`) currently uses `test_state_installed()`
-and carries the comment *"Even an empty add resolves the suffix template first, so the world
-must be declared."* That comment documents the bug as though it were the design. The test
-moves to the panicking default `test_state()` — which asserts, at the route level, that an
-empty POST never reaches resolution — and the comment is replaced.
+**Three existing tests to update.** Each currently declares an *installed* world only because
+of the bug, and each carries a comment that documents the bug as though it were the design.
+After the fix all three move to the panicking default, which converts every one of them into
+an additional regression guard — a test that says "this must not reach resolution" is
+strictly stronger than one that quietly tolerates it:
+
+| Test | Today | Its comment today |
+|---|---|---|
+| `queue_ops.rs:1683` `add_files_emits_finished_before_queue_updated` — calls `add_files(&ctx, &[])` | `StubLocator` + `seed_preset_cache` | *"Without the seed the stub path would be shelled out to and intake would return Err, swallowing the queue-updated emit this test asserts on."* |
+| `routes/mod.rs:258` `add_files_with_empty_paths_returns_empty_added_and_skipped` | `test_state_installed()` | *"Even an empty add resolves the suffix template first, so the world must be declared."* |
+| `routes/mod.rs:471` `confirm_folder_add_on_an_empty_tempdir_adds_nothing` | `test_state_installed()` | *"confirm_folder_add routes into the same intake, so it resolves the suffix template too."* |
+
+The third is the exact user-facing scenario this PR fixes — "add a folder that turned out to
+hold no videos" — and it needed an installed HandBrake to pass. That is the bug, written down
+as a fixture.
 
 ---
 
@@ -221,7 +238,7 @@ The `queue_ops.rs:1256` site needs care. `purge_bad_sources` currently reads
 the lock. After the change, the lock block reads only `bad_source_action`, and
 `require_handbrake_path` takes its own brief lock.
 
-**The R3 invariant is preserved**: the comment at `queue_ops.rs:1251-1255` requires the path
+**The R3 invariant is preserved**: the comment at `queue_ops.rs:1250-1253` requires the path
 to be resolved *once per batch, outside the lock*, because the fallback can spawn a blocking
 `which`/`where` and the original code did it per id under the mutex. `require_handbrake_path`
 locks only to read the setting, releases, then runs the locator unlocked — still once per
@@ -295,16 +312,17 @@ deferring the item below safe.
 ## Deferred — filed, not built
 
 The reason the server test pinned the exact wording is that a deliberate core error and a
-panic inside `spawn_blocking` are indistinguishable by status: all eleven join-error sites in
-`crates/convertbar-server/src/routes/` map to
-`core_err(format!("task panicked: {join}"))`, i.e. the same 500 as any ordinary failure. A
-client cannot tell a bug from an expected failure.
+panic inside `spawn_blocking` are indistinguishable by status: all ten join-error sites in
+`crates/convertbar-server/src/routes/` — `queue.rs:29,44,53,67,129`, `fs.rs:89`,
+`handbrake.rs:24,38,63,88` — map to `core_err(format!("task panicked: {join}"))`, i.e. the
+same 500 as any ordinary failure. A client cannot tell a bug from an expected failure. (A
+naive `grep` reports eleven; the extra hit is a comment inside a test in `routes/mod.rs`.)
 
 That is a third, larger idea — a transport error taxonomy touching every route — and it is
 out of scope here. It is added to `docs/RECOMMENDATIONS.md` under **Open — Polish** as:
 
 > ### 16. Server: panics masquerade as deliberate errors
-> All eleven `spawn_blocking` join-error sites in `crates/convertbar-server/src/routes/`
+> All ten `spawn_blocking` join-error sites in `crates/convertbar-server/src/routes/`
 > map to `core_err(format!("task panicked: {join}"))` — HTTP 500 with an `error` string,
 > identical in shape to an ordinary core failure. A client cannot distinguish a server bug
 > from an expected condition such as a missing HandBrakeCLI, and tests can only tell them
@@ -320,8 +338,17 @@ Deferring is safe because PR 2 preserves the property the test relies on (see ab
 Two PRs, in order. Both touch `queue_ops.rs`, but in non-overlapping regions
 (PR 1 at 775-780; PR 2 at 100, 831, 1256), so sequential landing avoids any conflict.
 
+**Outstanding collision.** A locked worktree at
+`.claude/worktrees/feature+server-auth-throttling` holds an unmerged
+`feature/server-auth-throttling` branch (RECOMMENDATIONS item 15) with pre-locator-seam copies
+of `routes/handbrake.rs` and `queue_ops.rs` — its `queue_ops.rs:104` still calls
+`detect_handbrake_path` directly. PR 2 rewrites those exact regions. Whoever lands second
+rebases through conflicts. Not a blocker, but land that branch first if it is close.
+
 1. **PR 1** — `fix: an empty intake is a no-op instead of an environment error`
-   Touches `queue_ops.rs`, `types.rs`, one new core test, one server test updated.
+   Touches `queue_ops.rs`, `types.rs`, one new core test, and three existing tests whose
+   declared worlds and comments were artifacts of the bug (`queue_ops.rs:1683`,
+   `routes/mod.rs:258`, `routes/mod.rs:471`).
 2. **PR 2** — `refactor: one named HandBrake-missing error instead of eight literals`
    Touches `handbrake.rs`, `queue_ops.rs`, `converter.rs`, both heads' `handbrake` command
    modules, three test assertions, two new unit tests, `docs/RECOMMENDATIONS.md`.
