@@ -1669,6 +1669,39 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_job_fails_as_environment_when_handbrake_is_missing() {
+        // process_queue resolves HandBrake per job. Absent, the job must be recorded as an
+        // Environment failure and the queue must move on — not hang, not retry forever, and not be
+        // mistaken for a bad source file. Before the locator seam this arm was unreachable in tests,
+        // because "HandBrake is not installed" could not be expressed.
+        let (ctx, _sink, _d) =
+            test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::AbsentLocator));
+
+        let dir = tempfile::tempdir().unwrap();
+        // A real file: the vanished-source gate runs first and would otherwise claim this job.
+        let src = real_source(dir.path(), "in.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            "/nowhere/out.mp4",
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        let (status, msg) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "error");
+        assert!(
+            msg.clone()
+                .unwrap_or_default()
+                .contains("HandBrakeCLI not found"),
+            "the failure must name the missing binary, not blame the source file — got {msg:?}"
+        );
+        assert_eq!(class_of(&ctx.db, "j1").as_deref(), Some("environment"));
+    }
+
+    #[test]
     fn spawn_failure_surfaces_like_every_other_error() {
         // A configured handbrake_path that exists but is not executable makes
         // Command::spawn fail. That branch must behave like all other failures:
