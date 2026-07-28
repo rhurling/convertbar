@@ -3,8 +3,11 @@
 //! There is deliberately no lockout. A lockout that refuses a correct token is a
 //! cheap permanent denial of service against the owner (sustaining it costs
 //! ~0.07 req/s), and one that honours a correct token rate-limits nothing —
-//! every guess is still evaluated. The escalating delay below makes guessing
-//! expensive without ever creating denial state an attacker can trigger.
+//! every guess is still evaluated. The escalating delay below deters a
+//! sequential, response-waiting guesser without ever creating denial state an
+//! attacker can trigger — it does not bound a concurrent or abandon-early
+//! guesser; the token strength floor (`config.rs`) is the actual defense. See
+//! the spec's "Why no lockout" for the full analysis.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -141,10 +144,6 @@ impl LoginThrottle {
     /// connections.
     pub fn record_failure(&self, id: ClientId, now: Instant) -> Duration {
         let mut map = self.lock();
-        if map.len() > PRUNE_THRESHOLD {
-            let window = self.policy.window;
-            map.retain(|_, f| now.duration_since(f.first_at) <= window);
-        }
         let entry = map.entry(id).or_insert(Failures {
             count: 0,
             first_at: now,
@@ -155,6 +154,31 @@ impl LoginThrottle {
         }
         entry.count += 1;
         let count = entry.count;
+
+        // Checked AFTER the insert above, so the map is bounded on exit from
+        // every call, not just the ones that happen to run before one.
+        if map.len() > PRUNE_THRESHOLD {
+            let window = self.policy.window;
+            map.retain(|_, f| now.duration_since(f.first_at) <= window);
+            // Expiry alone does not bound the map under a live flood of
+            // distinct sources — nothing in it is old enough to expire yet.
+            // Evict the lowest-count entries first: a hot attacker's bucket
+            // is the one actually worth remembering, and count-based eviction
+            // is harder to game than oldest-first — flooding fresh sources to
+            // force an eviction only spends the flood's own low-count
+            // buckets, never a bucket the flood doesn't control. Any eviction
+            // policy is somewhat gameable; bounded memory is worth more than
+            // a perfectly unevictable counter.
+            if map.len() > PRUNE_THRESHOLD {
+                let mut counts: Vec<(ClientId, u32)> =
+                    map.iter().map(|(id, f)| (*id, f.count)).collect();
+                counts.sort_unstable_by_key(|(_, count)| *count);
+                let excess = map.len() - PRUNE_THRESHOLD;
+                for (evict, _) in counts.into_iter().take(excess) {
+                    map.remove(&evict);
+                }
+            }
+        }
         drop(map);
 
         let delay = self.delay_for(count);
@@ -552,6 +576,42 @@ mod throttle_tests {
         );
         // The live entry expired too (same window), so it also resets.
         assert_eq!(t.record_failure(live, later), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn map_stays_bounded_under_a_live_flood_and_keeps_the_hottest_bucket() {
+        // Everything below is at the same `now`, so nothing is expirable —
+        // expiry-based pruning alone cannot bound this map. Only count-based
+        // eviction can.
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+
+        // A hot attacker, already ramped, before the flood arrives.
+        let hot = id("10.0.0.1");
+        for _ in 0..5 {
+            t.record_failure(hot, now);
+        }
+
+        // Flood well past PRUNE_THRESHOLD with distinct, single-failure
+        // sources — the low-value kind eviction should prefer to drop.
+        let flood = PRUNE_THRESHOLD as u32 + 2000;
+        for i in 0..flood {
+            let octets = i.to_be_bytes();
+            let addr = IpAddr::from([11, octets[1], octets[2], octets[3]]);
+            t.record_failure(ClientId::Addr(addr), now);
+        }
+
+        assert!(
+            t.len() <= PRUNE_THRESHOLD,
+            "map exceeded its ceiling under a live flood: {}",
+            t.len()
+        );
+        // The hot bucket must survive eviction: it has a higher count than
+        // any flood entry, and count-based eviction drops the lowest counts
+        // first. A test that only checked the size would pass under any
+        // eviction order, including gameable oldest-first — this is the
+        // assertion that actually pins the policy.
+        assert_eq!(t.record_failure(hot, now), Duration::from_secs(16));
     }
 
     #[test]
