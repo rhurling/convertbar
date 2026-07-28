@@ -1,10 +1,10 @@
 pub(crate) use convertbar_core::{
-    db, failure_class, handbrake, media_skip, probe, probe_cache, types,
+    add_progress, db, failure_class, handbrake, media_skip, probe, probe_cache, types,
 };
 
-mod add_progress;
 mod commands;
 mod converter;
+mod sink;
 mod watcher;
 
 use converter::{ConverterState, MenuBarUpdate};

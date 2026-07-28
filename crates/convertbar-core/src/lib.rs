@@ -1,4 +1,6 @@
+pub mod add_progress;
 pub mod db;
+pub mod events;
 pub mod failure_class;
 pub mod handbrake;
 pub mod media_skip;

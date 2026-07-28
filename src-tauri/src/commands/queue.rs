@@ -1060,7 +1060,9 @@ pub async fn add_files(app: AppHandle, paths: Vec<String>) -> Result<AddResult, 
     let app_for_emit = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let op = crate::add_progress::AddOp::new(&app, String::new());
+        let sink: std::sync::Arc<dyn convertbar_core::events::EventSink> =
+            std::sync::Arc::new(crate::sink::TauriSink(app.clone()));
+        let op = convertbar_core::add_progress::AddOp::new(sink, String::new());
         let reporter = |done: u32, total: u32| op.report(done, total);
         add_files_inner(&state, &paths, Some(&reporter as &dyn Fn(u32, u32)))
     })
@@ -1117,7 +1119,9 @@ pub async fn confirm_folder_add(app: AppHandle, path: String) -> Result<AddResul
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        let op = crate::add_progress::AddOp::new(&app, label);
+        let sink: std::sync::Arc<dyn convertbar_core::events::EventSink> =
+            std::sync::Arc::new(crate::sink::TauriSink(app.clone()));
+        let op = convertbar_core::add_progress::AddOp::new(sink, label);
         let files = scan_video_files(Path::new(&path));
         let paths: Vec<String> = files
             .into_iter()

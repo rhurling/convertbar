@@ -438,7 +438,9 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     }
     let app_state = app.state::<AppState>();
     let result = {
-        let op = crate::add_progress::AddOp::new(app, batch_label(&paths));
+        let sink: std::sync::Arc<dyn convertbar_core::events::EventSink> =
+            std::sync::Arc::new(crate::sink::TauriSink(app.clone()));
+        let op = convertbar_core::add_progress::AddOp::new(sink, batch_label(&paths));
         let reporter = |done: u32, total: u32| op.report(done, total);
         match queue::add_files_inner(&app_state, &paths, Some(&reporter as &dyn Fn(u32, u32))) {
             Ok(result) => result,
