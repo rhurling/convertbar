@@ -100,6 +100,95 @@ pub(crate) fn clear_installed(db: &Connection) {
     write_key(db, "update_installed", "");
 }
 
+/// An update the endpoint is offering. `notes` is `Update::body` — the GitHub release body,
+/// copied verbatim into latest.json by tauri-action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvailableUpdate {
+    pub version: String,
+    pub date: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UpdateStatus {
+    Idle,
+    Checking,
+    Available,
+    Downloading,
+    /// Downloaded; the install is held until the queue drains.
+    WaitingForIdle,
+    /// Installed and awaiting a restart. Unreachable on Windows, where `install()` exits
+    /// the process and the installer relaunches the app itself.
+    ReadyToRestart,
+    Error,
+}
+
+/// Everything the Settings panel renders. Emitted whole on the `update-state` event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateState {
+    pub mode: UpdateMode,
+    pub status: UpdateStatus,
+    pub current_version: String,
+    pub available: Option<AvailableUpdate>,
+    pub just_installed: Option<InstalledUpdate>,
+    pub last_checked: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+/// What a completed check should cause. Pure, so the policy table in the spec is directly
+/// testable without a network, a webview, or a real Tauri app.
+#[derive(Debug)]
+pub enum CheckOutcome {
+    Nothing,
+    Notify(AvailableUpdate),
+    Install(AvailableUpdate),
+}
+
+pub fn decide(
+    mode: UpdateMode,
+    found: Option<AvailableUpdate>,
+    skipped: Option<&str>,
+    notified: Option<&str>,
+) -> CheckOutcome {
+    let Some(update) = found else {
+        return CheckOutcome::Nothing;
+    };
+
+    match mode {
+        // Skip is deliberately ignored: in Automatic the user delegated the decision.
+        UpdateMode::Automatic => CheckOutcome::Install(update),
+        UpdateMode::Off => CheckOutcome::Nothing,
+        UpdateMode::Notify => {
+            if skipped == Some(update.version.as_str()) {
+                return CheckOutcome::Nothing;
+            }
+            if notified == Some(update.version.as_str()) {
+                return CheckOutcome::Nothing;
+            }
+            CheckOutcome::Notify(update)
+        }
+    }
+}
+
+/// A user-initiated check. Always reports, never installs (U7), and deliberately ignores
+/// both the skip list and the once-per-version marker: the user just asked, so hiding the
+/// answer would make "Check now" look broken.
+pub fn decide_manual(found: Option<AvailableUpdate>) -> CheckOutcome {
+    match found {
+        Some(update) => CheckOutcome::Notify(update),
+        None => CheckOutcome::Nothing,
+    }
+}
+
+/// The install action, injected so tests drive the real decision-to-action path with a
+/// recorder. `Update` cannot be constructed in a test (private fields, updater.rs:602-644)
+/// and `check()` needs the network, so without this seam the idle-gate mutation check would
+/// only ever exercise a detached predicate and would pass vacuously.
+pub trait Installer: Send + Sync {
+    fn install(&self, update: &AvailableUpdate) -> Result<(), String>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +266,77 @@ mod tests {
         let got = read_installed(&conn).unwrap();
         assert_eq!(got.version, "1.6.0");
         assert_eq!(got.notes, None);
+    }
+
+    fn upd(version: &str) -> AvailableUpdate {
+        AvailableUpdate {
+            version: version.to_string(),
+            date: None,
+            notes: Some(format!("notes for {version}")),
+        }
+    }
+
+    #[test]
+    fn no_update_found_means_do_nothing_in_every_mode() {
+        for mode in [UpdateMode::Automatic, UpdateMode::Notify, UpdateMode::Off] {
+            assert!(matches!(
+                decide(mode, None, None, None),
+                CheckOutcome::Nothing
+            ));
+        }
+    }
+
+    #[test]
+    fn automatic_installs_and_ignores_a_skipped_version() {
+        // Skip is a Notify-mode concept. In Automatic the user has delegated the decision,
+        // so honouring a skip list here would silently stop updates they asked to be automatic.
+        let outcome = decide(
+            UpdateMode::Automatic,
+            Some(upd("2.0.0")),
+            Some("2.0.0"),
+            None,
+        );
+        assert!(matches!(outcome, CheckOutcome::Install(u) if u.version == "2.0.0"));
+    }
+
+    #[test]
+    fn notify_suppresses_a_skipped_version_but_a_newer_one_resurfaces() {
+        // "Skip" means "not this one", not "stop telling me".
+        let skipped = decide(UpdateMode::Notify, Some(upd("2.0.0")), Some("2.0.0"), None);
+        assert!(matches!(skipped, CheckOutcome::Nothing));
+
+        let newer = decide(UpdateMode::Notify, Some(upd("2.1.0")), Some("2.0.0"), None);
+        assert!(matches!(newer, CheckOutcome::Notify(u) if u.version == "2.1.0"));
+    }
+
+    #[test]
+    fn notify_reports_a_version_only_once_even_across_restarts() {
+        // `notified` comes from the persisted update_notified_version row, so this holds
+        // across process restarts — an in-memory marker would re-notify on every launch.
+        let first = decide(UpdateMode::Notify, Some(upd("2.0.0")), None, None);
+        assert!(matches!(first, CheckOutcome::Notify(_)));
+
+        let repeat = decide(UpdateMode::Notify, Some(upd("2.0.0")), None, Some("2.0.0"));
+        assert!(matches!(repeat, CheckOutcome::Nothing));
+
+        let next_release = decide(UpdateMode::Notify, Some(upd("2.2.0")), None, Some("2.0.0"));
+        assert!(matches!(next_release, CheckOutcome::Notify(u) if u.version == "2.2.0"));
+    }
+
+    #[test]
+    fn off_never_acts_on_a_scheduled_check() {
+        let outcome = decide(UpdateMode::Off, Some(upd("2.0.0")), None, None);
+        assert!(matches!(outcome, CheckOutcome::Nothing));
+    }
+
+    #[test]
+    fn a_manual_check_reports_but_never_installs_in_any_mode() {
+        // U7. Pressing a button labelled "check" must not commit the user to an install —
+        // this is the one behaviour change from the pre-1.0 updater, so it is pinned by a
+        // test rather than left implicit in the scheduler's control flow.
+        assert!(matches!(decide_manual(None), CheckOutcome::Nothing));
+
+        let outcome = decide_manual(Some(upd("2.0.0")));
+        assert!(matches!(outcome, CheckOutcome::Notify(u) if u.version == "2.0.0"));
     }
 }
