@@ -197,7 +197,7 @@ impl ConverterState {
 
     /// Returns true if the current platform supports real process pause/resume (SIGSTOP/SIGCONT).
     pub fn can_pause_process() -> bool {
-        cfg!(target_os = "macos")
+        cfg!(unix)
     }
 
     /// Whether the queue is armed to pause after the current job. The source of truth for
@@ -220,7 +220,7 @@ pub fn kill_active_child(converter: &ConverterState) {
     converter
         .shutdown
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
         if let Ok(pid) = converter.current_pid.lock() {
             if let Some(pid) = *pid {

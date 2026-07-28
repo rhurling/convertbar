@@ -1,4 +1,5 @@
 pub mod add_progress;
+pub mod control;
 pub mod converter;
 pub mod ctx;
 pub mod db;

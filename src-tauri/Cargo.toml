@@ -36,9 +36,6 @@ dunce = "1.0.5"
 tauri-plugin-opener = "2"
 fs4 = { version = "0.13", features = ["sync"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2"
@@ -46,12 +43,6 @@ tauri-plugin-window-state = "2"
 
 [dev-dependencies]
 tempfile = "3"
-# Enables tauri::test (MockRuntime) for the process_queue / cancel integration tests.
+# Enables tauri::test (MockRuntime) for sink.rs's TauriSink emit-passthrough test.
 tauri = { version = "2", features = ["test"] }
-
-[target.'cfg(unix)'.dev-dependencies]
-# geteuid(), for a converter.rs test that skips the no-read-permission assertion when
-# running as root (rootful docker / `act`). Production libc usage stays macOS-only
-# (SIGSTOP/SIGCONT) — this is test-only and covers Linux CI too.
-libc = "0.2"
 
