@@ -197,6 +197,17 @@ pub struct PendingInstall {
     pub user_requested: bool,
 }
 
+/// Why an install is being attempted, and therefore whether it may *create* a pending install or
+/// only continue one that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallTrigger {
+    /// The user pressed "Install and restart" — a fresh decision, so it registers its own.
+    UserRequested,
+    /// A wake path continuing an existing deferral. Must not create one: the deferral it was
+    /// dispatched for may have been cancelled while it waited for the queue.
+    Retry,
+}
+
 /// What a retry of a pending install should do given the queue's current state.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RetryAction {
@@ -388,21 +399,27 @@ fn try_begin_cycle(runtime: &Arc<UpdaterRuntime>) -> Option<CycleGuard> {
     }
 }
 
-fn runtime_of(app: &AppHandle) -> Option<Arc<UpdaterRuntime>> {
+fn runtime_of<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<Arc<UpdaterRuntime>> {
     app.try_state::<Arc<UpdaterRuntime>>()
         .map(|s| s.inner().clone())
 }
 
-fn pending_of(app: &AppHandle) -> Option<PendingInstall> {
+fn pending_of<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PendingInstall> {
     runtime_of(app).and_then(|r| r.pending.lock().ok().and_then(|p| p.clone()))
 }
 
-fn set_pending(app: &AppHandle, value: Option<PendingInstall>) {
+fn set_pending<R: tauri::Runtime>(app: &AppHandle<R>, value: Option<PendingInstall>) {
     if let Some(runtime) = runtime_of(app) {
         if let Ok(mut p) = runtime.pending.lock() {
             *p = value;
         }
     }
+}
+
+/// Whether the registered pending install is still live and still names `version`. The liveness
+/// check every irreversible step re-reads, rather than trusting a value captured at dispatch.
+fn pending_matches<R: tauri::Runtime>(app: &AppHandle<R>, version: &str) -> bool {
+    pending_of(app).is_some_and(|p| p.update.version == version)
 }
 
 fn now_secs() -> i64 {
@@ -420,7 +437,7 @@ fn describe(update: &tauri_plugin_updater::Update) -> AvailableUpdate {
     }
 }
 
-fn notify(app: &AppHandle, body: String) {
+fn notify<R: tauri::Runtime>(app: &AppHandle<R>, body: String) {
     use tauri_plugin_notification::NotificationExt;
     let _ = app
         .notification()
@@ -449,7 +466,7 @@ impl Installer for PluginInstaller {
 /// The hook lives on the `UpdaterBuilder`, not on the plugin `Builder` (which has no
 /// `on_before_exit`): the builder's hook is what `Update::install` invokes immediately before
 /// `std::process::exit(0)` on Windows.
-fn build_updater(app: &AppHandle) -> Option<tauri_plugin_updater::Updater> {
+fn build_updater<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<tauri_plugin_updater::Updater> {
     let handle = app.clone();
     app.updater_builder()
         .on_before_exit(move || {
@@ -468,13 +485,13 @@ fn build_updater(app: &AppHandle) -> Option<tauri_plugin_updater::Updater> {
         .ok()
 }
 
-pub fn emit_state(app: &AppHandle) {
+pub fn emit_state<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Ok(state) = build_state(app) {
         let _ = app.emit("update-state", state);
     }
 }
 
-fn build_state(app: &AppHandle) -> Result<UpdateState, String> {
+fn build_state<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<UpdateState, String> {
     let app_state = app
         .try_state::<crate::AppState>()
         .ok_or_else(|| "app state unavailable".to_string())?;
@@ -507,7 +524,7 @@ fn build_state(app: &AppHandle) -> Result<UpdateState, String> {
     })
 }
 
-fn set_status(app: &AppHandle, status: UpdateStatus) {
+fn set_status<R: tauri::Runtime>(app: &AppHandle<R>, status: UpdateStatus) {
     if let Some(runtime) = runtime_of(app) {
         if let Ok(mut s) = runtime.status.lock() {
             *s = Some(status);
@@ -518,7 +535,7 @@ fn set_status(app: &AppHandle, status: UpdateStatus) {
 
 /// One full check-and-act cycle. `manual` forces the check regardless of mode and never
 /// installs (U7): a button labelled "check" must not commit the user to anything.
-pub async fn run_cycle(app: AppHandle, manual: bool) -> Result<(), String> {
+pub async fn run_cycle<R: tauri::Runtime>(app: AppHandle<R>, manual: bool) -> Result<(), String> {
     let Some(runtime) = runtime_of(&app) else {
         return Err("updater unavailable".into());
     };
@@ -624,8 +641,17 @@ pub async fn run_cycle(app: AppHandle, manual: bool) -> Result<(), String> {
                 *a = Some(u.clone());
             }
             if let Some((_, raw)) = found {
-                // The scheduler decided this, not the user: it may never pause a running queue.
-                perform_install(&app, &cycle, u, raw, false).await;
+                // Registered before the download starts, so a mode change or a skip arriving
+                // mid-download can cancel it. The scheduler decided this, not the user, so it
+                // may never pause a running queue.
+                set_pending(
+                    &app,
+                    Some(PendingInstall {
+                        update: u.clone(),
+                        user_requested: false,
+                    }),
+                );
+                perform_install(&app, &cycle, u, raw).await;
             }
         }
     }
@@ -640,12 +666,15 @@ pub async fn run_cycle(app: AppHandle, manual: bool) -> Result<(), String> {
 /// `_cycle` is proof the caller holds the single-flight latch. `try_install_now` does not
 /// self-serialize (it only samples `is_running` on entry), so this must never run twice
 /// concurrently — taking the guard by reference makes that unrepresentable.
-async fn perform_install(
-    app: &AppHandle,
+/// The caller registers the pending install BEFORE calling this and it stays registered for the
+/// whole sequence, so a cancellation landing mid-download (mode set to Off, version skipped) is
+/// visible here and wins. `Update::install` is irreversible — on Windows it terminates the
+/// process — so consent is re-read immediately before it, not merely sampled at dispatch.
+async fn perform_install<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     _cycle: &CycleGuard,
     meta: AvailableUpdate,
     raw: tauri_plugin_updater::Update,
-    user_requested: bool,
 ) {
     set_status(app, UpdateStatus::Downloading);
 
@@ -657,10 +686,22 @@ async fn perform_install(
                     *err = Some(e.to_string());
                 }
             }
+            // A download that failed is not an install waiting to happen; dropping it keeps the
+            // hourly backstop from re-fetching the whole bundle against a broken endpoint. The
+            // next scheduled check re-decides.
+            set_pending(app, None);
             set_status(app, UpdateStatus::Error);
             return;
         }
     };
+
+    // The download takes seconds to minutes — ample time for the user to switch updates off or
+    // skip this version. Re-read their consent rather than acting on what was true when the
+    // download started.
+    if !pending_matches(app, &meta.version) {
+        set_status(app, UpdateStatus::Idle);
+        return;
+    }
 
     // LOAD-BEARING ORDERING: written BEFORE the install. On Windows `Update::install` launches
     // the installer and calls std::process::exit(0) — it never returns, so a write placed after
@@ -691,17 +732,15 @@ async fn perform_install(
             // Nothing was installed, so the pre-written marker must not survive: a restart for
             // any other reason would otherwise show "What's new" for a version not running.
             rollback_installed(app);
-            // Record WHO wanted this, not just that something is waiting — the retry paths need
-            // the intent to decide whether draining the queue is allowed, and a mode change
-            // needs it to decide whether the deferral survives.
-            set_pending(
-                app,
-                Some(PendingInstall {
-                    update: meta.clone(),
-                    user_requested,
-                }),
-            );
-            set_status(app, UpdateStatus::WaitingForIdle);
+            // The registration made before the download already carries the right version and
+            // intent, so it is left exactly as it is. Deliberately NOT re-armed: re-writing it
+            // here would resurrect a deferral the user cancelled while the download ran, and
+            // there would be no further mode change to clear it again.
+            if pending_matches(app, &meta.version) {
+                set_status(app, UpdateStatus::WaitingForIdle);
+            } else {
+                set_status(app, UpdateStatus::Idle);
+            }
         }
         InstallAttempt::Failed(e) => {
             rollback_installed(app);
@@ -724,7 +763,7 @@ async fn perform_install(
     }
 }
 
-fn rollback_installed(app: &AppHandle) {
+fn rollback_installed<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Some(app_state) = app.try_state::<crate::AppState>() {
         if let Ok(conn) = app_state.db.lock() {
             clear_installed(&conn);
@@ -735,12 +774,27 @@ fn rollback_installed(app: &AppHandle) {
 /// Installs the update the last check found. Backs the panel's "Install and restart" and the
 /// idle retry. With a busy queue: pause after the current job, then let `on_queue_status` retry
 /// once it drains.
-pub async fn install_pending(app: AppHandle, user_requested: bool) -> Result<(), String> {
+pub async fn install_pending<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    trigger: InstallTrigger,
+) -> Result<(), String> {
     let Some(runtime) = runtime_of(&app) else {
         return Err("updater unavailable".into());
     };
     let Some(cycle) = try_begin_cycle(&runtime) else {
         return Err("an update operation is already running".into());
+    };
+
+    // Re-read the intent under the latch instead of trusting what was true when this was
+    // dispatched: a retry waits up to 2s for the queue to unwind, and the user can switch
+    // updates off or skip the version in that window. A retry that found nothing pending must
+    // NOT create one — that would resurrect the cancellation it just missed.
+    let user_requested = match trigger {
+        InstallTrigger::UserRequested => true,
+        InstallTrigger::Retry => match pending_of(&app) {
+            Some(pending) => pending.user_requested,
+            None => return Err("the pending install was cancelled".into()),
+        },
     };
 
     // Decided before the network round trip: a scheduler-decided retry against a still-busy
@@ -773,7 +827,21 @@ pub async fn install_pending(app: AppHandle, user_requested: bool) -> Result<(),
     };
     let meta = describe(&raw);
 
-    perform_install(&app, &cycle, meta, raw, user_requested).await;
+    // Checked again after the network round trip, for the same reason as after the download.
+    if trigger == InstallTrigger::Retry && pending_of(&app).is_none() {
+        return Err("the pending install was cancelled".into());
+    }
+    // Registered for the whole download → install sequence, so a cancellation arriving mid-flight
+    // has something to clear and `perform_install` can see that it did.
+    set_pending(
+        &app,
+        Some(PendingInstall {
+            update: meta.clone(),
+            user_requested,
+        }),
+    );
+
+    perform_install(&app, &cycle, meta, raw).await;
     Ok(())
 }
 
@@ -790,7 +858,7 @@ pub fn should_check_now(last_checked: Option<i64>, now: i64) -> bool {
     }
 }
 
-pub fn build_state_public(app: &AppHandle) -> Result<UpdateState, String> {
+pub fn build_state_public<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<UpdateState, String> {
     build_state(app)
 }
 
@@ -798,12 +866,12 @@ pub fn set_skipped_version_public(db: &Connection, version: &str) {
     set_skipped_version(db, version);
 }
 
-pub fn clear_status(app: &AppHandle) {
+pub fn clear_status<R: tauri::Runtime>(app: &AppHandle<R>) {
     set_status(app, UpdateStatus::Idle);
 }
 
 /// Cancels a pending install of `version`, if that is the one pending.
-pub fn cancel_pending_version(app: &AppHandle, version: &str) {
+pub fn cancel_pending_version<R: tauri::Runtime>(app: &AppHandle<R>, version: &str) {
     if let Some(pending) = pending_of(app) {
         if !pending_survives_skip(&pending, version) {
             set_pending(app, None);
@@ -811,29 +879,30 @@ pub fn cancel_pending_version(app: &AppHandle, version: &str) {
     }
 }
 
-fn spawn_cycle(app: AppHandle) {
+fn spawn_cycle<R: tauri::Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let _ = run_cycle(app, false).await;
     });
 }
 
-fn current_status(app: &AppHandle) -> Option<UpdateStatus> {
+fn current_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<UpdateStatus> {
     runtime_of(app).and_then(|r| r.status.lock().ok().and_then(|s| *s))
 }
 
-fn spawn_install_retry(app: AppHandle, user_requested: bool) {
+fn spawn_install_retry<R: tauri::Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         // `install_pending`, not `run_cycle`: a pending install is already decided, and
         // re-running the mode policy here would demote a user's explicit "Install and restart"
-        // in Notify mode back into a notification.
-        let _ = install_pending(app, user_requested).await;
+        // in Notify mode back into a notification. `Retry` re-reads the deferral rather than
+        // carrying a stale copy of it from dispatch time.
+        let _ = install_pending(app, InstallTrigger::Retry).await;
     });
 }
 
 /// Applies a change of update mode to whatever the updater is currently doing.
 ///
 /// Owns the whole policy so `commands::settings` does not have to know any of it.
-pub fn on_mode_changed(app: &AppHandle, mode: UpdateMode) {
+pub fn on_mode_changed<R: tauri::Runtime>(app: &AppHandle<R>, mode: UpdateMode) {
     if let Some(pending) = pending_of(app) {
         if !pending_survives_mode(&pending, mode) {
             // Dropped, not just hidden: the retry paths install a pending update regardless of
@@ -869,7 +938,7 @@ pub fn on_mode_changed(app: &AppHandle, mode: UpdateMode) {
 /// The tick is a coarse poll on purpose: the pacing lives in `should_check_now`, which compares
 /// wall-clock timestamps. A 24h timer would be `Instant`-backed and stop while the machine
 /// sleeps, stretching "daily" into whatever a nightly-sleeping laptop makes of it.
-pub fn start(app: AppHandle) {
+pub fn start<R: tauri::Runtime>(app: AppHandle<R>) {
     spawn_cycle(app.clone());
 
     std::thread::spawn(move || loop {
@@ -885,8 +954,8 @@ pub fn start(app: AppHandle) {
         // Backstop for an install whose drain event never arrived — the queue picked up another
         // job before it went idle — so a pending install can't sit forever. Carries the original
         // requester's intent, so a scheduler-decided install still refuses to pause the queue.
-        if let Some(pending) = pending_of(&app) {
-            spawn_install_retry(app.clone(), pending.user_requested);
+        if pending_of(&app).is_some() {
+            spawn_install_retry(app.clone());
             continue;
         }
 
@@ -900,15 +969,15 @@ pub fn start(app: AppHandle) {
 /// Retries a deferred install when the queue drains. Wakes on both "idle" and "error" —
 /// `final_run_status` (converter.rs) emits "error", never "idle", for any run in which a job
 /// failed — and re-derives the update from the endpoint rather than trusting the stale event.
-pub fn on_queue_status(app: &AppHandle, status: &str) {
+pub fn on_queue_status<R: tauri::Runtime>(app: &AppHandle<R>, status: &str) {
     if status != "idle" && status != "error" {
         return;
     }
     // Keyed on the pending install itself, not on the status: a manual check or a mode change
     // can legitimately move the status while the deferral is still outstanding.
-    let Some(pending) = pending_of(app) else {
+    if pending_of(app).is_none() {
         return;
-    };
+    }
 
     let app = app.clone();
     std::thread::spawn(move || {
@@ -919,14 +988,19 @@ pub fn on_queue_status(app: &AppHandle, status: &str) {
         if !wait_for_idle_queue(&app) {
             return;
         }
-        spawn_install_retry(app, pending.user_requested);
+        // Re-checked after the wait: the user had up to 2s to switch updates off or skip this
+        // version, and dispatching on the stale read would reinstate the deferral they cancelled.
+        if pending_of(&app).is_none() {
+            return;
+        }
+        spawn_install_retry(app);
     });
 }
 
 /// Polls `is_running` until the queue is genuinely idle. Bounded: a queue that immediately
 /// picks up another job leaves the install pending for the next drain (or the hourly backstop)
 /// rather than blocking here.
-fn wait_for_idle_queue(app: &AppHandle) -> bool {
+fn wait_for_idle_queue<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
     let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
         return false;
     };
@@ -1290,6 +1364,132 @@ mod tests {
             None
         );
         assert_eq!(manual_check_block(Some(UpdateStatus::Error), None), None);
+    }
+
+    // --- call-site harness (mock runtime) ---
+    //
+    // The predicate tests above pin the policy; these drive the real functions, so deleting a
+    // call site turns them red. Everything reachable from `on_mode_changed`, `run_cycle`'s
+    // refusal, and `install_pending`'s retry gate is generic over `R: Runtime`, which is what
+    // makes a `MockRuntime` app able to stand in for the real one.
+
+    fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        app.manage(crate::AppState {
+            db: std::sync::Arc::new(StdMutex::new(conn)),
+            preset_cache: StdMutex::new(Default::default()),
+        });
+        app.manage(std::sync::Arc::new(UpdaterRuntime::default()));
+        app.manage(std::sync::Arc::new(ConverterState::new()));
+        app
+    }
+
+    fn arm_pending(app: &tauri::AppHandle<tauri::test::MockRuntime>, user_requested: bool) {
+        set_pending(app, Some(pending(user_requested)));
+        set_status(app, UpdateStatus::WaitingForIdle);
+    }
+
+    #[test]
+    fn switching_the_mode_off_actually_drops_the_pending_install() {
+        // Drives the real `on_mode_changed`, so deleting its `pending_survives_mode` branch —
+        // not just breaking the predicate — turns this red. Without it the deferral stays live
+        // and the next queue drain installs the update the user just switched off.
+        let app = mock_app();
+        let handle = app.handle().clone();
+
+        arm_pending(&handle, false);
+        on_mode_changed(&handle, UpdateMode::Off);
+        assert!(
+            pending_of(&handle).is_none(),
+            "a scheduler-decided deferral must not survive updates being turned off"
+        );
+        assert_eq!(current_status(&handle), Some(UpdateStatus::Idle));
+
+        // The user's own "Install and restart" survives: the mode governs future updates, not
+        // the one they already asked for.
+        arm_pending(&handle, true);
+        on_mode_changed(&handle, UpdateMode::Off);
+        assert!(pending_of(&handle).is_some());
+    }
+
+    #[test]
+    fn a_manual_check_is_refused_while_an_install_is_pending() {
+        // Drives the real `run_cycle`, so deleting its `if manual { manual_check_block(..) }`
+        // guard turns this red: without it the check proceeds, walks the status off
+        // WaitingForIdle and orphans the deferral.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        arm_pending(&handle, true);
+
+        let err = tauri::async_runtime::block_on(run_cycle(handle.clone(), true))
+            .expect_err("a manual check must be refused while an install is pending");
+        assert!(
+            err.contains("waiting to install"),
+            "the refusal must say why, got: {err}"
+        );
+
+        // Refused means untouched: the deferral and its status are exactly as they were, so the
+        // drain retry and the hourly backstop can still find it.
+        assert!(pending_of(&handle).is_some());
+        assert_eq!(current_status(&handle), Some(UpdateStatus::WaitingForIdle));
+    }
+
+    #[test]
+    fn a_scheduled_retry_against_a_busy_queue_leaves_the_queue_alone() {
+        // Drives the real `install_pending`, so replacing its `retry_action` gate with the
+        // unconditional `if busy { pause_after_current = true }` it replaced turns this red.
+        // That arming is what stopped a user's batch mid-run and persisted queue_paused across
+        // the update restart.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        arm_pending(&handle, false);
+
+        let conv = handle
+            .state::<std::sync::Arc<ConverterState>>()
+            .inner()
+            .clone();
+        *conv.is_running.lock().unwrap() = true;
+
+        let err =
+            tauri::async_runtime::block_on(install_pending(handle.clone(), InstallTrigger::Retry))
+                .expect_err("a scheduled retry must not proceed against a running queue");
+        assert!(err.contains("busy"), "got: {err}");
+
+        assert!(
+            !*conv.pause_after_current.lock().unwrap(),
+            "the scheduler must never arm pause_after_current — only an explicit \
+             'Install and restart' may drain the queue"
+        );
+        assert!(
+            pending_of(&handle).is_some(),
+            "the deferral stays pending for the next drain"
+        );
+    }
+
+    #[test]
+    fn a_retry_does_not_resurrect_a_deferral_that_was_cancelled_while_it_waited() {
+        // A retry is dispatched, then the user turns updates off before it runs. Re-reading the
+        // deferral (rather than trusting the intent captured at dispatch) is what stops
+        // `install_pending` from recreating it and installing anyway.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        arm_pending(&handle, false);
+
+        // What on_mode_changed(Off) does while the retry is in flight.
+        set_pending(&handle, None);
+
+        let err =
+            tauri::async_runtime::block_on(install_pending(handle.clone(), InstallTrigger::Retry))
+                .expect_err("a retry whose deferral was cancelled must abort");
+        assert!(err.contains("cancelled"), "got: {err}");
+        assert!(
+            pending_of(&handle).is_none(),
+            "a retry must never recreate a deferral the user cancelled"
+        );
     }
 
     #[test]
