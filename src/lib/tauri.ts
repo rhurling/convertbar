@@ -164,6 +164,39 @@ export interface WatchedDirectory {
   created_at: string;
 }
 
+export type UpdateMode = "automatic" | "notify" | "off";
+
+export type UpdateStatus =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "waitingForIdle"
+  | "readyToRestart"
+  | "error";
+
+export interface AvailableUpdate {
+  version: string;
+  date: string | null;
+  notes: string | null;
+}
+
+export interface InstalledUpdate {
+  version: string;
+  notes: string | null;
+}
+
+// Mirrors src-tauri/src/updater.rs UpdateState exactly.
+export interface UpdateState {
+  mode: UpdateMode;
+  status: UpdateStatus;
+  current_version: string;
+  available: AvailableUpdate | null;
+  just_installed: InstalledUpdate | null;
+  last_checked: number | null;
+  last_error: string | null;
+}
+
 export const commands = {
   addFiles: (paths: string[]) => invoke<AddResult>("add_files", { paths }),
   scanFolder: (path: string) =>
@@ -244,4 +277,10 @@ export const commands = {
   getBadSources: () => invoke<JobInfo[]>("get_bad_sources"),
   purgeBadSources: (ids: string[]) =>
     invoke<PurgeResult[]>("purge_bad_sources", { ids }),
+  getUpdateState: () => invoke<UpdateState>("get_update_state"),
+  checkForUpdate: () => invoke<void>("check_for_update"),
+  installUpdate: () => invoke<void>("install_update"),
+  skipUpdateVersion: (version: string) =>
+    invoke<void>("skip_update_version", { version }),
+  restartApp: () => invoke<void>("restart_app"),
 };
