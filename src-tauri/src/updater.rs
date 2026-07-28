@@ -820,10 +820,41 @@ pub async fn install_pending<R: tauri::Runtime>(
     let Some(updater) = build_updater(&app) else {
         return Err("updater unavailable".into());
     };
+    // Both failure exits drop the deferral they were dispatched for, because a pending install
+    // that can no longer be fulfilled has no in-app escape: `manual_check_block` refuses every
+    // "Check now" while one exists, the panel disables that button for `WaitingForIdle` anyway,
+    // and Skip only renders at `Available`. Switching mode drops a scheduler-decided deferral, but
+    // a user-requested one survives that too — so a yanked release would strand the panel on
+    // "Downloaded — will install when the queue finishes" until the app is quit. Same call the
+    // failed download in `perform_install` makes, for the same reason: the next scheduled check
+    // re-decides. Guarded on there actually being one, so an ordinary "Install and restart" that
+    // fails on a flaky network keeps its Available banner and its Install button.
     let raw = match updater.check().await {
         Ok(Some(raw)) => raw,
-        Ok(None) => return Err("no update available".into()),
-        Err(e) => return Err(e.to_string()),
+        Ok(None) => {
+            if pending_of(&app).is_some() {
+                // Mirrors `run_cycle`'s CheckOutcome::Nothing: the update is simply gone.
+                if let Ok(mut a) = runtime.available.lock() {
+                    *a = None;
+                }
+                set_pending(&app, None);
+                set_status(&app, UpdateStatus::Idle);
+            }
+            return Err("no update available".into());
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if pending_of(&app).is_some() {
+                // Recorded as the scheduler's own failure too: without it the status change below
+                // would take the panel off the deferral line with nothing said about why.
+                if let Ok(mut err) = runtime.last_error.lock() {
+                    *err = Some(msg.clone());
+                }
+                set_pending(&app, None);
+                set_status(&app, UpdateStatus::Error);
+            }
+            return Err(msg);
+        }
     };
     let meta = describe(&raw);
 
