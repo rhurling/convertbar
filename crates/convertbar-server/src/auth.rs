@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::config::AuthMode;
 use crate::routes::ServerState;
-use crate::throttle::client_id;
+use crate::throttle::{client_id, Gate};
 
 /// Name of the cookie `login` sets and `auth_guard`/SSE reads back. `EventSource` can't send
 /// an `Authorization` header, so the cookie is the only way `/api/events` can authenticate.
@@ -140,24 +140,28 @@ pub async fn auth_guard(State(s): State<ServerState>, req: Request, next: Next) 
         return next.run(req).await;
     }
 
-    // Order matters. A request with NO credential is not a guess: it is how the
-    // web UI discovers it needs to show the login screen. Charging it a delay
-    // would make the login screen slow exactly when it is needed.
+    // A request with NO credential is not a guess — it is how the web UI
+    // discovers it must show the login screen. Gating these would spend the
+    // bucket's budget on rendering the login form.
     let Some(provided) = bearer_token(&req).or_else(|| cookie_token(&req)) else {
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
     };
 
-    // Checked before any throttle work, so the authenticated hot path (SSE,
-    // polling) takes no lock at all.
+    let id = client_id(peer_ip(&req), req.headers(), &s.config.trusted_proxies);
+    let now = std::time::Instant::now();
+
+    // BEFORE the comparison, not after. Comparing first would compute the
+    // verdict the attacker wants regardless of what we do with the response.
+    if s.login_throttle.check(id, now) == Gate::Deny {
+        return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+
     if token_matches(&provided, expected) {
+        s.login_throttle.record_success(id);
         return next.run(req).await;
     }
 
-    let id = client_id(peer_ip(&req), req.headers(), &s.config.trusted_proxies);
-    let delay = s
-        .login_throttle
-        .record_failure(id, std::time::Instant::now());
-    tokio::time::sleep(delay).await;
+    s.login_throttle.record_failure(id, now);
     json_err(StatusCode::UNAUTHORIZED, "unauthorized")
 }
 
@@ -675,16 +679,12 @@ mod tests {
         #[tokio::test]
         async fn uncredentialed_requests_are_never_throttled() {
             // The web UI fires several uncredentialed /api/* requests on page load
-            // specifically to trigger the login screen. If those counted, a user would
-            // lock themselves into a slow login before typing a character.
+            // specifically to trigger the login screen. If those counted toward the
+            // gate, a user would find their own correct token refused before ever
+            // typing a character.
             let state = throttled_state("abcdefghijklmnop", Duration::from_millis(80));
             let app = app_from(state, "10.0.0.1:5555");
             for _ in 0..12 {
-                // Assert the elapsed time of EACH uncredentialed request. Asserting only
-                // the status would let a "count them as failures" regression pass: the
-                // loop would just get slow, and a later authenticated request still
-                // returns fast because the success path never sleeps.
-                let start = std::time::Instant::now();
                 let response = send(
                     app.clone(),
                     "GET",
@@ -694,31 +694,11 @@ mod tests {
                 )
                 .await;
                 assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-                assert!(
-                    start.elapsed() < Duration::from_millis(80),
-                    "uncredentialed request was delayed: {:?}",
-                    start.elapsed()
-                );
             }
-            // And the ramp must still be at zero: a wrong credential now should cost the
-            // FIRST step (80ms), not the thirteenth.
-            let start = std::time::Instant::now();
-            send(
-                app.clone(),
-                "GET",
-                "/api/queue",
-                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
-                None,
-            )
-            .await;
-            let first_real_failure = start.elapsed();
-            assert!(
-                first_real_failure < Duration::from_millis(300),
-                "counter advanced on uncredentialed requests: first real failure cost {first_real_failure:?}"
-            );
 
-            // A correct credential must still be served immediately.
-            let start = std::time::Instant::now();
+            // If the twelve requests above had counted, the free allowance (3) would
+            // be long spent and the gate would be shut — refusing even this correct
+            // credential.
             let response = send(
                 app,
                 "GET",
@@ -731,11 +711,6 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
-            assert!(
-                start.elapsed() < Duration::from_millis(80),
-                "authenticated request was delayed: {:?}",
-                start.elapsed()
-            );
         }
 
         #[tokio::test]
@@ -769,15 +744,114 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        #[tokio::test]
-        async fn wrong_credentials_are_delayed_and_the_delay_escalates() {
-            // Pins BOTH that the sleep happens at all and that it derives from the
-            // post-increment count — a delay computed before incrementing would make
-            // every attempt cost the same, which is bypassable by opening connections.
-            let state = throttled_state("abcdefghijklmnop", Duration::from_millis(60));
-            let app = app_from(state, "10.0.0.1:5555");
+        /// A policy that gates immediately and stays shut for the whole test: `free: 0`
+        /// means the first failure closes the slot, and a 1-hour base means it does not
+        /// reopen. Lets the gate be observed without modelling time.
+        fn gated_state(token: &str) -> ServerState {
+            let mut state = token_state(token);
+            state.login_throttle = std::sync::Arc::new(crate::throttle::LoginThrottle::new(
+                crate::throttle::ThrottlePolicy {
+                    free: 0,
+                    base: Duration::from_secs(3600),
+                    ..Default::default()
+                },
+            ));
+            state
+        }
 
-            let first = std::time::Instant::now();
+        #[tokio::test]
+        async fn a_denied_request_is_not_evaluated_so_even_the_correct_token_is_refused() {
+            // This is the rate limit. Refusing to answer is what bounds throughput —
+            // a gate that still honoured a correct token would still answer every
+            // guess, which is exactly how the previous delay-based design failed.
+            let app = app_from(gated_state("abcdefghijklmnop"), "10.0.0.1:5555");
+            let first = send(
+                app.clone(),
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                None,
+            )
+            .await;
+            assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+
+            let correct = send(
+                app,
+                "GET",
+                "/api/queue",
+                &[
+                    ("Host", "localhost"),
+                    ("Authorization", "Bearer abcdefghijklmnop"),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(
+                correct.status(),
+                StatusCode::UNAUTHORIZED,
+                "the gate was open, so the credential was still being evaluated"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_denied_response_is_indistinguishable_from_a_wrong_credential() {
+            let app = app_from(gated_state("abcdefghijklmnop"), "10.0.0.1:5555");
+            let evaluated = send(
+                app.clone(),
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                None,
+            )
+            .await;
+            let denied = send(
+                app,
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                None,
+            )
+            .await;
+            assert_eq!(evaluated.status(), denied.status());
+            assert!(evaluated.headers().get(SET_COOKIE).is_none());
+            assert!(denied.headers().get(SET_COOKIE).is_none());
+            assert_eq!(json_body(evaluated).await, json_body(denied).await);
+        }
+
+        #[tokio::test]
+        async fn uncredentialed_requests_never_close_the_gate() {
+            // The web UI fires these on page load to trigger its login screen. If they
+            // consumed slots, the login form would gate itself out.
+            let app = app_from(gated_state("abcdefghijklmnop"), "10.0.0.1:5555");
+            for _ in 0..25 {
+                let response = send(
+                    app.clone(),
+                    "GET",
+                    "/api/queue",
+                    &[("Host", "localhost")],
+                    None,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            let response = send(
+                app,
+                "GET",
+                "/api/queue",
+                &[
+                    ("Host", "localhost"),
+                    ("Authorization", "Bearer abcdefghijklmnop"),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_successful_credential_reopens_the_gate_for_that_source() {
+            let state = gated_state("abcdefghijklmnop");
+            let app = app_from(state, "10.0.0.1:5555");
             send(
                 app.clone(),
                 "GET",
@@ -786,64 +860,19 @@ mod tests {
                 None,
             )
             .await;
-            let first = first.elapsed();
-
-            let second = std::time::Instant::now();
-            send(
-                app,
+            // Gate is shut; a different source proves the shut gate is per-source.
+            let other = send(
+                app_from(token_state("abcdefghijklmnop"), "10.0.0.2:5555"),
                 "GET",
                 "/api/queue",
-                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                &[
+                    ("Host", "localhost"),
+                    ("Authorization", "Bearer abcdefghijklmnop"),
+                ],
                 None,
             )
             .await;
-            let second = second.elapsed();
-
-            // Absolute bounds, not `second >= first * 2`: that form doubles the first
-            // request's scheduling overhead into the bound and is flaky on a loaded
-            // machine. These are still discriminating — a delay computed BEFORE the
-            // increment gives second ~= 60ms and fails, and a dropped sleep fails the
-            // first assertion.
-            assert!(
-                first >= Duration::from_millis(60),
-                "first not delayed: {first:?}"
-            );
-            assert!(
-                second >= Duration::from_millis(120),
-                "delay did not escalate: {first:?} then {second:?}"
-            );
-        }
-
-        #[tokio::test]
-        async fn one_sources_failures_do_not_slow_another_source() {
-            let state = throttled_state("abcdefghijklmnop", Duration::from_millis(60));
-            let noisy = app_from(state.clone(), "10.0.0.1:5555");
-            for _ in 0..6 {
-                send(
-                    noisy.clone(),
-                    "GET",
-                    "/api/queue",
-                    &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
-                    None,
-                )
-                .await;
-            }
-            let quiet = app_from(state, "10.0.0.2:5555");
-            let start = std::time::Instant::now();
-            send(
-                quiet,
-                "GET",
-                "/api/queue",
-                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
-                None,
-            )
-            .await;
-            // Second source is at ramp step 1, not step 7.
-            assert!(
-                start.elapsed() < Duration::from_millis(200),
-                "unrelated source inherited the ramp: {:?}",
-                start.elapsed()
-            );
+            assert_eq!(other.status(), StatusCode::OK);
         }
 
         #[tokio::test]

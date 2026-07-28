@@ -1,13 +1,16 @@
-//! Per-source login throttling: who is attempting, and how long they must wait.
+//! Per-source login throttling: who may spend an evaluation right now.
 //!
 //! There is deliberately no lockout. A lockout that refuses a correct token is a
 //! cheap permanent denial of service against the owner (sustaining it costs
-//! ~0.07 req/s), and one that honours a correct token rate-limits nothing —
-//! every guess is still evaluated. The escalating delay below deters a
-//! sequential, response-waiting guesser without ever creating denial state an
-//! attacker can trigger — it does not bound a concurrent or abandon-early
-//! guesser; the token strength floor (`config.rs`) is the actual defense. See
-//! the spec's "Why no lockout" for the full analysis.
+//! ~0.07 req/s), so the gate below is temporary: after `free` failures a source
+//! may be evaluated only once per spacing interval, doubling on every further
+//! failure up to a cap, and a successful evaluation clears it immediately. The
+//! gate closes the COMPARISON, not the response — `check` reserves the slot
+//! BEFORE `token_matches` runs, so a denied request never computes a verdict at
+//! all. Answering after the fact (a delay) bounds nothing: the verdict already
+//! exists by then, and an attacker who abandons the connection before it
+//! arrives pays nothing for the guess. See the spec's "Why no lockout" for the
+//! full analysis.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -98,8 +101,19 @@ pub fn client_id(peer: Option<IpAddr>, headers: &HeaderMap, trusted: &[IpNet]) -
 /// hundred KB, which is the right order for a LAN appliance.
 const PRUNE_THRESHOLD: usize = 4096;
 
+/// Whether a source may spend an evaluation right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Compare the credential. This call consumed the bucket's slot.
+    Allow,
+    /// Do NOT compare the credential — answer 401 without evaluating.
+    Deny,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ThrottlePolicy {
+    /// Failures a source may spend before any gating begins.
+    pub free: u32,
     pub base: Duration,
     pub cap: Duration,
     pub window: Duration,
@@ -108,6 +122,7 @@ pub struct ThrottlePolicy {
 impl Default for ThrottlePolicy {
     fn default() -> Self {
         Self {
+            free: 3,
             base: Duration::from_millis(500),
             cap: Duration::from_secs(30),
             window: Duration::from_secs(900),
@@ -119,6 +134,8 @@ impl Default for ThrottlePolicy {
 struct Failures {
     count: u32,
     first_at: Instant,
+    /// Earliest instant at which this source may next be evaluated.
+    next_at: Instant,
 }
 
 pub struct LoginThrottle {
@@ -134,19 +151,41 @@ impl LoginThrottle {
         }
     }
 
-    /// Records a rejected attempt and returns how long the caller must wait
-    /// before responding.
+    /// Reserves this source's evaluation slot.
     ///
-    /// The count is incremented HERE, under the lock, and the delay derives from
-    /// the post-increment value — so N concurrent attempts get N escalating
-    /// delays rather than N copies of the first one. Computing the delay before
-    /// incrementing would let an attacker bypass the whole ramp by opening more
-    /// connections.
-    pub fn record_failure(&self, id: ClientId, now: Instant) -> Duration {
+    /// MUST be called BEFORE comparing the credential. Comparing first would
+    /// compute the verdict regardless, and the attacker only ever needed the
+    /// verdict — withholding the response afterwards limits nothing.
+    ///
+    /// The slot is reserved inside the same critical section that reads it, so
+    /// racing requests cannot all observe one open window.
+    pub fn check(&self, id: ClientId, now: Instant) -> Gate {
         let mut map = self.lock();
+        let Some(entry) = map.get_mut(&id) else {
+            return Gate::Allow;
+        };
+        if now.duration_since(entry.first_at) > self.policy.window {
+            map.remove(&id);
+            return Gate::Allow;
+        }
+        if now < entry.next_at {
+            return Gate::Deny;
+        }
+        entry.next_at = now + self.spacing_for(entry.count);
+        Gate::Allow
+    }
+
+    /// Records that an allowed evaluation rejected the credential.
+    pub fn record_failure(&self, id: ClientId, now: Instant) {
+        let mut map = self.lock();
+        if map.len() > PRUNE_THRESHOLD {
+            let window = self.policy.window;
+            map.retain(|_, f| now.duration_since(f.first_at) <= window);
+        }
         let entry = map.entry(id).or_insert(Failures {
             count: 0,
             first_at: now,
+            next_at: now,
         });
         if now.duration_since(entry.first_at) > self.policy.window {
             entry.count = 0;
@@ -154,71 +193,59 @@ impl LoginThrottle {
         }
         entry.count += 1;
         let count = entry.count;
+        entry.next_at = now + self.spacing_for(count);
+        let reached_cap = self.spacing_for(count) == self.policy.cap
+            && self.spacing_for(count.saturating_sub(1)) != self.policy.cap;
 
-        // Checked AFTER the insert above, so the map is bounded on exit from
-        // every call, not just the ones that happen to run before one.
+        // Expiry alone does not bound the map under a live flood of distinct
+        // sources — nothing in it is old enough to expire yet.
         if map.len() > PRUNE_THRESHOLD {
-            let window = self.policy.window;
-            map.retain(|_, f| now.duration_since(f.first_at) <= window);
-            // Expiry alone does not bound the map under a live flood of
-            // distinct sources — nothing in it is old enough to expire yet.
-            // Evict the lowest-count entries first: a hot attacker's bucket
-            // is the one actually worth remembering, and count-based eviction
-            // is harder to game than oldest-first — flooding fresh sources to
-            // force an eviction only spends the flood's own low-count
-            // buckets, never a bucket the flood doesn't control. Any eviction
-            // policy is somewhat gameable; bounded memory is worth more than
-            // a perfectly unevictable counter.
-            if map.len() > PRUNE_THRESHOLD {
-                let mut counts: Vec<(ClientId, u32)> =
-                    map.iter().map(|(id, f)| (*id, f.count)).collect();
-                counts.sort_unstable_by_key(|(_, count)| *count);
-                let excess = map.len() - PRUNE_THRESHOLD;
-                for (evict, _) in counts.into_iter().take(excess) {
-                    map.remove(&evict);
-                }
+            let mut by_count: Vec<(ClientId, u32)> =
+                map.iter().map(|(k, f)| (*k, f.count)).collect();
+            // Lowest-count first: hot attackers are the entries worth keeping,
+            // and evicting oldest-first would be gameable by flooding fresh
+            // sources to shed your own bucket.
+            by_count.sort_unstable_by_key(|(_, count)| *count);
+            for (victim, _) in by_count
+                .into_iter()
+                .take(map.len().saturating_sub(PRUNE_THRESHOLD))
+            {
+                map.remove(&victim);
             }
         }
         drop(map);
 
-        let delay = self.delay_for(count);
-        if delay == self.policy.cap && count == self.cap_reached_at() {
+        if reached_cap {
             tracing::warn!(
                 ?id,
-                "login throttle: source reached the {:?} delay cap after {count} failed attempts",
+                "login throttle: source reached the {:?} evaluation spacing after {count} failures",
                 self.policy.cap
             );
         }
-        delay
     }
 
-    /// Clears a source's ramp. Called only on a successful login.
+    /// Clears the bucket. Called when an allowed evaluation accepted the credential.
     pub fn record_success(&self, id: ClientId) {
         self.lock().remove(&id);
     }
 
-    /// `base << (n-1)`, capped. The shift is CLAMPED rather than special-cased:
-    /// `1u32 << shift` panics once shift reaches 32, and returning the cap
-    /// directly at that point would be wrong for a zero `base` — doubling zero
-    /// is still zero, and a zero-base policy means "no throttling" (the tests
-    /// rely on it). Clamping keeps one code path correct for every policy.
-    fn delay_for(&self, count: u32) -> Duration {
-        let shift = count.saturating_sub(1).min(31);
+    /// `0` while the source is inside its free allowance, then
+    /// `base << (n - free)` capped. The shift is CLAMPED rather than
+    /// special-cased: `1u32 << shift` panics at 32, and returning the cap there
+    /// would be wrong for a zero `base` — doubling zero is still zero, and a
+    /// zero-base policy means "no gating" (the integration tests rely on it).
+    fn spacing_for(&self, count: u32) -> Duration {
+        let Some(steps) = count.checked_sub(self.policy.free) else {
+            return Duration::ZERO;
+        };
+        if steps == 0 {
+            return Duration::ZERO;
+        }
+        let shift = (steps - 1).min(31);
         match self.policy.base.checked_mul(1u32 << shift) {
             Some(d) => d.min(self.policy.cap),
             None => self.policy.cap,
         }
-    }
-
-    /// The lowest failure count whose delay is the cap — used so the cap warning
-    /// logs once per ramp instead of on every subsequent attempt. Note "per ramp",
-    /// not "per source": after a window rollover or a successful login the source
-    /// starts over and will warn again if it climbs back to the cap. That is the
-    /// intended reading — a fresh ramp reaching the cap is a fresh event.
-    fn cap_reached_at(&self) -> u32 {
-        (1..=32)
-            .find(|n| self.delay_for(*n) == self.policy.cap)
-            .unwrap_or(u32::MAX)
     }
 
     /// Poisoning must not take the server down: this lock sits on a global
@@ -462,6 +489,7 @@ mod throttle_tests {
 
     fn policy() -> ThrottlePolicy {
         ThrottlePolicy {
+            free: 3,
             base: Duration::from_millis(500),
             cap: Duration::from_secs(30),
             window: Duration::from_secs(900),
@@ -472,161 +500,203 @@ mod throttle_tests {
         ClientId::Addr(s.parse::<IpAddr>().unwrap())
     }
 
-    #[test]
-    fn delay_doubles_with_each_failure_then_pins_at_the_cap() {
-        let t = LoginThrottle::new(policy());
-        let now = Instant::now();
-        let a = id("10.0.0.1");
-        assert_eq!(t.record_failure(a, now), Duration::from_millis(500));
-        assert_eq!(t.record_failure(a, now), Duration::from_secs(1));
-        assert_eq!(t.record_failure(a, now), Duration::from_secs(2));
-        assert_eq!(t.record_failure(a, now), Duration::from_secs(4));
-        assert_eq!(t.record_failure(a, now), Duration::from_secs(8));
-        assert_eq!(t.record_failure(a, now), Duration::from_secs(16));
-        // 32s would exceed the cap.
-        assert_eq!(t.record_failure(a, now), Duration::from_secs(30));
-        assert_eq!(t.record_failure(a, now), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn a_very_long_run_of_failures_does_not_overflow() {
-        // `base << (n-1)` overflows once n-1 reaches 32, so the shift must be
-        // guarded. Iterate well past that point — and only assert the cap from
-        // failure 7 on, because failures 1-6 are still climbing the ramp
-        // (500ms, 1s, 2s, 4s, 8s, 16s) and asserting the cap on those would make
-        // the test die at iteration 1, never reaching the code it exists to pin.
-        let t = LoginThrottle::new(policy());
-        let now = Instant::now();
-        let a = id("10.0.0.1");
-        let mut last = Duration::ZERO;
-        for i in 1..=200u32 {
-            last = t.record_failure(a, now);
-            if i >= 7 {
-                assert_eq!(last, Duration::from_secs(30), "failure #{i} left the cap");
-            }
+    /// Drives `n` allowed failures onto a bucket, asserting each was allowed.
+    fn fail_n(t: &LoginThrottle, id: ClientId, now: Instant, n: u32) {
+        for i in 0..n {
+            assert_eq!(t.check(id, now), Gate::Allow, "failure {i} was denied");
+            t.record_failure(id, now);
         }
-        assert_eq!(last, Duration::from_secs(30));
     }
 
     #[test]
-    fn failures_older_than_the_window_start_a_fresh_count() {
+    fn the_first_free_failures_are_not_gated() {
+        // Typos, a stale cookie, and the web UI's concurrent page-load fan-out
+        // must never hit a denial.
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        fail_n(&t, a, now, 3);
+        // The 4th is the first gated one, and it is still allowed because the
+        // ramp only starts spacing AFTER it.
+        assert_eq!(t.check(a, now), Gate::Allow);
+        t.record_failure(a, now);
+        // Now the bucket is spaced: an immediate retry is refused.
+        assert_eq!(t.check(a, now), Gate::Deny);
+    }
+
+    #[test]
+    fn a_denied_check_does_not_advance_the_ramp() {
+        // Otherwise an attacker could inflate a shared bucket's spacing for
+        // free, without ever spending an evaluation.
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        fail_n(&t, a, now, 4);
+        for _ in 0..50 {
+            assert_eq!(t.check(a, now), Gate::Deny);
+        }
+        // Spacing is still the first step (500ms), not 50 steps further on.
+        assert_eq!(t.check(a, now + Duration::from_millis(500)), Gate::Allow);
+    }
+
+    #[test]
+    fn the_slot_reopens_exactly_when_the_spacing_elapses() {
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        fail_n(&t, a, now, 4);
+        assert_eq!(t.check(a, now + Duration::from_millis(499)), Gate::Deny);
+        assert_eq!(t.check(a, now + Duration::from_millis(500)), Gate::Allow);
+    }
+
+    #[test]
+    fn spacing_doubles_per_failure_and_pins_at_the_cap() {
         let t = LoginThrottle::new(policy());
         let start = Instant::now();
         let a = id("10.0.0.1");
-        t.record_failure(a, start);
-        t.record_failure(a, start);
-        assert_eq!(t.record_failure(a, start), Duration::from_secs(2));
-        // Past the window: the ramp resets to base.
-        let later = start + Duration::from_secs(901);
-        assert_eq!(t.record_failure(a, later), Duration::from_millis(500));
-    }
+        fail_n(&t, a, start, 3); // free failures, no spacing yet
 
-    #[test]
-    fn a_successful_login_clears_the_ramp() {
-        let t = LoginThrottle::new(policy());
-        let now = Instant::now();
-        let a = id("10.0.0.1");
-        t.record_failure(a, now);
-        t.record_failure(a, now);
-        t.record_success(a);
-        assert_eq!(t.record_failure(a, now), Duration::from_millis(500));
-    }
-
-    #[test]
-    fn distinct_sources_have_independent_ramps() {
-        let t = LoginThrottle::new(policy());
-        let now = Instant::now();
-        for _ in 0..5 {
-            t.record_failure(id("10.0.0.1"), now);
+        // Each subsequent failure doubles the wait before the next evaluation.
+        let expected = [
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+            Duration::from_secs(30), // 32s would exceed the cap
+            Duration::from_secs(30),
+        ];
+        let mut at = start;
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(t.check(a, at), Gate::Allow, "step {i} denied at its slot");
+            t.record_failure(a, at);
+            let just_before = at + *want - Duration::from_millis(1);
+            assert_eq!(t.check(a, just_before), Gate::Deny, "step {i} opened early");
+            at += *want;
         }
-        assert_eq!(
-            t.record_failure(id("10.0.0.2"), now),
-            Duration::from_millis(500)
-        );
-        assert_eq!(
-            t.record_failure(ClientId::Unknown, now),
-            Duration::from_millis(500)
-        );
-        assert_eq!(
-            t.record_failure(ClientId::MalformedChain, now),
-            Duration::from_millis(500)
-        );
     }
 
     #[test]
-    fn pruning_drops_expired_entries_and_keeps_live_ones() {
-        let t = LoginThrottle::new(policy());
-        let start = Instant::now();
-        // Fill past the prune threshold with entries that will expire.
-        for i in 0..5000u32 {
-            let octets = i.to_be_bytes();
-            let addr = IpAddr::from([10, octets[1], octets[2], octets[3]]);
-            t.record_failure(ClientId::Addr(addr), start);
-        }
-        let live = id("192.168.1.1");
-        t.record_failure(live, start);
-        // Well past the window, so everything above is prunable. This failure
-        // triggers a prune; the map must not retain the dead entries.
-        let later = start + Duration::from_secs(901);
-        t.record_failure(id("192.168.1.2"), later);
-        assert!(
-            t.len() < 5000,
-            "expired entries were not pruned: {}",
-            t.len()
-        );
-        // The live entry expired too (same window), so it also resets.
-        assert_eq!(t.record_failure(live, later), Duration::from_millis(500));
-    }
-
-    #[test]
-    fn map_stays_bounded_under_a_live_flood_and_keeps_the_hottest_bucket() {
-        // Everything below is at the same `now`, so nothing is expirable —
-        // expiry-based pruning alone cannot bound this map. Only count-based
-        // eviction can.
-        let t = LoginThrottle::new(policy());
-        let now = Instant::now();
-
-        // A hot attacker, already ramped, before the flood arrives.
-        let hot = id("10.0.0.1");
-        for _ in 0..5 {
-            t.record_failure(hot, now);
-        }
-
-        // Flood well past PRUNE_THRESHOLD with distinct, single-failure
-        // sources — the low-value kind eviction should prefer to drop.
-        let flood = PRUNE_THRESHOLD as u32 + 2000;
-        for i in 0..flood {
-            let octets = i.to_be_bytes();
-            let addr = IpAddr::from([11, octets[1], octets[2], octets[3]]);
-            t.record_failure(ClientId::Addr(addr), now);
-        }
-
-        assert!(
-            t.len() <= PRUNE_THRESHOLD,
-            "map exceeded its ceiling under a live flood: {}",
-            t.len()
-        );
-        // The hot bucket must survive eviction: it has a higher count than
-        // any flood entry, and count-based eviction drops the lowest counts
-        // first. A test that only checked the size would pass under any
-        // eviction order, including gameable oldest-first — this is the
-        // assertion that actually pins the policy.
-        assert_eq!(t.record_failure(hot, now), Duration::from_secs(16));
-    }
-
-    #[test]
-    fn a_zero_base_policy_never_delays_no_matter_how_high_the_count_climbs() {
-        // Tasks 5 and 6 use a zero-base policy so the suite does not sleep. A
-        // guard that returns the cap once the shift saturates would silently
-        // reintroduce 30-second sleeps into exactly those tests.
+    fn a_zero_base_policy_never_gates() {
+        // The integration tests use this policy so they can drive many attempts
+        // without modelling time.
         let t = LoginThrottle::new(ThrottlePolicy {
             base: Duration::ZERO,
-            ..Default::default()
+            ..policy()
         });
         let now = Instant::now();
         let a = id("10.0.0.1");
         for _ in 0..100 {
-            assert_eq!(t.record_failure(a, now), Duration::ZERO);
+            assert_eq!(t.check(a, now), Gate::Allow);
+            t.record_failure(a, now);
         }
+    }
+
+    #[test]
+    fn a_successful_evaluation_clears_the_gate_immediately() {
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        fail_n(&t, a, now, 4);
+        assert_eq!(t.check(a, now), Gate::Deny);
+        t.record_success(a);
+        assert_eq!(t.check(a, now), Gate::Allow);
+    }
+
+    #[test]
+    fn the_window_forgets_failures_and_reopens_the_gate() {
+        let t = LoginThrottle::new(policy());
+        let start = Instant::now();
+        let a = id("10.0.0.1");
+        fail_n(&t, a, start, 4);
+        assert_eq!(t.check(a, start), Gate::Deny);
+        // Past the window the bucket is forgotten entirely, so the source is
+        // back to its free allowance.
+        let later = start + Duration::from_secs(901);
+        assert_eq!(t.check(a, later), Gate::Allow);
+        t.record_failure(a, later);
+        assert_eq!(
+            t.check(a, later),
+            Gate::Allow,
+            "free allowance did not reset"
+        );
+    }
+
+    #[test]
+    fn sources_are_gated_independently() {
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        fail_n(&t, id("10.0.0.1"), now, 4);
+        assert_eq!(t.check(id("10.0.0.1"), now), Gate::Deny);
+        assert_eq!(t.check(id("10.0.0.2"), now), Gate::Allow);
+        assert_eq!(t.check(ClientId::Unknown, now), Gate::Allow);
+        assert_eq!(t.check(ClientId::MalformedChain, now), Gate::Allow);
+    }
+
+    #[test]
+    fn concurrent_checks_cannot_share_one_slot() {
+        // THE property that makes this a rate limiter rather than a delay: the
+        // slot is reserved inside the same lock that reads it, so N racing
+        // requests cannot all observe the same open window.
+        use std::sync::Arc;
+        let t = Arc::new(LoginThrottle::new(policy()));
+        let now = Instant::now();
+        let a = id("10.0.0.1");
+        fail_n(&t, a, now, 4);
+        let later = now + Duration::from_secs(60); // slot is open again
+
+        let allowed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let t = Arc::clone(&t);
+            let allowed = Arc::clone(&allowed);
+            handles.push(std::thread::spawn(move || {
+                if t.check(a, later) == Gate::Allow {
+                    allowed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            allowed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "more than one racing request claimed the same evaluation slot"
+        );
+    }
+
+    #[test]
+    fn map_stays_bounded_under_a_live_flood_and_keeps_the_hottest_bucket() {
+        let t = LoginThrottle::new(policy());
+        let now = Instant::now();
+        let hot = id("192.168.1.1");
+        // 4, not more: with `free: 3` only four evaluations fit at a single
+        // instant before the gate shuts (the fifth is Deny). Count 4 is still
+        // far hotter than the flood's count-of-1 entries, which is all this
+        // test needs to prove eviction keeps the right bucket.
+        fail_n(&t, hot, now, 4);
+
+        for i in 0..(PRUNE_THRESHOLD as u32 * 2) {
+            let o = i.to_be_bytes();
+            let addr = IpAddr::from([10, o[1], o[2], o[3]]);
+            let cold = ClientId::Addr(addr);
+            t.check(cold, now);
+            t.record_failure(cold, now);
+        }
+
+        assert!(
+            t.len() <= PRUNE_THRESHOLD,
+            "map exceeded its ceiling: {}",
+            t.len()
+        );
+        // Lowest-count-first eviction must keep the attacker, not shed it —
+        // evicting the hot bucket would silently reset the ramp that matters.
+        assert_eq!(
+            t.check(hot, now),
+            Gate::Deny,
+            "the hottest bucket was evicted and its ramp reset"
+        );
     }
 }

@@ -719,9 +719,12 @@ pub(crate) mod tests {
             )
             .expect("valid test config"),
         );
+        // `free: 0` and a long base close the gate after one failure and keep it
+        // shut — the test asserts on status alone and needs no clock control.
         state.login_throttle = Arc::new(crate::throttle::LoginThrottle::new(
             crate::throttle::ThrottlePolicy {
-                base: std::time::Duration::from_millis(150),
+                free: 0,
+                base: std::time::Duration::from_secs(3600),
                 ..Default::default()
             },
         ));
@@ -737,10 +740,10 @@ pub(crate) mod tests {
             .unwrap();
         });
 
-        async fn wrong_credential_from(addr: std::net::SocketAddr, forwarded: &str) -> String {
+        async fn request_from(addr: std::net::SocketAddr, forwarded: &str, token: &str) -> String {
             let request = format!(
                 "GET /api/queue HTTP/1.1\r\nHost: localhost\r\n\
-                 Authorization: Bearer wrong\r\nX-Forwarded-For: {forwarded}\r\n\
+                 Authorization: Bearer {token}\r\nX-Forwarded-For: {forwarded}\r\n\
                  Connection: close\r\n\r\n"
             );
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -750,28 +753,28 @@ pub(crate) mod tests {
             response
         }
 
-        // Ramp up one forwarded client.
-        for _ in 0..4 {
-            let response = wrong_credential_from(addr, "203.0.113.1").await;
-            assert!(
-                response.starts_with("HTTP/1.1 401"),
-                "unexpected: {response}"
-            );
-        }
-
-        // A DIFFERENT forwarded client must start at step 1 (~150ms), not inherit
-        // the first client's ramp (~1.2s at step 4).
-        let start = std::time::Instant::now();
-        let response = wrong_credential_from(addr, "203.0.113.2").await;
+        // Close the first forwarded client's gate with one wrong-credential attempt.
+        let response = request_from(addr, "203.0.113.1", "wrong").await;
         assert!(
             response.starts_with("HTTP/1.1 401"),
             "unexpected: {response}"
         );
+
+        // The gate is shut, so even the CORRECT token is refused for this source.
+        let response = request_from(addr, "203.0.113.1", "abcdefghijklmnop").await;
         assert!(
-            start.elapsed() < std::time::Duration::from_millis(600),
-            "second forwarded client inherited the first's ramp ({:?}) — connect info \
-             is missing, so every client shares the Unknown bucket",
-            start.elapsed()
+            response.starts_with("HTTP/1.1 401"),
+            "gate was open, so the same source's correct token was still evaluated: {response}"
+        );
+
+        // A DIFFERENT forwarded client is a separate bucket: its correct token is
+        // still evaluated and succeeds. Without connect info both collapse into
+        // the Unknown bucket and this would also be refused — the discrimination
+        // this test exists to prove.
+        let response = request_from(addr, "203.0.113.2", "abcdefghijklmnop").await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "second forwarded client inherited the first's shut gate: {response}"
         );
     }
 }
