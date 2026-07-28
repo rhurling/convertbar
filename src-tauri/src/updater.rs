@@ -1868,6 +1868,7 @@ mod tests {
             conn,
             std::sync::Arc::new(convertbar_core::events::TestSink::default()),
             std::sync::Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
+            std::sync::Arc::new(convertbar_core::handbrake::PanickingLocator),
         ));
         app.manage(std::sync::Arc::new(UpdaterRuntime::default()));
         app

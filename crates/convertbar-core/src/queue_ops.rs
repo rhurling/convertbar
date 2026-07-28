@@ -1435,7 +1435,12 @@ mod tests {
     fn test_ctx(conn: Connection) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
         let sink = Arc::new(TestSink::default());
         let disposer = Arc::new(RecordingDisposer::default());
-        let ctx = Ctx::new(conn, sink.clone(), disposer.clone());
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer.clone(),
+            Arc::new(crate::handbrake::PanickingLocator),
+        );
         (ctx, sink, disposer)
     }
 

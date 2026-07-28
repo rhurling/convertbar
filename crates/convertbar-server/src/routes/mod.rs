@@ -169,12 +169,22 @@ pub(crate) mod tests {
     /// sender immediately (as `test_state` does) would flip `wait_for_shutdown` true on
     /// first poll and end an SSE stream before any assertions ran.
     pub(crate) fn test_state_with_shutdown() -> (ServerState, tokio::sync::watch::Sender<bool>) {
+        test_state_with_locator(Arc::new(convertbar_core::handbrake::PanickingLocator))
+    }
+
+    /// Same as `test_state_with_shutdown`, but lets the caller declare whether HandBrake is
+    /// installed instead of inheriting `PanickingLocator`'s fail-loud default — needed by tests
+    /// that exercise HandBrake resolution itself.
+    pub(crate) fn test_state_with_locator(
+        locator: Arc<dyn convertbar_core::handbrake::HandbrakeLocator>,
+    ) -> (ServerState, tokio::sync::watch::Sender<bool>) {
         let conn = Connection::open_in_memory().expect("open in-memory db");
         convertbar_core::db::init_db(&conn).expect("init db");
         let ctx = Ctx::new(
             conn,
             Arc::new(TestSink::default()),
             Arc::new(RecordingDisposer::default()),
+            locator,
         );
         // Pin a literal suffix for the default preset so any test that adds files
         // through the routes never needs to resolve HandBrakeCLI (the default suffix

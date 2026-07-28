@@ -1163,7 +1163,12 @@ mod tests {
         .unwrap();
 
         let sink = Arc::new(crate::events::TestSink::default());
-        let ctx = Ctx::new(conn, sink.clone(), Arc::new(crate::dispose::DeleteDisposer));
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            Arc::new(crate::dispose::DeleteDisposer),
+            Arc::new(crate::handbrake::PanickingLocator),
+        );
         // Cover the fake path with a watch so it survives `filter_watched`; nothing else needs
         // to exist on disk since add_files_inner's cheap skip checks are extension/DB-based.
         ctx.watcher

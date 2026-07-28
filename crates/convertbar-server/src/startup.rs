@@ -119,6 +119,7 @@ mod tests {
             conn,
             Arc::new(TestSink::default()),
             Arc::new(RecordingDisposer::default()),
+            Arc::new(convertbar_core::handbrake::PanickingLocator),
         )
     }
 

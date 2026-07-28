@@ -397,6 +397,7 @@ mod tests {
             conn,
             Arc::new(crate::events::TestSink::default()),
             Arc::new(crate::dispose::DeleteDisposer),
+            Arc::new(crate::handbrake::PanickingLocator),
         )
     }
 
@@ -621,7 +622,12 @@ mod tests {
         .unwrap();
 
         let sink = Arc::new(LockProbeSink::default());
-        let ctx = Ctx::new(conn, sink.clone(), Arc::new(crate::dispose::DeleteDisposer));
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            Arc::new(crate::dispose::DeleteDisposer),
+            Arc::new(crate::handbrake::PanickingLocator),
+        );
         sink.db.set(ctx.db.clone()).unwrap();
 
         // Stand-in for the paused encode's process.

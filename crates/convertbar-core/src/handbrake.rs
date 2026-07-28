@@ -480,6 +480,7 @@ mod tests {
             conn,
             std::sync::Arc::new(crate::events::TestSink::default()),
             std::sync::Arc::new(crate::dispose::DeleteDisposer),
+            std::sync::Arc::new(crate::handbrake::PanickingLocator),
         )
     }
 
