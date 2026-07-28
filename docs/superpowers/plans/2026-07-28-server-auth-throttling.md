@@ -1744,12 +1744,21 @@ Expected: identical results.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p convertbar-server --all-targets
 ```
 
-Watch for `clippy::useless_format` in the new tests: a `format!` with no
-interpolated arguments is a warn-by-default lint and therefore an error under
-`-D warnings`. Use a plain `&str` literal where there is nothing to interpolate.
+**Do not use `-D warnings`.** `convertbar-core` carries 10 pre-existing clippy
+warnings on `main`, so a workspace-wide `-D warnings` gate fails regardless of
+this work and is not part of CI. The bar here is: **no new warnings in
+`convertbar-server`**. Verify by reading the warning list and confirming every
+`-->` path outside `convertbar-core` belongs to code this plan did not add.
+
+Watch specifically for `clippy::useless_format` in the new tests — a `format!`
+with no interpolated arguments. Use a plain `&str` literal where there is
+nothing to interpolate.
+
+Note: a `field is never read` warning for `trusted_proxies` is expected between
+Tasks 1 and 2 and must be gone once `client_id` consumes it.
 
 - [ ] **Step 4: Frontend suite (unchanged, but prove it)**
 
