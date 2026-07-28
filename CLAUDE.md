@@ -2,6 +2,10 @@
 
 Menu bar app for batch video conversion using HandBrakeCLI. Built with Tauri 2 + React + Rust.
 
+## Workspace Layout
+
+Cargo workspace: `crates/convertbar-core` (head-agnostic engine: converter, watcher, queue_ops, control, settings_ops, db — zero tauri deps, enforced by the crate graph) + `src-tauri` (desktop shell: thin `#[tauri::command]` adapters, tray, updater, dialogs, `TauriSink`/`TrashDisposer`). The version lives in the root `Cargo.toml` `[workspace.package]`; `release.sh` bumps it there. Run tests with `cargo test --workspace`.
+
 ## Version Bump Workflow
 
 `main` is protected (changes via PR, no merge commits, signed commits). Use the `/release` skill, or run the script it wraps:
@@ -40,8 +44,8 @@ Window position is persisted across restarts via `tauri-plugin-window-state`. Sc
 
 ## Cross-Platform
 
-- `libc` (SIGSTOP/SIGCONT) is a `[target.'cfg(target_os = "macos")'.dependencies]` entry in Cargo.toml, and the call sites are gated with `#[cfg(target_os = "macos")]` attributes — never the `cfg!()` macro, which only skips code at runtime and would still require linking libc on every platform. There is also a `[target.'cfg(unix)'.dev-dependencies]` `libc` entry (for a Linux/macOS-only test), so don't assume the crate is macOS-exclusive when touching Cargo.toml.
-- Pause/resume: real process freeze on macOS, queue-level pause on other platforms
+- `libc` (SIGSTOP/SIGCONT) is a `[target.'cfg(unix)'.dependencies]` entry in `crates/convertbar-core/Cargo.toml`, and the signal call sites are gated with `#[cfg(unix)]` attributes — never the `cfg!()` macro, which only skips code at runtime and would still require linking libc on every platform. Mid-encode pause works on macOS and Linux; Windows falls back to queue-level pause.
+- Pause/resume: real process freeze (SIGSTOP/SIGCONT) on macOS and Linux, queue-level pause on Windows
 - Cancel: `Child::kill()` on all platforms
 - HandBrakeCLI detection: `which` on Unix, `where` on Windows (PATH-only, no hardcoded paths)
 - Default presets: VideoToolbox (macOS), NVENC (Windows), MKV (Linux)

@@ -1,28 +1,17 @@
-mod add_progress;
-mod commands;
-mod converter;
-mod db;
-mod failure_class;
-mod handbrake;
-mod media_skip;
-mod probe;
-mod probe_cache;
-mod types;
-mod updater;
-mod watcher;
+pub(crate) use convertbar_core::{converter, db, handbrake, probe, types, watcher};
 
-use converter::{ConverterState, MenuBarUpdate};
+mod commands;
+mod sink;
+mod updater;
+
+use convertbar_core::ctx::Ctx;
+use convertbar_core::events::EventSink;
+use converter::MenuBarUpdate;
 use rusqlite::Connection;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Listener, Manager};
-
-pub struct AppState {
-    pub db: Arc<Mutex<Connection>>,
-    pub preset_cache: Mutex<HashMap<String, handbrake::PresetMetadata>>,
-}
 
 /// Truncate a filename for the tray title on a char boundary — byte slicing panics
 /// mid-codepoint on multi-byte names (umlauts, CJK, emoji), crashing the tray updater.
@@ -36,12 +25,6 @@ fn truncate_tray_title(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let db_path = db::get_db_path();
-    let conn = Connection::open(&db_path).expect("Failed to open database");
-    db::init_db(&conn).expect("Failed to initialize database");
-
-    let converter_state = Arc::new(ConverterState::new());
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -50,12 +33,6 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
-        .manage(AppState {
-            db: Arc::new(Mutex::new(conn)),
-            preset_cache: Mutex::new(HashMap::new()),
-        })
-        .manage(converter_state)
-        .manage(watcher::WatcherState::new())
         .manage(Arc::new(updater::UpdaterRuntime::default()))
         .invoke_handler(tauri::generate_handler![
             commands::settings::get_settings,
@@ -107,6 +84,14 @@ pub fn run() {
             commands::updater::restart_app,
         ])
         .setup(|app| {
+            let db_path = db::get_db_path();
+            let conn = Connection::open(&db_path).expect("Failed to open database");
+            db::init_db(&conn).expect("Failed to initialize database");
+
+            let events: Arc<dyn EventSink> = Arc::new(sink::TauriSink(app.handle().clone()));
+            let ctx = Ctx::new(conn, events, Arc::new(sink::TrashDisposer));
+            app.manage(ctx.clone());
+
             // Shared error flag for tray icon state
             let has_error: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
@@ -136,7 +121,7 @@ pub fn run() {
                                 let mut err = has_error.lock().unwrap();
                                 if *err {
                                     *err = false;
-                                    let conv = app.state::<Arc<ConverterState>>();
+                                    let conv = &app.state::<Arc<Ctx>>().converter;
                                     let is_running = *conv.is_running.lock().unwrap();
                                     if !is_running {
                                         if let Some(tray) = app.tray_by_id("main") {
@@ -210,7 +195,7 @@ pub fn run() {
                                         let mut err = has_error.lock().unwrap();
                                         if *err {
                                             *err = false;
-                                            let conv = app.state::<Arc<ConverterState>>();
+                                            let conv = &app.state::<Arc<Ctx>>().converter;
                                             let is_running = *conv.is_running.lock().unwrap();
                                             if !is_running {
                                                 let _ = tray_icon.set_title(Some(""));
@@ -229,7 +214,7 @@ pub fn run() {
             // Listen for menu-bar-update events to update tray title/tooltip
             let tray_id = tray.id().clone();
             let app_handle = app.handle().clone();
-            let db_for_tray = app.state::<AppState>().db.clone();
+            let db_for_tray = ctx.db.clone();
             let error_flag = has_error.clone();
             app.listen("menu-bar-update", move |event| {
                 if let Ok(update) = serde_json::from_str::<MenuBarUpdate>(event.payload()) {
@@ -349,12 +334,10 @@ pub fn run() {
             });
 
             // Task 8: Auto-resume on launch
-            let app_state = app.state::<AppState>();
-            let conv_state = app.state::<Arc<ConverterState>>();
             let has_queued;
             let should_resume;
             {
-                let db = app_state.db.lock().unwrap();
+                let db = ctx.db.lock().unwrap();
 
                 // Reset interrupted jobs to queued, deleting only their partial output (never the
                 // source — critical for in-place jobs where output_path == source_path).
@@ -369,18 +352,15 @@ pub fn run() {
                 // queue for a user-requested "Install and restart" — the user never pressed
                 // Pause, so keeping it past the restart that applied the update would leave the
                 // rest of their batch stopped indefinitely. Lifted once, then forgotten.
-                should_resume = crate::updater::should_resume_queue_at_launch(&db, has_queued);
+                should_resume = crate::converter::should_resume_queue_at_launch(&db, has_queued);
             }
 
             if should_resume {
-                let db_arc = app_state.db.clone();
-                let conv_arc = (*conv_state).clone();
-                let app_handle = app.handle().clone();
-                converter::run_queue(app_handle, db_arc, conv_arc);
+                converter::run_queue(ctx.clone());
             }
 
             // Arm directory watchers and ingest any files already present in enabled folders.
-            watcher::start(app.handle().clone());
+            watcher::start(ctx.clone());
 
             // All update policy lives in `updater` — mode, scheduling, skip, and the idle gate.
             updater::start(app.handle().clone());
@@ -396,8 +376,8 @@ pub fn run() {
             // auto-resume would delete that file and start a second encoder against
             // the same path while the orphan still holds it.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                let conv = app.state::<Arc<ConverterState>>();
-                converter::kill_active_child(&conv);
+                let ctx = app.state::<Arc<Ctx>>();
+                converter::kill_active_child(&ctx.converter);
             }
         });
 }

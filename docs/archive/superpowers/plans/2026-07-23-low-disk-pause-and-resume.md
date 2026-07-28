@@ -15,7 +15,7 @@
 - Threshold unit is GB where 1 GB = 1024³ bytes (matches the app's existing `formatBytes`/`format_bytes_short`). Stored as `low_disk_min_gb` (f64); `0` (or negative/unparseable) = disabled.
 - The check runs **before spawning** the next encode, never mid-encode. No `SIGSTOP` of a running process.
 - Fail **open**: if the threshold is 0/disabled, or the destination parent can't be resolved, or the free-space query errors, the encode proceeds. Uncertainty must never wedge the queue.
-- Surfacing the pause reason is **event-only** (`queue-paused-low-disk`) — no new command, no durable backend state. The Queue tab unmounts on tab switch (`App.tsx:43`), so a message can be missed if the user is elsewhere; that's acceptable because clicking Resume while still low re-runs the gate and re-emits the event (self-healing), and the Resume button itself is always present while work remains.
+- ~~Surfacing the pause reason is **event-only** (`queue-paused-low-disk`) — no new command, no durable backend state.~~ **[Superseded by the implementation — do not read this as the shipped architecture.]** The shipped code *does* keep durable state and *does* add a command: `ConverterState.low_disk_pause: Mutex<Option<LowDiskPause>>` in `converter.rs`, read via a `get_low_disk_pause` command (`commands/converter.rs`, registered in `lib.rs`), which `QueuePage.tsx` calls on mount to seed the banner. The plan's own concern — that the Queue tab unmounts on tab switch (`App.tsx:43`) and the message can be missed — is exactly why: the event alone was not enough, so the reason was made queryable. The self-healing re-emit on Resume still holds as a secondary path.
 
 ---
 

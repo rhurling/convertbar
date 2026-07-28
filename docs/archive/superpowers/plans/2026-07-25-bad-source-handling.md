@@ -1622,6 +1622,12 @@ git commit -S -m "feat: add bad-source review list and purge commands"
 
 ### Task 8: Review-list UI
 
+> **[Markup superseded by PR #114.]** The row layout specified below shipped and was then
+> replaced: rows now stack, both halves ellipsize, and the reason is rendered from the
+> `failure_class` enum rather than showing raw stderr. Read `src/pages/HistoryPage.tsx` for
+> the current UI — the structural steps below no longer describe it. The hook, commands, and
+> data flow (Tasks 6–7) are unchanged and did ship as written.
+
 **Files:**
 - Create: `src/hooks/useBadSources.ts`, `src/hooks/useBadSources.test.ts`
 - Modify: `src/lib/tauri.ts` (types + command wrappers), `src/pages/HistoryPage.tsx`

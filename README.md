@@ -107,9 +107,11 @@ npm run build         # type-check + production frontend build
 cd src-tauri && cargo test
 ```
 
-`docs/SPEC.md` holds the original design spec (partly superseded — `CLAUDE.md`
-and the implementation are the source of truth), and `docs/RECOMMENDATIONS.md`
-tracks what's been built against it.
+`docs/RECOMMENDATIONS.md` is the live backlog and `docs/OPEN_ISSUES.md` holds
+larger unstarted ideas. `docs/archive/` holds completed history — the original
+design spec (`docs/archive/SPEC.md`, largely superseded), shipped feature
+specs/plans, and two rounds of code review. `CLAUDE.md` and the implementation
+are the source of truth over any of it.
 
 Releases go through `scripts/release.sh`, which bumps every manifest, rebuilds,
 opens a PR, and tags the merged commit to trigger the multi-platform CI build.

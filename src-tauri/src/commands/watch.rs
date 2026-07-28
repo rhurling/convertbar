@@ -1,17 +1,16 @@
+use convertbar_core::ctx::Ctx;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::types::WatchedDirectory;
 use crate::watcher;
-use crate::AppState;
 
 #[tauri::command]
-pub fn get_watched_directories(
-    state: State<'_, AppState>,
-) -> Result<Vec<WatchedDirectory>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+pub fn get_watched_directories(ctx: State<'_, Arc<Ctx>>) -> Result<Vec<WatchedDirectory>, String> {
+    let conn = ctx.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
             "SELECT id, path, recursive, stability_delay_secs, enabled, created_at
@@ -46,8 +45,7 @@ fn canonical_watch_path(path: &str) -> String {
 
 #[tauri::command]
 pub fn add_watched_directory(
-    app: AppHandle,
-    state: State<'_, AppState>,
+    ctx: State<'_, Arc<Ctx>>,
     path: String,
     recursive: bool,
     stability_delay_secs: i64,
@@ -63,7 +61,7 @@ pub fn add_watched_directory(
     let now = chrono::Utc::now().to_rfc3339();
 
     let record = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let conn = ctx.db.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO watched_directories
                 (id, path, recursive, stability_delay_secs, enabled, created_at)
@@ -87,24 +85,23 @@ pub fn add_watched_directory(
         }
     }; // db lock released before reconcile re-acquires it
 
-    watcher::reconcile(&app);
+    watcher::reconcile(&ctx);
     // Scan off-thread: it probes every existing file with a blocking HandBrakeCLI call, which would
     // freeze the UI on the main thread (this command is sync) for a folder full of files.
-    watcher::scan_existing_background(&app, dir.to_path_buf(), recursive);
+    watcher::scan_existing_background(&ctx, dir.to_path_buf(), recursive);
     Ok(record)
 }
 
 #[tauri::command]
 pub fn update_watched_directory(
-    app: AppHandle,
-    state: State<'_, AppState>,
+    ctx: State<'_, Arc<Ctx>>,
     id: String,
     recursive: bool,
     stability_delay_secs: i64,
 ) -> Result<(), String> {
     let delay = stability_delay_secs.max(1);
     {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let conn = ctx.db.lock().map_err(|e| e.to_string())?;
         let changed = conn
             .execute(
                 "UPDATE watched_directories SET recursive = ?1, stability_delay_secs = ?2 WHERE id = ?3",
@@ -115,19 +112,18 @@ pub fn update_watched_directory(
             return Err("Watched directory not found".to_string());
         }
     }
-    watcher::reconcile(&app);
+    watcher::reconcile(&ctx);
     Ok(())
 }
 
 #[tauri::command]
 pub fn set_watched_directory_enabled(
-    app: AppHandle,
-    state: State<'_, AppState>,
+    ctx: State<'_, Arc<Ctx>>,
     id: String,
     enabled: bool,
 ) -> Result<(), String> {
     let (path, recursive) = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let conn = ctx.db.lock().map_err(|e| e.to_string())?;
         let changed = conn
             .execute(
                 "UPDATE watched_directories SET enabled = ?1 WHERE id = ?2",
@@ -145,28 +141,24 @@ pub fn set_watched_directory_enabled(
         .map_err(|e| e.to_string())?
     };
 
-    watcher::reconcile(&app);
+    watcher::reconcile(&ctx);
     // Re-enabling a folder ingests anything that landed while it was off (or the app was closed).
     // Scan off-thread — see `add_watched_directory`: the blocking HandBrake probe would otherwise
     // freeze the UI (this sync command runs on the main thread) for a folder with many files.
     if enabled {
-        watcher::scan_existing_background(&app, PathBuf::from(&path), recursive);
+        watcher::scan_existing_background(&ctx, PathBuf::from(&path), recursive);
     }
     Ok(())
 }
 
 #[tauri::command]
-pub fn remove_watched_directory(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub fn remove_watched_directory(ctx: State<'_, Arc<Ctx>>, id: String) -> Result<(), String> {
     {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let conn = ctx.db.lock().map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM watched_directories WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
     }
-    watcher::reconcile(&app);
+    watcher::reconcile(&ctx);
     Ok(())
 }
 

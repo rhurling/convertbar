@@ -1,3 +1,4 @@
+use convertbar_core::ctx::Ctx;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
@@ -28,10 +29,10 @@ pub fn skip_update_version<R: tauri::Runtime>(
     version: String,
 ) -> Result<(), String> {
     {
-        let state = app
-            .try_state::<crate::AppState>()
+        let ctx = app
+            .try_state::<Arc<Ctx>>()
             .ok_or_else(|| "app state unavailable".to_string())?;
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let conn = ctx.db.lock().map_err(|e| e.to_string())?;
         updater::set_skipped_version_public(&conn, &version);
     }
 
@@ -52,7 +53,6 @@ pub fn skip_update_version<R: tauri::Runtime>(
 mod tests {
     use super::*;
     use crate::updater::{AvailableUpdate, PendingInstall};
-    use std::sync::Mutex;
 
     #[test]
     fn skipping_a_version_cancels_the_install_pending_for_it() {
@@ -64,10 +64,11 @@ mod tests {
             .unwrap();
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
-        app.manage(crate::AppState {
-            db: Arc::new(Mutex::new(conn)),
-            preset_cache: Mutex::new(Default::default()),
-        });
+        app.manage(Ctx::new(
+            conn,
+            Arc::new(convertbar_core::events::TestSink::default()),
+            Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
+        ));
         let runtime = Arc::new(UpdaterRuntime::default());
         *runtime.pending.lock().unwrap() = Some(PendingInstall {
             update: AvailableUpdate {
@@ -123,11 +124,16 @@ mod tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        let converter = Arc::new(crate::converter::ConverterState::new());
+        let ctx = Ctx::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            Arc::new(convertbar_core::events::TestSink::default()),
+            Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
+        );
+        let converter = ctx.converter.clone();
         let child = long_running_child();
         *converter.current_pid.lock().unwrap() = Some(child.id());
         *converter.current_child.lock().unwrap() = Some(child);
-        app.manage(converter.clone());
+        app.manage(ctx);
 
         let mut restarted = false;
         restart_after_killing_encoder(app.handle(), || restarted = true);
@@ -157,8 +163,8 @@ mod tests {
 /// rather than relying on the exit handler. Killing twice is harmless; not killing orphans
 /// HandBrakeCLI across the restart.
 fn restart_after_killing_encoder<R: tauri::Runtime>(app: &AppHandle<R>, restart: impl FnOnce()) {
-    if let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() {
-        crate::converter::kill_active_child(&conv);
+    if let Some(ctx) = app.try_state::<Arc<Ctx>>() {
+        crate::converter::kill_active_child(&ctx.converter);
     }
     restart();
 }

@@ -109,6 +109,9 @@ Against that: a configured-optional engine means **two classification paths**, a
 
 ## Deferred: Phase 3 — pre-flight preview shortfall
 
+> **Tracked as issue #122** (opened 2026-07-28 when this spec was archived), together with
+> the accepted path-marker false-negative described further down.
+
 Recorded because the finding above makes it nearly free, **not committed to this spec.**
 
 Parse `scan: N previews` from the scan already run in `probe.rs`, flipping `.stderr(Stdio::null())` to piped. `N` < requested → the source is truncated, detectable before any encode.

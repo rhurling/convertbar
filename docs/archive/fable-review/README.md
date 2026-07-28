@@ -1,5 +1,18 @@
 # Fable Review — 2026-07-07
 
+> **CLOSED 2026-07-08.** Every accepted finding from both rounds shipped in PRs #63–#84.
+> Round 2 re-verified all 56 round-1 verdicts against source: 54 fixed, 2 partial (both
+> later closed by round 2's mock-runtime work), 0 regressed. Four findings were explicitly
+> declined with rationale in [DECISIONS.md](DECISIONS.md) (D9, D10, D14, D16).
+>
+> The Low/Nit items still listed in the `round2/` report bodies are **accepted residual
+> debt, not a backlog** — each is stamped "unbatched by triage policy" / "no action
+> implied" there. Re-verified 2026-07-28: still open, still deliberate.
+>
+> [DECISIONS.md](DECISIONS.md) is *not* historical — it is the live rationale record for
+> the CSP, the ACL trim, D3 zero-byte semantics, D5 updater behaviour, and D7 (cited by
+> `.claude/hooks/check-version-sync.sh`). Keep it.
+
 Full-codebase review by 7 parallel Fable subagents. Each report ends with its own
 `## Summary` and `## Recommendations`; this index captures the cross-cutting picture.
 

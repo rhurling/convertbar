@@ -1,84 +1,32 @@
-use rusqlite::params;
+use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::State;
 
 use crate::handbrake as hb;
 use crate::handbrake::PresetMetadata;
 use crate::types::HandbrakeStatus;
-use crate::AppState;
+use convertbar_core::ctx::Ctx;
 
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The user-configured path if it points at an existing file, otherwise PATH
-/// detection. The DB lock is released before `which`/`where` shells out.
-fn resolve_handbrake_path(state: &AppState) -> Result<Option<String>, String> {
-    let configured: Option<String> = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        conn.query_row(
-            "SELECT value FROM settings WHERE key = 'handbrake_path'",
-            params![],
-            |row| row.get(0),
-        )
-        .ok()
-    };
-
-    if let Some(ref path) = configured {
-        if !path.is_empty() && std::path::Path::new(path).exists() {
-            return Ok(Some(path.clone()));
-        }
-    }
-
-    Ok(hb::detect_handbrake_path())
-}
-
-/// Preset metadata via the shared cache. The cache mutex is deliberately NOT held
-/// across the HandBrake shell-out: any command contending this lock would otherwise
-/// block for the whole subprocess run (lock convoy). Concurrent misses may fetch the
-/// same metadata twice; the duplicate insert is harmless.
-pub(crate) fn cached_preset_metadata(
-    state: &AppState,
-    hb_path: &str,
-    preset: &str,
-) -> Result<PresetMetadata, String> {
-    {
-        let cache = state.preset_cache.lock().map_err(|e| e.to_string())?;
-        if let Some(m) = cache.get(preset) {
-            return Ok(m.clone());
-        }
-    }
-
-    let metadata = hb::get_preset_metadata(hb_path, preset)?;
-
-    state
-        .preset_cache
-        .lock()
-        .map_err(|e| e.to_string())?
-        .insert(preset.to_string(), metadata.clone());
-    Ok(metadata)
-}
 
 // All four commands below reach a subprocess (HandBrakeCLI or `which`/`where`); as
 // sync commands they ran on the main thread and stalled the UI for the subprocess
 // duration. async + spawn_blocking moves them off it, mirroring add_files.
 
 #[tauri::command]
-pub async fn detect_handbrake(app: AppHandle) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        resolve_handbrake_path(&state)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+pub async fn detect_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<Option<String>, String> {
+    let ctx = ctx.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || hb::resolve_handbrake_path(&ctx))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn list_handbrake_presets(app: AppHandle) -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        match resolve_handbrake_path(&state)? {
-            Some(p) => hb::list_presets(&p),
-            None => Err("HandBrakeCLI not found".to_string()),
-        }
+pub async fn list_handbrake_presets(ctx: State<'_, Arc<Ctx>>) -> Result<Vec<String>, String> {
+    let ctx = ctx.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || match hb::resolve_handbrake_path(&ctx)? {
+        Some(p) => hb::list_presets(&p),
+        None => Err("HandBrakeCLI not found".to_string()),
     })
     .await
     .map_err(|e| e.to_string())?
@@ -86,46 +34,43 @@ pub async fn list_handbrake_presets(app: AppHandle) -> Result<Vec<String>, Strin
 
 #[tauri::command]
 pub async fn generate_preset_suffix(
-    app: AppHandle,
+    ctx: State<'_, Arc<Ctx>>,
     preset: String,
 ) -> Result<PresetMetadata, String> {
+    let ctx = ctx.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-
         // Cache hit skips path resolution entirely (no DB lock, no `which`).
         {
-            let cache = state.preset_cache.lock().map_err(|e| e.to_string())?;
+            let cache = ctx.preset_cache.lock().map_err(|e| e.to_string())?;
             if let Some(metadata) = cache.get(&preset) {
                 return Ok(metadata.clone());
             }
         }
 
-        let handbrake_path = resolve_handbrake_path(&state)?.ok_or("HandBrakeCLI not found")?;
-        cached_preset_metadata(&state, &handbrake_path, &preset)
+        let handbrake_path = hb::resolve_handbrake_path(&ctx)?.ok_or("HandBrakeCLI not found")?;
+        hb::cached_preset_metadata(&ctx, &handbrake_path, &preset)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn validate_handbrake(app: AppHandle) -> Result<HandbrakeStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        match resolve_handbrake_path(&state)? {
-            Some(p) => {
-                let version = handbrake_version(&p).unwrap_or_default();
-                Ok(HandbrakeStatus {
-                    found: true,
-                    path: p,
-                    version,
-                })
-            }
-            None => Ok(HandbrakeStatus {
-                found: false,
-                path: String::new(),
-                version: String::new(),
-            }),
+pub async fn validate_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<HandbrakeStatus, String> {
+    let ctx = ctx.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || match hb::resolve_handbrake_path(&ctx)? {
+        Some(p) => {
+            let version = handbrake_version(&p).unwrap_or_default();
+            Ok(HandbrakeStatus {
+                found: true,
+                path: p,
+                version,
+            })
         }
+        None => Ok(HandbrakeStatus {
+            found: false,
+            path: String::new(),
+            version: String::new(),
+        }),
     })
     .await
     .map_err(|e| e.to_string())?
@@ -164,18 +109,6 @@ fn handbrake_version(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    fn test_state() -> AppState {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::init_db(&conn).unwrap();
-        AppState {
-            db: Arc::new(Mutex::new(conn)),
-            preset_cache: Mutex::new(HashMap::new()),
-        }
-    }
 
     fn metadata(codec: &str) -> PresetMetadata {
         PresetMetadata {
@@ -187,31 +120,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cached_preset_metadata_serves_hits_without_shelling_out() {
-        let state = test_state();
-        state
-            .preset_cache
-            .lock()
-            .unwrap()
-            .insert("My Preset".to_string(), metadata("h265"));
-
-        // The bogus binary path proves a cache hit never reaches the subprocess:
-        // if it did, this would error instead of returning the cached value.
-        let m = cached_preset_metadata(&state, "/nonexistent/HandBrakeCLI", "My Preset").unwrap();
-        assert_eq!(m.codec, "h265");
-    }
-
-    #[test]
-    fn cached_preset_metadata_miss_reaches_the_fetch_and_propagates_errors() {
-        let state = test_state();
-
-        let result = cached_preset_metadata(&state, "/nonexistent/HandBrakeCLI", "My Preset");
-        assert!(result.is_err(), "a cache miss must attempt the real fetch");
-
-        // A failed fetch must not poison the cache mutex or insert junk.
-        assert!(state.preset_cache.lock().unwrap().is_empty());
-    }
+    // cached_preset_metadata's own tests moved to convertbar_core::handbrake alongside the
+    // function itself (Task 5); this file now only wraps it behind a Ctx-fetching command.
 
     #[test]
     fn resolve_suffix_template_command_matches_the_backend_resolver() {

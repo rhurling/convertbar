@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../lib/events";
 import { commands, type UpdateMode, type UpdateState, type UpdateStatus } from "../lib/tauri";
 
 // Statuses where the backend's `manual_check_block` (updater.rs) would refuse a fresh manual

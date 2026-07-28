@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../lib/events";
 import {
   commands,
   type JobInfo,

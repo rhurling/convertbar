@@ -1,3 +1,4 @@
+use convertbar_core::ctx::Ctx;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -103,55 +104,12 @@ pub(crate) fn clear_installed(db: &Connection) {
     write_key(db, "update_installed", "");
 }
 
-fn read_drain_pause(db: &Connection) -> bool {
-    read_key(db, "update_drain_pause").is_some_and(|v| v == "true")
-}
-
-fn set_drain_pause(db: &Connection, armed: bool) {
-    write_key(db, "update_drain_pause", if armed { "true" } else { "" });
-}
-
-/// Drops the updater's claim on the persisted queue pause.
-///
-/// The breadcrumb is a bare boolean — it records that the updater caused *a* pause, not *which*
-/// one — so it is only sound for as long as nobody else has touched the pause state. Called by
-/// `converter::set_queue_paused` whenever a real stop is being lifted, and by `pause_conversion`
-/// when the user stops the queue themselves: after either, the pause in force is somebody else's
-/// and lifting it at the next launch would override a deliberate decision.
-pub(crate) fn forget_drain_pause(db: &Connection) {
-    set_drain_pause(db, false);
-}
-
-/// The launch-time decision: whether to start the queue, after lifting any pause the updater
-/// itself caused. Composed here rather than inline in `setup()` so the "consult the breadcrumb
-/// before honouring the pause" step is pinned by a test — `setup()` itself is not reachable from
-/// one.
-pub(crate) fn should_resume_queue_at_launch(db: &Connection, has_queued: bool) -> bool {
-    let queue_paused = take_drain_pause(db, crate::converter::is_queue_paused(db));
-    crate::converter::should_auto_resume(has_queued, queue_paused)
-}
-
-/// Lifts a queue pause the updater itself caused, exactly once, and reports the queue's real
-/// paused state.
-///
-/// A user-initiated "Install and restart" against a busy queue drains it by arming
-/// `pause_after_current`, which `process_queue` consumes into a *persisted* `queue_paused = true`
-/// plus a `break` with jobs still queued (converter.rs:1277-1290). The user never pressed Pause —
-/// the updater did — so leaving that pause in force after the update restart would strand the
-/// rest of their batch indefinitely. The breadcrumb marks the pause as the updater's doing.
-///
-/// Consumed whether or not it is used, so a breadcrumb left behind by an install that never got
-/// as far as pausing anything cannot resurface against an unrelated pause later.
-fn take_drain_pause(db: &Connection, queue_paused: bool) -> bool {
-    // Read before any write: `set_queue_paused(false)` below re-enters `forget_drain_pause`.
-    let was_update_drain = read_drain_pause(db);
-    set_drain_pause(db, false);
-    if was_update_drain && queue_paused {
-        crate::converter::set_queue_paused(db, false);
-        return false;
-    }
-    queue_paused
-}
+// The `update_drain_pause` breadcrumb — the record that a persisted queue pause was the
+// updater's doing — lives in `convertbar_core::converter` alongside `set_queue_paused`, which
+// has to release the claim whenever anyone else takes ownership of the pause state. Core cannot
+// reach into this module, so the helpers went there rather than the guard coming here:
+// `converter::{set_drain_pause, forget_drain_pause, take_drain_pause,
+// should_resume_queue_at_launch}`.
 
 /// An update the endpoint is offering. `notes` is `Update::body` — the GitHub release body,
 /// copied verbatim into latest.json by tauri-action.
@@ -538,6 +496,12 @@ fn runtime_of<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<Arc<UpdaterRuntim
         .map(|s| s.inner().clone())
 }
 
+/// The engine context — db + converter state — as managed by `lib.rs`. The updater is shell
+/// code, so it reaches the queue the same way every other command does: through `Ctx`.
+fn ctx_of<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<Arc<Ctx>> {
+    app.try_state::<Arc<Ctx>>().map(|s| s.inner().clone())
+}
+
 fn pending_of<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PendingInstall> {
     runtime_of(app).and_then(|r| r.pending.lock().ok().and_then(|p| p.clone()))
 }
@@ -617,8 +581,8 @@ fn build_updater<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<tauri_plugin_u
             // handler — without this, HandBrakeCLI is orphaned and keeps encoding into the
             // partial output while the next launch's auto-resume deletes that file and starts
             // a second encoder against the same path.
-            if let Some(conv) = handle.try_state::<Arc<crate::converter::ConverterState>>() {
-                crate::converter::kill_active_child(&conv);
+            if let Some(ctx) = ctx_of(&handle) {
+                crate::converter::kill_active_child(&ctx.converter);
             }
             // Setting a hook replaces the one `updater_builder()` installs by default, so the
             // default teardown has to be re-done here.
@@ -635,12 +599,10 @@ pub fn emit_state<R: tauri::Runtime>(app: &AppHandle<R>) {
 }
 
 fn build_state<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<UpdateState, String> {
-    let app_state = app
-        .try_state::<crate::AppState>()
-        .ok_or_else(|| "app state unavailable".to_string())?;
+    let ctx = ctx_of(app).ok_or_else(|| "app state unavailable".to_string())?;
 
     let (mode, just_installed) = {
-        let conn = app_state.db.lock().map_err(|e| e.to_string())?;
+        let conn = ctx.db.lock().map_err(|e| e.to_string())?;
         (
             normalize_update_mode(
                 &read_key(&conn, "update_mode").unwrap_or_else(|| "automatic".into()),
@@ -696,10 +658,10 @@ pub async fn run_cycle<R: tauri::Runtime>(app: AppHandle<R>, manual: bool) -> Re
     }
 
     let mode = {
-        let Some(app_state) = app.try_state::<crate::AppState>() else {
+        let Some(ctx) = ctx_of(&app) else {
             return Err("app state unavailable".into());
         };
-        let Ok(conn) = app_state.db.lock() else {
+        let Ok(conn) = ctx.db.lock() else {
             return Err("settings unavailable".into());
         };
         normalize_update_mode(&read_key(&conn, "update_mode").unwrap_or_else(|| "automatic".into()))
@@ -744,10 +706,10 @@ pub async fn run_cycle<R: tauri::Runtime>(app: AppHandle<R>, manual: bool) -> Re
     }
 
     let (skipped, notified) = {
-        let Some(app_state) = app.try_state::<crate::AppState>() else {
+        let Some(ctx) = ctx_of(&app) else {
             return Err("app state unavailable".into());
         };
-        let Ok(conn) = app_state.db.lock() else {
+        let Ok(conn) = ctx.db.lock() else {
             return Err("settings unavailable".into());
         };
         (read_skipped_version(&conn), read_notified_version(&conn))
@@ -778,8 +740,8 @@ pub async fn run_cycle<R: tauri::Runtime>(app: AppHandle<R>, manual: bool) -> Re
             // already false for a manual check and for a version previously notified, so this
             // is the whole of the once-per-version rule (design.md:159).
             if announce {
-                if let Some(app_state) = app.try_state::<crate::AppState>() {
-                    if let Ok(conn) = app_state.db.lock() {
+                if let Some(ctx) = ctx_of(&app) {
+                    if let Ok(conn) = ctx.db.lock() {
                         set_notified_version(&conn, &u.version);
                     }
                 }
@@ -867,22 +829,20 @@ async fn perform_install<R: tauri::Runtime>(
     // it would never happen and the post-restart "What's new" panel would have nothing to show.
     // Rolled back below on every path where the install did not actually happen.
     // Untestable automatically: `install()` cannot be exercised in a unit test.
-    if let Some(app_state) = app.try_state::<crate::AppState>() {
-        if let Ok(conn) = app_state.db.lock() {
-            set_installed(&conn, &meta.version, meta.notes.as_deref());
-        }
-    }
-
-    let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
+    let Some(ctx) = ctx_of(app) else {
         return InstallOutcome::Abandoned;
     };
+    if let Ok(conn) = ctx.db.lock() {
+        set_installed(&conn, &meta.version, meta.notes.as_deref());
+    }
+
     let installer = PluginInstaller { update: raw, bytes };
 
-    let attempt = try_install_now(&conv, &installer, &meta);
-    // Dropped once it is done with. A `State` handle holds no lock, so this is housekeeping rather
+    let attempt = try_install_now(&ctx.converter, &installer, &meta);
+    // Dropped once it is done with. An `Arc<Ctx>` holds no lock, so this is housekeeping rather
     // than a correctness requirement — but everything below can start the queue, and keeping a
-    // borrow of the converter state alive across that reads as though it were load-bearing.
-    drop(conv);
+    // handle on the converter state alive across that reads as though it were load-bearing.
+    drop(ctx);
 
     match attempt {
         InstallAttempt::Installed => {
@@ -939,8 +899,8 @@ async fn perform_install<R: tauri::Runtime>(
 }
 
 fn rollback_installed<R: tauri::Runtime>(app: &AppHandle<R>) {
-    if let Some(app_state) = app.try_state::<crate::AppState>() {
-        if let Ok(conn) = app_state.db.lock() {
+    if let Some(ctx) = ctx_of(app) {
+        if let Ok(conn) = ctx.db.lock() {
             clear_installed(&conn);
         }
     }
@@ -949,13 +909,10 @@ fn rollback_installed<R: tauri::Runtime>(app: &AppHandle<R>) {
 /// Fires `run_queue` with the app's managed state. Split out so its two callers below read as
 /// policy rather than plumbing.
 fn start_queue_now<R: tauri::Runtime>(app: &AppHandle<R>) {
-    let Some(app_state) = app.try_state::<crate::AppState>() else {
+    let Some(ctx) = ctx_of(app) else {
         return;
     };
-    let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
-        return;
-    };
-    crate::converter::run_queue(app.clone(), app_state.db.clone(), (*conv).clone());
+    crate::converter::run_queue(ctx);
 }
 
 /// Re-triggers the queue once an install has finished holding the interlock.
@@ -973,10 +930,10 @@ fn resume_queue_after_install_with<R: tauri::Runtime>(
     app: &AppHandle<R>,
     run: impl FnOnce(&AppHandle<R>),
 ) {
-    let Some(app_state) = app.try_state::<crate::AppState>() else {
+    let Some(ctx) = ctx_of(app) else {
         return;
     };
-    let paused = match app_state.db.lock() {
+    let paused = match ctx.db.lock() {
         Ok(conn) => crate::converter::is_queue_paused(&conn),
         Err(_) => return,
     };
@@ -1033,9 +990,9 @@ impl<R: tauri::Runtime> DrainGuard<R> {
         // launch after the update restart can lift it once instead of leaving the rest of the
         // batch stopped for good. Written after the flag lock is released — no site in this
         // module holds two of the db / pending / queue locks at once.
-        if let Some(app_state) = self.app.try_state::<crate::AppState>() {
-            if let Ok(conn) = app_state.db.lock() {
-                set_drain_pause(&conn, true);
+        if let Some(ctx) = ctx_of(&self.app) {
+            if let Ok(conn) = ctx.db.lock() {
+                crate::converter::set_drain_pause(&conn, true);
             }
         }
     }
@@ -1073,9 +1030,9 @@ impl<R: tauri::Runtime> Drop for DrainGuard<R> {
 }
 
 fn clear_drain_pause<R: tauri::Runtime>(app: &AppHandle<R>) {
-    if let Some(app_state) = app.try_state::<crate::AppState>() {
-        if let Ok(conn) = app_state.db.lock() {
-            set_drain_pause(&conn, false);
+    if let Some(ctx) = ctx_of(app) {
+        if let Ok(conn) = ctx.db.lock() {
+            crate::converter::set_drain_pause(&conn, false);
         }
     }
 }
@@ -1084,16 +1041,17 @@ fn clear_drain_pause<R: tauri::Runtime>(app: &AppHandle<R>) {
 /// Keyed on the breadcrumb rather than unpausing blindly, so a pause the *user* asked for is left
 /// exactly where it is.
 fn undo_drain_pause<R: tauri::Runtime>(app: &AppHandle<R>) {
-    let Some(app_state) = app.try_state::<crate::AppState>() else {
+    let Some(ctx) = ctx_of(app) else {
         return;
     };
-    let lifted = match app_state.db.lock() {
+    let lifted = match ctx.db.lock() {
         Ok(conn) => {
             // The breadcrumb is consulted — and consumed — only once a stop is actually visible.
             // If `process_queue` is in the handful of instructions between taking the flag and
             // persisting the stop, this sees nothing and leaves the breadcrumb alone, so the next
             // launch finishes the job rather than the batch staying halted for good.
-            crate::converter::is_queue_paused(&conn) && !take_drain_pause(&conn, true)
+            crate::converter::is_queue_paused(&conn)
+                && !crate::converter::take_drain_pause(&conn, true)
         }
         Err(_) => false,
     };
@@ -1129,12 +1087,13 @@ pub async fn install_pending<R: tauri::Runtime>(
     };
 
     // Cloned out of the managed state rather than borrowed: a Tauri `State` must not be held
-    // across the `.await`s below, and the drain guard has to outlive this scope.
+    // across the `.await`s below, and the drain guard has to outlive this scope. The `Ctx`
+    // handle is scoped away with it — everything after this needs only the converter.
     let conv = {
-        let Some(state) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
+        let Some(ctx) = ctx_of(&app) else {
             return Err("converter unavailable".into());
         };
-        (*state).clone()
+        ctx.converter.clone()
     };
 
     // Every exit from here on drops `drain`, which undoes the drain unless it was kept — see
@@ -1432,11 +1391,16 @@ pub fn on_queue_status<R: tauri::Runtime>(app: &AppHandle<R>, status: &str) {
 /// picks up another job leaves the install pending for the next drain (or the hourly backstop)
 /// rather than blocking here.
 fn wait_for_idle_queue<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
-    let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() else {
+    let Some(ctx) = ctx_of(app) else {
         return false;
     };
     for _ in 0..40 {
-        if !*conv.is_running.lock().unwrap_or_else(|e| e.into_inner()) {
+        if !*ctx
+            .converter
+            .is_running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1447,6 +1411,12 @@ fn wait_for_idle_queue<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Moved to core alongside `set_queue_paused` (which has to release the claim); the tests
+    // that pin the breadcrumb's policy stay here, with the updater code that is the reason it
+    // exists.
+    use crate::converter::{
+        read_drain_pause, set_drain_pause, should_resume_queue_at_launch, take_drain_pause,
+    };
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1891,12 +1861,14 @@ mod tests {
             .unwrap();
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
-        app.manage(crate::AppState {
-            db: std::sync::Arc::new(StdMutex::new(conn)),
-            preset_cache: StdMutex::new(Default::default()),
-        });
+        // `Ctx` carries the db and the converter state that used to be managed separately; the
+        // sink and disposer are the core test doubles and are unused by the updater.
+        app.manage(Ctx::new(
+            conn,
+            std::sync::Arc::new(convertbar_core::events::TestSink::default()),
+            std::sync::Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
+        ));
         app.manage(std::sync::Arc::new(UpdaterRuntime::default()));
-        app.manage(std::sync::Arc::new(ConverterState::new()));
         app
     }
 
@@ -1968,10 +1940,7 @@ mod tests {
         let handle = app.handle().clone();
         arm_pending(&handle, false);
 
-        let conv = handle
-            .state::<std::sync::Arc<ConverterState>>()
-            .inner()
-            .clone();
+        let conv = handle.state::<Arc<Ctx>>().converter.clone();
         *conv.is_running.lock().unwrap() = true;
 
         let err =
@@ -2013,7 +1982,7 @@ mod tests {
     }
 
     fn db_of(app: &tauri::AppHandle<tauri::test::MockRuntime>) -> Arc<StdMutex<Connection>> {
-        app.state::<crate::AppState>().inner().db.clone()
+        app.state::<Arc<Ctx>>().db.clone()
     }
 
     #[test]
@@ -2025,10 +1994,7 @@ mod tests {
         // batch and keeps it halted across restarts, for an update that never arrives.
         let app = mock_app();
         let handle = app.handle().clone();
-        let conv = handle
-            .state::<std::sync::Arc<ConverterState>>()
-            .inner()
-            .clone();
+        let conv = handle.state::<Arc<Ctx>>().converter.clone();
         let db = db_of(&handle);
 
         {
@@ -2065,10 +2031,7 @@ mod tests {
         // batch halted exactly when that retry is the one that fails.
         let app = mock_app();
         let handle = app.handle().clone();
-        let conv = handle
-            .state::<std::sync::Arc<ConverterState>>()
-            .inner()
-            .clone();
+        let conv = handle.state::<Arc<Ctx>>().converter.clone();
         let db = db_of(&handle);
         {
             let conn = db.lock().unwrap();
@@ -2115,10 +2078,7 @@ mod tests {
         // finish unwinding. Undoing here would restart the batch the install is waiting on.
         let app = mock_app();
         let handle = app.handle().clone();
-        let conv = handle
-            .state::<std::sync::Arc<ConverterState>>()
-            .inner()
-            .clone();
+        let conv = handle.state::<Arc<Ctx>>().converter.clone();
 
         {
             let mut drain = DrainGuard::new(handle.clone(), conv.clone());
@@ -2138,10 +2098,7 @@ mod tests {
         // a flag it never raised would silently cancel the user's own pause.
         let app = mock_app();
         let handle = app.handle().clone();
-        let conv = handle
-            .state::<std::sync::Arc<ConverterState>>()
-            .inner()
-            .clone();
+        let conv = handle.state::<Arc<Ctx>>().converter.clone();
         let db = db_of(&handle);
         *conv.pause_after_current.lock().unwrap() = true;
 
@@ -2172,10 +2129,7 @@ mod tests {
         let app = mock_app();
         let handle = app.handle().clone();
         arm_pending(&handle, true);
-        let conv = handle
-            .state::<std::sync::Arc<ConverterState>>()
-            .inner()
-            .clone();
+        let conv = handle.state::<Arc<Ctx>>().converter.clone();
         *conv.is_running.lock().unwrap() = true;
 
         let prev_hook = std::panic::take_hook();
@@ -2307,10 +2261,7 @@ mod tests {
         // their pause when its check fails.
         let app = mock_app();
         let handle = app.handle().clone();
-        let conv = handle
-            .state::<std::sync::Arc<ConverterState>>()
-            .inner()
-            .clone();
+        let conv = handle.state::<Arc<Ctx>>().converter.clone();
         let db = db_of(&handle);
         {
             let conn = db.lock().unwrap();

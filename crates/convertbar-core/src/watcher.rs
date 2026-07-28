@@ -4,11 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tauri::{AppHandle, Emitter, Manager};
 
-use crate::commands::queue;
-use crate::converter::{self, ConverterState};
-use crate::AppState;
+use crate::ctx::Ctx;
+use crate::events::EventSinkExt;
 
 /// Download tools write to a temporary name and rename to the final name only when complete.
 /// Files carrying one of these extensions are known-incomplete and must never be enqueued —
@@ -18,7 +16,7 @@ use crate::AppState;
 const TEMP_EXTENSIONS: &[&str] = &["part", "crdownload", "download", "tmp", "partial", "!ut"];
 
 /// True when `path`'s extension marks an in-progress download (see `TEMP_EXTENSIONS`).
-pub(crate) fn is_temp_file(path: &Path) -> bool {
+pub fn is_temp_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| TEMP_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
@@ -27,7 +25,7 @@ pub(crate) fn is_temp_file(path: &Path) -> bool {
 
 /// A file the watcher has seen change and is waiting to settle before enqueuing.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingEntry {
+pub struct PendingEntry {
     size: u64,
     mtime: SystemTime,
     /// When `size`/`mtime` were last observed to change. The stability timer counts from here.
@@ -37,7 +35,7 @@ pub(crate) struct PendingEntry {
 }
 
 impl PendingEntry {
-    pub(crate) fn new(size: u64, mtime: SystemTime, now: Instant, delay: Duration) -> Self {
+    pub fn new(size: u64, mtime: SystemTime, now: Instant, delay: Duration) -> Self {
         Self {
             size,
             mtime,
@@ -49,7 +47,7 @@ impl PendingEntry {
     /// Fold in a fresh stat reading taken at `now`. Returns `true` when the file has been
     /// unchanged (same size and mtime) for at least `delay` — i.e. it is finished writing.
     /// Any change resets the stability timer.
-    pub(crate) fn observe(&mut self, size: u64, mtime: SystemTime, now: Instant) -> bool {
+    pub fn observe(&mut self, size: u64, mtime: SystemTime, now: Instant) -> bool {
         if size != self.size || mtime != self.mtime {
             self.size = size;
             self.mtime = mtime;
@@ -63,7 +61,7 @@ impl PendingEntry {
 /// Computes the watch changes needed to move from the `current` set to the `desired` set.
 /// Each entry is `(path, recursive)`. Returns `(to_unwatch, to_watch)`. A path whose recursive
 /// mode changed appears in both — unwatch the old, re-watch with the new mode.
-pub(crate) fn diff_watches(
+pub fn diff_watches(
     current: &[(PathBuf, bool)],
     desired: &[(PathBuf, bool)],
 ) -> (Vec<PathBuf>, Vec<(PathBuf, bool)>) {
@@ -87,7 +85,7 @@ pub(crate) fn diff_watches(
 /// nested watch (`/w/sub`) — no further FS event would re-add a file that already stopped changing.
 /// It also subsumes the recursive-mode-flip case: a subfolder file survives only if the new
 /// (possibly non-recursive) config still covers it.
-pub(crate) fn purge_pending_uncovered(
+pub fn purge_pending_uncovered(
     pending: &mut HashMap<PathBuf, PendingEntry>,
     desired: &[WatchedDirConfig],
 ) {
@@ -98,7 +96,7 @@ pub(crate) fn purge_pending_uncovered(
 /// (and with what delay) an incoming path should be tracked. Kept separate from the serde
 /// `WatchedDirectory` DB row so the hot path doesn't carry id/created_at/enabled.
 #[derive(Debug, Clone)]
-pub(crate) struct WatchedDirConfig {
+pub struct WatchedDirConfig {
     pub path: PathBuf,
     pub recursive: bool,
     pub delay: Duration,
@@ -107,8 +105,8 @@ pub(crate) struct WatchedDirConfig {
 /// Returns the stability delay to apply to `path` if it is a video file that belongs to one of
 /// the watched directories (respecting each directory's recursive flag), or `None` if the path
 /// should be ignored. Temp/partial download files are always ignored.
-pub(crate) fn delay_for_path(configs: &[WatchedDirConfig], path: &Path) -> Option<Duration> {
-    if !queue::is_video_file(path) || is_temp_file(path) {
+pub fn delay_for_path(configs: &[WatchedDirConfig], path: &Path) -> Option<Duration> {
+    if !crate::queue_ops::is_video_file(path) || is_temp_file(path) {
         return None;
     }
     let parent = path.parent()?;
@@ -127,7 +125,7 @@ pub(crate) fn delay_for_path(configs: &[WatchedDirConfig], path: &Path) -> Optio
 /// root so a stray file with the marker name above the watched tree is never honored, and returns
 /// `false` when `path` sits inside no watched directory. `marker_exists` is injected so the walk
 /// is unit-testable without touching the filesystem.
-pub(crate) fn has_active_marker(
+pub fn has_active_marker(
     configs: &[WatchedDirConfig],
     path: &Path,
     marker: &str,
@@ -157,7 +155,7 @@ pub(crate) fn has_active_marker(
 /// `(directory, recursive)` subtree to re-scan so files ignored while the marker existed get picked
 /// up. Returns `None` when `path` isn't the marker, isn't inside a watched directory, or still
 /// exists (a create/modify, not a delete). `exists` is injected for testability.
-pub(crate) fn marker_removed_dir(
+pub fn marker_removed_dir(
     configs: &[WatchedDirConfig],
     path: &Path,
     marker: &str,
@@ -191,7 +189,7 @@ fn stat_size_mtime(path: &Path) -> Option<(u64, SystemTime)> {
 }
 
 /// Owns the OS filesystem watcher and the bookkeeping shared between the event handler and the
-/// reaper thread. Managed by Tauri for the lifetime of the app.
+/// reaper thread. Lives for the app's lifetime as a `Ctx` field.
 pub struct WatcherState {
     watcher: Mutex<Option<RecommendedWatcher>>,
     /// The `(path, recursive)` set currently armed on `watcher`, so `reconcile` can diff against it.
@@ -202,7 +200,7 @@ pub struct WatcherState {
     configs: Arc<Mutex<Vec<WatchedDirConfig>>>,
     /// The active skip-marker filename (`None`/empty = feature off). Refreshed on reconcile and
     /// whenever the setting changes; read by the event handler and the enqueue filter.
-    skip_marker: Arc<Mutex<Option<String>>>,
+    pub skip_marker: Arc<Mutex<Option<String>>>,
 }
 
 impl WatcherState {
@@ -224,7 +222,7 @@ fn build_watcher(
     pending: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>,
     configs: Arc<Mutex<Vec<WatchedDirConfig>>>,
     skip_marker: Arc<Mutex<Option<String>>>,
-    app: AppHandle,
+    ctx: Arc<Ctx>,
 ) -> RecommendedWatcher {
     notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let event = match res {
@@ -245,7 +243,7 @@ fn build_watcher(
                 if let Some((dir, recursive)) =
                     marker_removed_dir(&configs, path, marker, |p| p.exists())
                 {
-                    scan_existing_background(&app, dir, recursive);
+                    scan_existing_background(&ctx, dir, recursive);
                     continue;
                 }
             }
@@ -294,7 +292,8 @@ fn reap_pending_once(
 /// Spawns the reaper: once a second it re-stats every pending file. Files that have settled are
 /// enqueued; files that vanished are dropped. The stat re-check is the safety net for events the
 /// OS coalesced or dropped.
-fn spawn_reaper(app: AppHandle, pending: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>) {
+fn spawn_reaper(ctx: &Arc<Ctx>, pending: Arc<Mutex<HashMap<PathBuf, PendingEntry>>>) {
+    let ctx = ctx.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         let now = Instant::now();
@@ -303,7 +302,7 @@ fn spawn_reaper(app: AppHandle, pending: Arc<Mutex<HashMap<PathBuf, PendingEntry
             Err(_) => Vec::new(),
         };
         if !stable.is_empty() {
-            enqueue_and_start(&app, stable);
+            enqueue_and_start(&ctx, stable);
         }
     });
 }
@@ -311,16 +310,15 @@ fn spawn_reaper(app: AppHandle, pending: Arc<Mutex<HashMap<PathBuf, PendingEntry
 /// Drops paths that currently sit under an active skip marker (see `has_active_marker`). A no-op
 /// when the feature is disabled. Applied at the single enqueue chokepoint so live events, startup
 /// and enable scans, and marker-removal rescans all honor markers uniformly.
-fn filter_marked(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
-    let state = app.state::<WatcherState>();
-    let marker = match state.skip_marker.lock() {
+fn filter_marked(ctx: &Arc<Ctx>, paths: Vec<String>) -> Vec<String> {
+    let marker = match ctx.watcher.skip_marker.lock() {
         Ok(guard) => guard.clone(),
         Err(_) => return paths,
     };
     let Some(marker) = marker else {
         return paths;
     };
-    let configs = match state.configs.lock() {
+    let configs = match ctx.watcher.configs.lock() {
         Ok(configs) => configs.clone(),
         Err(_) => return paths,
     };
@@ -343,9 +341,8 @@ fn covered_paths(configs: &[WatchedDirConfig], paths: Vec<String>) -> Vec<String
 /// (`scan_existing_background`) that started before the user removed/disabled the watch still
 /// enqueues the folder's files — the detached scan thread bypasses `pending`, so the reconcile
 /// purge can't reach it. Also hardens the reaper against the same-tick remove/stabilize race.
-fn filter_watched(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
-    let state = app.state::<WatcherState>();
-    let configs = match state.configs.lock() {
+fn filter_watched(ctx: &Arc<Ctx>, paths: Vec<String>) -> Vec<String> {
+    let configs = match ctx.watcher.configs.lock() {
         Ok(configs) => configs.clone(),
         Err(_) => return paths,
     };
@@ -391,9 +388,8 @@ fn drop_known_bad_sources(
 /// `add_files_inner` itself: manual drag-and-drop must stay permissive, since re-adding a file by
 /// hand is the user's deliberate retry mechanism (e.g. after fixing a permission problem or
 /// confirming a "corrupt" file is actually fine).
-fn filter_known_bad_sources(app: &AppHandle, paths: Vec<String>) -> Vec<String> {
-    let app_state = app.state::<AppState>();
-    let bad = match app_state.db.lock() {
+fn filter_known_bad_sources(ctx: &Arc<Ctx>, paths: Vec<String>) -> Vec<String> {
+    let bad = match ctx.db.lock() {
         Ok(conn) => unpurged_bad_source_paths(&conn),
         Err(_) => return paths,
     };
@@ -423,24 +419,23 @@ fn batch_label(paths: &[String]) -> String {
 /// Feeds stabilized paths through the same pipeline as drag-dropped files, then (auto-start)
 /// kicks the queue and notifies the UI. `add_files_inner` applies all existing skip rules, so
 /// already-converted or already-queued files are dropped here.
-fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
-    let paths = filter_watched(app, paths);
+fn enqueue_and_start(ctx: &Arc<Ctx>, paths: Vec<String>) {
+    let paths = filter_watched(ctx, paths);
     if paths.is_empty() {
         return;
     }
-    let paths = filter_marked(app, paths);
+    let paths = filter_marked(ctx, paths);
     if paths.is_empty() {
         return;
     }
-    let paths = filter_known_bad_sources(app, paths);
+    let paths = filter_known_bad_sources(ctx, paths);
     if paths.is_empty() {
         return;
     }
-    let app_state = app.state::<AppState>();
     let result = {
-        let op = crate::add_progress::AddOp::new(app, batch_label(&paths));
+        let op = crate::add_progress::AddOp::new(ctx.events.clone(), batch_label(&paths));
         let reporter = |done: u32, total: u32| op.report(done, total);
-        match queue::add_files_inner(&app_state, &paths, Some(&reporter as &dyn Fn(u32, u32))) {
+        match crate::queue_ops::add_files_inner(ctx, &paths, Some(&reporter as &dyn Fn(u32, u32))) {
             Ok(result) => result,
             Err(err) => {
                 eprintln!("watcher: failed to enqueue {paths:?}: {err}");
@@ -452,8 +447,6 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     if result.added.is_empty() {
         return;
     }
-    let db = app_state.db.clone();
-    let converter = (*app.state::<Arc<ConverterState>>()).clone();
     // An update install holds the queue interlock, so `run_queue` below would refuse — after the
     // paused flag had already been cleared, leaving the queue neither running nor paused. Bail
     // before touching it, exactly as `start_queue` does; the install re-triggers the queue when
@@ -464,27 +457,27 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     // order to `set_queue_paused`'s own breadcrumb guard: leaving a remembered pause untouched
     // during an install is recoverable with one click, whereas clearing it and then being refused
     // leaves the queue in a state with no affordance to fix it.
-    if converter
+    if ctx
+        .converter
         .installing
         .load(std::sync::atomic::Ordering::SeqCst)
     {
-        let _ = app.emit("queue-updated", ());
+        ctx.events.emit_t("queue-updated", ());
         return;
     }
     // A watched-folder file arriving is an add; per the design, adding files starts the queue,
     // so clear any remembered pause before running.
-    if let Ok(conn) = app_state.db.lock() {
+    if let Ok(conn) = ctx.db.lock() {
         crate::converter::set_queue_paused(&conn, false);
     }
-    converter::run_queue(app.clone(), db, converter);
-    let _ = app.emit("queue-updated", ());
+    crate::converter::run_queue(ctx.clone());
+    ctx.events.emit_t("queue-updated", ());
 }
 
 /// Reads the enabled watched directories from the DB into runtime configs. The stability delay
 /// is floored at one second so a misconfigured zero can't enqueue files mid-write.
-fn read_enabled_configs(app: &AppHandle) -> Result<Vec<WatchedDirConfig>, String> {
-    let app_state = app.state::<AppState>();
-    let conn = app_state.db.lock().map_err(|e| e.to_string())?;
+fn read_enabled_configs(ctx: &Arc<Ctx>) -> Result<Vec<WatchedDirConfig>, String> {
+    let conn = ctx.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
             "SELECT path, recursive, stability_delay_secs FROM watched_directories WHERE enabled = 1",
@@ -516,9 +509,8 @@ fn valid_marker(value: &str) -> Option<String> {
 
 /// Reads the `watch_skip_marker` setting, returning the marker only when it is a valid plain
 /// filename. An empty, missing, or malformed value disables the skip-marker feature.
-fn read_skip_marker(app: &AppHandle) -> Option<String> {
-    let app_state = app.state::<AppState>();
-    let conn = app_state.db.lock().ok()?;
+fn read_skip_marker(ctx: &Ctx) -> Option<String> {
+    let conn = ctx.db.lock().ok()?;
     let value: String = conn
         .query_row(
             "SELECT value FROM settings WHERE key = 'watch_skip_marker'",
@@ -531,9 +523,9 @@ fn read_skip_marker(app: &AppHandle) -> Option<String> {
 
 /// Refreshes the watcher's cached skip-marker name from the DB. Called on reconcile and whenever
 /// the setting changes, so the event handler and enqueue filter see the current value.
-pub fn refresh_skip_marker(app: &AppHandle) {
-    let marker = read_skip_marker(app);
-    if let Ok(mut guard) = app.state::<WatcherState>().skip_marker.lock() {
+pub fn refresh_skip_marker(ctx: &Ctx) {
+    let marker = read_skip_marker(ctx);
+    if let Ok(mut guard) = ctx.watcher.skip_marker.lock() {
         *guard = marker;
     }
 }
@@ -542,14 +534,14 @@ pub fn refresh_skip_marker(app: &AppHandle) {
 /// files. Reuses the queue module's scanner so the recursive walk stays in one place.
 fn collect_video_paths(dir: &Path, recursive: bool) -> Vec<String> {
     let paths: Vec<PathBuf> = if recursive {
-        queue::scan_video_files(dir)
+        crate::queue_ops::scan_video_files(dir)
     } else {
         std::fs::read_dir(dir)
             .map(|entries| {
                 entries
                     .flatten()
                     .map(|e| e.path())
-                    .filter(|p| p.is_file() && queue::is_video_file(p))
+                    .filter(|p| p.is_file() && crate::queue_ops::is_video_file(p))
                     .collect()
             })
             .unwrap_or_default()
@@ -563,35 +555,36 @@ fn collect_video_paths(dir: &Path, recursive: bool) -> Vec<String> {
 
 /// Enqueues files already present in `dir` when a watch is first enabled or on app start, so
 /// downloads that landed while the app was closed aren't missed.
-pub fn scan_existing(app: &AppHandle, dir: &Path, recursive: bool) {
+pub fn scan_existing(ctx: &Arc<Ctx>, dir: &Path, recursive: bool) {
     let paths = collect_video_paths(dir, recursive);
     if !paths.is_empty() {
-        enqueue_and_start(app, paths);
+        enqueue_and_start(ctx, paths);
     }
 }
 
-/// Background variant of `scan_existing` for Tauri command handlers, which run on the main thread.
-/// The scan probes every existing file with a blocking `HandBrakeCLI --scan`, so scanning inline
-/// freezes the UI when a folder holds many files (identical hazard to the initial scan in `start`).
-/// Spawns the scan off-thread — the same proven-safe path the startup scan and reaper already use.
-pub fn scan_existing_background(app: &AppHandle, dir: PathBuf, recursive: bool) {
-    let app = app.clone();
-    std::thread::spawn(move || scan_existing(&app, &dir, recursive));
+/// Background variant of `scan_existing` for synchronous command handlers, which run on the main
+/// thread. The scan probes every existing file with a blocking `HandBrakeCLI --scan`, so scanning
+/// inline freezes the UI when a folder holds many files (identical hazard to the initial scan in
+/// `start`). Spawns the scan off-thread — the same proven-safe path the startup scan and reaper
+/// already use.
+pub fn scan_existing_background(ctx: &Arc<Ctx>, dir: PathBuf, recursive: bool) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || scan_existing(&ctx, &dir, recursive));
 }
 
 /// Scans the existing contents of every enabled watched directory.
-fn scan_all_enabled(app: &AppHandle) {
-    if let Ok(configs) = read_enabled_configs(app) {
+fn scan_all_enabled(ctx: &Arc<Ctx>) {
+    if let Ok(configs) = read_enabled_configs(ctx) {
         for config in configs {
-            scan_existing(app, &config.path, config.recursive);
+            scan_existing(ctx, &config.path, config.recursive);
         }
     }
 }
 
 /// Arms the OS watcher to exactly the set of enabled directories in the DB, adding/removing
 /// watches as needed. Called on startup and after any change to the watched-directory config.
-pub fn reconcile(app: &AppHandle) {
-    let desired = match read_enabled_configs(app) {
+pub fn reconcile(ctx: &Arc<Ctx>) {
+    let desired = match read_enabled_configs(ctx) {
         Ok(configs) => configs,
         Err(err) => {
             eprintln!("watcher: failed to read watched directories: {err}");
@@ -603,23 +596,22 @@ pub fn reconcile(app: &AppHandle) {
         .map(|config| (config.path.clone(), config.recursive))
         .collect();
 
-    let state = app.state::<WatcherState>();
-    if let Ok(mut configs) = state.configs.lock() {
+    if let Ok(mut configs) = ctx.watcher.configs.lock() {
         *configs = desired.clone();
     }
-    refresh_skip_marker(app);
+    refresh_skip_marker(ctx);
 
-    let mut watched = match state.watched.lock() {
+    let mut watched = match ctx.watcher.watched.lock() {
         Ok(watched) => watched,
         Err(_) => return,
     };
     let (to_unwatch, to_watch) = diff_watches(&watched, &desired_tuples);
 
-    if let Ok(mut pending) = state.pending.lock() {
+    if let Ok(mut pending) = ctx.watcher.pending.lock() {
         purge_pending_uncovered(&mut pending, &desired);
     }
 
-    if let Ok(mut guard) = state.watcher.lock() {
+    if let Ok(mut guard) = ctx.watcher.watcher.lock() {
         if let Some(watcher) = guard.as_mut() {
             for path in &to_unwatch {
                 let _ = watcher.unwatch(path);
@@ -641,27 +633,25 @@ pub fn reconcile(app: &AppHandle) {
 
 /// Starts the watcher subsystem: builds the OS watcher, spawns the reaper, arms watches from the
 /// DB, and scans existing contents. Call once during app setup.
-pub fn start(app: AppHandle) {
-    let (pending, configs, skip_marker) = {
-        let state = app.state::<WatcherState>();
-        (
-            state.pending.clone(),
-            state.configs.clone(),
-            state.skip_marker.clone(),
-        )
-    };
+pub fn start(ctx: Arc<Ctx>) {
+    let (pending, configs, skip_marker) = (
+        ctx.watcher.pending.clone(),
+        ctx.watcher.configs.clone(),
+        ctx.watcher.skip_marker.clone(),
+    );
 
-    let watcher = build_watcher(pending.clone(), configs, skip_marker, app.clone());
-    *app.state::<WatcherState>().watcher.lock().unwrap() = Some(watcher);
+    let watcher = build_watcher(pending.clone(), configs, skip_marker, ctx.clone());
+    *ctx.watcher.watcher.lock().unwrap() = Some(watcher);
 
-    spawn_reaper(app.clone(), pending);
-    reconcile(&app);
+    spawn_reaper(&ctx, pending);
+    reconcile(&ctx);
     // The initial scan probes every existing file with a blocking `HandBrakeCLI --scan` (seconds
-    // per file when skip-by-source-media is on). `start` runs inside Tauri's `setup` on the main
-    // thread, so scanning inline freezes the UI at launch — the event loop never starts pumping.
-    // Run it off-thread; the reaper already enqueues from a background thread, so this is the same
+    // per file when skip-by-source-media is on). `start` runs during app setup on the main thread,
+    // so scanning inline freezes the UI at launch — the event loop never starts pumping. Run it
+    // off-thread; the reaper already enqueues from a background thread, so this is the same
     // proven-safe path.
-    std::thread::spawn(move || scan_all_enabled(&app));
+    let scan_ctx = ctx.clone();
+    std::thread::spawn(move || scan_all_enabled(&scan_ctx));
 }
 
 #[cfg(test)]
