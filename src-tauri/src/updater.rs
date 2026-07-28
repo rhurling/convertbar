@@ -1022,29 +1022,53 @@ impl<R: tauri::Runtime> DrainGuard<R> {
 
 impl<R: tauri::Runtime> Drop for DrainGuard<R> {
     fn drop(&mut self) {
-        if !self.armed || self.keep {
+        if self.keep {
             return;
         }
-        if let Ok(mut flag) = self.conv.pause_after_current.lock() {
-            *flag = false;
+        // A flag still standing was never consumed, so no stop reached the database and none
+        // will. A flag already lowered means `process_queue` took it while the download ran, and
+        // the stop is landing (or has landed) in the database instead.
+        let mut nothing_landed = false;
+        if self.armed {
+            if let Ok(mut flag) = self.conv.pause_after_current.lock() {
+                nothing_landed = *flag;
+                *flag = false;
+            }
         }
-        // Lowering the one-shot flag is too late if the running job already finished and consumed
-        // it while the download ran: the batch is stopped and the stop is persisted. Lift it.
+        if nothing_landed {
+            clear_drain_pause(&self.app);
+            return;
+        }
+        // Runs even when this guard armed nothing: a deferral's drain is armed by the call that
+        // created it, but the retry that finally gives up is a *different* call, with its own
+        // guard and an idle queue. The breadcrumb, not this guard, is the durable record of who
+        // stopped the queue, so an abandoned install lifts whatever the updater stopped.
         undo_drain_pause(&self.app);
     }
 }
 
-/// Lifts a persisted pause this install caused, now that the install is not going to happen.
-/// Version-matched by the breadcrumb rather than by blanket unpausing, so a pause the *user* asked
-/// for is left exactly where it is.
+fn clear_drain_pause<R: tauri::Runtime>(app: &AppHandle<R>) {
+    if let Some(app_state) = app.try_state::<crate::AppState>() {
+        if let Ok(conn) = app_state.db.lock() {
+            set_drain_pause(&conn, false);
+        }
+    }
+}
+
+/// Lifts a persisted pause the updater caused, now that the install is not going to happen.
+/// Keyed on the breadcrumb rather than unpausing blindly, so a pause the *user* asked for is left
+/// exactly where it is.
 fn undo_drain_pause<R: tauri::Runtime>(app: &AppHandle<R>) {
     let Some(app_state) = app.try_state::<crate::AppState>() else {
         return;
     };
     let lifted = match app_state.db.lock() {
         Ok(conn) => {
-            let was_paused = crate::converter::is_queue_paused(&conn);
-            was_paused && !take_drain_pause(&conn, was_paused)
+            // The breadcrumb is consulted — and consumed — only once a stop is actually visible.
+            // If `process_queue` is in the handful of instructions between taking the flag and
+            // persisting the stop, this sees nothing and leaves the breadcrumb alone, so the next
+            // launch finishes the job rather than the batch staying halted for good.
+            crate::converter::is_queue_paused(&conn) && !take_drain_pause(&conn, true)
         }
         Err(_) => false,
     };
@@ -1979,6 +2003,63 @@ mod tests {
         assert!(
             !crate::converter::is_queue_paused(&db.lock().unwrap()),
             "the batch must not stay halted for an install that is not coming"
+        );
+        assert!(
+            !read_drain_pause(&db.lock().unwrap()),
+            "and the breadcrumb is spent once it has been acted on"
+        );
+    }
+
+    #[test]
+    fn a_stop_the_updater_persisted_is_lifted_by_whichever_attempt_gives_up() {
+        // The call that arms a drain and the call that finally gives up are usually different:
+        // the first defers behind the busy queue (`AwaitingIdle`, drain kept), and the retry that
+        // fires once the queue drains is a fresh `install_pending` with its own guard and an idle
+        // queue — so it arms nothing. Keying the undo on "did *this* guard arm it" would leave the
+        // batch halted exactly when that retry is the one that fails.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        let conv = handle
+            .state::<std::sync::Arc<ConverterState>>()
+            .inner()
+            .clone();
+        let db = db_of(&handle);
+        {
+            let conn = db.lock().unwrap();
+            // What the earlier, armed attempt left behind once the running job finished.
+            set_drain_pause(&conn, true);
+            crate::converter::set_queue_paused(&conn, true);
+        }
+        // Keeps `claim_queue_slot` from spawning a real queue thread; this test is about the
+        // persisted stop being lifted, which is what `should_auto_resume` and Start both read.
+        *conv.is_running.lock().unwrap() = true;
+
+        {
+            let _drain = DrainGuard::new(handle.clone(), conv.clone());
+        }
+
+        assert!(
+            !crate::converter::is_queue_paused(&db.lock().unwrap()),
+            "an abandoned install must lift the stop it caused, whichever attempt abandons it"
+        );
+    }
+
+    #[test]
+    fn a_stop_that_has_not_landed_yet_leaves_the_breadcrumb_for_the_next_launch() {
+        // `process_queue` takes the one-shot flag and persists the stop a few instructions later.
+        // An undo landing in that window sees no stop to lift; consuming the breadcrumb there
+        // would leave the batch halted with nothing left to lift it, ever. Leaving it means the
+        // next launch finishes the job.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        let db = db_of(&handle);
+        set_drain_pause(&db.lock().unwrap(), true);
+
+        undo_drain_pause(&handle);
+
+        assert!(
+            read_drain_pause(&db.lock().unwrap()),
+            "a breadcrumb whose stop has not appeared yet must survive to be redeemed at launch"
         );
     }
 
