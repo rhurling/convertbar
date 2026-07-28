@@ -4,7 +4,9 @@
 //! order is explicit and total: every request, including static assets, passes through all
 //! three (`auth_guard`/`json_content_guard` no-op where they don't apply).
 
-use axum::extract::{Request, State};
+use std::net::{IpAddr, SocketAddr};
+
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -14,6 +16,7 @@ use serde_json::json;
 
 use crate::config::AuthMode;
 use crate::routes::ServerState;
+use crate::throttle::client_id;
 
 /// Name of the cookie `login` sets and `auth_guard`/SSE reads back. `EventSource` can't send
 /// an `Authorization` header, so the cookie is the only way `/api/events` can authenticate.
@@ -99,6 +102,15 @@ pub async fn host_guard(State(s): State<ServerState>, req: Request, next: Next) 
     next.run(req).await
 }
 
+/// The connecting peer's address, from request extensions. NOT an
+/// `Option<ConnectInfo<..>>` extractor — that does not satisfy axum 0.8's
+/// middleware trait bounds and will not compile.
+pub fn peer_ip(req: &Request) -> Option<IpAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip())
+}
+
 fn bearer_token(req: &Request) -> Option<String> {
     req.headers()
         .get(header::AUTHORIZATION)
@@ -128,14 +140,25 @@ pub async fn auth_guard(State(s): State<ServerState>, req: Request, next: Next) 
         return next.run(req).await;
     }
 
-    let provided = bearer_token(&req).or_else(|| cookie_token(&req));
-    let ok = provided.is_some_and(|t| token_matches(&t, expected));
-
-    if !ok {
+    // Order matters. A request with NO credential is not a guess: it is how the
+    // web UI discovers it needs to show the login screen. Charging it a delay
+    // would make the login screen slow exactly when it is needed.
+    let Some(provided) = bearer_token(&req).or_else(|| cookie_token(&req)) else {
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+
+    // Checked before any throttle work, so the authenticated hot path (SSE,
+    // polling) takes no lock at all.
+    if token_matches(&provided, expected) {
+        return next.run(req).await;
     }
 
-    next.run(req).await
+    let id = client_id(peer_ip(&req), req.headers(), &s.config.trusted_proxies);
+    let delay = s
+        .login_throttle
+        .record_failure(id, std::time::Instant::now());
+    tokio::time::sleep(delay).await;
+    json_err(StatusCode::UNAUTHORIZED, "unauthorized")
 }
 
 /// CSRF belt: for POST/PUT/DELETE under `/api` (login included), require a `Content-Type`
@@ -256,9 +279,14 @@ mod tests {
     /// than the bare `api_router` most other route tests use — these are specifically about
     /// the guards' behavior and ordering, which only exist at that outer layer.
     mod guard_integration_tests {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
         use axum::body::Body;
+        use axum::extract::ConnectInfo;
         use axum::http::header::SET_COOKIE;
         use axum::http::{Request, Response, StatusCode};
+        use axum::Extension;
         use serde_json::{json, Value};
         use tower::ServiceExt;
 
@@ -616,6 +644,222 @@ mod tests {
         async fn missing_host_header_is_misdirected() {
             let response = send(app(open_state()), "GET", "/api/queue", &[], None).await;
             assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+        }
+
+        /// Wraps `app` so requests carry a peer address, the way a real listener does.
+        /// `oneshot` supplies no connect info, so without this every test would land in
+        /// the single `Unknown` bucket and prove nothing about per-source behaviour.
+        ///
+        /// NOT `MockConnectInfo` — that inserts an extension of type `MockConnectInfo<T>`,
+        /// and only the `ConnectInfo` *extractor* falls back to it. Code reading
+        /// `extensions().get::<ConnectInfo<_>>()` sees nothing, so every request would
+        /// silently resolve to `Unknown` and these tests would pass for the wrong reason.
+        /// `Extension(ConnectInfo(..))` inserts exactly what
+        /// `into_make_service_with_connect_info` inserts in production. (Verified
+        /// empirically; see the spec's §6.)
+        fn app_from(state: ServerState, peer: &str) -> axum::Router {
+            app(state).layer(Extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap())))
+        }
+
+        fn throttled_state(token: &str, base: Duration) -> ServerState {
+            let mut state = token_state(token);
+            state.login_throttle = std::sync::Arc::new(crate::throttle::LoginThrottle::new(
+                crate::throttle::ThrottlePolicy {
+                    base,
+                    ..Default::default()
+                },
+            ));
+            state
+        }
+
+        #[tokio::test]
+        async fn uncredentialed_requests_are_never_throttled() {
+            // The web UI fires several uncredentialed /api/* requests on page load
+            // specifically to trigger the login screen. If those counted, a user would
+            // lock themselves into a slow login before typing a character.
+            let state = throttled_state("abcdefghijklmnop", Duration::from_millis(80));
+            let app = app_from(state, "10.0.0.1:5555");
+            for _ in 0..12 {
+                // Assert the elapsed time of EACH uncredentialed request. Asserting only
+                // the status would let a "count them as failures" regression pass: the
+                // loop would just get slow, and a later authenticated request still
+                // returns fast because the success path never sleeps.
+                let start = std::time::Instant::now();
+                let response = send(
+                    app.clone(),
+                    "GET",
+                    "/api/queue",
+                    &[("Host", "localhost")],
+                    None,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert!(
+                    start.elapsed() < Duration::from_millis(80),
+                    "uncredentialed request was delayed: {:?}",
+                    start.elapsed()
+                );
+            }
+            // And the ramp must still be at zero: a wrong credential now should cost the
+            // FIRST step (80ms), not the thirteenth.
+            let start = std::time::Instant::now();
+            send(
+                app.clone(),
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                None,
+            )
+            .await;
+            let first_real_failure = start.elapsed();
+            assert!(
+                first_real_failure < Duration::from_millis(300),
+                "counter advanced on uncredentialed requests: first real failure cost {first_real_failure:?}"
+            );
+
+            // A correct credential must still be served immediately.
+            let start = std::time::Instant::now();
+            let response = send(
+                app,
+                "GET",
+                "/api/queue",
+                &[
+                    ("Host", "localhost"),
+                    ("Authorization", "Bearer abcdefghijklmnop"),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                start.elapsed() < Duration::from_millis(80),
+                "authenticated request was delayed: {:?}",
+                start.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_correct_token_always_succeeds_no_matter_how_many_failures_precede_it() {
+            // The goal-3 regression test. There is no lockout by design: no sequence of
+            // unauthenticated requests may deny a client holding the right token.
+            let state = throttled_state("abcdefghijklmnop", Duration::ZERO);
+            let app = app_from(state, "10.0.0.1:5555");
+            for _ in 0..40 {
+                let response = send(
+                    app.clone(),
+                    "GET",
+                    "/api/queue",
+                    &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                    None,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            let response = send(
+                app,
+                "GET",
+                "/api/queue",
+                &[
+                    ("Host", "localhost"),
+                    ("Authorization", "Bearer abcdefghijklmnop"),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn wrong_credentials_are_delayed_and_the_delay_escalates() {
+            // Pins BOTH that the sleep happens at all and that it derives from the
+            // post-increment count — a delay computed before incrementing would make
+            // every attempt cost the same, which is bypassable by opening connections.
+            let state = throttled_state("abcdefghijklmnop", Duration::from_millis(60));
+            let app = app_from(state, "10.0.0.1:5555");
+
+            let first = std::time::Instant::now();
+            send(
+                app.clone(),
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                None,
+            )
+            .await;
+            let first = first.elapsed();
+
+            let second = std::time::Instant::now();
+            send(
+                app,
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                None,
+            )
+            .await;
+            let second = second.elapsed();
+
+            // Absolute bounds, not `second >= first * 2`: that form doubles the first
+            // request's scheduling overhead into the bound and is flaky on a loaded
+            // machine. These are still discriminating — a delay computed BEFORE the
+            // increment gives second ~= 60ms and fails, and a dropped sleep fails the
+            // first assertion.
+            assert!(
+                first >= Duration::from_millis(60),
+                "first not delayed: {first:?}"
+            );
+            assert!(
+                second >= Duration::from_millis(120),
+                "delay did not escalate: {first:?} then {second:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_sources_failures_do_not_slow_another_source() {
+            let state = throttled_state("abcdefghijklmnop", Duration::from_millis(60));
+            let noisy = app_from(state.clone(), "10.0.0.1:5555");
+            for _ in 0..6 {
+                send(
+                    noisy.clone(),
+                    "GET",
+                    "/api/queue",
+                    &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                    None,
+                )
+                .await;
+            }
+            let quiet = app_from(state, "10.0.0.2:5555");
+            let start = std::time::Instant::now();
+            send(
+                quiet,
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                None,
+            )
+            .await;
+            // Second source is at ramp step 1, not step 7.
+            assert!(
+                start.elapsed() < Duration::from_millis(200),
+                "unrelated source inherited the ramp: {:?}",
+                start.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn rejection_body_and_headers_are_unchanged_and_carry_no_cookie() {
+            let state = throttled_state("abcdefghijklmnop", Duration::ZERO);
+            let response = send(
+                app_from(state, "10.0.0.1:5555"),
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Authorization", "Bearer wrong")],
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().get(SET_COOKIE).is_none());
+            assert_eq!(json_body(response).await, json!({"error": "unauthorized"}));
         }
     }
 }
