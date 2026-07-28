@@ -70,12 +70,16 @@ pub fn pause_conversion(ctx: &Ctx) -> Result<(), String> {
             *ctx.converter.is_paused.lock().map_err(|e| e.to_string())? = true;
 
             if let Some(ref job_id) = job_id_val {
-                let db = ctx.db.lock().map_err(|e| e.to_string())?;
-                let _ = db.execute(
-                    "UPDATE jobs SET status = 'paused' WHERE id = ?1",
-                    params![job_id],
-                );
-                converter::set_queue_paused(&db, true);
+                {
+                    let db = ctx.db.lock().map_err(|e| e.to_string())?;
+                    let _ = db.execute(
+                        "UPDATE jobs SET status = 'paused' WHERE id = ?1",
+                        params![job_id],
+                    );
+                    converter::set_queue_paused(&db, true);
+                } // db must be dropped before these emits: the tray listener re-locks ctx.db
+                  // synchronously on this same thread, and std::sync::Mutex is not reentrant —
+                  // holding the guard here self-deadlocks.
 
                 ctx.events.emit_t(
                     "job-status-changed",
@@ -146,23 +150,13 @@ pub fn resume_conversion(ctx: &Ctx) -> Result<(), String> {
             *ctx.converter.is_paused.lock().map_err(|e| e.to_string())? = false;
 
             if let Some(ref job_id) = job_id_val {
-                let db = ctx.db.lock().map_err(|e| e.to_string())?;
-                let _ = db.execute(
-                    "UPDATE jobs SET status = 'encoding' WHERE id = ?1",
-                    params![job_id],
-                );
-
-                ctx.events.emit_t(
-                    "job-status-changed",
-                    serde_json::json!({
-                        "job_id": job_id,
-                        "old_status": "paused",
-                        "new_status": "encoding",
-                        "status": "encoding",
-                    }),
-                );
-
                 let file_name = {
+                    let db = ctx.db.lock().map_err(|e| e.to_string())?;
+                    let _ = db.execute(
+                        "UPDATE jobs SET status = 'encoding' WHERE id = ?1",
+                        params![job_id],
+                    );
+
                     let source: Option<String> = db
                         .query_row(
                             "SELECT source_path FROM jobs WHERE id = ?1",
@@ -176,7 +170,19 @@ pub fn resume_conversion(ctx: &Ctx) -> Result<(), String> {
                             .and_then(|n| n.to_str())
                             .map(|s| s.to_string())
                     })
-                };
+                }; // db must be dropped before these emits: the tray listener re-locks ctx.db
+                   // synchronously on this same thread for its "encoding" branch, and
+                   // std::sync::Mutex is not reentrant — holding the guard here self-deadlocks.
+
+                ctx.events.emit_t(
+                    "job-status-changed",
+                    serde_json::json!({
+                        "job_id": job_id,
+                        "old_status": "paused",
+                        "new_status": "encoding",
+                        "status": "encoding",
+                    }),
+                );
 
                 ctx.events.emit_t(
                     "menu-bar-update",
@@ -371,6 +377,7 @@ pub fn get_low_disk_pause(ctx: &Ctx) -> Option<LowDiskPause> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use std::sync::{Mutex, OnceLock};
 
     fn test_ctx(conn: Connection) -> Arc<Ctx> {
         Ctx::new(
@@ -378,6 +385,33 @@ mod tests {
             Arc::new(crate::events::TestSink::default()),
             Arc::new(crate::dispose::DeleteDisposer),
         )
+    }
+
+    /// Probe sink for the regression test below. Mirrors the desktop tray listener
+    /// (src-tauri/src/lib.rs), which locks `ctx.db` synchronously on the emitting thread to read
+    /// `menubar_show_*` settings whenever a "menu-bar-update" event arrives. If `db` is set,
+    /// `emit` does a non-blocking `try_lock()` on it: on the SAME thread, `std::sync::Mutex` is
+    /// not reentrant, so `try_lock()` against a guard this thread already holds returns
+    /// `WouldBlock` rather than deadlocking -- which is exactly what lets this probe fail loud
+    /// (a recorded violation) instead of hanging if pause/resume ever regress to emitting while
+    /// still holding the db guard.
+    #[derive(Default)]
+    struct LockProbeSink {
+        db: OnceLock<Arc<Mutex<rusqlite::Connection>>>,
+        violations: Mutex<Vec<String>>,
+        events: Mutex<Vec<String>>,
+    }
+
+    impl crate::events::EventSink for LockProbeSink {
+        fn emit(&self, event: &str, _payload: serde_json::Value) {
+            self.events.lock().unwrap().push(event.to_string());
+            if let Some(db) = self.db.get() {
+                if db.try_lock().is_err() {
+                    self.violations.lock().unwrap().push(event.to_string());
+                }
+            }
+        }
+        fn notify(&self, _title: &str, _body: &str) {}
     }
 
     #[test]
@@ -507,5 +541,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(paused, "false", "Resume clears the remembered pause");
+    }
+
+    // Regression test for the resume/pause self-deadlock: the desktop tray listener's
+    // "menu-bar-update" handler re-locks ctx.db synchronously on the emitting thread (see
+    // src-tauri/src/lib.rs), so pause/resume must drop the db guard before emitting.
+    //
+    // The PID here is a real spawned child, not this test's own process: SIGSTOP directed at
+    // `std::process::id()` was verified (outside this suite) to actually stop the whole test
+    // binary -- all threads, including the one that would assert the result -- until an
+    // external SIGCONT arrives, which nothing in this test sends. Using a throwaway child
+    // process keeps the SIGSTOP/SIGCONT harmless, same as the `cancel_conversion` test above.
+    #[cfg(unix)]
+    #[test]
+    fn resume_and_pause_do_not_hold_db_lock_across_tray_bound_emits() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.mp4");
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j1', ?1, ?1, 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            params![source.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let sink = Arc::new(LockProbeSink::default());
+        let ctx = Ctx::new(conn, sink.clone(), Arc::new(crate::dispose::DeleteDisposer));
+        sink.db.set(ctx.db.clone()).unwrap();
+
+        // Stand-in for the paused encode's process.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".to_string());
+        *ctx.converter.is_paused.lock().unwrap() = true;
+
+        resume_conversion(&ctx).unwrap();
+        pause_conversion(&ctx).unwrap();
+
+        // Clean up: the child is SIGSTOPed from pause_conversion above, so CONT before kill.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGCONT);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            sink.violations.lock().unwrap().is_empty(),
+            "db lock was held during emit(s): {:?}",
+            sink.violations.lock().unwrap()
+        );
+        let events = sink.events.lock().unwrap();
+        assert!(events.contains(&"job-status-changed".to_string()));
+        assert!(events.contains(&"menu-bar-update".to_string()));
     }
 }
