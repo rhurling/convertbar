@@ -1,8 +1,11 @@
 # Server Head — Login Throttling and a Token-Entropy Floor — Design
 
-> Revision 2, after an adversarial review of revision 1. The review overturned
-> three of revision 1's decisions; see **Changed after review** at the end for
-> what and why. Revision 1 is in the git history of this file.
+> **Revision 3.** An empirical review of the shipped revision-2 implementation
+> found its escalating delay was not a rate limiter at all — it postponed the
+> response after the verdict was already computed, so an attacker who abandoned
+> the connection was unthrottled (~18,000 guesses/sec measured). Revision 3
+> gates the *evaluation* instead. See **Why the delay was not enough**.
+> Revisions 1 and 2 are in this file's git history.
 
 ## Problem
 
@@ -28,12 +31,15 @@ acceptable for a trusted LAN and not acceptable for anything wider.
 ## Goals
 
 1. Make a guessable token impossible to configure by accident.
-2. Make online guessing cost enough that it is not a viable attack.
-3. **Never deny the owner access.** No input from an unauthenticated party may
-   prevent a client holding the correct token from getting in.
+2. **Bound online guess throughput per source.** Not "make guessing feel slow" —
+   bound the number of times a source can learn whether a credential is correct.
+3. Keep the owner's normal use unaffected, and their worst case bounded and
+   self-clearing.
 
-Goal 3 is the constraint that shapes everything below, and it is why this design
-has no lockout. See **Why no lockout**.
+> **Revision 3 changed goal 2 and goal 3.** Revision 2 read goal 3 as "never deny
+> the owner access" and built a post-evaluation delay to honour it. That delay is
+> not a rate limiter — see **Why the delay was not enough**. Goal 3 as originally
+> written is unachievable alongside goal 2, and this revision subordinates it.
 
 ## Non-goals
 
@@ -165,79 +171,70 @@ not already provide.
 
 ### 4. `LoginThrottle` — `throttle.rs`
 
-An **escalating per-bucket delay**. No lockout, no threshold, no denial.
+A **per-source evaluation gate**. The unit being limited is not the response —
+it is the *credential comparison itself*.
 
 ```rust
+pub enum Gate {
+    /// Evaluate the credential. This consumed the bucket's slot.
+    Allow,
+    /// Do NOT evaluate. Answer 401 immediately.
+    Deny,
+}
+
 pub struct ThrottlePolicy {
-    pub base: Duration,    // 500ms — delay after the 1st failure
-    pub cap: Duration,     // 30s   — ceiling
+    pub free: u32,         // 3     — failures before gating begins
+    pub base: Duration,    // 500ms — spacing after the first gated failure
+    pub cap: Duration,     // 30s   — spacing ceiling
     pub window: Duration,  // 15min — failures older than this are forgotten
 }
 
-pub struct LoginThrottle {
-    failures: Mutex<HashMap<ClientId, Failures>>,
-    policy: ThrottlePolicy,
-}
-
 impl LoginThrottle {
-    /// Records a rejected attempt; returns the delay the caller must apply.
-    pub fn record_failure(&self, id: ClientId, now: Instant) -> Duration;
-    /// Clears the bucket. Called only on a successful login.
+    /// Reserves this source's evaluation slot. MUST be called BEFORE comparing
+    /// the credential — that ordering is the entire defense.
+    pub fn check(&self, id: ClientId, now: Instant) -> Gate;
+    /// Records that an allowed evaluation rejected the credential.
+    pub fn record_failure(&self, id: ClientId, now: Instant);
+    /// Clears the bucket. Called when an allowed evaluation accepted it.
     pub fn record_success(&self, id: ClientId);
 }
 ```
 
-`delay(n) = min(base << (n-1), cap)` — 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, then
-pinned at the 30 s cap from the 7th failure on. The shift must be guarded
-(`checked_shl` or an early `n > 20 → cap`) so a long-running bucket cannot
-overflow.
+`spacing(n) = 0` for `n < free`, else `min(base << (n - free), cap)` — so
+failures 1-3 are ungated, then 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, and pinned at
+the 30 s cap from the 9th failure on. The shift is clamped so a long-lived
+bucket cannot overflow.
 
-Sustained *sequential* guessing — one guess, wait for the response, repeat —
-therefore costs ~2 attempts/minute per bucket. The owner is never locked out —
-their worst case is a 30-second wait, after which a correct token succeeds and
-resets the bucket to zero. **This figure does not hold for a concurrent or
-response-abandoning attacker; see the correction filed under "Why no lockout"
-below.**
+**`check` reserves; it does not merely observe.** Under the lock it compares
+`now` against the bucket's `next_at` and, when it allows, immediately sets
+`next_at = now + spacing(count)`. Reserving inside the same critical section is
+what stops a parallel attacker: N concurrent requests do not all observe the
+same open window, because the first one closes it before the second reads it.
 
-**The counter increments under the lock *before* the sleep, and the delay is
-computed from the post-increment count.** This prevents an attacker from
-resetting the ramp by opening more connections: concurrent attempts still draw
-escalating counter values (500 ms, 1 s, 2 s … 30 s, 30 s, 30 s) rather than N
-copies of the first delay. **It does not bound the attacker's throughput** —
-evaluation happens before the sleep, so those escalating delays run
-concurrently rather than serializing the guesses. See the correction below for
-what this ordering does and does not achieve.
+**The first `free` failures are ungated** so that ordinary use is untouched: a
+mistyped token, a stale cookie, and the web UI's concurrent page-load fan-out
+all stay under the threshold and never see a denial.
 
-State per bucket: `count` and `first_at`. A failure with `now - first_at >
-window` starts a fresh window at `count = 1`. `record_success` removes the entry.
+Time is always an explicit `now: Instant` parameter, so every property above is
+testable without a single `sleep` — the suite gained determinism as a side
+effect of this redesign.
 
-Time is always an explicit `now: Instant` parameter rather than an internal
-`Instant::now()`, so window rollover is deterministically testable with no
-`sleep` in the unit suite. (`record_success` takes no `now`; clearing a bucket
-is time-independent.)
+**Nothing sleeps.** Every response is immediate, which is why this is a rate
+limiter and the previous design was not: a client learns nothing by abandoning
+a connection, and holds no server resource by keeping one open.
 
-**Lock poisoning:** all call sites use `.lock().unwrap_or_else(|e| e.into_inner())`.
-This is the only new lock on a global request path — `auth_guard` layers over
-every request including static assets — so a poisoned mutex would turn one panic
-into a 500 on every request forever. A possibly-stale counter is the better
-failure mode.
-
-The map is pruned lazily inside `record_failure` once it exceeds 4096 keys:
-first by dropping entries whose window has expired, then — if a live flood of
-distinct sources leaves it still over the threshold, since nothing expired —
-by evicting the lowest-`count` entries until it is back at 4096. Eviction
-prefers count over age because a hot attacker's bucket is the one worth
-keeping, and count-based eviction is harder to game: flooding fresh sources to
-force an eviction only spends the flood's own low-count buckets. The map is
-therefore bounded at ~4096 entries (a few hundred KB) regardless of how many
-distinct sources attack concurrently.
+Lock poisoning is swallowed (`.lock().unwrap_or_else(|e| e.into_inner())`) — this
+lock sits on a global request path, so one panic must not 500 every subsequent
+request forever. The map is bounded at `PRUNE_THRESHOLD` keys, evicting expired
+entries first and then lowest-`count` entries, so hot attackers are retained and
+the long tail is shed.
 
 ### 5. Enforcement — `routes/login.rs` and `auth.rs::auth_guard`
 
-`auth_guard` already exempts `POST /api/login` (`auth.rs:126`), so a login
-attempt is counted at exactly one site. Both sites derive the bucket key through
-the same `client_id`, so failures against the login route and against `/api/*`
-accumulate in the **same** bucket.
+`auth_guard` already exempts `POST /api/login` (`auth.rs:126`), so an attempt is
+gated at exactly one site. Both sites derive the bucket key through the same
+`client_id`, so attempts against the login route and against `/api/*` share one
+bucket and one rate.
 
 **`auth_guard`, in this exact order:**
 
@@ -245,33 +242,33 @@ accumulate in the **same** bucket.
 |---|---|---|
 | 1 | `AuthMode::Open` | pass through |
 | 2 | exempt path (`POST /api/login`, any non-`/api`) | pass through |
-| 3 | **no credential presented at all** | plain 401, no delay, no counter — *terminal* |
-| 4 | credential matches | `next.run(req)` — no lock taken |
-| 5 | credential mismatch | `record_failure`, sleep that long, 401 |
+| 3 | **no credential presented at all** | plain 401, no gate, no counter — *terminal* |
+| 4 | `check` returns `Deny` | 401 **without comparing the credential** |
+| 5 | credential matches | `record_success`, `next.run(req)` |
+| 6 | credential mismatch | `record_failure`, 401 |
 
-**`login`:** open mode → 204; token matches → `record_success`, set cookie, 204;
-mismatch → `record_failure`, sleep, 401.
+**`login`:** open mode → 204; `Deny` → 401 without comparing; matches →
+`record_success`, set cookie, 204; mismatch → `record_failure`, 401.
 
-Two properties worth stating explicitly, because both were wrong in revision 1:
+Three properties that carry the design:
 
-- **Step 3 is terminal and must come before any throttle interaction.** The web
-  UI deliberately fires uncredentialed `/api/*` requests on load to trigger the
-  login screen (`src/lib/transport/http.ts:30` dispatches
-  `convertbar:unauthorized` on 401). A request is only a *guess* if it presented
-  a credential. Charging those a delay would make the login screen slow exactly
-  when the user needs it.
-- **Step 4 precedes any throttle work, so the authenticated hot path (SSE,
-  polling) takes no lock at all.** With no lockout there is no state to consult
-  on success. Only failures touch the throttle.
+- **Step 4 precedes step 5.** This is the whole feature. If the comparison ran
+  first, the attacker would learn the answer regardless of what the gate did
+  afterwards, and no amount of delaying the response would change that.
+- **Step 3 is terminal and ungated.** The web UI deliberately fires
+  uncredentialed `/api/*` requests on load to trigger the login screen
+  (`src/lib/transport/http.ts:30` dispatches `convertbar:unauthorized` on 401).
+  A request is only a guess if it presented a credential; gating these would
+  spend the bucket's budget on the login screen rendering itself.
+- **A `Deny` and a wrong credential are the same response** —
+  `401 {"error":"unauthorized"}`, no `Set-Cookie`, both immediate. The attacker
+  cannot tell whether their guess was tested, so to *guarantee* a test they must
+  wait out the spacing. That is what converts the spacing into a rate.
 
-The 401 body and status are unchanged from today (`{"error":"unauthorized"}`),
-and **no `Set-Cookie` is attached** — see **Changed after review**.
-
-**Logging:** `tracing::warn!` once per bucket, when it first reaches the delay
-cap — matching `host_guard`'s convention of logging an operator-diagnosable
-rejection (`auth.rs:89`). Not per attempt, which would make the log a flood
-amplifier.
-
+**Logging:** `tracing::warn!` once per ramp, when a bucket first reaches the
+spacing cap — matching `host_guard`'s convention of logging an
+operator-diagnosable rejection (`auth.rs:89`). Not per attempt, which would make
+the log a flood amplifier.
 ### 6. Wiring
 
 - `ServerState` gains `login_throttle: Arc<LoginThrottle>`. Only two sites
@@ -362,66 +359,58 @@ regression would turn a per-source throttle into a global one.
 - `unraid-template.xml`: token field description gains the requirement.
 - `docs/RECOMMENDATIONS.md`: item 15 moves to the shipped section.
 
-## Why no lockout
+## Why the delay was not enough
 
-The recommendation and the first revision both assumed a lockout. It cannot be
-made to satisfy goal 3, because the two possible behaviours are exhaustive and
-both fail:
+Revisions 1 and 2 argued about lockouts and reached a false dichotomy:
 
 - **A lockout that refuses a correct token** is a cheap, permanent denial of
-  service. Sustaining it costs 20 requests per 5 minutes — 0.07 req/s — and the
-  owner cannot escape it by knowing the password. In any deployment where
-  clients share a source address (Docker Desktop's userland forwarding, NAT,
-  VPN, or a reverse proxy without `CONVERTBAR_TRUSTED_PROXIES`), a single
-  unauthenticated LAN device permanently bricks the owner's access.
-- **A lockout that accepts a correct token** provides no rate limiting at all.
-  Every guess is still evaluated and still answered; the attacker's throughput is
-  unchanged. It is pure ceremony.
+  service against the owner.
+- **A lockout that accepts a correct token** provides no rate limiting at all —
+  every guess is still evaluated and answered.
 
-Revision 1 chose the first and justified it with "otherwise the lockout means
-nothing." That reasoning was backwards: a lockout exists to stop *guessing*, and
-a guesser does not hold the correct token. Honoring a correct token costs
-essentially zero anti-guessing value and removes 100% of the DoS.
+Revision 2 concluded these were exhaustive, rejected both, and shipped an
+escalating delay applied *after* `token_matches`. That was wrong, and the error
+is instructive enough to keep on the record.
 
-The escalating delay deters casual, sequential guessing with no denial state
-to abuse, and is less code than a lockout. It does **not** make guessing
-expensive in the sense originally claimed here — see the correction below,
-filed after empirical review of the shipped implementation.
+**What the evaluate-then-sleep design actually achieved:** it deterred a
+*sequential, response-waiting* client — one that sends a guess, waits for the
+401, and only then sends the next — holding it to ~2 attempts/minute once
+ramped.
 
-### Correction, filed after the fix shipped (empirical review)
+**Why it was not a rate limiter.** Because the comparison ran before the sleep,
+the verdict existed immediately; the sleep only postponed *writing* it, and
+nothing compelled the attacker to wait. Measured against the shipped code:
 
-The dichotomy above is false. It considers only two lockout behaviours and
-misses a third: **gate evaluation behind the delay**, checking a per-bucket
-`next_allowed_at` *before* `token_matches` runs, instead of sleeping after a
-verdict is already known. That option rate-limits genuinely — no answer is
-produced until the wait elapses, so an attacker cannot get a faster verdict by
-opening more connections or abandoning ones it doesn't want to wait on — while
-still never permanently denying the owner, since the wait is bounded by the
-same 30 s cap. This option was not identified during design, is not what
-shipped, and is a deliberate future decision rather than part of this
-correction — see `docs/RECOMMENDATIONS.md` item 15.
+- 20 simultaneous wrong guesses cost one delay, not twenty — throughput was
+  `concurrency / cap`, not `1 / cap`.
+- A correct token was served immediately even with the bucket pinned at the
+  30 s cap, so response latency was a perfect oracle: send a guess, wait ~50 ms,
+  abandon the socket if nothing came back. Measured: 8 guesses in 0.63 s against
+  ~64 s of nominal delay; a tighter loop reached ~18,000 guesses/sec.
 
-**What the shipped delay (evaluate-then-sleep) actually achieves:** it deters
-a *sequential, response-waiting* client — one that sends a guess, waits for
-the 401, and only then sends the next. That client is genuinely held to
-~2 attempts/minute once ramped.
+**The missing third option** — and what revision 3 implements — is to gate the
+*evaluation* rather than the response: check the bucket's `next_at` **before**
+`token_matches` runs, and answer 401 without comparing when the slot is not yet
+open. Then abandoning a connection buys nothing (no verdict was computed to
+abandon) and opening more connections buys nothing (the slot is reserved under
+the same lock that reads it).
 
-**What it does not do:** rate-limit a client that parallelises or abandons the
-connection. Because `token_matches` runs before the sleep, the verdict exists
-immediately; the sleep only delays *when* the 401 is written, and nothing
-forces the attacker to wait for it. Measured against this implementation: 20
-simultaneous wrong guesses cost one delay, not twenty — throughput is
-`concurrency / cap`, not `1 / cap`. A correct token is also served immediately
-even at the cap, so response latency is a perfect oracle: send a guess, wait
-~50 ms, abandon the socket if nothing came back. Measured: 8 guesses in 0.63 s
-(versus ~64 s had the client waited out each delay sequentially); a tighter
-loop reached ~18,000 guesses/sec.
+**The cost, stated plainly.** Any correct rate limiter must sometimes refuse to
+answer whether a credential is valid — that refusal *is* the limit. So a correct
+token is sometimes refused, not merely delayed. This is unavoidable rather than
+chosen: a mechanism that always honours a correct token also always answers the
+attacker, which is exactly how revision 2 failed. Revision 3 therefore
+subordinates the old goal 3 and bounds the cost instead of eliminating it:
 
-**Consequence:** the escalating delay deters naive/sequential scanners and is
-worth keeping for that reason — it is cheap and harmless to a legitimate
-owner — but it is not the server's rate limit. **The 16-character/8-distinct
-token floor (§1) is the actual defense**; at that length, throughput against
-the delay is irrelevant to whether guessing is viable at all.
+- The first `free` (3) failures are ungated, so typos, a stale cookie, and the
+  web UI's concurrent page-load fan-out never see a denial.
+- A successful evaluation clears the bucket outright.
+- Failures are forgotten after the 15-minute window.
+- A source only shares a bucket with an attacker when it shares a source
+  address — the case `CONVERTBAR_TRUSTED_PROXIES` exists to eliminate.
+
+On a normal LAN, where the attacker holds a different address, the owner's
+bucket is untouched and they are never gated at all.
 
 ## Changed after review
 
@@ -453,6 +442,11 @@ broad-CIDR guidance which was itself the attack (§2), `MalformedChain` bucketin
 the ten existing tests that break (Testing).
 
 ## Risks and accepted trade-offs
+
+- **A correct token is refused while its bucket is gated.** Inherent to rate
+  limiting (see **Why the delay was not enough**), bounded by the spacing cap
+  (30 s), cleared by any successful evaluation, and forgotten after the window.
+  It only arises when the owner shares a source address with an attacker.
 
 - **Shared bucket.** Where clients share a source address, one attacker's
   failures slow everyone's *failed* attempts on that address. A correct token
