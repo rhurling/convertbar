@@ -547,38 +547,6 @@ fn read_bounded_tail(mut reader: impl Read) -> String {
 
 const ERROR_TAIL_LINES: usize = 20;
 
-/// Substrings that mark a line as the actual failure reason. HandBrake opens its
-/// stderr with a build banner and host-info preamble (none of which match these), so
-/// the first hit is the diagnostic rather than the noise above it.
-const DIAGNOSTIC_MARKERS: [&str; 18] = [
-    "error",
-    "failed",
-    "fatal",
-    "aborted",
-    "not found",
-    "no such file",
-    "no title",
-    "unrecognized",
-    "unsupported",
-    "invalid",
-    "corrupt",
-    "no space",
-    "read-only",
-    "permission denied",
-    "not permitted",
-    "cannot",
-    "could not",
-    "unable",
-];
-
-/// The first line that reads like a failure reason, or None if nothing stands out.
-fn diagnostic_headline<'a>(lines: &[&'a str]) -> Option<&'a str> {
-    lines.iter().copied().find(|line| {
-        let lower = line.to_lowercase();
-        DIAGNOSTIC_MARKERS.iter().any(|m| lower.contains(m))
-    })
-}
-
 /// A failure prefix plus the informative end of HandBrake's stderr, so the history
 /// entry says WHY the encode failed instead of just that it did. The diagnostic line
 /// is promoted to the headline because the UI truncates the entry to a single line —
@@ -591,33 +559,10 @@ fn message_with_tail(prefix: &str, tail: &str) -> String {
     }
     let start = lines.len().saturating_sub(ERROR_TAIL_LINES);
     let tail_block = lines[start..].join("\n");
-    match diagnostic_headline(&lines) {
+    match crate::failure_class::diagnostic_headline(&lines) {
         Some(headline) => format!("{prefix}: {headline}\n{tail_block}"),
         None => format!("{prefix}:\n{tail_block}"),
     }
-}
-
-/// The bare failure prefixes written before the diagnostic headline was promoted. A
-/// stored message whose first line is exactly one of these predates the change and
-/// still leads with HandBrake's banner. Kept in sync with the `message_with_tail`
-/// callers below.
-const LEGACY_ERROR_PREFIXES: [&str; 2] = [
-    "Conversion failed:",
-    "Conversion produced an empty output file:",
-];
-
-/// Rewrite a previously-stored error message so its first line is the failure reason
-/// instead of HandBrake's build banner. Returns None when the message is already
-/// headlined, isn't one of our messages, or has no recognizable diagnostic — which
-/// makes the backfill that calls this idempotent (a rewritten first line no longer
-/// matches a legacy prefix).
-pub(crate) fn promote_stored_diagnostic(message: &str) -> Option<String> {
-    let (first_line, body) = message.split_once('\n')?;
-    if !LEGACY_ERROR_PREFIXES.contains(&first_line) {
-        return None;
-    }
-    let headline = diagnostic_headline(&body.lines().collect::<Vec<_>>())?;
-    Some(format!("{first_line} {headline}\n{body}"))
 }
 
 fn error_message_from_tail(tail: &str) -> String {
@@ -2949,52 +2894,6 @@ HandBrake has exited.";
                 "the build banner must never win, got: {headline:?}"
             );
         }
-    }
-
-    #[test]
-    fn promote_stored_diagnostic_rewrites_old_banner_first_messages() {
-        let old = "Conversion failed:\n\
-                   [00:00:00] Compile-time hardening features are enabled\n\
-                   [mov] moov atom not found\n\
-                   No title found.";
-        let promoted =
-            promote_stored_diagnostic(old).expect("a banner-first legacy row should be rewritten");
-        assert_eq!(
-            promoted.lines().next().unwrap(),
-            "Conversion failed: [mov] moov atom not found"
-        );
-        assert!(promoted.contains("No title found."), "detail is preserved");
-        // Idempotent: a second pass over the rewritten message is a no-op.
-        assert_eq!(promote_stored_diagnostic(&promoted), None);
-    }
-
-    #[test]
-    fn promote_stored_diagnostic_leaves_foreign_messages_untouched() {
-        // Already headlined (space after the prefix, not a bare "prefix:").
-        assert_eq!(
-            promote_stored_diagnostic(
-                "Conversion failed: moov atom not found\nmoov atom not found"
-            ),
-            None
-        );
-        // Single-line generic fallback with no tail to promote from.
-        assert_eq!(promote_stored_diagnostic("Conversion failed"), None);
-        // Legacy shape but nothing diagnostic in the body — leave it rather than promote noise.
-        assert_eq!(
-            promote_stored_diagnostic("Conversion failed:\nScanning title 1\nOpening file"),
-            None
-        );
-        // The empty-output prefix is handled too.
-        assert_eq!(
-            promote_stored_diagnostic(
-                "Conversion produced an empty output file:\nbanner\nNo space left on device"
-            )
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap(),
-            "Conversion produced an empty output file: No space left on device"
-        );
     }
 
     #[test]

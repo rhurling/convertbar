@@ -517,6 +517,7 @@ name = "convertbar"
 version = "1.0.0"
 dependencies = [
  "chrono",
+ "convertbar-core",
  "dirs 6.0.0",
  "dunce",
  "fs4",
@@ -537,6 +538,23 @@ dependencies = [
  "tauri-plugin-window-state",
  "tempfile",
  "trash",
+ "uuid",
+]
+
+[[package]]
+name = "convertbar-core"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "dirs 6.0.0",
+ "dunce",
+ "fs4",
+ "notify",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
  "uuid",
 ]
 

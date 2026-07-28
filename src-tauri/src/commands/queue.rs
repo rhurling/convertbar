@@ -77,22 +77,7 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobInfo> {
     })
 }
 
-/// The cache key for a probe: the file's byte size + last-modified time (epoch millis).
-/// `None` when the file can't be stat'd or has no readable mtime — such a file has no
-/// stable identity and is probed every scan (handled by `resolve_media`'s forced-miss path).
-pub(crate) fn file_identity(path: &str) -> Option<crate::probe_cache::FileIdentity> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis() as i64;
-    Some(crate::probe_cache::FileIdentity {
-        size: meta.len() as i64,
-        mtime,
-    })
-}
+pub(crate) use crate::probe_cache::file_identity;
 
 /// Reads the configured `handbrake_path` setting, if any. DB-only — no filesystem or subprocess
 /// work — so this is safe to call under the mutex.
