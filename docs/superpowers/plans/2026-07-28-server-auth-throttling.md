@@ -1710,14 +1710,24 @@ CONVERTBAR_TRUSTED_PROXIES=172.18.0.5
 
 - [ ] **Step 3: Fix the compose example**
 
-`docker-compose.example.yml:7` currently suggests a 9-character token that the
-server now refuses. Replace that line:
+`docker-compose.example.yml:7` suggests `"change-me"`, a 9-character token the
+server now refuses at startup. **Keep it refusing.** Replace the line with a
+placeholder that also fails the floor:
 
 ```yaml
       # Generate with: openssl rand -base64 24
-      # Must be >=16 chars using >=8 distinct characters, or the server exits.
-      CONVERTBAR_AUTH_TOKEN: "REPLACE_ME_WITH_A_GENERATED_TOKEN"
+      # This placeholder is deliberately too weak: >=16 chars using >=8 distinct
+      # characters is required, so the server refuses to start until you replace it.
+      CONVERTBAR_AUTH_TOKEN: "CHANGE_ME"
 ```
+
+**Do not use a descriptive placeholder like `"REPLACE_ME_WITH_A_GENERATED_TOKEN"`** —
+at 33 characters and 17 distinct it *passes* `token_is_strong`, so a user who
+copies the file verbatim gets a booting server protected by a string published
+in a public repository. The old `"change-me"` failed loudly at startup; the
+replacement must preserve that fail-safe, not remove it. Verify whatever you
+write against `token_is_strong` rather than eyeballing it, and check the other
+template files (`unraid-template.xml`) for the same trap.
 
 - [ ] **Step 4: Update the Unraid template**
 
