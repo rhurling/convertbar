@@ -1,4 +1,18 @@
 [
+  {"command": "add_files",            "method": "POST",   "path": "/api/queue/files"},
+  {"command": "scan_folder",          "method": "POST",   "path": "/api/folders/scan"},
+  {"command": "confirm_folder_add",   "method": "POST",   "path": "/api/queue/folder"},
+  {"command": "classify_paths",       "method": "POST",   "path": "/api/paths/classify"},
+  {"command": "get_queue",            "method": "GET",    "path": "/api/queue"},
+  {"command": "remove_job",           "method": "DELETE", "path": "/api/queue/jobs/{id}"},
+  {"command": "reorder_queue",        "method": "PUT",    "path": "/api/queue/order"},
+  {"command": "clear_queue",          "method": "DELETE", "path": "/api/queue"},
+  {"command": "get_history",          "method": "GET",    "path": "/api/history"},
+  {"command": "get_history_summary",  "method": "GET",    "path": "/api/history/summary"},
+  {"command": "remove_history_entry", "method": "DELETE", "path": "/api/history/{id}"},
+  {"command": "clear_completed",      "method": "POST",   "path": "/api/history/clear"},
+  {"command": "get_bad_sources",      "method": "GET",    "path": "/api/bad-sources"},
+  {"command": "purge_bad_sources",    "method": "POST",   "path": "/api/bad-sources/purge"},
   {"command": "get_app_info", "method": "GET",  "path": "/api/info"},
   {"command": "login",        "method": "POST", "path": "/api/login"}
 ]

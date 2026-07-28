@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -9,7 +9,17 @@ use tokio::sync::broadcast;
 use crate::config::ServerConfig;
 
 pub mod events;
+pub mod history;
 pub mod info;
+pub mod queue;
+
+/// Maps a core `Err(String)` to the `500 {"error": ...}` shape shared by every route.
+pub fn core_err(e: String) -> (axum::http::StatusCode, Json<Value>) {
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e })),
+    )
+}
 
 /// State threaded through every axum handler. `events_tx` is fed by `ServerSink` (the
 /// `EventSink` the converter emits through) and consumed fresh per-request by the SSE
@@ -33,6 +43,19 @@ pub fn api_router(state: ServerState) -> Router {
     let api = Router::new()
         .route("/info", get(info::get_app_info))
         .route("/events", get(events::sse_handler))
+        .route("/queue/files", post(queue::add_files))
+        .route("/folders/scan", post(queue::scan_folder))
+        .route("/queue/folder", post(queue::confirm_folder_add))
+        .route("/paths/classify", post(queue::classify_paths))
+        .route("/queue", get(queue::get_queue).delete(queue::clear_queue))
+        .route("/queue/jobs/{id}", delete(queue::remove_job))
+        .route("/queue/order", put(queue::reorder_queue))
+        .route("/bad-sources", get(queue::get_bad_sources))
+        .route("/bad-sources/purge", post(queue::purge_bad_sources))
+        .route("/history", get(history::get_history))
+        .route("/history/summary", get(history::get_history_summary))
+        .route("/history/{id}", delete(history::remove_history_entry))
+        .route("/history/clear", post(history::clear_completed))
         .fallback(api_not_found);
 
     Router::new().nest("/api", api).with_state(state)
@@ -52,8 +75,11 @@ pub fn app(state: ServerState) -> Router {
     api_router(state).fallback(crate::embed::fallback)
 }
 
+// `pub(crate)` so sibling route modules' own `#[cfg(test)]` submodules (e.g.
+// `routes::events::tests`) can reach the shared helpers below via
+// `crate::routes::tests::test_state()`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use rusqlite::Connection;
@@ -65,9 +91,18 @@ mod tests {
 
     use super::*;
 
-    // Inlined for this task; Task 5 promotes this to a shared `test_state()` helper once
-    // more route modules need it.
-    fn test_state() -> ServerState {
+    /// Shared temp-db `ServerState` for every route module's integration tests. Drops its
+    /// own shutdown sender immediately, which is fine for anything that doesn't touch
+    /// `/api/events` — see `test_state_with_shutdown` for tests that need to control it.
+    pub(crate) fn test_state() -> ServerState {
+        test_state_with_shutdown().0
+    }
+
+    /// Same as `test_state`, but also returns the shutdown watch's sender. Needed by
+    /// `routes::events`'s tests, which flip the shutdown flag mid-test — dropping the
+    /// sender immediately (as `test_state` does) would flip `wait_for_shutdown` true on
+    /// first poll and end an SSE stream before any assertions ran.
+    pub(crate) fn test_state_with_shutdown() -> (ServerState, tokio::sync::watch::Sender<bool>) {
         let conn = Connection::open_in_memory().expect("open in-memory db");
         convertbar_core::db::init_db(&conn).expect("init db");
         let ctx = Ctx::new(
@@ -76,8 +111,8 @@ mod tests {
             Arc::new(RecordingDisposer::default()),
         );
         let (events_tx, _rx) = broadcast::channel(256);
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        ServerState {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = ServerState {
             ctx,
             config: Arc::new(
                 ServerConfig::from_vars(
@@ -87,7 +122,253 @@ mod tests {
             ),
             events_tx,
             shutdown_rx,
-        }
+        };
+        (state, shutdown_tx)
+    }
+
+    /// Sends `body` as a JSON request to `method`/`uri` against `app`, returning the
+    /// decoded response status and (if any) JSON body — `null` for an empty (e.g. 204)
+    /// body. Shared by every route test below to keep the request/response boilerplate
+    /// out of each individual test.
+    async fn request_json(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        let request_body = match body {
+            Some(v) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = app
+            .oneshot(builder.body(request_body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("response body must be valid JSON")
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn get_queue_when_empty_returns_an_empty_array() {
+        let (status, json) =
+            request_json(api_router(test_state()), "GET", "/api/queue", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!([]));
+    }
+
+    #[tokio::test]
+    async fn add_files_with_empty_paths_returns_empty_added_and_skipped() {
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!({"added": [], "skipped": []}));
+    }
+
+    #[tokio::test]
+    async fn remove_job_deletes_a_seeded_queued_row() {
+        let app = api_router(test_state());
+
+        // Seed via the real add_files route rather than raw SQL: a fake .mp4 path is
+        // enough to insert a 'queued' row (add_files_inner only checks the extension and
+        // stats the file for size — a missing file just yields a null original_size).
+        let (_, added) = request_json(
+            app.clone(),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/nonexistent/seed-video.mp4"]})),
+        )
+        .await;
+        let id = added["added"][0]["id"]
+            .as_str()
+            .expect("seeded job id")
+            .to_string();
+
+        let (status, _) = request_json(
+            app.clone(),
+            "DELETE",
+            &format!("/api/queue/jobs/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, queue) = request_json(app, "GET", "/api/queue", None).await;
+        assert_eq!(queue, json!([]), "removed job must be gone from the queue");
+    }
+
+    #[tokio::test]
+    async fn reorder_queue_accepts_camelcase_job_ids() {
+        let app = api_router(test_state());
+
+        let (_, added_a) = request_json(
+            app.clone(),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/nonexistent/a.mp4"]})),
+        )
+        .await;
+        let (_, added_b) = request_json(
+            app.clone(),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/nonexistent/b.mp4"]})),
+        )
+        .await;
+        let id_a = added_a["added"][0]["id"].as_str().unwrap().to_string();
+        let id_b = added_b["added"][0]["id"].as_str().unwrap().to_string();
+
+        // "jobIds" (camelCase) must deserialize into the request struct's `job_ids` field.
+        let (status, _) = request_json(
+            app.clone(),
+            "PUT",
+            "/api/queue/order",
+            Some(json!({"jobIds": [id_b.clone(), id_a.clone()]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, queue) = request_json(app, "GET", "/api/queue", None).await;
+        assert_eq!(queue[0]["id"], id_b, "b must now sort first");
+        assert_eq!(queue[1]["id"], id_a, "a must now sort second");
+    }
+
+    #[tokio::test]
+    async fn get_history_with_limit_and_offset_returns_an_empty_page() {
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "GET",
+            "/api/history?limit=10&offset=0",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!({"jobs": [], "total": 0}));
+    }
+
+    #[tokio::test]
+    async fn get_history_summary_when_empty_returns_zeroed_totals() {
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "GET",
+            "/api/history/summary",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!({"total_saved_bytes": 0, "total_files": 0}));
+    }
+
+    #[tokio::test]
+    async fn remove_history_entry_on_a_nonexistent_id_is_a_no_op_204() {
+        // remove_history_entry's DELETE is unconditional on row existence (matches
+        // remove_job); a nonexistent id simply deletes zero rows and still returns Ok(()).
+        let (status, _) = request_json(
+            api_router(test_state()),
+            "DELETE",
+            "/api/history/does-not-exist",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn clear_completed_and_clear_queue_return_204() {
+        let app = api_router(test_state());
+        let (status, _) = request_json(
+            app.clone(),
+            "POST",
+            "/api/history/clear",
+            Some(json!({"mode": "all"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = request_json(app, "DELETE", "/api/queue", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn get_bad_sources_when_empty_returns_an_empty_array() {
+        let (status, json) =
+            request_json(api_router(test_state()), "GET", "/api/bad-sources", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!([]));
+    }
+
+    #[tokio::test]
+    async fn purge_bad_sources_with_no_ids_returns_an_empty_array() {
+        // ids=[] never touches HandBrake resolution's outcome (the map iterator is empty),
+        // so this is deterministic regardless of whether HandBrakeCLI is on the test host.
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "POST",
+            "/api/bad-sources/purge",
+            Some(json!({"ids": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!([]));
+    }
+
+    #[tokio::test]
+    async fn classify_paths_with_no_paths_returns_empty_files_and_folders() {
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "POST",
+            "/api/paths/classify",
+            Some(json!({"paths": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!({"files": [], "folders": []}));
+    }
+
+    #[tokio::test]
+    async fn confirm_folder_add_on_an_empty_tempdir_adds_nothing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "POST",
+            "/api/queue/folder",
+            Some(json!({"path": dir.path().to_str().unwrap()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, json!({"added": [], "skipped": []}));
+    }
+
+    #[tokio::test]
+    async fn scan_folder_on_a_nonexistent_path_maps_the_core_error_to_500() {
+        // scan_folder deterministically errors on any non-directory path, unlike
+        // clear_completed (any mode string other than "errors" is treated as "all" and
+        // never errors) — chosen as the core-error-mapping proof for exactly that reason.
+        let (status, json) = request_json(
+            api_router(test_state()),
+            "POST",
+            "/api/folders/scan",
+            Some(json!({"path": "/definitely/does/not/exist-convertbar"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json, json!({"error": "Path is not a directory"}));
     }
 
     #[tokio::test]

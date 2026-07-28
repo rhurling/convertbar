@@ -57,53 +57,18 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::body::Body;
     use axum::http::Request;
     use futures_util::StreamExt;
-    use rusqlite::Connection;
     use serde_json::json;
     use tower::ServiceExt;
 
-    use convertbar_core::ctx::Ctx;
-    use convertbar_core::dispose::RecordingDisposer;
-    use convertbar_core::events::TestSink;
-
-    use crate::config::ServerConfig;
-    use crate::routes::{api_router, ServerState};
-
-    /// Local to this module until Task 5 promotes a shared helper (see `routes::mod`'s
-    /// own `test_state()`). Returns the shutdown sender too so tests can control it —
-    /// dropping it immediately would flip `wait_for_shutdown` true on first poll and end
-    /// the SSE stream before any assertions ran.
-    fn test_state() -> (ServerState, tokio::sync::watch::Sender<bool>) {
-        let conn = Connection::open_in_memory().expect("open in-memory db");
-        convertbar_core::db::init_db(&conn).expect("init db");
-        let ctx = Ctx::new(
-            conn,
-            Arc::new(TestSink::default()),
-            Arc::new(RecordingDisposer::default()),
-        );
-        let (events_tx, _rx) = tokio::sync::broadcast::channel(256);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = ServerState {
-            ctx,
-            config: Arc::new(
-                ServerConfig::from_vars(
-                    &[("CONVERTBAR_NO_AUTH".to_string(), "1".to_string())].into(),
-                )
-                .expect("valid test config"),
-            ),
-            events_tx,
-            shutdown_rx,
-        };
-        (state, shutdown_tx)
-    }
+    use crate::routes::api_router;
+    use crate::routes::tests::test_state_with_shutdown;
 
     #[tokio::test]
     async fn sse_route_streams_broadcast_events() {
-        let (state, _shutdown_tx) = test_state();
+        let (state, _shutdown_tx) = test_state_with_shutdown();
         let events_tx = state.events_tx.clone();
         let app = api_router(state);
 
@@ -141,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn sse_stream_ends_when_shutdown_flips() {
-        let (state, shutdown_tx) = test_state();
+        let (state, shutdown_tx) = test_state_with_shutdown();
         let app = api_router(state);
 
         let response = app
