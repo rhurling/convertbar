@@ -349,21 +349,25 @@ pub enum VersionDrift {
     Reconsent,
 }
 
-/// Whether a deferral may install a version other than the one it was registered for.
+/// Whether an install may proceed with a version other than the one that was consented to.
 ///
-/// A deferral can wait hours behind a draining queue — long enough for a new release to ship. The
-/// retry re-checks the endpoint and gets whatever is current now, so without this a user who
-/// pressed "Install and restart" on 2.0.0 would silently receive 2.1.0, still carrying their
-/// `user_requested` consent, while the panel went on showing 2.0.0's notes. Per-version consent
-/// is the whole point of Notify mode.
+/// Every install re-checks the endpoint immediately before downloading, so what it gets can differ
+/// from what consent was given for. Both windows are wide:
 ///
-/// An Automatic-mode deferral is different in kind: the user delegated the decision and never saw
-/// a version number, so demanding fresh consent there would break the mode's contract instead of
-/// honouring it.
-pub fn retry_version_drift(pending: &PendingInstall, offered: &str) -> VersionDrift {
-    if pending.update.version == offered {
+/// - a deferral waits behind a draining queue for as long as the batch takes, and
+/// - the panel's "Install and restart" button renders `runtime.available`, which only a check
+///   refreshes — so it can be a whole `CHECK_INTERVAL_SECS` (24h) stale when it is clicked.
+///
+/// Without this, a user who consented to 2.0.0 and read its notes silently receives 2.1.0.
+/// Per-version consent is the whole point of Notify mode.
+///
+/// A scheduler-decided install is different in kind: the user delegated the decision and was never
+/// shown a version number, so demanding fresh consent there would break Automatic mode's contract
+/// instead of honouring it.
+pub fn version_drift(consented: &str, user_consented: bool, offered: &str) -> VersionDrift {
+    if consented == offered {
         VersionDrift::Proceed
-    } else if pending.user_requested {
+    } else if user_consented {
         VersionDrift::Reconsent
     } else {
         VersionDrift::Adopt
@@ -1193,18 +1197,44 @@ pub async fn install_pending<R: tauri::Runtime>(
     };
     let meta = describe(&raw);
 
-    // Checked again after the network round trip, for the same reason as after the download —
-    // and against the *version*, not merely the existence of a deferral. A retry can sit behind a
-    // draining queue for hours, which is ample time for a newer release to ship, and the
-    // `pending_matches` check inside `perform_install` compares against this same fresh `meta`,
-    // so it would wave the substitution through by construction.
-    if trigger == InstallTrigger::Retry {
-        let Some(pending) = pending_of(&app) else {
-            return Err("the pending install was cancelled".into());
-        };
-        match retry_version_drift(&pending, &meta.version) {
-            VersionDrift::Proceed | VersionDrift::Adopt => {}
+    // Checked again after the network round trip, for the same reason as after the download — and
+    // against the *version*, not merely the existence of a deferral. `pending_matches` inside
+    // `perform_install` compares against this same fresh `meta`, so it would wave any substitution
+    // through by construction.
+    //
+    // What was consented to differs by trigger. A retry's consent is the deferral it is
+    // continuing; a click's is whatever the panel was rendering, which is `runtime.available` —
+    // refreshed only by a check, so up to CHECK_INTERVAL_SECS (24h) stale by the time the button
+    // is pressed. The button is the commoner path of the two, so it needs this at least as much.
+    let consented = match trigger {
+        InstallTrigger::Retry => match pending_of(&app) {
+            Some(pending) => Some((pending.update.version, pending.user_requested)),
+            None => return Err("the pending install was cancelled".into()),
+        },
+        // Always user consent by definition. `None` only when the panel had nothing on offer, in
+        // which case there is no displayed version to have consented to.
+        InstallTrigger::UserRequested => runtime
+            .available
+            .lock()
+            .ok()
+            .and_then(|a| a.clone())
+            .map(|u| (u.version, true)),
+    };
+    if let Some((consented_version, user_consented)) = consented {
+        match version_drift(&consented_version, user_consented, &meta.version) {
+            VersionDrift::Proceed => {}
+            VersionDrift::Adopt => {
+                // Automatic mode: install what is current. The panel must follow, or a re-deferred
+                // install would sit on "Downloaded — will install when the queue finishes" naming
+                // the superseded version.
+                if let Ok(mut a) = runtime.available.lock() {
+                    *a = Some(meta.clone());
+                }
+            }
             VersionDrift::Reconsent => {
+                // Hand it back to the user rather than installing something they never saw. The
+                // panel is still rendering the old version and its notes, so proceeding would
+                // install a version nobody read about.
                 set_pending(&app, None);
                 if let Ok(mut a) = runtime.available.lock() {
                     *a = Some(meta.clone());
@@ -1779,29 +1809,34 @@ mod tests {
     }
 
     #[test]
-    fn a_deferral_never_installs_a_version_the_user_did_not_consent_to() {
-        // LOAD-BEARING. A deferral waits behind a draining queue for as long as the batch takes —
-        // hours — and the retry re-checks the endpoint, so it gets whatever ships in the meantime.
-        let user = PendingInstall {
-            update: upd("2.0.0"),
-            user_requested: true,
-        };
-        assert_eq!(retry_version_drift(&user, "2.0.0"), VersionDrift::Proceed);
-        assert_eq!(retry_version_drift(&user, "2.1.0"), VersionDrift::Reconsent);
-        assert_eq!(retry_version_drift(&user, "1.9.0"), VersionDrift::Reconsent);
-
-        let scheduled = PendingInstall {
-            update: upd("2.0.0"),
-            user_requested: false,
-        };
+    fn an_install_never_substitutes_a_version_the_user_did_not_consent_to() {
+        // LOAD-BEARING, on both paths that reach it.
+        //
+        // A deferral waits behind a draining queue for as long as the batch takes, and a click on
+        // "Install and restart" acts on `runtime.available`, which only a check refreshes — so it
+        // can be a whole 24h stale. Both then re-check the endpoint and get whatever shipped in
+        // the meantime. The old guard asked only WHETHER a deferral existed, so 2.1.0 installed
+        // under 2.0.0's consent while the panel still showed 2.0.0's notes; `pending_matches`
+        // inside perform_install compares against the same fresh metadata, so it passes by
+        // construction and catches nothing.
+        assert_eq!(version_drift("2.0.0", true, "2.0.0"), VersionDrift::Proceed);
         assert_eq!(
-            retry_version_drift(&scheduled, "2.0.0"),
+            version_drift("2.0.0", true, "2.1.0"),
+            VersionDrift::Reconsent
+        );
+        // Downgrades are the same violation, not a special case.
+        assert_eq!(
+            version_drift("2.0.0", true, "1.9.0"),
+            VersionDrift::Reconsent
+        );
+
+        // A scheduler-decided install names no version to the user — they delegated the decision —
+        // so demanding fresh consent there would break Automatic mode instead of honouring it.
+        assert_eq!(
+            version_drift("2.0.0", false, "2.0.0"),
             VersionDrift::Proceed
         );
-        assert_eq!(
-            retry_version_drift(&scheduled, "2.1.0"),
-            VersionDrift::Adopt
-        );
+        assert_eq!(version_drift("2.0.0", false, "2.1.0"), VersionDrift::Adopt);
     }
 
     #[test]
