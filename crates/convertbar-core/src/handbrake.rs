@@ -46,6 +46,10 @@ pub fn detect_handbrake_path() -> Option<String> {
 /// Injected on [`crate::ctx::Ctx`] rather than called directly so that tests can state which
 /// world they are in. `detect_handbrake_path` shells out to `which`/`where`, i.e. it reads the
 /// machine the test happens to run on — which let five tests pass locally and fail in CI.
+///
+/// `locate()` may run while `ctx.db`'s mutex is held (`queue_ops::add_files_inner`,
+/// `converter::process_queue`). Implementations must not lock `ctx.db` or emit events:
+/// `std::sync::Mutex` is not reentrant, and the tray listener re-locks synchronously.
 pub trait HandbrakeLocator: Send + Sync {
     fn locate(&self) -> Option<String>;
 }

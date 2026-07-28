@@ -143,8 +143,12 @@ Both call sites run *under* the guard: `queue_ops.rs:790` takes the lock, `:823`
 releases it; `converter.rs:802` takes it, `:807` resolves, `:812` releases. Handing them `&Ctx`
 invites a resolver that re-locks `ctx.db` — and `std::sync::Mutex` is not reentrant, so that
 self-deadlocks. This is the same hazard class as the emit-under-db-lock invariant documented in
-CLAUDE.md, which cost two shipped deadlocks. The `&Connection` shape is what makes the re-entrancy
-impossible to write by accident.
+CLAUDE.md, which cost two shipped deadlocks. **Correction:** the `&Connection` shape only
+constrains the two resolver *functions* — they never see `ctx.db`, so they cannot re-lock it. It
+does not constrain the `&dyn HandbrakeLocator` trait object they call into: a locator can close
+over anything, including `Arc<Mutex<Connection>>`, independent of that parameter. The invariant is
+enforced by the doc comment on `HandbrakeLocator::locate` (`handbrake.rs`), not by the type
+system.
 
 Two consequences follow, both accepted rather than fixed here:
 
@@ -299,6 +303,17 @@ after, nothing committed):
   ...").
 
 Both mutations produced the predicted failure, so the guard is not decorative.
+
+**Static confirmation, stronger than the two runtime suite runs above:**
+`grep -rn "PathLocator\|detect_handbrake_path" crates src-tauri/src --include=*.rs` shows every
+test-side use of either name inside an `#[ignore]`d test —
+`converter.rs:2537,2540` (`process_queue_drives_a_real_encode_from_queued_to_done`),
+`converter.rs:2639` (`real_handbrake_flags_a_truncated_source_and_spares_the_original`),
+`queue_ops.rs:2394,2398` (`add_files_inner_skips_at_target_source_end_to_end`), and
+`probe.rs:377` (`probe_source_reads_real_clip`) — plus `PathLocator`'s own definition/impl in
+`handbrake.rs` and the two production injection sites (`convertbar-server/src/main.rs:44`,
+`src-tauri/src/lib.rs:96`). No non-`#[ignore]`d test can reach `detect_handbrake_path()` by any
+route.
 
 Frontend: `git diff --stat f3ca8b4 -- src/` (merge base with `origin/main`) is empty — no frontend
 files touched by this branch. `npm test` passes **206/206**.

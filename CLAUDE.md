@@ -10,6 +10,10 @@ Cargo workspace: `crates/convertbar-core` (head-agnostic engine: converter, watc
 
 Never emit a Tauri event while holding `ctx.db`'s lock (`crates/convertbar-core/src/control.rs:80-82` and sibling call sites): the desktop tray listener re-locks `ctx.db` synchronously on the same thread to read settings, and `std::sync::Mutex` is not reentrant, so holding the guard across an emit self-deadlocks. Pause/resume/cancel drop the `db` guard before emitting; `LockProbeSink` (a test double in `control.rs`) fails loud instead of hanging if this regresses. Two shipped deadlocks came from violating it.
 
+## HandBrake Locator Test Fixtures
+
+Test fixtures default to `PanickingLocator` (`crates/convertbar-core/src/handbrake.rs`): a test that reaches HandBrake resolution without declaring its world fails loud instead of silently reading whatever the host has installed. Declare the world explicitly — `AbsentLocator` for the CI world, `StubLocator` for the installed world, `PathLocator` only in `#[ignore]`d tests that genuinely want the host binary. On the queue thread (`process_queue` runs on a spawned thread), a `PanickingLocator` panic poisons `ctx.db`, so the test thread's own `.lock().unwrap()` on that mutex can surface a `PoisonError` instead of the locator's message — a confusing poison error there is a hint to check for a missing locator declaration before chasing something else.
+
 ## Version Bump Workflow
 
 `main` is protected (changes via PR, no merge commits, signed commits). Use the `/release` skill, or run the script it wraps:

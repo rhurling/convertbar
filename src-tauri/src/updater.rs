@@ -1863,7 +1863,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
         // `Ctx` carries the db and the converter state that used to be managed separately; the
-        // sink and disposer are the core test doubles and are unused by the updater.
+        // sink, disposer, and locator are the core test doubles and are unused by the updater.
         app.manage(Ctx::new(
             conn,
             std::sync::Arc::new(convertbar_core::events::TestSink::default()),
