@@ -1,26 +1,17 @@
-pub(crate) use convertbar_core::{
-    add_progress, converter, db, failure_class, handbrake, media_skip, probe, probe_cache, types,
-    watcher,
-};
+pub(crate) use convertbar_core::{converter, db, handbrake, probe, types, watcher};
 
 mod commands;
 mod sink;
 
 use convertbar_core::ctx::Ctx;
 use convertbar_core::events::EventSink;
-use converter::{ConverterState, MenuBarUpdate};
+use converter::MenuBarUpdate;
 use rusqlite::Connection;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Listener, Manager};
 use tauri_plugin_updater::UpdaterExt;
-
-pub struct AppState {
-    pub db: Arc<Mutex<Connection>>,
-    pub preset_cache: Mutex<HashMap<String, handbrake::PresetMetadata>>,
-}
 
 /// Truncate a filename for the tray title on a char boundary — byte slicing panics
 /// mid-codepoint on multi-byte names (umlauts, CJK, emoji), crashing the tray updater.
@@ -105,12 +96,6 @@ pub fn run() {
             let events: Arc<dyn EventSink> = Arc::new(sink::TauriSink(app.handle().clone()));
             let ctx = Ctx::new(conn, events, Arc::new(sink::TrashDisposer));
             app.manage(ctx.clone());
-            // Transitional dual-manage — same Arcs, so there is one db and one ConverterState:
-            app.manage(AppState {
-                db: ctx.db.clone(),
-                preset_cache: Mutex::new(HashMap::new()),
-            });
-            app.manage(ctx.converter.clone());
 
             // Shared error flag for tray icon state
             let has_error: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
@@ -141,7 +126,7 @@ pub fn run() {
                                 let mut err = has_error.lock().unwrap();
                                 if *err {
                                     *err = false;
-                                    let conv = app.state::<Arc<ConverterState>>();
+                                    let conv = &app.state::<Arc<Ctx>>().converter;
                                     let is_running = *conv.is_running.lock().unwrap();
                                     if !is_running {
                                         if let Some(tray) = app.tray_by_id("main") {
@@ -215,7 +200,7 @@ pub fn run() {
                                         let mut err = has_error.lock().unwrap();
                                         if *err {
                                             *err = false;
-                                            let conv = app.state::<Arc<ConverterState>>();
+                                            let conv = &app.state::<Arc<Ctx>>().converter;
                                             let is_running = *conv.is_running.lock().unwrap();
                                             if !is_running {
                                                 let _ = tray_icon.set_title(Some(""));
@@ -234,7 +219,7 @@ pub fn run() {
             // Listen for menu-bar-update events to update tray title/tooltip
             let tray_id = tray.id().clone();
             let app_handle = app.handle().clone();
-            let db_for_tray = app.state::<AppState>().db.clone();
+            let db_for_tray = ctx.db.clone();
             let error_flag = has_error.clone();
             app.listen("menu-bar-update", move |event| {
                 if let Ok(update) = serde_json::from_str::<MenuBarUpdate>(event.payload()) {

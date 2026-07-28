@@ -521,7 +521,6 @@ dependencies = [
  "dirs 6.0.0",
  "dunce",
  "fs4",
- "notify",
  "regex",
  "rusqlite",
  "serde",
