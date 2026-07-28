@@ -657,4 +657,61 @@ mod tests {
         assert!(events.contains(&"job-status-changed".to_string()));
         assert!(events.contains(&"menu-bar-update".to_string()));
     }
+
+    // Regression test: a user pause must release the updater's drain claim, not just record the
+    // pause. `set_queue_paused` alone would leave `update_drain_pause` standing, and a failed
+    // install (or the next launch) would then lift a pause the user set deliberately.
+    #[cfg(unix)]
+    #[test]
+    fn pause_conversion_releases_the_updaters_drain_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.mp4");
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('j1', ?1, ?1, 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            params![source.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let ctx = test_ctx(conn);
+
+        // Stand in for an "Install and restart" drain armed before the user's own Pause.
+        {
+            let db = ctx.db.lock().unwrap();
+            converter::set_drain_pause(&db, true);
+        }
+
+        // Stand-in for the paused encode's process, same as the tray-emit test above.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".to_string());
+
+        pause_conversion(&ctx).unwrap();
+
+        // Clean up: the child is SIGSTOPed from pause_conversion above, so CONT before kill.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGCONT);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let db = ctx.db.lock().unwrap();
+        assert!(
+            converter::is_queue_paused(&db),
+            "the user's pause must be recorded"
+        );
+        assert!(
+            !converter::read_drain_pause(&db),
+            "pause_conversion must release the updater's drain claim (set_user_queue_pause), or \
+             a failed install / the next launch would lift the pause the user just set"
+        );
+    }
 }
