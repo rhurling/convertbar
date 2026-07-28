@@ -1,0 +1,4 @@
+[
+  {"command": "get_app_info", "method": "GET",  "path": "/api/info"},
+  {"command": "login",        "method": "POST", "path": "/api/login"}
+]
