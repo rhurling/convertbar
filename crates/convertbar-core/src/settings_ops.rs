@@ -144,12 +144,15 @@ pub fn update_setting(ctx: &Ctx, key: &str, value: &str) -> Result<(), String> {
     if !ALLOWED_KEYS.contains(&key) {
         return Err(format!("Invalid setting key: {}", key));
     }
-    let conn = ctx.db.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
-        params![key, value],
-    )
-    .map_err(|e| e.to_string())?;
+    {
+        let conn = ctx.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )
+        .map_err(|e| e.to_string())?;
+    } // conn must be dropped before refresh_skip_marker: it re-locks ctx.db on this same thread,
+      // and std::sync::Mutex is not reentrant — holding the guard here self-deadlocks.
 
     // Let the running watcher pick up a changed skip-marker name without a restart.
     if key == "watch_skip_marker" {
@@ -162,12 +165,35 @@ pub fn update_setting(ctx: &Ctx, key: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispose::RecordingDisposer;
+    use crate::events::TestSink;
     use rusqlite::Connection;
+    use std::sync::Arc;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
         conn
+    }
+
+    /// Same harness as `queue_ops.rs`/`watcher.rs`'s tests: a `Ctx` backed by an in-memory DB, a
+    /// `TestSink` for event assertions, and a `RecordingDisposer` (unused here, but required by
+    /// `Ctx::new`).
+    fn test_ctx(conn: Connection) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
+        let sink = Arc::new(TestSink::default());
+        let disposer = Arc::new(RecordingDisposer::default());
+        let ctx = Ctx::new(conn, sink.clone(), disposer.clone());
+        (ctx, sink, disposer)
+    }
+
+    #[test]
+    fn update_setting_refreshes_the_watcher_skip_marker() {
+        let (ctx, _sink, _d) = test_ctx(test_conn());
+        update_setting(&ctx, "watch_skip_marker", ".uploading").unwrap();
+        assert_eq!(
+            ctx.watcher.skip_marker.lock().unwrap().as_deref(),
+            Some(".uploading")
+        );
     }
 
     #[test]
