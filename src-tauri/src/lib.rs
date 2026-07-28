@@ -1,10 +1,10 @@
 pub(crate) use convertbar_core::{
     add_progress, converter, db, failure_class, handbrake, media_skip, probe, probe_cache, types,
+    watcher,
 };
 
 mod commands;
 mod sink;
-mod watcher;
 
 use convertbar_core::ctx::Ctx;
 use convertbar_core::events::EventSink;
@@ -53,7 +53,6 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
-        .manage(watcher::WatcherState::new())
         .invoke_handler(tauri::generate_handler![
             commands::settings::get_settings,
             commands::settings::update_setting,
@@ -373,7 +372,7 @@ pub fn run() {
             }
 
             // Arm directory watchers and ingest any files already present in enabled folders.
-            watcher::start(app.handle().clone());
+            watcher::start(ctx.clone());
 
             // Check for updates on startup. Install stays automatic (decision D5),
             // but the user is told an update landed instead of it being invisible;

@@ -1,4 +1,6 @@
+use convertbar_core::ctx::Ctx;
 use rusqlite::params;
+use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
 
@@ -97,6 +99,7 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
 pub fn update_setting(
     app: AppHandle,
     state: State<'_, AppState>,
+    ctx: State<'_, Arc<Ctx>>,
     key: String,
     value: String,
 ) -> Result<(), String> {
@@ -122,7 +125,7 @@ pub fn update_setting(
 
     // Let the running watcher pick up a changed skip-marker name without a restart.
     if key == "watch_skip_marker" {
-        crate::watcher::refresh_skip_marker(&app);
+        crate::watcher::refresh_skip_marker(&ctx);
     }
 
     Ok(())

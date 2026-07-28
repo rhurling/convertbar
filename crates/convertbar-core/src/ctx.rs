@@ -13,6 +13,7 @@ pub struct Ctx {
     /// (settings preview, add_files' suffix resolution) so a preset's metadata is fetched from
     /// HandBrakeCLI at most once per process lifetime.
     pub preset_cache: Mutex<HashMap<String, crate::handbrake::PresetMetadata>>,
+    pub watcher: crate::watcher::WatcherState,
 }
 
 impl Ctx {
@@ -27,6 +28,7 @@ impl Ctx {
             events,
             disposer,
             preset_cache: Mutex::new(HashMap::new()),
+            watcher: crate::watcher::WatcherState::new(),
         })
     }
 }
