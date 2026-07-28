@@ -685,13 +685,22 @@ mod throttle_tests {
 
     #[test]
     fn a_very_long_run_of_failures_does_not_overflow() {
-        // `base << (n-1)` overflows fast; the shift must be guarded.
+        // `base << (n-1)` overflows once n-1 reaches 32, so the shift must be
+        // guarded. Iterate well past that point — and only assert the cap from
+        // failure 7 on, because failures 1-6 are still climbing the ramp
+        // (500ms, 1s, 2s, 4s, 8s, 16s) and asserting the cap on those would make
+        // the test die at iteration 1, never reaching the code it exists to pin.
         let t = LoginThrottle::new(policy());
         let now = Instant::now();
         let a = id("10.0.0.1");
-        for _ in 0..200 {
-            assert_eq!(t.record_failure(a, now), Duration::from_secs(30));
+        let mut last = Duration::ZERO;
+        for i in 1..=200u32 {
+            last = t.record_failure(a, now);
+            if i >= 7 {
+                assert_eq!(last, Duration::from_secs(30), "failure #{i} left the cap");
+            }
         }
+        assert_eq!(last, Duration::from_secs(30));
     }
 
     #[test]
