@@ -8,16 +8,20 @@ use tokio::sync::broadcast;
 
 use crate::config::ServerConfig;
 
+pub mod events;
 pub mod info;
 
-/// State threaded through every axum handler. `events_tx` has no subscriber until Task 3
-/// wires `ServerSink` + the SSE route, but the channel exists from this task so the
-/// struct is total (no `Option` to unwrap at every call site).
+/// State threaded through every axum handler. `events_tx` is fed by `ServerSink` (the
+/// `EventSink` the converter emits through) and consumed fresh per-request by the SSE
+/// route. `shutdown_rx` flips to `true` when the server begins graceful shutdown; the
+/// SSE route watches it so an open `/api/events` connection doesn't block the drain
+/// forever (the sender lives in `main.rs`, wired up in a later task).
 #[derive(Clone)]
 pub struct ServerState {
     pub ctx: Arc<convertbar_core::ctx::Ctx>,
     pub config: Arc<ServerConfig>,
     pub events_tx: broadcast::Sender<(String, Value)>,
+    pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Nests all `/api` routes; the caller (`main.rs`) adds the static/embed fallback.
@@ -28,6 +32,7 @@ pub fn api_router(state: ServerState) -> Router {
     // with 200 instead of a 404.
     let api = Router::new()
         .route("/info", get(info::get_app_info))
+        .route("/events", get(events::sse_handler))
         .fallback(api_not_found);
 
     Router::new().nest("/api", api).with_state(state)
@@ -71,6 +76,7 @@ mod tests {
             Arc::new(RecordingDisposer::default()),
         );
         let (events_tx, _rx) = broadcast::channel(256);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         ServerState {
             ctx,
             config: Arc::new(
@@ -80,6 +86,7 @@ mod tests {
                 .expect("valid test config"),
             ),
             events_tx,
+            shutdown_rx,
         }
     }
 

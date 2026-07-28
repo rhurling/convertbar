@@ -1,23 +1,16 @@
 mod config;
 mod embed;
 mod routes;
+mod sink;
 
 use std::sync::Arc;
 
 use convertbar_core::dispose::DeleteDisposer;
-use convertbar_core::events::EventSink;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use config::{ConfigError, ServerConfig};
 use routes::ServerState;
-
-/// Placeholder event sink until Task 3 wires the real broadcast-backed `ServerSink`.
-struct NullSink;
-
-impl EventSink for NullSink {
-    fn emit(&self, _event: &str, _payload: serde_json::Value) {}
-    fn notify(&self, _title: &str, _body: &str) {}
-}
+use sink::ServerSink;
 
 #[tokio::main]
 async fn main() {
@@ -41,14 +34,24 @@ async fn main() {
     let conn = rusqlite::Connection::open(&db_path).expect("open database");
     convertbar_core::db::init_db(&conn).expect("initialize database");
 
-    let ctx = convertbar_core::ctx::Ctx::new(conn, Arc::new(NullSink), Arc::new(DeleteDisposer));
     let (events_tx, _rx) = broadcast::channel(256);
+    let ctx = convertbar_core::ctx::Ctx::new(
+        conn,
+        Arc::new(ServerSink(events_tx.clone())),
+        Arc::new(DeleteDisposer),
+    );
+    // The sender is unused until a later task wires it into the shutdown-signal path
+    // (SIGTERM/SIGINT handler flips it to `true`). It must stay alive for the server's
+    // lifetime regardless: dropping it here would flip every SSE stream's shutdown watch
+    // to "sender gone" immediately, ending them right away instead of on real shutdown.
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let bind = config.bind;
 
     let state = ServerState {
         ctx,
         config: Arc::new(config),
         events_tx,
+        shutdown_rx,
     };
 
     let app = routes::app(state);

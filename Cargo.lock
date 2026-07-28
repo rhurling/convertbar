@@ -661,6 +661,7 @@ dependencies = [
  "axum-extra",
  "constant_time_eq",
  "convertbar-core",
+ "futures-util",
  "mime_guess",
  "rusqlite",
  "rust-embed",
