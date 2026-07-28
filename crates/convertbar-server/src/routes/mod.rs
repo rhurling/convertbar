@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
+use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
-use serde_json::Value;
+use axum::{Json, Router};
+use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::config::ServerConfig;
@@ -21,9 +22,29 @@ pub struct ServerState {
 
 /// Nests all `/api` routes; the caller (`main.rs`) adds the static/embed fallback.
 pub fn api_router(state: ServerState) -> Router {
-    let api = Router::new().route("/info", get(info::get_app_info));
+    // A nested router with no `.fallback()` of its own inherits the OUTER router's
+    // fallback (axum 0.8 documented behavior) — without this, an unmatched `/api/*`
+    // path would fall through to the SPA embed handler and could serve `index.html`
+    // with 200 instead of a 404.
+    let api = Router::new()
+        .route("/info", get(info::get_app_info))
+        .fallback(api_not_found);
 
     Router::new().nest("/api", api).with_state(state)
+}
+
+async fn api_not_found() -> impl IntoResponse {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({"error": "not found"})),
+    )
+}
+
+/// The full app: `api_router` plus the embedded SPA fallback, exactly as `main.rs` serves
+/// it. Factored out so tests can exercise the real composition (nest + outer fallback
+/// together) rather than `api_router` alone.
+pub fn app(state: ServerState) -> Router {
+    api_router(state).fallback(crate::embed::fallback)
 }
 
 #[cfg(test)]
@@ -88,5 +109,36 @@ mod tests {
         assert_eq!(json["can_pause_process"], cfg!(unix));
         // AuthMode::Open in test_state() -> auth is not required.
         assert_eq!(json["auth_required"], false);
+    }
+
+    /// Regression: a nested router with no `.fallback()` of its own inherits the OUTER
+    /// router's fallback (axum 0.8 documented behavior). Without an api-specific
+    /// fallback, an unmatched `/api/*` path fell through to the SPA embed handler and
+    /// would serve `index.html` with 200 once `dist-web` is populated in production —
+    /// silently masked in tests because an empty `dist-web` makes the SPA fallback 404
+    /// too. Asserting a JSON error body (not just a 404 status) proves the response came
+    /// from the api fallback, not the embed one, regardless of `dist-web`'s contents.
+    #[tokio::test]
+    async fn unregistered_api_path_returns_json_404_not_the_spa_fallback() {
+        let app = app(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value =
+            serde_json::from_slice(&body).expect("api fallback must return a JSON body");
+        assert_eq!(json["error"], "not found");
     }
 }

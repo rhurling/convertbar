@@ -51,7 +51,7 @@ async fn main() {
         events_tx,
     };
 
-    let app = routes::api_router(state).fallback(embed::fallback);
+    let app = routes::app(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
