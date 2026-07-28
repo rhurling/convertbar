@@ -89,7 +89,12 @@ pub fn run() {
             db::init_db(&conn).expect("Failed to initialize database");
 
             let events: Arc<dyn EventSink> = Arc::new(sink::TauriSink(app.handle().clone()));
-            let ctx = Ctx::new(conn, events, Arc::new(sink::TrashDisposer));
+            let ctx = Ctx::new(
+                conn,
+                events,
+                Arc::new(sink::TrashDisposer),
+                Arc::new(convertbar_core::handbrake::PathLocator),
+            );
             app.manage(ctx.clone());
 
             // Shared error flag for tray icon state

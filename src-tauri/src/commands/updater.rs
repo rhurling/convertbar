@@ -68,6 +68,7 @@ mod tests {
             conn,
             Arc::new(convertbar_core::events::TestSink::default()),
             Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
+            Arc::new(convertbar_core::handbrake::PanickingLocator),
         ));
         let runtime = Arc::new(UpdaterRuntime::default());
         *runtime.pending.lock().unwrap() = Some(PendingInstall {
@@ -128,6 +129,7 @@ mod tests {
             rusqlite::Connection::open_in_memory().unwrap(),
             Arc::new(convertbar_core::events::TestSink::default()),
             Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
+            Arc::new(convertbar_core::handbrake::PanickingLocator),
         );
         let converter = ctx.converter.clone();
         let child = long_running_child();

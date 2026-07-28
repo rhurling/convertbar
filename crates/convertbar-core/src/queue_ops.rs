@@ -89,23 +89,15 @@ fn read_configured_handbrake_path(conn: &rusqlite::Connection) -> Option<String>
     .ok()
 }
 
-/// Resolves the actual HandBrakeCLI path from an already-read configured setting: an existence
-/// check, falling back to `detect_handbrake_path`'s `which`/`where` subprocess spawn when the
-/// configured path is absent/missing/gone. Filesystem/subprocess work only — no DB access — so
-/// this is meant to run OUTSIDE the DB mutex (see R3 in `purge_bad_sources`'s doc comment: this
-/// used to run per id, under the lock, in both purge phases — up to 2N blocking spawns for a
-/// batch of N ids).
-fn resolve_from_configured(configured: Option<&str>) -> Result<String, String> {
-    if let Some(path) = configured {
-        if !path.is_empty() && std::path::Path::new(path).exists() {
-            return Ok(path.to_string());
-        }
-    }
-    handbrake::detect_handbrake_path().ok_or_else(|| "HandBrakeCLI not found".to_string())
-}
-
-fn get_handbrake_path(conn: &rusqlite::Connection) -> Result<String, String> {
-    resolve_from_configured(read_configured_handbrake_path(conn).as_deref())
+/// Takes the locator as a parameter rather than a `&Ctx`: this runs *under* the DB guard at its
+/// `add_files_inner` call site, and a `&Ctx`-taking resolver would invite re-locking the
+/// non-reentrant `ctx.db` mutex there.
+fn get_handbrake_path(
+    conn: &rusqlite::Connection,
+    locator: &dyn handbrake::HandbrakeLocator,
+) -> Result<String, String> {
+    handbrake::resolve_with_locator(read_configured_handbrake_path(conn).as_deref(), locator)
+        .ok_or_else(|| "HandBrakeCLI not found".to_string())
 }
 
 /// Whether a row's verdict should be re-verified with a fresh scan before its file is
@@ -820,7 +812,7 @@ pub fn add_files_inner(
         // Source-media skip also needs the target preset metadata, so fetch HandBrake when
         // either the suffix template or the skip toggle requires it.
         let hb_path = if suffix_template.contains('{') || skip_by_source_media {
-            get_handbrake_path(&conn).ok()
+            get_handbrake_path(&conn, &*ctx.handbrake).ok()
         } else {
             None
         };
@@ -1256,11 +1248,12 @@ pub fn purge_bad_sources(ctx: &Arc<Ctx>, ids: Vec<String>) -> Result<Vec<PurgeRe
     };
     let action = PurgeAction::from_setting(&action);
     // R3: resolved ONCE for the whole batch, OUTSIDE the lock, and passed to every
-    // `purge_one_locked` call below. `resolve_from_configured`'s fallback spawns a blocking
-    // `which`/`where` subprocess (`detect_handbrake_path`) — this used to run per id, under
-    // the DB mutex, in both purge phases, i.e. up to 2N blocking spawns under the lock for a
-    // batch of N ids.
-    let handbrake_path = resolve_from_configured(configured_handbrake_path.as_deref());
+    // `purge_one_locked` call below — the fallback can spawn a blocking `which`/`where`
+    // subprocess (`PathLocator`), and this used to run per id, under the DB mutex, in both
+    // purge phases, i.e. up to 2N blocking spawns under the lock for a batch of N ids.
+    let handbrake_path =
+        handbrake::resolve_with_locator(configured_handbrake_path.as_deref(), &*ctx.handbrake)
+            .ok_or_else(|| "HandBrakeCLI not found".to_string());
     Ok(ids
         .iter()
         .map(|id| PurgeResult {
@@ -1420,6 +1413,7 @@ mod tests {
     use super::*;
     use crate::dispose::{DeleteDisposer, RecordingDisposer};
     use crate::events::TestSink;
+    use crate::handbrake::{AbsentLocator, StubLocator};
     use rusqlite::Connection;
     use std::path::Path;
 
@@ -1433,9 +1427,18 @@ mod tests {
     /// `TestSink` for event assertions, and a `RecordingDisposer` (records then deletes) so
     /// destructive-path tests can assert dispose calls without touching the real OS Trash.
     fn test_ctx(conn: Connection) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
+        test_ctx_with_locator(conn, Arc::new(crate::handbrake::PanickingLocator))
+    }
+
+    /// `test_ctx` for tests that actually reach HandBrake resolution and must therefore say
+    /// which world they are in, rather than inheriting whatever the host has installed.
+    fn test_ctx_with_locator(
+        conn: Connection,
+        locator: Arc<dyn crate::handbrake::HandbrakeLocator>,
+    ) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
         let sink = Arc::new(TestSink::default());
         let disposer = Arc::new(RecordingDisposer::default());
-        let ctx = Ctx::new(conn, sink.clone(), disposer.clone());
+        let ctx = Ctx::new(conn, sink.clone(), disposer.clone(), locator);
         (ctx, sink, disposer)
     }
 
@@ -1634,15 +1637,29 @@ mod tests {
         );
     }
 
-    // Pins the RAII bracketing Plan 1 preserved by hand: `AddOp`'s `add-finished` fires on Drop
-    // (before the `queue-updated` emit that follows it in `add_files`), so the UI spinner always
-    // clears before the queue refetch signal — even for a trivially empty add.
     #[test]
-    fn add_files_emits_finished_before_queue_updated() {
-        let (ctx, sink, _d) = test_ctx(test_conn());
-        // Pin a literal suffix so add_files_inner never needs to resolve HandBrakeCLI
-        // (the default suffix template contains `{...}` placeholders, which would
-        // otherwise make this test depend on HandBrakeCLI being installed).
+    fn add_files_inner_reports_handbrake_missing_when_the_suffix_needs_a_probe() {
+        // The default suffix template contains {...} placeholders, so intake must resolve HandBrake
+        // to expand them. With HandBrake absent the caller gets a named error — not a panic, and
+        // not a silent success that would write files with an unexpanded literal suffix.
+        let (ctx, _sink, _disposer) = test_ctx_with_locator(test_conn(), Arc::new(AbsentLocator));
+        let err = add_files_inner(&ctx, &["/tmp/whatever.mkv".to_string()], None).expect_err(
+            "intake must fail when the suffix template needs HandBrake and it is absent",
+        );
+        assert!(err.contains("HandBrakeCLI not found"), "got: {err}");
+    }
+
+    #[test]
+    fn add_files_inner_with_a_literal_suffix_never_resolves_handbrake() {
+        // Before this branch, three tests incidentally covered the "literal suffix -> don't
+        // resolve HandBrake at all" branch (the `suffix_template.contains('{') ||
+        // skip_by_source_media` guard above) via a pinned `.conv`-style suffix; all three pins are
+        // gone now (see the locator-seam design doc) and nothing else exercises it. Built with the
+        // plain `test_ctx` (the `PanickingLocator` default) rather than a declared world on
+        // purpose: if this guard were ever removed or broken, resolution would be reached and the
+        // fixture default would panic instead of this assertion quietly passing for the wrong
+        // reason — the cleanest demonstration in the suite that the guard is a real guard.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
         let preset: String = ctx
             .db
             .lock()
@@ -1651,7 +1668,29 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        crate::settings_ops::set_preset_suffix(&ctx, &preset, ".conv").unwrap();
+        crate::settings_ops::set_preset_suffix(&ctx, &preset, "-conv").unwrap();
+
+        let result = add_files_inner(&ctx, &["/movies/clip.mp4".to_string()], None);
+        assert!(
+            result.is_ok(),
+            "a literal suffix must never reach HandBrake resolution, got: {result:?}"
+        );
+    }
+
+    // Pins the RAII bracketing Plan 1 preserved by hand: `AddOp`'s `add-finished` fires on Drop
+    // (before the `queue-updated` emit that follows it in `add_files`), so the UI spinner always
+    // clears before the queue refetch signal — even for a trivially empty add.
+    #[test]
+    fn add_files_emits_finished_before_queue_updated() {
+        // The installed world, exercising the real default (templated) suffix — the pinned
+        // literal suffix this test used to carry meant it never expanded a template at all.
+        let (ctx, sink, _d) = test_ctx_with_locator(
+            test_conn(),
+            Arc::new(StubLocator("/opt/fake/HandBrakeCLI".into())),
+        );
+        // Without the seed the stub path would be shelled out to and intake would return Err,
+        // swallowing the queue-updated emit this test asserts on.
+        crate::handbrake::seed_preset_cache(&ctx);
 
         // an empty add still brackets: add-started → add-finished → queue-updated
         let _ = add_files(&ctx, &[]);
@@ -2352,7 +2391,11 @@ mod tests {
             [],
         )
         .unwrap();
-        let (ctx, _sink, _disposer) = test_ctx(conn);
+        // PathLocator, not the fixture default: this e2e genuinely wants the host's real
+        // HandBrakeCLI to probe the synthesized clips — the one place reading the machine is
+        // the point rather than an accident.
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(conn, Arc::new(crate::handbrake::PathLocator));
         // Pin the target to h265/1080p without shelling out to HandBrake for preset metadata.
         ctx.preset_cache.lock().unwrap().insert(
             preset,
@@ -2532,9 +2575,9 @@ mod tests {
     /// `purge_bad_sources`). This mirrors that same resolution for tests whose row's class
     /// actually reaches the rescan rung and needs a real answer (from the `handbrake_path`
     /// setting the test configured).
-    fn resolve_handbrake_for_test(db: &Arc<Mutex<Connection>>) -> Result<String, String> {
-        let conn = db.lock().unwrap();
-        get_handbrake_path(&conn)
+    fn resolve_handbrake_for_test(ctx: &Arc<Ctx>) -> Result<String, String> {
+        let conn = ctx.db.lock().unwrap();
+        get_handbrake_path(&conn, &*ctx.handbrake)
     }
 
     /// Placeholder for `purge_one_locked` tests whose row never reaches the rescan rung (blocked
@@ -2830,7 +2873,11 @@ mod tests {
         let p = f.to_str().unwrap().to_string();
         insert_error_row(&conn, "old", &p, "bad_source_truncated");
         stamp_identity(&conn, "old", &p);
-        let (ctx, _sink, disposer) = test_ctx(conn);
+        // The assertion is about the disposer, not about HandBrake: this row's class is
+        // bad_source_truncated, which never reaches the rescan rung, so the resolved path is
+        // never consumed. AbsentLocator says so instead of letting the host answer.
+        let (ctx, _sink, disposer) =
+            test_ctx_with_locator(conn, Arc::new(crate::handbrake::AbsentLocator));
 
         let results = purge_bad_sources(&ctx, vec!["old".to_string()]).unwrap();
 
@@ -2936,11 +2983,11 @@ mod tests {
             params![dir.path().to_str().unwrap()],
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let handbrake_path = resolve_handbrake_for_test(&db);
+        let (ctx, _sink, _disposer) = test_ctx(conn);
+        let handbrake_path = resolve_handbrake_for_test(&ctx);
 
         let outcome = purge_one_locked(
-            &db,
+            &ctx.db,
             "old",
             PurgeAction::Delete,
             &handbrake_path,
@@ -3067,11 +3114,11 @@ mod tests {
             params![script.to_str().unwrap()],
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let handbrake_path = resolve_handbrake_for_test(&db);
+        let (ctx, _sink, _disposer) = test_ctx(conn);
+        let handbrake_path = resolve_handbrake_for_test(&ctx);
 
         let outcome = purge_one_locked(
-            &db,
+            &ctx.db,
             "old",
             PurgeAction::Delete,
             &handbrake_path,
@@ -3112,11 +3159,11 @@ mod tests {
             params![script.to_str().unwrap()],
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let handbrake_path = resolve_handbrake_for_test(&db);
+        let (ctx, _sink, _disposer) = test_ctx(conn);
+        let handbrake_path = resolve_handbrake_for_test(&ctx);
 
         let outcome = purge_one_locked(
-            &db,
+            &ctx.db,
             "old",
             PurgeAction::Delete,
             &handbrake_path,
@@ -3133,13 +3180,14 @@ mod tests {
         );
         // F12: a file just proved healthy must not sit in "Bad sources" forever.
         assert!(
-            get_bad_sources_inner(&db.lock().unwrap())
+            get_bad_sources_inner(&ctx.db.lock().unwrap())
                 .unwrap()
                 .is_empty(),
             "a recovered row must drop out of the review list, or it costs a fresh ~30s \
              rescan on every future purge press"
         );
-        let still_there: i64 = db
+        let still_there: i64 = ctx
+            .db
             .lock()
             .unwrap()
             .query_row("SELECT COUNT(*) FROM jobs WHERE id = 'old'", [], |r| {
@@ -3296,11 +3344,11 @@ mod tests {
             params![script.to_str().unwrap()],
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let handbrake_path = resolve_handbrake_for_test(&db);
+        let (ctx, _sink, _disposer) = test_ctx(conn);
+        let handbrake_path = resolve_handbrake_for_test(&ctx);
 
         let outcome = purge_one_locked(
-            &db,
+            &ctx.db,
             "old",
             PurgeAction::Delete,
             &handbrake_path,
@@ -3356,11 +3404,11 @@ mod tests {
             params![script.to_str().unwrap()],
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let handbrake_path = resolve_handbrake_for_test(&db);
+        let (ctx, _sink, _disposer) = test_ctx(conn);
+        let handbrake_path = resolve_handbrake_for_test(&ctx);
 
         let outcome = purge_one_locked(
-            &db,
+            &ctx.db,
             "old",
             PurgeAction::Delete,
             &handbrake_path,

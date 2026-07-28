@@ -41,6 +41,110 @@ pub fn detect_handbrake_path() -> Option<String> {
     None
 }
 
+/// How the engine discovers HandBrakeCLI when no usable path is configured.
+///
+/// Injected on [`crate::ctx::Ctx`] rather than called directly so that tests can state which
+/// world they are in. `detect_handbrake_path` shells out to `which`/`where`, i.e. it reads the
+/// machine the test happens to run on — which let five tests pass locally and fail in CI.
+///
+/// `locate()` may run while `ctx.db`'s mutex is held (`queue_ops::add_files_inner`,
+/// `converter::process_queue`). Implementations must not lock `ctx.db` or emit events:
+/// `std::sync::Mutex` is not reentrant, and the tray listener re-locks synchronously.
+pub trait HandbrakeLocator: Send + Sync {
+    fn locate(&self) -> Option<String>;
+}
+
+/// Production: PATH detection via `which` / `where`.
+pub struct PathLocator;
+
+impl HandbrakeLocator for PathLocator {
+    fn locate(&self) -> Option<String> {
+        detect_handbrake_path()
+    }
+}
+
+/// The test-harness default. Fails loud when a test reaches HandBrake resolution without
+/// saying whether HandBrake is installed — the same tactic as `LockProbeSink` in `control.rs`.
+/// Reaching this means the test's outcome would otherwise depend on the host.
+pub struct PanickingLocator;
+
+impl HandbrakeLocator for PanickingLocator {
+    fn locate(&self) -> Option<String> {
+        panic!(
+            "HandBrake resolution was reached with the default test locator, so this test's \
+             result would depend on whether HandBrakeCLI is installed on this machine. \
+             Declare the world explicitly: `Arc::new(AbsentLocator)` for the CI world (no \
+             HandBrake), or `Arc::new(StubLocator(path))` for the installed world."
+        );
+    }
+}
+
+/// The CI world: HandBrakeCLI is not installed.
+pub struct AbsentLocator;
+
+impl HandbrakeLocator for AbsentLocator {
+    fn locate(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The installed world, without requiring a real binary on the host.
+pub struct StubLocator(pub String);
+
+impl HandbrakeLocator for StubLocator {
+    fn locate(&self) -> Option<String> {
+        Some(self.0.clone())
+    }
+}
+
+/// Test support, alongside the locator doubles above: pre-populates `ctx`'s preset-metadata
+/// cache for the configured preset.
+///
+/// [`StubLocator`] alone does *not* express the "HandBrake installed" world. Past resolution,
+/// intake calls [`cached_preset_metadata`], which on a cache miss runs the resolved path and
+/// propagates the failure — so a stub pointing at a non-existent binary makes `add_files_inner`
+/// return `Err`. Seeding short-circuits that shell-out, which is what lets `StubLocator` alone
+/// stand in for an installed HandBrake.
+///
+/// The values are fixed rather than parameterized because callers assert on what they expand to:
+/// the default `.{resolution}-{codec}` template becomes `.1080p-h265`.
+pub fn seed_preset_cache(ctx: &Ctx) {
+    let preset: String = ctx
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    ctx.preset_cache.lock().unwrap().insert(
+        preset,
+        PresetMetadata {
+            codec: "h265".into(),
+            resolution: "1080p".into(),
+            quality: "22".into(),
+            preset: "Fast 1080p30".into(),
+            device: "VideoToolbox".into(),
+        },
+    );
+}
+
+/// The configured path if it points at an existing file, otherwise the locator's answer.
+///
+/// Filesystem work only — no DB access — so callers can hold or release the db guard as their
+/// own call site requires.
+pub fn resolve_with_locator(
+    configured: Option<&str>,
+    locator: &dyn HandbrakeLocator,
+) -> Option<String> {
+    if let Some(path) = configured {
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    locator.locate()
+}
+
 /// `HandBrakeCLI --version` with a hard deadline — a binary on a hung network mount
 /// must not stall the validation thread indefinitely. `--version` output is tiny, so
 /// reading stderr after exit cannot hit the pipe-buffer limit.
@@ -300,8 +404,9 @@ fn slugify(name: &str) -> String {
     slug
 }
 
-/// The user-configured path if it points at an existing file, otherwise PATH
-/// detection. The DB lock is released before `which`/`where` shells out.
+/// The user-configured path if it points at an existing file, otherwise the injected locator's
+/// answer. The DB lock is released before the locator runs, because `PathLocator` shells out to
+/// `which`/`where`.
 pub fn resolve_handbrake_path(ctx: &Ctx) -> Result<Option<String>, String> {
     let configured: Option<String> = {
         let conn = ctx.db.lock().map_err(|e| e.to_string())?;
@@ -313,13 +418,7 @@ pub fn resolve_handbrake_path(ctx: &Ctx) -> Result<Option<String>, String> {
         .ok()
     };
 
-    if let Some(ref path) = configured {
-        if !path.is_empty() && std::path::Path::new(path).exists() {
-            return Ok(Some(path.clone()));
-        }
-    }
-
-    Ok(detect_handbrake_path())
+    Ok(resolve_with_locator(configured.as_deref(), &*ctx.handbrake))
 }
 
 /// Preset metadata via the shared cache. The cache mutex is deliberately NOT held
@@ -412,6 +511,7 @@ mod tests {
             conn,
             std::sync::Arc::new(crate::events::TestSink::default()),
             std::sync::Arc::new(crate::dispose::DeleteDisposer),
+            std::sync::Arc::new(crate::handbrake::PanickingLocator),
         )
     }
 
@@ -675,5 +775,46 @@ Matroska/
         assert_eq!(classify_preset(&zero, "preset").resolution, "");
         let hd = serde_json::json!({ "PictureHeight": 1080 });
         assert_eq!(classify_preset(&hd, "preset").resolution, "1080p");
+    }
+
+    #[test]
+    fn resolve_with_locator_prefers_an_existing_configured_path() {
+        // A configured path that exists must win outright — the locator is the *fallback*, and
+        // consulting it anyway would spawn a subprocess the user already told us to skip.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let configured = f.path().to_str().unwrap();
+        let got = resolve_with_locator(Some(configured), &StubLocator("/never/used".into()));
+        assert_eq!(got.as_deref(), Some(configured));
+    }
+
+    #[test]
+    fn resolve_with_locator_falls_back_when_the_configured_path_is_gone() {
+        // A stale setting (HandBrake uninstalled/moved since it was saved) must not be trusted.
+        let got = resolve_with_locator(
+            Some("/nonexistent/HandBrakeCLI"),
+            &StubLocator("/found/here".into()),
+        );
+        assert_eq!(got.as_deref(), Some("/found/here"));
+    }
+
+    #[test]
+    fn resolve_with_locator_falls_back_when_configured_is_empty() {
+        // "" is the shipped DB default, so this is the unconfigured-user path, not an edge case.
+        let got = resolve_with_locator(Some(""), &StubLocator("/found/here".into()));
+        assert_eq!(got.as_deref(), Some("/found/here"));
+    }
+
+    #[test]
+    fn absent_locator_reports_handbrake_missing() {
+        // The CI world, expressible for the first time.
+        assert_eq!(resolve_with_locator(Some(""), &AbsentLocator), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Declare the world explicitly")]
+    fn panicking_locator_fails_loud_rather_than_reading_the_machine() {
+        // The guard itself must be able to fail; a fixture default that silently succeeded
+        // would reintroduce exactly the machine-coupling this seam removes.
+        let _ = resolve_with_locator(Some(""), &PanickingLocator);
     }
 }
