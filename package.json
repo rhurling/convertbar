@@ -20,8 +20,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-process": "^2.3.1",
-    "@tauri-apps/plugin-updater": "^2.10.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
