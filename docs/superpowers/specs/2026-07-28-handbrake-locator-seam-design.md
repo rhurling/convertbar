@@ -1,5 +1,8 @@
 # HandBrake Locator Seam — Design
 
+> Revised after an adversarial review (2026-07-28). Findings that changed the design are
+> marked **[R]** at the relevant section.
+
 ## Problem
 
 Five tests shipped a hidden dependency on HandBrakeCLI being installed. They passed on the
@@ -8,21 +11,29 @@ has no HandBrake. One was caught by CI during PR #130; a stripped-PATH sweep fou
 
 Both were patched by pinning a literal suffix in the fixture so the intake path never needs to
 resolve HandBrake at all (`crates/convertbar-core/src/queue_ops.rs:1643`,
-`crates/convertbar-server/src/routes/mod.rs:179`). Those patches fix two instances. They do not
-close the class — the next test to reach the intake path with default settings reacquires the
+`crates/convertbar-server/src/routes/mod.rs:179`) — and a third instance of the same dodge already
+existed at `crates/convertbar-core/src/watcher.rs:1153-1156`. Those patches fix specific instances.
+They do not close the class — the next test to reach the intake path with default settings reacquires the
 same dependency, and the developer machine hides it again.
 
 ### Why the tests could not simply cover both worlds
 
-Three functions triplicate the same resolution logic:
+Four call sites resolve HandBrake, three of them triplicating the same logic: **[R]**
 
 | Function | Signature | Detection fallback | Callers |
 |---|---|---|---|
 | `handbrake::resolve_handbrake_path` | `&Ctx` | `handbrake.rs:322` | 8 — server routes + tauri commands |
 | `queue_ops::get_handbrake_path` | `&Connection` | `queue_ops.rs:104` | 2 — `add_files_inner`, a test helper |
 | `converter::get_handbrake_path` | `&Connection` | `converter.rs:452` | 1 — `process_queue` |
+| `queue_ops::purge_bad_sources` | `&Arc<Ctx>` | calls `resolve_from_configured` direct, `queue_ops.rs:1263` | — resolves inline |
 
-All three have the identical shape:
+The fourth was missed in the first draft. `purge_bad_sources` resolves **unconditionally**, before
+iterating ids — even for an empty list — and the DB default for `handbrake_path` is `""`
+(`db.rs:196`), so it reaches the fallback. It already takes `&Arc<Ctx>`, so wiring it to the seam is
+trivial; the cost is that it pulls four more existing tests into the "must declare a world" set
+(enumerated under Testing).
+
+The first three have the identical shape:
 
 ```rust
 // read the `handbrake_path` setting from the DB
@@ -53,7 +64,7 @@ of those tests untouched, and fires only where a test actually falls through to 
 ## Design
 
 Add a locator collaborator to `Ctx`, beside the two injected collaborators already there
-(`ctx.rs:12-13`):
+(`ctx.rs:10-11`):
 
 ```rust
 pub trait HandbrakeLocator: Send + Sync {
@@ -98,12 +109,11 @@ remove. The explicit parameter makes forgetting impossible.
 ### Converging the three resolvers
 
 One shared helper in `handbrake.rs`, next to the trait, owns the logic that is currently
-triplicated. It **replaces** `queue_ops::resolve_from_configured` (`queue_ops.rs:99-105`), which is
-deleted along with the two now-redundant private wrappers:
+triplicated. It **replaces** `queue_ops::resolve_from_configured` (`queue_ops.rs:98-105`), which is
+deleted:
 
 ```rust
 /// The configured path if it points at an existing file, otherwise the locator's answer.
-/// Filesystem/subprocess work only — no DB access — so this is meant to run OUTSIDE the DB mutex.
 pub fn resolve_with_locator(
     configured: Option<&str>,
     locator: &dyn HandbrakeLocator,
@@ -113,14 +123,38 @@ pub fn resolve_with_locator(
 Callers that need the current `Result<String, String>` shape keep their own
 `.ok_or_else(|| "HandBrakeCLI not found".to_string())`, so no error text changes.
 
-The two `&Connection`-shaped wrappers take the locator as a **second argument** rather than
-switching to `&Ctx`. This is deliberate: `queue_ops.rs:92-97` documents that these run outside the
-DB mutex precisely so a `which` spawn never happens under the lock (R3 — it previously ran per id,
-under the lock, up to 2N blocking spawns per batch). Handing them `&Ctx` would put a `db` handle
-back in scope at exactly the site that must not touch it. Both callers (`add_files_inner`,
-`process_queue`) already have `ctx` in scope, so passing `&*ctx.handbrake` costs nothing.
+Explicitly, so an implementer cannot satisfy the letter and miss the point: **[R]**
 
-`handbrake::resolve_handbrake_path` already takes `&Ctx`, so its 8 callers are unaffected.
+- `queue_ops::get_handbrake_path` and `converter::get_handbrake_path` are **kept**, gaining a
+  locator parameter. (An earlier draft said these were deleted *and* kept — they are kept.)
+- `handbrake::resolve_handbrake_path`'s **body changes**: its fallback at `handbrake.rs:322` stops
+  calling `detect_handbrake_path()` and calls `ctx.handbrake.locate()` instead. Its 8 callers are
+  unaffected, but leaving the body alone would keep the ambient read alive at the detect route and
+  falsify the entire thesis.
+- `purge_bad_sources` (`queue_ops.rs:1263`) resolves through the helper, passing `&*ctx.handbrake`.
+
+### Why the `&Connection` wrappers keep that shape **[R]**
+
+The two `&Connection` wrappers take the locator as a **second argument** rather than switching to
+`&Ctx`. The first draft justified this by claiming they run outside the DB mutex. **That is
+backwards, and the corrected reason matters more than the original one.**
+
+Both call sites run *under* the guard: `queue_ops.rs:790` takes the lock, `:823` resolves, `:835`
+releases it; `converter.rs:802` takes it, `:807` resolves, `:812` releases. Handing them `&Ctx`
+invites a resolver that re-locks `ctx.db` — and `std::sync::Mutex` is not reentrant, so that
+self-deadlocks. This is the same hazard class as the emit-under-db-lock invariant documented in
+CLAUDE.md, which cost two shipped deadlocks. The `&Connection` shape is what makes the re-entrancy
+impossible to write by accident.
+
+Two consequences follow, both accepted rather than fixed here:
+
+- `locate()` runs under the db lock at those two sites. That is exactly what
+  `detect_handbrake_path()` does there today, so the seam neither improves nor worsens it. The R3
+  comment at `queue_ops.rs:92-97` expresses the intent to avoid this, and `purge_bad_sources`
+  honors it while these two do not — a pre-existing inconsistency, out of scope for a testability
+  change.
+- A `PanickingLocator` firing under that lock **poisons the mutex**. Loud and messy, but loud is
+  the point, and the alternative is silent machine-coupling.
 
 ### Test doubles
 
@@ -133,13 +167,21 @@ Three, mirroring the existing `TestSink` / `RecordingDisposer` idiom:
 | `StubLocator(String)` | Returns a fixed path | HandBrake-installed world without a real binary |
 
 `PanickingLocator` as the default is the same tactic as `LockProbeSink` in `control.rs`: make a
-silent regression loud. A future test that wanders onto the intake path without declaring a world
-fails immediately with a clear message, instead of quietly reading the developer's machine and
-passing for the wrong reason.
+silent regression loud. A test that reaches a resolver without declaring a world fails instead of
+quietly reading the developer's machine and passing for the wrong reason.
 
-The evidence says this default is cheap: the converter tests pin `handbrake_path` and never reach
-the fallback, so they need no change. Only tests that genuinely fall through must declare a world —
-which is exactly the coupled set.
+**How loudly, precisely — it varies by thread. [R]** On a direct call (`add_files_inner` from a
+test body) the panic fails that test outright. But `process_queue` runs on a spawned thread
+(`converter.rs:1442`, started from `control.rs:42`, `watcher.rs:473`, `src-tauri/src/updater.rs:915`),
+where a panic does not fail the test process — it surfaces indirectly as missing events. On a
+server route it degrades to a 500 via the `JoinError` arm (`routes/handbrake.rs:24`). So the guard
+is strongest exactly where the defect occurred (the intake path) and weaker on the queue thread.
+No non-ignored test currently reaches `process_queue` unpinned, so this is a limit on the guard's
+reach, not a present gap.
+
+The default is still cheap, but not free: the converter tests pin `handbrake_path` and never reach
+the fallback, so they need no change. Four other existing tests do reach a fallback and must
+declare a world — they are enumerated below rather than left for the implementer to discover.
 
 ## Testing
 
@@ -147,13 +189,47 @@ which is exactly the coupled set.
 
 - `add_files_inner` with a `{...}` suffix template and `AbsentLocator` → the documented
   `"HandBrakeCLI not found"` error, no panic, no silent success.
-- The same with `StubLocator` → resolution proceeds.
+- The same in the present world → resolution proceeds (see the caveat immediately below).
 - The server add-files route, both worlds, asserting the HTTP status rather than a 500.
 
-**The two pinned-suffix workarounds are removed.** `queue_ops.rs:1643` and `routes/mod.rs:179`
-pinned a literal suffix specifically to dodge resolution. With the seam, each declares a locator
-instead, which restores the original intent of both tests — `add_files_emits_finished_before_queue_updated`
-is about event ordering, and it should exercise the default suffix template, not a special-cased one.
+**Expressing the present world needs more than `StubLocator`. [R]** A bare stub path is *not*
+sufficient on the intake path: past resolution, `add_files_inner` calls `cached_preset_metadata`
+(`queue_ops.rs:838-840`), which on a cache miss shells out to the resolved path and propagates the
+failure (`handbrake.rs:341`). A stub pointing at a non-executable path therefore returns `Err`, and
+`add_files_emits_finished_before_queue_updated` would lose its `queue-updated` emit entirely
+(emitted only on `Ok`, `queue_ops.rs:1053-1055`) — i.e. the restored test would fail.
+
+The present world is therefore expressed as `StubLocator` **plus a pre-populated
+`ctx.preset_cache`**, which short-circuits before the shell-out. `preset_cache` is already a public
+field on `Ctx`, so this needs no new API. (The `#[ignore]`d e2e test at `queue_ops.rs:2355-2365`
+solves the same problem with a real fake executable; the cache is cheaper and needs no temp files.)
+
+**Three pinned-suffix workarounds are removed, not two. [R]** `queue_ops.rs:1643`,
+`routes/mod.rs:179`, and — missed in the first draft — `watcher.rs:1153-1156`, which carries the
+same comment and the same dodge. Each pinned a literal suffix specifically to avoid resolution;
+with the seam, each declares a locator instead. That restores the original intent:
+`add_files_emits_finished_before_queue_updated` is about event ordering and should exercise the
+default suffix template, not a special-cased one.
+
+**Four existing tests must declare a world. [R]** These reach a fallback today and pass in both
+environments by luck; under the strict default each needs an explicit locator:
+
+| Test | Location | Route to the fallback |
+|---|---|---|
+| `purge_bad_sources_destroys_through_the_ctx_disposer` | `queue_ops.rs:2820` | `purge_bad_sources` at `:2835` |
+| `purge_bad_sources_with_no_ids_returns_an_empty_array` | `routes/mod.rs:396` | route → `queue.rs:126` → unconditional resolve |
+| `detect_handbrake_smoke_returns_200_with_valid_json` | `routes/mod.rs:605-618` | `/api/handbrake/detect` → `resolve_handbrake_path` |
+| `add_files_inner_skips_at_target_source_end_to_end` | `queue_ops.rs:2343` (`#[ignore]`d) | `skip_by_source_media` → `get_handbrake_path` at `:823` |
+
+The last one is `#[ignore]`d but reaches the fallback *through the seam* rather than by calling
+`detect_handbrake_path()` directly, so unlike the other ignored tests it cannot simply be left
+alone — it would panic under the fixture default when run locally.
+
+**One test is added outside the intake path. [R]** The mid-encode absent arm
+(`converter.rs:876-889`: "HandBrakeCLI not found" → `record_job_error`, Environment class) is
+untested today and is the one place the queue actually consumes a missing-HandBrake answer.
+`AbsentLocator` makes it expressible for the first time; skipping it would leave the spec's own
+framing ("that asymmetry is the defect") unhonored at the site that matters most.
 
 **Verification, run rather than asserted:**
 
@@ -168,16 +244,23 @@ guard that cannot fail is not a guard.
 
 ## Out of scope
 
-- **The `#[ignore]`d local-only integration tests** (`converter.rs:2591`, `probe.rs:377`) keep
-  calling `detect_handbrake_path()` directly. They want a real binary and a real `ffmpeg`; they are
-  `#[ignore]`d so they never run in CI. Routing them through the seam would remove the point of them.
+- **The `#[ignore]`d tests that call `detect_handbrake_path()` directly** (`converter.rs:2591`,
+  `probe.rs:377`). They want a real binary and a real `ffmpeg`; they are `#[ignore]`d so they never
+  run in CI. Routing them through the seam would remove the point of them. Note this does **not**
+  cover `queue_ops.rs:2343`, which is also `#[ignore]`d but reaches the fallback *through* the seam
+  and so must declare a world (see Testing). **[R]**
 - **A stripped-PATH script, an env-var backdoor, or a new CI job.** Once the suite has no ambient
   dependency, there is nothing left for a PATH sweep to catch. Adding one anyway would encode the
   workaround as permanent infrastructure.
 - **`ffmpeg` coupling.** Only the `#[ignore]`d tests use it, and they are opt-in by construction.
-- **Present/absent pairs at every resolve site.** `process_queue`'s mid-encode resolution and the 8
-  command/route callers get the seam but keep their current tests. Several are already covered
-  indirectly, and the intake path is where the defect actually occurred.
+- **Present/absent pairs at the 8 command/route callers.** They get the seam but keep their current
+  tests; they are thin adapters over `resolve_handbrake_path`, already covered indirectly. The
+  intake path is where the defect occurred, and mid-encode gets one test (see Testing) because it
+  is the only site that consumes a missing-HandBrake answer.
+- **The lock-discipline inconsistency.** `purge_bad_sources` resolves outside the DB mutex per the
+  R3 intent at `queue_ops.rs:92-97`; `add_files_inner` and `process_queue` resolve under it. The
+  seam preserves both behaviors exactly as they are. Reconciling them is a real cleanup but not a
+  testability change. **[R]**
 
 ## Migration and compatibility
 
