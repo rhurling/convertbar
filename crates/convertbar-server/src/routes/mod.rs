@@ -10,6 +10,7 @@ use crate::config::ServerConfig;
 
 pub mod converter;
 pub mod events;
+pub mod fs;
 pub mod handbrake;
 pub mod history;
 pub mod info;
@@ -100,6 +101,7 @@ pub fn api_router(state: ServerState) -> Router {
             "/watched/{id}/enabled",
             put(watch::set_watched_directory_enabled),
         )
+        .route("/fs/list", get(fs::fs_list))
         .fallback(api_not_found);
 
     Router::new().nest("/api", api).with_state(state)

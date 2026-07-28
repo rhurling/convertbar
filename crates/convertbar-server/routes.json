@@ -35,6 +35,7 @@
   {"command": "update_watched_directory",   "method": "PUT",    "path": "/api/watched/{id}"},
   {"command": "set_watched_directory_enabled", "method": "PUT", "path": "/api/watched/{id}/enabled"},
   {"command": "remove_watched_directory",   "method": "DELETE", "path": "/api/watched/{id}"},
+  {"command": "fs_list",                    "method": "GET",    "path": "/api/fs/list"},
   {"command": "get_app_info", "method": "GET",  "path": "/api/info"},
   {"command": "login",        "method": "POST", "path": "/api/login"}
 ]
