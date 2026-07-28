@@ -176,6 +176,19 @@ pub(crate) mod tests {
             Arc::new(TestSink::default()),
             Arc::new(RecordingDisposer::default()),
         );
+        // Pin a literal suffix for the default preset so any test that adds files
+        // through the routes never needs to resolve HandBrakeCLI (the default suffix
+        // template contains `{...}` placeholders, which would otherwise make these
+        // tests depend on HandBrakeCLI being installed on the host running them).
+        let default_preset: String = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        convertbar_core::settings_ops::set_preset_suffix(&ctx, &default_preset, ".conv").unwrap();
         let (events_tx, _rx) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let state = ServerState {

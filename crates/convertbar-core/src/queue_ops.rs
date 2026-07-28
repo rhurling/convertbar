@@ -1640,6 +1640,19 @@ mod tests {
     #[test]
     fn add_files_emits_finished_before_queue_updated() {
         let (ctx, sink, _d) = test_ctx(test_conn());
+        // Pin a literal suffix so add_files_inner never needs to resolve HandBrakeCLI
+        // (the default suffix template contains `{...}` placeholders, which would
+        // otherwise make this test depend on HandBrakeCLI being installed).
+        let preset: String = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        crate::settings_ops::set_preset_suffix(&ctx, &preset, ".conv").unwrap();
+
         // an empty add still brackets: add-started → add-finished → queue-updated
         let _ = add_files(&ctx, &[]);
         let names: Vec<String> = sink
