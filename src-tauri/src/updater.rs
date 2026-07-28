@@ -111,6 +111,26 @@ fn set_drain_pause(db: &Connection, armed: bool) {
     write_key(db, "update_drain_pause", if armed { "true" } else { "" });
 }
 
+/// Drops the updater's claim on the persisted queue pause.
+///
+/// The breadcrumb is a bare boolean — it records that the updater caused *a* pause, not *which*
+/// one — so it is only sound for as long as nobody else has touched the pause state. Called by
+/// `converter::set_queue_paused` whenever a real stop is being lifted, and by `pause_conversion`
+/// when the user stops the queue themselves: after either, the pause in force is somebody else's
+/// and lifting it at the next launch would override a deliberate decision.
+pub(crate) fn forget_drain_pause(db: &Connection) {
+    set_drain_pause(db, false);
+}
+
+/// The launch-time decision: whether to start the queue, after lifting any pause the updater
+/// itself caused. Composed here rather than inline in `setup()` so the "consult the breadcrumb
+/// before honouring the pause" step is pinned by a test — `setup()` itself is not reachable from
+/// one.
+pub(crate) fn should_resume_queue_at_launch(db: &Connection, has_queued: bool) -> bool {
+    let queue_paused = take_drain_pause(db, crate::converter::is_queue_paused(db));
+    crate::converter::should_auto_resume(has_queued, queue_paused)
+}
+
 /// Lifts a queue pause the updater itself caused, exactly once, and reports the queue's real
 /// paused state.
 ///
@@ -122,16 +142,8 @@ fn set_drain_pause(db: &Connection, armed: bool) {
 ///
 /// Consumed whether or not it is used, so a breadcrumb left behind by an install that never got
 /// as far as pausing anything cannot resurface against an unrelated pause later.
-/// The launch-time decision: whether to start the queue, after lifting any pause the updater
-/// itself caused. Composed here rather than inline in `setup()` so the "consult the breadcrumb
-/// before honouring the pause" step is pinned by a test — `setup()` itself is not reachable from
-/// one.
-pub(crate) fn should_resume_queue_at_launch(db: &Connection, has_queued: bool) -> bool {
-    let queue_paused = take_drain_pause(db, crate::converter::is_queue_paused(db));
-    crate::converter::should_auto_resume(has_queued, queue_paused)
-}
-
 fn take_drain_pause(db: &Connection, queue_paused: bool) -> bool {
+    // Read before any write: `set_queue_paused(false)` below re-enters `forget_drain_pause`.
     let was_update_drain = read_drain_pause(db);
     set_drain_pause(db, false);
     if was_update_drain && queue_paused {
@@ -863,9 +875,9 @@ async fn perform_install<R: tauri::Runtime>(
     let installer = PluginInstaller { update: raw, bytes };
 
     let attempt = try_install_now(&conv, &installer, &meta);
-    // Dropped before anything below can start the queue: `claim_queue_slot` takes the same
-    // `is_running` lock this borrows the state for, and holding a Tauri `State` past the point it
-    // is needed is what this module's lock discipline exists to avoid.
+    // Dropped once it is done with. A `State` handle holds no lock, so this is housekeeping rather
+    // than a correctness requirement — but everything below can start the queue, and keeping a
+    // borrow of the converter state alive across that reads as though it were load-bearing.
     drop(conv);
 
     match attempt {
@@ -1193,9 +1205,6 @@ pub async fn install_pending<R: tauri::Runtime>(
         match retry_version_drift(&pending, &meta.version) {
             VersionDrift::Proceed | VersionDrift::Adopt => {}
             VersionDrift::Reconsent => {
-                // Hand it back to the user rather than installing something they never saw. The
-                // panel is still rendering the old version and its notes, so leaving the deferral
-                // in place would install a version nobody read about.
                 set_pending(&app, None);
                 if let Ok(mut a) = runtime.available.lock() {
                     *a = Some(meta.clone());
@@ -1773,21 +1782,14 @@ mod tests {
     fn a_deferral_never_installs_a_version_the_user_did_not_consent_to() {
         // LOAD-BEARING. A deferral waits behind a draining queue for as long as the batch takes —
         // hours — and the retry re-checks the endpoint, so it gets whatever ships in the meantime.
-        // The old liveness check asked only WHETHER a deferral existed, so 2.1.0 was installed
-        // under 2.0.0's consent while the panel still showed 2.0.0's notes. `pending_matches`
-        // inside perform_install compares against the same fresh metadata, so it passes by
-        // construction and catches nothing.
         let user = PendingInstall {
             update: upd("2.0.0"),
             user_requested: true,
         };
         assert_eq!(retry_version_drift(&user, "2.0.0"), VersionDrift::Proceed);
         assert_eq!(retry_version_drift(&user, "2.1.0"), VersionDrift::Reconsent);
-        // Downgrades are the same violation, not a special case.
         assert_eq!(retry_version_drift(&user, "1.9.0"), VersionDrift::Reconsent);
 
-        // An Automatic-mode deferral names no version to the user — they delegated the decision —
-        // so demanding fresh consent there would break the mode instead of honouring it.
         let scheduled = PendingInstall {
             update: upd("2.0.0"),
             user_requested: false,
@@ -2193,6 +2195,83 @@ mod tests {
         set_drain_pause(&conn, true);
         assert!(!take_drain_pause(&conn, false));
         assert!(take_drain_pause(&conn, true));
+    }
+
+    #[test]
+    fn anyone_else_taking_charge_of_the_pause_invalidates_the_breadcrumb() {
+        // LOAD-BEARING. The breadcrumb is a bare boolean — it records that the updater caused *a*
+        // pause, never which one. Once Start, Resume, Cancel, a cleared queue or a watched file
+        // has lifted the stop, any pause in force afterwards is somebody else's, and lifting it at
+        // the next launch would override a deliberate decision.
+        let conn = test_conn();
+
+        set_drain_pause(&conn, true);
+        crate::converter::set_queue_paused(&conn, true);
+        assert!(read_drain_pause(&conn));
+
+        crate::converter::set_queue_paused(&conn, false);
+        assert!(
+            !read_drain_pause(&conn),
+            "lifting the stop hands the pause state to whoever lifted it"
+        );
+
+        // So a pause set afterwards survives the launch that would otherwise have resumed it.
+        crate::converter::set_queue_paused(&conn, true);
+        assert!(
+            !should_resume_queue_at_launch(&conn, true),
+            "the updater must not resume a batch the user stopped after its claim expired"
+        );
+    }
+
+    #[test]
+    fn a_clear_that_lifts_nothing_leaves_the_breadcrumb_alone() {
+        // The watcher clears the remembered pause on every add. While a drain is armed but has not
+        // landed yet, `queue_paused` is still false — that clear takes ownership of nothing, and
+        // spending the breadcrumb on it would leave the batch stopped after the update restart.
+        let conn = test_conn();
+        set_drain_pause(&conn, true);
+        assert!(!crate::converter::is_queue_paused(&conn));
+
+        crate::converter::set_queue_paused(&conn, false);
+
+        assert!(
+            read_drain_pause(&conn),
+            "a no-op clear must not spend a breadcrumb that refers to a stop still to come"
+        );
+    }
+
+    #[test]
+    fn a_pause_the_user_set_during_a_live_deferral_survives_the_install_failing() {
+        // The macOS route. The user clicks "Install and restart" against a busy queue (drain
+        // armed, breadcrumb written, deferral kept), then presses Pause: SIGSTOP leaves the queue
+        // thread alive, so `is_running` never clears and the two persisted stops are otherwise
+        // indistinguishable. `pause_conversion` dropping the updater's claim is what stops the
+        // hourly retry — which arms nothing, because the flag is already raised — from lifting
+        // their pause when its check fails.
+        let app = mock_app();
+        let handle = app.handle().clone();
+        let conv = handle
+            .state::<std::sync::Arc<ConverterState>>()
+            .inner()
+            .clone();
+        let db = db_of(&handle);
+        {
+            let conn = db.lock().unwrap();
+            set_drain_pause(&conn, true);
+            // What pause_conversion does: the user's stop, and the updater's claim released.
+            crate::converter::set_queue_paused(&conn, true);
+            forget_drain_pause(&conn);
+        }
+
+        {
+            // The hourly retry, which found the flag already raised and so armed nothing.
+            let _drain = DrainGuard::new(handle.clone(), conv.clone());
+        }
+
+        assert!(
+            crate::converter::is_queue_paused(&db.lock().unwrap()),
+            "a failed install must not resume the batch the user deliberately stopped"
+        );
     }
 
     #[test]

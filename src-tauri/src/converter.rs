@@ -454,6 +454,16 @@ fn get_low_disk_min_gb(db: &Connection) -> f64 {
 /// Read-with-default (no seed) so existing databases need no migration and the settings-count
 /// guard test is untouched. It is backend runtime state — NOT in ALLOWED_KEYS, NOT in the UI.
 pub(crate) fn set_queue_paused(db: &Connection, paused: bool) {
+    // Lifting a stop that is actually in force means somebody — Start, Resume, Cancel, a cleared
+    // queue, a watched file, or the launch-time lift itself — has taken ownership of the pause
+    // state. The updater's `update_drain_pause` breadcrumb records only that it caused *a* pause,
+    // never which one, so it must not outlive that: otherwise a later, unrelated pause the user
+    // set deliberately would be lifted at the next launch. Guarded on the queue really being
+    // paused, so a no-op clear (the watcher's, while a drain is armed but has not landed yet)
+    // does not spend a breadcrumb that refers to a stop still to come.
+    if !paused && is_queue_paused(db) {
+        crate::updater::forget_drain_pause(db);
+    }
     let _ = db.execute(
         "INSERT INTO settings (key, value) VALUES ('queue_paused', ?1)
          ON CONFLICT(key) DO UPDATE SET value = ?1",

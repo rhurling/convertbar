@@ -459,6 +459,11 @@ fn enqueue_and_start(app: &AppHandle, paths: Vec<String>) {
     // before touching it, exactly as `start_queue` does; the install re-triggers the queue when
     // it finishes (`resume_queue_after_install`). The files themselves are already enqueued, so
     // the UI still needs telling.
+    //
+    // Deliberately checked BEFORE clearing the pause rather than after, which is the opposite
+    // order to `set_queue_paused`'s own breadcrumb guard: leaving a remembered pause untouched
+    // during an install is recoverable with one click, whereas clearing it and then being refused
+    // leaves the queue in a state with no affordance to fix it.
     if converter
         .installing
         .load(std::sync::atomic::Ordering::SeqCst)

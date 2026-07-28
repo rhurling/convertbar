@@ -90,6 +90,13 @@ pub fn pause_conversion(
                     rusqlite::params![job_id],
                 );
                 crate::converter::set_queue_paused(&db, true);
+                // This pause is the user's, so the updater must not claim it. A drain armed for
+                // an "Install and restart" can still be outstanding here — on macOS the queue
+                // thread stays alive under SIGSTOP, so `is_running` never clears and the two
+                // persisted stops are otherwise indistinguishable. Without this, an install that
+                // later failed would lift the pause the user just set and the next launch would
+                // resume the batch they deliberately stopped.
+                crate::updater::forget_drain_pause(&db);
 
                 let _ = app.emit(
                     "job-status-changed",
