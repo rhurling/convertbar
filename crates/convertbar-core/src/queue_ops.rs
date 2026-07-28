@@ -1642,11 +1642,39 @@ mod tests {
         // The default suffix template contains {...} placeholders, so intake must resolve HandBrake
         // to expand them. With HandBrake absent the caller gets a named error — not a panic, and
         // not a silent success that would write files with an unexpanded literal suffix.
-        let (ctx, _sink, _d) = test_ctx_with_locator(test_conn(), Arc::new(AbsentLocator));
+        let (ctx, _sink, _disposer) = test_ctx_with_locator(test_conn(), Arc::new(AbsentLocator));
         let err = add_files_inner(&ctx, &["/tmp/whatever.mkv".to_string()], None).expect_err(
             "intake must fail when the suffix template needs HandBrake and it is absent",
         );
         assert!(err.contains("HandBrakeCLI not found"), "got: {err}");
+    }
+
+    #[test]
+    fn add_files_inner_with_a_literal_suffix_never_resolves_handbrake() {
+        // Before this branch, three tests incidentally covered the "literal suffix -> don't
+        // resolve HandBrake at all" branch (the `suffix_template.contains('{') ||
+        // skip_by_source_media` guard above) via a pinned `.conv`-style suffix; all three pins are
+        // gone now (see the locator-seam design doc) and nothing else exercises it. Built with the
+        // plain `test_ctx` (the `PanickingLocator` default) rather than a declared world on
+        // purpose: if this guard were ever removed or broken, resolution would be reached and the
+        // fixture default would panic instead of this assertion quietly passing for the wrong
+        // reason — the cleanest demonstration in the suite that the guard is a real guard.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        let preset: String = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        crate::settings_ops::set_preset_suffix(&ctx, &preset, "-conv").unwrap();
+
+        let result = add_files_inner(&ctx, &["/movies/clip.mp4".to_string()], None);
+        assert!(
+            result.is_ok(),
+            "a literal suffix must never reach HandBrake resolution, got: {result:?}"
+        );
     }
 
     // Pins the RAII bracketing Plan 1 preserved by hand: `AddOp`'s `add-finished` fires on Drop

@@ -1674,7 +1674,7 @@ mod tests {
         // Environment failure and the queue must move on — not hang, not retry forever, and not be
         // mistaken for a bad source file. Before the locator seam this arm was unreachable in tests,
         // because "HandBrake is not installed" could not be expressed.
-        let (ctx, _sink, _d) =
+        let (ctx, _sink, _disposer) =
             test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::AbsentLocator));
 
         let dir = tempfile::tempdir().unwrap();
@@ -2632,6 +2632,9 @@ mod tests {
     #[ignore]
     fn real_handbrake_flags_a_truncated_source_and_spares_the_original() {
         let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        // No locator declaration needed here: `handbrake_path` is set below to a real, existing
+        // path BEFORE any resolution runs, so `resolve_with_locator` short-circuits on the
+        // configured branch and the fixture's `PanickingLocator` is never consulted.
         let handbrake_path =
             crate::handbrake::detect_handbrake_path().expect("HandBrakeCLI must be on PATH");
         set_setting(&ctx.db, "handbrake_path", &handbrake_path);
