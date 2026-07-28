@@ -8,6 +8,9 @@ use tokio::sync::broadcast;
 
 use crate::config::ServerConfig;
 
+#[cfg(test)]
+mod contract_test;
+
 pub mod converter;
 pub mod events;
 pub mod fs;
