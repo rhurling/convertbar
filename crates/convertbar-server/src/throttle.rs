@@ -17,8 +17,10 @@
 //! rate limit, not a bug — a mechanism that always honoured a correct token
 //! would still answer every guess. There is no permanent lockout, though: a
 //! successful evaluation clears the bucket immediately (`record_success`),
-//! and the whole bucket is forgotten after `window` of inactivity. See the
-//! spec's "Why the delay was not enough" for the full analysis.
+//! and the whole bucket is forgotten `window` after its FIRST attempt — not
+//! after `window` of idleness, so a source attacking continuously still gets
+//! its ramp reset at each window boundary. See the spec's "Why the delay was
+//! not enough" for the full analysis.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};

@@ -424,7 +424,11 @@ subordinates the old goal 3 and bounds the cost instead of eliminating it:
 - The first `free` (3) failures are ungated, so typos, a stale cookie, and the
   web UI's concurrent page-load fan-out never see a denial.
 - A successful evaluation clears the bucket outright.
-- Failures are forgotten after the 15-minute window.
+- A bucket is forgotten 15 minutes after its *first* attempt — a window, not an
+  idle timer, so a continuously-attacking source also gets its ramp reset at each
+  boundary. That is a deliberate ceiling on how long one bad hour can penalise a
+  shared address, and it costs the attacker a fresh `free` allowance every 15
+  minutes rather than anything sustained.
 - A source only shares a bucket with an attacker when it shares a source
   address — the case `CONVERTBAR_TRUSTED_PROXIES` exists to eliminate.
 
