@@ -89,16 +89,85 @@ mod tests {
             "skipping the pending version must cancel the install waiting behind the idle gate"
         );
     }
+
+    /// A child that outlives the test unless something kills it, so the assertion below is about
+    /// a real process being reaped and not about a flag being flipped.
+    fn long_running_child() -> std::process::Child {
+        #[cfg(windows)]
+        {
+            // A cmd-internal busy loop, like converter's fake HandBrake: `timeout`/`pause` need a
+            // console stdin, which the test harness does not guarantee.
+            std::process::Command::new("cmd")
+                .args(["/c", "for /l %i in (1,1,2000000000) do rem"])
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn restarting_after_an_install_kills_the_active_encoder() {
+        // Reachable with a live encoder: once an install completes `installing` clears, a watched
+        // file can land and start the queue, and only then does the user press "Restart now".
+        // `AppHandle::restart` on the main thread goes straight to cleanup_before_exit +
+        // process::restart (tauri app.rs:589), skipping RunEvent::ExitRequested and so the kill in
+        // lib.rs. Drop the kill here and HandBrakeCLI survives the restart, still writing into the
+        // partial output while the next launch's auto-resume deletes that file and starts a second
+        // encoder against the same path.
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let converter = Arc::new(crate::converter::ConverterState::new());
+        let child = long_running_child();
+        *converter.current_pid.lock().unwrap() = Some(child.id());
+        *converter.current_child.lock().unwrap() = Some(child);
+        app.manage(converter.clone());
+
+        let mut restarted = false;
+        restart_after_killing_encoder(app.handle(), || restarted = true);
+
+        assert!(restarted, "the restart itself must still happen");
+        assert!(
+            converter
+                .current_child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_some(),
+            "the encoder must be dead and reaped before the app restarts, or it outlives it"
+        );
+    }
 }
 
-#[tauri::command]
-pub fn restart_app(app: AppHandle) {
-    // `AppHandle::restart` skips RunEvent::ExitRequested when it is called on the main thread
-    // (tauri app.rs:588) — and a sync command may well run there — so the encoder is killed
-    // here rather than relying on the exit handler. Killing twice is harmless; not killing
-    // orphans HandBrakeCLI across the restart.
+/// The whole body of `restart_app` bar the restart itself, with the restart injected: calling
+/// the real `AppHandle::restart` terminates the process, so this is the largest slice of the
+/// command a test can drive.
+///
+/// `AppHandle::restart` skips RunEvent::ExitRequested when it is called on the main thread
+/// (tauri app.rs:589) — and a sync command may well run there — so the encoder is killed here
+/// rather than relying on the exit handler. Killing twice is harmless; not killing orphans
+/// HandBrakeCLI across the restart.
+fn restart_after_killing_encoder<R: tauri::Runtime>(app: &AppHandle<R>, restart: impl FnOnce()) {
     if let Some(conv) = app.try_state::<Arc<crate::converter::ConverterState>>() {
         crate::converter::kill_active_child(&conv);
     }
-    app.restart();
+    restart();
+}
+
+/// Generic over the runtime for the same reason as `skip_update_version`: so a `MockRuntime`
+/// test can drive the kill above.
+#[tauri::command]
+pub fn restart_app<R: tauri::Runtime>(app: AppHandle<R>) {
+    restart_after_killing_encoder(&app, || {
+        app.restart();
+    });
 }
