@@ -10,6 +10,7 @@ const mockUpdate = {
   install: vi.fn(),
   skip: vi.fn(),
   restart: vi.fn(),
+  dismissError: vi.fn(),
 };
 
 vi.mock("../hooks/useUpdate", () => ({
@@ -131,6 +132,68 @@ describe("UpdatePanel", () => {
     mockUpdate.actionError = "network unreachable";
     render(<UpdatePanel />);
     expect(await screen.findAllByText(/network unreachable/i)).toHaveLength(1);
+  });
+
+  it("frames a Check now failure as a past attempt, not a present fact", async () => {
+    mockUpdate.actionError = "network unreachable";
+    render(<UpdatePanel />);
+    await userEvent.click(screen.getByRole("button", { name: /check now/i }));
+
+    expect(
+      screen.getByText("Couldn't check for updates: network unreachable"),
+    ).toBeInTheDocument();
+  });
+
+  it("frames a Skip failure as a past attempt, not a present fact", async () => {
+    mockUpdate.state = {
+      ...base,
+      status: "available",
+      available: { version: "1.1.0", date: null, notes: null },
+    };
+    mockUpdate.actionError = "app state unavailable";
+    render(<UpdatePanel />);
+    await userEvent.click(screen.getByRole("button", { name: /skip/i }));
+
+    expect(
+      screen.getByText("Couldn't skip that version: app state unavailable"),
+    ).toBeInTheDocument();
+  });
+
+  it("frames an Install failure as a past attempt, so it can't contradict a later completed install", async () => {
+    // The concrete case this guards: a concurrent cycle held the single-flight latch when
+    // Install was clicked ("an update operation is already running", status untouched), then
+    // that same cycle went on to finish installing (status -> readyToRestart, "What's new"
+    // appears). The raw backend string would flatly contradict a completed install if shown
+    // unframed; read as a past attempt, it can sit right next to it without contradiction.
+    mockUpdate.state = {
+      ...base,
+      status: "available",
+      available: { version: "1.1.0", date: null, notes: null },
+    };
+    const { rerender } = render(<UpdatePanel />);
+    await userEvent.click(screen.getByRole("button", { name: /install/i }));
+
+    mockUpdate.actionError = "an update operation is already running";
+    mockUpdate.state = {
+      ...base,
+      status: "readyToRestart",
+      just_installed: { version: "1.1.0", notes: null },
+    };
+    rerender(<UpdatePanel />);
+
+    expect(
+      screen.getByText("Couldn't start the install: an update operation is already running"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/what's new in 1\.1\.0/i)).toBeInTheDocument();
+  });
+
+  it("dismisses an error via a labeled control, not a timer", async () => {
+    mockUpdate.actionError = "network unreachable";
+    render(<UpdatePanel />);
+
+    const dismiss = screen.getByTitle("Dismiss");
+    await userEvent.click(dismiss);
+    expect(mockUpdate.dismissError).toHaveBeenCalled();
   });
 
   it("renders mode radios that reflect and update the current mode", async () => {

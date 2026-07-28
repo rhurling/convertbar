@@ -114,80 +114,48 @@ describe("useUpdate", () => {
     expect(result.current.actionError).toBeNull();
   });
 
-  it("clears actionError once a pushed event shows the situation has settled", async () => {
-    // Reproduces the exact bug this guards: an offline manual check sets actionError to
-    // "network unreachable" (and, via the backend, the identical state.last_error). The user
-    // then flips the update mode, which triggers an unrelated background check that succeeds —
-    // status becomes "available" and last_error clears. Nothing about that push touches
-    // actionError directly; if it isn't cleared, the "network unreachable" banner keeps showing
-    // directly above the now-available update, contradicting the state right beside it.
-    vi.spyOn(commands, "checkForUpdate").mockRejectedValue("network unreachable");
+  it("does not let any push clear a checkNow error, at any status — only another action or a dismissal can", async () => {
+    // Three rounds of trying to infer "is this push related to the error" each leaked somewhere:
+    // a push that resolved a real failure could arrive before the rejection that set it (silently
+    // untagging it), and a push merely reporting unrelated progress could still race a refusal off
+    // screen. actionError is a past-tense record of one click's outcome now, not a claim about
+    // current state, so no push is entitled to remove it — checked here across a progression of
+    // statuses, ending at "available", the exact one from the original bug this guarded.
+    const message = "an update is already waiting to install once the queue is idle";
+    vi.spyOn(commands, "checkForUpdate").mockRejectedValue(message);
     const { result } = renderHook(() => useUpdate());
     await waitFor(() => expect(result.current.state).not.toBeNull());
 
     await act(async () => { await result.current.checkNow(); });
-    expect(result.current.actionError).toBe("network unreachable");
+    expect(result.current.actionError).toBe(message);
+
+    act(() => { emit?.({ ...baseState, status: "downloading" }); });
+    await waitFor(() => expect(result.current.state?.status).toBe("downloading"));
+    expect(result.current.actionError).toBe(message);
+
+    act(() => { emit?.({ ...baseState, status: "waitingForIdle" }); });
+    await waitFor(() => expect(result.current.state?.status).toBe("waitingForIdle"));
+    expect(result.current.actionError).toBe(message);
 
     act(() => {
       emit?.({
         ...baseState,
         status: "available",
         available: { version: "1.1.0", date: null, notes: null },
-        last_error: null,
       });
     });
-
     await waitFor(() => expect(result.current.state?.status).toBe("available"));
-    expect(result.current.actionError).toBeNull();
+    expect(result.current.actionError).toBe(message);
   });
 
-  it("does not let a push clear actionError while the blocking situation is still unfolding", async () => {
-    // The refusal "an update is already waiting to install" is rejected synchronously by the
-    // backend before any state mutation, so no event accompanies it — but the pending install it
-    // names keeps emitting its own progress (downloading -> waitingForIdle) around the same time.
-    // None of those pushes may race the refusal off screen: the reason the check was refused is
-    // still true for as long as status stays in a "blocked" state.
-    vi.spyOn(commands, "checkForUpdate").mockRejectedValue(
-      "an update is already waiting to install once the queue is idle",
-    );
-    const { result } = renderHook(() => useUpdate());
-    await waitFor(() => expect(result.current.state).not.toBeNull());
-
-    await act(async () => { await result.current.checkNow(); });
-    expect(result.current.actionError).toBe(
-      "an update is already waiting to install once the queue is idle",
-    );
-
-    act(() => {
-      emit?.({ ...baseState, status: "downloading" });
-    });
-    await waitFor(() => expect(result.current.state?.status).toBe("downloading"));
-    expect(result.current.actionError).toBe(
-      "an update is already waiting to install once the queue is idle",
-    );
-
-    act(() => {
-      emit?.({ ...baseState, status: "waitingForIdle" });
-    });
-    await waitFor(() => expect(result.current.state?.status).toBe("waitingForIdle"));
-    expect(result.current.actionError).toBe(
-      "an update is already waiting to install once the queue is idle",
-    );
-
-    // Only once status leaves the blocked set (the install finished and the app is idle again)
-    // has the situation genuinely settled, and the stale refusal is safe to drop.
-    act(() => {
-      emit?.({ ...baseState, status: "idle" });
-    });
-    await waitFor(() => expect(result.current.state?.status).toBe("idle"));
-    expect(result.current.actionError).toBeNull();
-  });
-
-  it("does not let a push clear an Install rejection while status stays available", async () => {
+  it("does not let a push clear an Install rejection, even one that reaches readyToRestart", async () => {
     // install_pending's Err paths (updater.rs: "an update operation is already running", "no
     // update available", a network-error string) never touch `status` — Install only renders
-    // while status is already "available", and none of those refusals move it. A later, wholly
-    // unrelated push (e.g. a concurrent cycle finishing and going idle) must not wipe this.
+    // while status is already "available", and none of those refusals move it. The concrete case
+    // that matters: a concurrent cycle holding the latch is what caused this rejection, and that
+    // very cycle can go on to finish the install (status -> readyToRestart). The hook no longer
+    // tries to decide whether that resolves the error — it's the panel's job to word the message
+    // so it stays true (a past attempt) rather than contradicting the present (a finished install).
     vi.spyOn(commands, "getUpdateState").mockResolvedValue({
       ...baseState,
       status: "available",
@@ -203,9 +171,9 @@ describe("useUpdate", () => {
     expect(result.current.actionError).toBe("an update operation is already running");
 
     act(() => {
-      emit?.({ ...baseState, status: "idle" });
+      emit?.({ ...baseState, status: "readyToRestart", just_installed: { version: "1.1.0", notes: null } });
     });
-    await waitFor(() => expect(result.current.state?.status).toBe("idle"));
+    await waitFor(() => expect(result.current.state?.status).toBe("readyToRestart"));
     expect(result.current.actionError).toBe("an update operation is already running");
   });
 
@@ -230,6 +198,20 @@ describe("useUpdate", () => {
     });
     await waitFor(() => expect(result.current.state?.status).toBe("idle"));
     expect(result.current.actionError).toBe("app state unavailable");
+  });
+
+  it("clears actionError when the user dismisses it", async () => {
+    // The only two ways actionError is meant to go away: the user tries again (already covered
+    // above), or the user explicitly dismisses it. No push-based path exists any more.
+    vi.spyOn(commands, "checkForUpdate").mockRejectedValue("network unreachable");
+    const { result } = renderHook(() => useUpdate());
+    await waitFor(() => expect(result.current.state).not.toBeNull());
+
+    await act(async () => { await result.current.checkNow(); });
+    expect(result.current.actionError).toBe("network unreachable");
+
+    act(() => { result.current.dismissError(); });
+    expect(result.current.actionError).toBeNull();
   });
 
   it("does not let a stale initial getUpdateState response clobber a fresher push event", async () => {

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { MANUAL_CHECK_BLOCKED_STATUSES, useUpdate } from "../hooks/useUpdate";
 import { commands, type AvailableUpdate, type UpdateMode } from "../lib/tauri";
 
@@ -6,6 +7,18 @@ const MODES: { value: UpdateMode; label: string }[] = [
   { value: "notify", label: "Notify me" },
   { value: "off", label: "Manual only" },
 ];
+
+// Which of the three actions produced the current actionError, tracked here (not in the hook)
+// purely to pick the right past-tense framing below. Set synchronously by the button's own
+// onClick, before the async action runs — nothing else ever touches it, so unlike every prior
+// attempt at tracking "which action" inside the hook, there is no event listener racing it.
+type ActionKind = "check" | "install" | "skip";
+
+const ACTION_PREFIX: Record<ActionKind, string> = {
+  check: "Couldn't check for updates",
+  install: "Couldn't start the install",
+  skip: "Couldn't skip that version",
+};
 
 function relativeTime(unixSeconds: number): string {
   const mins = Math.max(0, Math.round((Date.now() / 1000 - unixSeconds) / 60));
@@ -30,16 +43,23 @@ function AvailableDetails({ update }: { update: AvailableUpdate }) {
 }
 
 export default function UpdatePanel() {
-  const { state, actionError, checkNow, install, skip, restart } = useUpdate();
+  const { state, actionError, checkNow, install, skip, restart, dismissError } = useUpdate();
+  const [lastAction, setLastAction] = useState<ActionKind | null>(null);
   if (!state) return null;
 
   // `actionError` (a rejected checkNow/install/skip) and `state.last_error` (the scheduler's
   // own background check/install failure) are different channels, but a manual check made
-  // while offline dual-writes the identical message to both. Preferring `last_error` — the
-  // persistent, backend-driven signal — and suppressing an `actionError` that merely repeats
-  // it avoids showing the same line twice while still surfacing an actionError with distinct
-  // text (e.g. "an update is already waiting to install", which never touches last_error).
+  // while offline dual-writes the identical raw message to both. Comparing the raw strings
+  // (before the past-tense framing below is applied) and preferring `last_error` avoids showing
+  // the same fact twice while still surfacing an actionError with distinct text (e.g. "an update
+  // is already waiting to install", which never touches last_error).
   const showActionError = actionError && actionError !== state.last_error;
+  // actionError never expires on its own (see useUpdate) — it is a past-tense record of one
+  // click's outcome, not a claim about current state, so framing it that way is what keeps it
+  // from ever contradicting whatever renders below (e.g. an Install failure sitting above a
+  // completed "What's new" restart prompt is fine once it reads as something that *was* refused,
+  // not something that *is* happening).
+  const framedActionError = lastAction ? `${ACTION_PREFIX[lastAction]}: ${actionError}` : actionError;
 
   return (
     <div className="setting-group">
@@ -64,7 +84,7 @@ export default function UpdatePanel() {
       <div className="setting-row">
         <button
           className="btn btn-small"
-          onClick={() => checkNow()}
+          onClick={() => { setLastAction("check"); checkNow(); }}
           disabled={MANUAL_CHECK_BLOCKED_STATUSES.has(state.status)}
         >
           Check now
@@ -80,16 +100,23 @@ export default function UpdatePanel() {
       </div>
 
       {state.last_error && <div className="update-error">{state.last_error}</div>}
-      {showActionError && <div className="update-error">{actionError}</div>}
+      {showActionError && (
+        <div className="update-error">
+          <span>{framedActionError}</span>
+          <button className="btn-icon" onClick={dismissError} title="Dismiss">
+            &times;
+          </button>
+        </div>
+      )}
 
       {state.status === "available" && state.available && (
         <div className="update-available">
           <AvailableDetails update={state.available} />
           <div className="setting-row">
-            <button className="btn btn-small" onClick={() => install()}>
+            <button className="btn btn-small" onClick={() => { setLastAction("install"); install(); }}>
               Install and restart
             </button>
-            <button className="btn btn-small" onClick={() => skip()}>
+            <button className="btn btn-small" onClick={() => { setLastAction("skip"); skip(); }}>
               Skip this version
             </button>
           </div>
