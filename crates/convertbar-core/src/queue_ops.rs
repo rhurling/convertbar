@@ -2767,6 +2767,42 @@ mod tests {
         assert_eq!(still_there, 1, "the history entry itself survives");
     }
 
+    // Pins the DI wiring at purge_bad_sources' own call site (`&*ctx.disposer` in the
+    // purge_one_locked call), not just the lower-level purge_one_locked/destroy_and_record
+    // functions the tests above and below exercise directly with their own injected disposer.
+    // Every other purge test in this file enters one level down, so none of them can catch a
+    // mutation that swaps `&*ctx.disposer` for a hardcoded delete primitive at that call site —
+    // this is the one test that goes in through the actual public entry point and checks the
+    // disposer that's WIRED INTO ctx (via test_ctx) is the one that performed the destroy.
+    #[test]
+    fn purge_bad_sources_destroys_through_the_ctx_disposer() {
+        let conn = test_conn();
+        conn.execute(
+            "UPDATE settings SET value = 'trash' WHERE key = 'bad_source_action'",
+            [],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("movie.mkv");
+        std::fs::write(&f, b"garbage").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        insert_error_row(&conn, "old", &p, "bad_source_truncated");
+        stamp_identity(&conn, "old", &p);
+        let (ctx, _sink, disposer) = test_ctx(conn);
+
+        let results = purge_bad_sources(&ctx, vec!["old".to_string()]).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, PurgeOutcome::Purged);
+        assert_eq!(
+            disposer.0.lock().unwrap().as_slice(),
+            [p],
+            "purge_bad_sources must destroy through ctx.disposer, not some other hardcoded \
+             primitive — a mutation swapping in DeleteDisposer (or a raw remove_file) still \
+             deletes the file, but leaves the ctx-wired RecordingDisposer's record empty"
+        );
+    }
+
     // ---- destructive-path review findings (C1, I2, I3, I5, I6) ----
 
     #[test]
