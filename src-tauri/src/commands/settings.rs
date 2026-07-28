@@ -5,114 +5,26 @@ use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::types::Settings;
-use crate::AppState;
-
-pub(crate) use convertbar_core::settings_ops::{
-    normalize_bad_source_action, read_suffix_template, ALLOWED_KEYS, DEFAULT_SUFFIX_TEMPLATE,
-};
 
 #[tauri::command]
-pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settings, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-
-    let mut stmt = conn
-        .prepare("SELECT key, value FROM settings")
-        .map_err(|e| e.to_string())?;
-
-    let mut preset = String::new();
-    let mut cleanup_mode = String::new();
-    let mut launch_at_login = false;
-    let mut handbrake_path = String::new();
-    let mut menubar_show_percent = true;
-    let mut menubar_show_eta = true;
-    let mut menubar_show_queue = false;
-    let mut menubar_show_filename = false;
-    let mut menubar_show_fps = false;
-    let mut notifications_per_file = true;
-    let mut notifications_errors_only = false;
-    let mut notifications_queue_done = true;
-    let mut skip_already_converted = false;
-    let mut skip_by_source_media = false;
-    let mut watch_skip_marker = String::new();
-    let mut low_disk_min_gb: f64 = 0.0;
-    let mut bad_source_action = String::from("trash");
-
-    let rows = stmt
-        .query_map([], |row| {
-            let key: String = row.get(0)?;
-            let value: String = row.get(1)?;
-            Ok((key, value))
-        })
-        .map_err(|e| e.to_string())?;
-
-    for row in rows {
-        let (key, value) = row.map_err(|e| e.to_string())?;
-        match key.as_str() {
-            "preset" => preset = value,
-            "cleanup_mode" => cleanup_mode = value,
-            "launch_at_login" => launch_at_login = value == "true",
-            "handbrake_path" => handbrake_path = value,
-            "menubar_show_percent" => menubar_show_percent = value == "true",
-            "menubar_show_eta" => menubar_show_eta = value == "true",
-            "menubar_show_queue" => menubar_show_queue = value == "true",
-            "menubar_show_filename" => menubar_show_filename = value == "true",
-            "menubar_show_fps" => menubar_show_fps = value == "true",
-            "notifications_per_file" => notifications_per_file = value == "true",
-            "notifications_errors_only" => notifications_errors_only = value == "true",
-            "notifications_queue_done" => notifications_queue_done = value == "true",
-            "skip_already_converted" => skip_already_converted = value == "true",
-            "skip_by_source_media" => skip_by_source_media = value == "true",
-            "watch_skip_marker" => watch_skip_marker = value,
-            "low_disk_min_gb" => low_disk_min_gb = value.parse().unwrap_or(0.0),
-            "bad_source_action" => {
-                bad_source_action = normalize_bad_source_action(&value).to_string()
-            }
-            _ => {}
-        }
-    }
-
-    // Read actual autostart state from the plugin (source of truth)
-    let launch_at_login = app.autolaunch().is_enabled().unwrap_or(launch_at_login);
-
-    Ok(Settings {
-        preset,
-        cleanup_mode,
-        launch_at_login,
-        handbrake_path,
-        menubar_show_percent,
-        menubar_show_eta,
-        menubar_show_queue,
-        menubar_show_filename,
-        menubar_show_fps,
-        notifications_per_file,
-        notifications_errors_only,
-        notifications_queue_done,
-        skip_already_converted,
-        skip_by_source_media,
-        watch_skip_marker,
-        low_disk_min_gb,
-        bad_source_action,
-    })
+pub fn get_settings(app: AppHandle, ctx: State<'_, Arc<Ctx>>) -> Result<Settings, String> {
+    let mut settings = convertbar_core::settings_ops::get_settings(&ctx)?;
+    // Autostart plugin is the source of truth on desktop; core returns the stored value.
+    settings.launch_at_login = app
+        .autolaunch()
+        .is_enabled()
+        .unwrap_or(settings.launch_at_login);
+    Ok(settings)
 }
 
 #[tauri::command]
 pub fn update_setting(
     app: AppHandle,
-    state: State<'_, AppState>,
     ctx: State<'_, Arc<Ctx>>,
     key: String,
     value: String,
 ) -> Result<(), String> {
-    if !ALLOWED_KEYS.contains(&key.as_str()) {
-        return Err(format!("Invalid setting key: {}", key));
-    }
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
-        params![key, value],
-    )
-    .map_err(|e| e.to_string())?;
-
+    convertbar_core::settings_ops::update_setting(&ctx, &key, &value)?;
     // Sync autostart state with the plugin
     if key == "launch_at_login" {
         let autostart = app.autolaunch();
@@ -122,28 +34,24 @@ pub fn update_setting(
             let _ = autostart.disable();
         }
     }
-
-    // Let the running watcher pick up a changed skip-marker name without a restart.
-    if key == "watch_skip_marker" {
-        crate::watcher::refresh_skip_marker(&ctx);
-    }
-
     Ok(())
 }
 
 #[tauri::command]
-pub fn get_preset_suffix(state: State<'_, AppState>, preset: String) -> Result<String, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    Ok(read_suffix_template(&conn, &preset))
+pub fn get_preset_suffix(ctx: State<'_, Arc<Ctx>>, preset: String) -> Result<String, String> {
+    let conn = ctx.db.lock().map_err(|e| e.to_string())?;
+    Ok(convertbar_core::settings_ops::read_suffix_template(
+        &conn, &preset,
+    ))
 }
 
 #[tauri::command]
 pub fn set_preset_suffix(
-    state: State<'_, AppState>,
+    ctx: State<'_, Arc<Ctx>>,
     preset: String,
     suffix: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = ctx.db.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO preset_suffixes (preset_name, suffix) VALUES (?1, ?2) ON CONFLICT(preset_name) DO UPDATE SET suffix = ?2",
         params![preset, suffix],
