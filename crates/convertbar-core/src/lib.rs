@@ -13,4 +13,5 @@ pub mod probe_cache;
 pub mod queue_ops;
 pub mod settings_ops;
 pub mod types;
+pub mod watch_ops;
 pub mod watcher;

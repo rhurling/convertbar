@@ -274,6 +274,20 @@ describe("useFileIntake", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("confirm_folder_add", { path: "/big" });
   });
 
+  it("addPaths (the server head's file-browser-modal entry point) feeds the same classify → enqueue pipeline as a drop", async () => {
+    classified = { files: ["/m/a.mp4"], folders: [] };
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    await act(async () => {
+      await result.current.addPaths(["/m/a.mp4"]);
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("classify_paths", { paths: ["/m/a.mp4"] });
+    expect(invokeMock).toHaveBeenCalledWith("add_files", { paths: ["/m/a.mp4"] });
+    expect(invokeMock).toHaveBeenCalledWith("start_queue");
+  });
+
   it("surfaces an error in the status line when a folder add fails", async () => {
     // Regression guard for old DropZone.test.tsx:178 — a failing confirm must not vanish silently.
     classified = { files: [], folders: [{ file_count: 12, folder_name: "Big", folder_path: "/big" }] };

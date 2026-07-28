@@ -15,8 +15,7 @@ use crate::ctx::Ctx;
 use crate::events::EventSinkExt;
 
 /// (Re)starts the queue if it isn't already running, clearing any remembered pause first — a
-/// user (re)starting the queue (Resume button, or a drag-drop add which routes through this)
-/// clears any remembered pause.
+/// user (re)starting the queue (Resume button, or a drag-drop add which routes through this).
 pub fn start_queue(ctx: &Arc<Ctx>) -> Result<(), String> {
     let is_running = *ctx.converter.is_running.lock().map_err(|e| e.to_string())?;
     if is_running {
@@ -44,7 +43,6 @@ pub fn start_queue(ctx: &Arc<Ctx>) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn pause_conversion(ctx: &Ctx) -> Result<(), String> {
     // On non-unix, fall back to queue-level pause (pause_after_current)
     if !ConverterState::can_pause_process() {
@@ -124,7 +122,6 @@ pub fn pause_conversion(ctx: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn resume_conversion(ctx: &Ctx) -> Result<(), String> {
     // Resuming un-pauses the queue on either platform; drop the remembered pause.
     if let Ok(conn) = ctx.db.lock() {

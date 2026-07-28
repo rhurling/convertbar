@@ -66,9 +66,13 @@ export function useHistory() {
     const unlistenError = listen("job-error", () => {
       refresh();
     });
+    // Server head only: after an SSE reconnect, refetch to heal any events missed while the
+    // connection was down. Never fires on desktop, so this listener is inert there.
+    window.addEventListener("convertbar:events-reconnected", refresh);
     return () => {
       unlistenCompleted.then((fn) => fn());
       unlistenError.then((fn) => fn());
+      window.removeEventListener("convertbar:events-reconnected", refresh);
     };
   }, [refresh]);
 

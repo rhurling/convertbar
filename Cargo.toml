@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/convertbar-core", "src-tauri"]
+members = ["crates/convertbar-core", "crates/convertbar-server", "src-tauri"]
 
 [workspace.package]
 version = "1.0.0"

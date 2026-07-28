@@ -16,7 +16,7 @@ use crate::events::EventSinkExt;
 const TEMP_EXTENSIONS: &[&str] = &["part", "crdownload", "download", "tmp", "partial", "!ut"];
 
 /// True when `path`'s extension marks an in-progress download (see `TEMP_EXTENSIONS`).
-pub fn is_temp_file(path: &Path) -> bool {
+pub(crate) fn is_temp_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| TEMP_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
@@ -25,7 +25,7 @@ pub fn is_temp_file(path: &Path) -> bool {
 
 /// A file the watcher has seen change and is waiting to settle before enqueuing.
 #[derive(Debug, Clone)]
-pub struct PendingEntry {
+pub(crate) struct PendingEntry {
     size: u64,
     mtime: SystemTime,
     /// When `size`/`mtime` were last observed to change. The stability timer counts from here.
@@ -35,7 +35,7 @@ pub struct PendingEntry {
 }
 
 impl PendingEntry {
-    pub fn new(size: u64, mtime: SystemTime, now: Instant, delay: Duration) -> Self {
+    pub(crate) fn new(size: u64, mtime: SystemTime, now: Instant, delay: Duration) -> Self {
         Self {
             size,
             mtime,
@@ -47,7 +47,7 @@ impl PendingEntry {
     /// Fold in a fresh stat reading taken at `now`. Returns `true` when the file has been
     /// unchanged (same size and mtime) for at least `delay` — i.e. it is finished writing.
     /// Any change resets the stability timer.
-    pub fn observe(&mut self, size: u64, mtime: SystemTime, now: Instant) -> bool {
+    pub(crate) fn observe(&mut self, size: u64, mtime: SystemTime, now: Instant) -> bool {
         if size != self.size || mtime != self.mtime {
             self.size = size;
             self.mtime = mtime;
@@ -61,7 +61,7 @@ impl PendingEntry {
 /// Computes the watch changes needed to move from the `current` set to the `desired` set.
 /// Each entry is `(path, recursive)`. Returns `(to_unwatch, to_watch)`. A path whose recursive
 /// mode changed appears in both — unwatch the old, re-watch with the new mode.
-pub fn diff_watches(
+pub(crate) fn diff_watches(
     current: &[(PathBuf, bool)],
     desired: &[(PathBuf, bool)],
 ) -> (Vec<PathBuf>, Vec<(PathBuf, bool)>) {
@@ -85,7 +85,7 @@ pub fn diff_watches(
 /// nested watch (`/w/sub`) — no further FS event would re-add a file that already stopped changing.
 /// It also subsumes the recursive-mode-flip case: a subfolder file survives only if the new
 /// (possibly non-recursive) config still covers it.
-pub fn purge_pending_uncovered(
+pub(crate) fn purge_pending_uncovered(
     pending: &mut HashMap<PathBuf, PendingEntry>,
     desired: &[WatchedDirConfig],
 ) {
@@ -96,7 +96,7 @@ pub fn purge_pending_uncovered(
 /// (and with what delay) an incoming path should be tracked. Kept separate from the serde
 /// `WatchedDirectory` DB row so the hot path doesn't carry id/created_at/enabled.
 #[derive(Debug, Clone)]
-pub struct WatchedDirConfig {
+pub(crate) struct WatchedDirConfig {
     pub path: PathBuf,
     pub recursive: bool,
     pub delay: Duration,
@@ -105,7 +105,7 @@ pub struct WatchedDirConfig {
 /// Returns the stability delay to apply to `path` if it is a video file that belongs to one of
 /// the watched directories (respecting each directory's recursive flag), or `None` if the path
 /// should be ignored. Temp/partial download files are always ignored.
-pub fn delay_for_path(configs: &[WatchedDirConfig], path: &Path) -> Option<Duration> {
+pub(crate) fn delay_for_path(configs: &[WatchedDirConfig], path: &Path) -> Option<Duration> {
     if !crate::queue_ops::is_video_file(path) || is_temp_file(path) {
         return None;
     }
@@ -125,7 +125,7 @@ pub fn delay_for_path(configs: &[WatchedDirConfig], path: &Path) -> Option<Durat
 /// root so a stray file with the marker name above the watched tree is never honored, and returns
 /// `false` when `path` sits inside no watched directory. `marker_exists` is injected so the walk
 /// is unit-testable without touching the filesystem.
-pub fn has_active_marker(
+pub(crate) fn has_active_marker(
     configs: &[WatchedDirConfig],
     path: &Path,
     marker: &str,
@@ -155,7 +155,7 @@ pub fn has_active_marker(
 /// `(directory, recursive)` subtree to re-scan so files ignored while the marker existed get picked
 /// up. Returns `None` when `path` isn't the marker, isn't inside a watched directory, or still
 /// exists (a create/modify, not a delete). `exists` is injected for testability.
-pub fn marker_removed_dir(
+pub(crate) fn marker_removed_dir(
     configs: &[WatchedDirConfig],
     path: &Path,
     marker: &str,
@@ -204,7 +204,7 @@ pub struct WatcherState {
 }
 
 impl WatcherState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             watcher: Mutex::new(None),
             watched: Mutex::new(Vec::new()),
@@ -555,7 +555,7 @@ fn collect_video_paths(dir: &Path, recursive: bool) -> Vec<String> {
 
 /// Enqueues files already present in `dir` when a watch is first enabled or on app start, so
 /// downloads that landed while the app was closed aren't missed.
-pub fn scan_existing(ctx: &Arc<Ctx>, dir: &Path, recursive: bool) {
+pub(crate) fn scan_existing(ctx: &Arc<Ctx>, dir: &Path, recursive: bool) {
     let paths = collect_video_paths(dir, recursive);
     if !paths.is_empty() {
         enqueue_and_start(ctx, paths);
@@ -567,7 +567,7 @@ pub fn scan_existing(ctx: &Arc<Ctx>, dir: &Path, recursive: bool) {
 /// inline freezes the UI when a folder holds many files (identical hazard to the initial scan in
 /// `start`). Spawns the scan off-thread — the same proven-safe path the startup scan and reaper
 /// already use.
-pub fn scan_existing_background(ctx: &Arc<Ctx>, dir: PathBuf, recursive: bool) {
+pub(crate) fn scan_existing_background(ctx: &Arc<Ctx>, dir: PathBuf, recursive: bool) {
     let ctx = ctx.clone();
     std::thread::spawn(move || scan_existing(&ctx, &dir, recursive));
 }

@@ -29,7 +29,14 @@ import QueuePage from "./QueuePage";
 import { commands } from "../lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 
-const intakeStub = { pendingConfirm: null, onAdd: vi.fn(), onSkip: vi.fn(), status: null, isDragOver: false };
+const intakeStub = {
+  pendingConfirm: null,
+  onAdd: vi.fn(),
+  onSkip: vi.fn(),
+  status: null,
+  isDragOver: false,
+  addPaths: vi.fn(),
+};
 
 beforeEach(() => {
   vi.clearAllMocks();

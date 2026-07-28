@@ -4,7 +4,9 @@ import QueuePage from "./pages/QueuePage";
 import HistoryPage from "./pages/HistoryPage";
 import WatchedFoldersPage from "./pages/WatchedFoldersPage";
 import SettingsPage from "./pages/SettingsPage";
+import LoginScreen from "./components/LoginScreen";
 import { commands, type HandbrakeStatus } from "./lib/tauri";
+import { isServerHead } from "./lib/head";
 import { useAddProgress } from "./hooks/useAddProgress";
 import { useFileIntake } from "./hooks/useFileIntake";
 import { useUpdate } from "./hooks/useUpdate";
@@ -15,9 +17,17 @@ type Tab = "queue" | "history" | "watch" | "settings";
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("queue");
   const [hbStatus, setHbStatus] = useState<HandbrakeStatus | null>(null);
+  const [unauthorized, setUnauthorized] = useState(false);
   const { isAdding, activity } = useAddProgress();
   const intake = useFileIntake({ onDrop: () => setActiveTab("queue") });
   const { state: updateState } = useUpdate();
+
+  // Server head only: desktop never dispatches this event.
+  useEffect(() => {
+    const handler = () => setUnauthorized(true);
+    window.addEventListener("convertbar:unauthorized", handler);
+    return () => window.removeEventListener("convertbar:unauthorized", handler);
+  }, []);
 
   const refreshHbStatus = async () => {
     const status = await commands.validateHandbrake();
@@ -29,6 +39,9 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // Desktop-only: hideWindow() has no server equivalent (there's no window to hide), so the
+    // listener itself is never registered on the server build rather than gating the call inside it.
+    if (isServerHead) return;
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         commands.hideWindow();
@@ -37,6 +50,8 @@ function App() {
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   }, []);
+
+  if (unauthorized) return <LoginScreen />;
 
   return (
     <div className="app">

@@ -11,6 +11,7 @@ import {
   type PurgeResult,
 } from "../lib/tauri";
 import { resolveTargetPath } from "../lib/historyTarget";
+import { isServerHead } from "../lib/head";
 import HistoryItem from "../components/HistoryItem";
 import ContextMenu from "../components/ContextMenu";
 
@@ -162,7 +163,11 @@ export default function HistoryPage() {
     }
   };
 
+  // Desktop-only: every action the menu offers (checkPathsExist, openPath, revealInDir) is a
+  // local-filesystem concern the server head has no equivalent for — gate the whole menu here
+  // rather than showing it with those individual actions disabled/broken.
   const handleItemContextMenu = (e: React.MouseEvent, job: JobInfo) => {
+    if (isServerHead) return;
     setMenu({ job, x: e.clientX, y: e.clientY, exists: null });
     commands.checkPathsExist(job.source_path, job.output_path).then(
       (exists) =>

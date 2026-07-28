@@ -2,6 +2,9 @@ use crate::ctx::Ctx;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::time::Duration;
+
+const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresetMetadata {
@@ -36,6 +39,28 @@ pub fn detect_handbrake_path() -> Option<String> {
     }
 
     None
+}
+
+/// `HandBrakeCLI --version` with a hard deadline — a binary on a hung network mount
+/// must not stall the validation thread indefinitely. `--version` output is tiny, so
+/// reading stderr after exit cannot hit the pipe-buffer limit.
+pub fn handbrake_version(hb_path: &str) -> Option<String> {
+    use std::io::Read;
+
+    let mut child = std::process::Command::new(hb_path)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    crate::probe::wait_with_timeout(&mut child, VERSION_CHECK_TIMEOUT)?;
+
+    let mut stderr = String::new();
+    child.stderr.take()?.read_to_string(&mut stderr).ok()?;
+    stderr
+        .lines()
+        .find(|l| l.contains("HandBrake"))
+        .map(|l| l.split_whitespace().nth(1).unwrap_or("unknown").to_string())
 }
 
 pub fn list_presets(handbrake_path: &str) -> Result<Vec<String>, String> {
@@ -100,7 +125,7 @@ fn parse_preset_list(stderr: &str) -> Vec<String> {
     presets
 }
 
-pub fn get_preset_metadata(
+pub(crate) fn get_preset_metadata(
     handbrake_path: &str,
     preset_name: &str,
 ) -> Result<PresetMetadata, String> {

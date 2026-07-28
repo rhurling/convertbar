@@ -1,4 +1,5 @@
 import { commands } from "../lib/tauri";
+import { isServerHead } from "../lib/head";
 
 type Tab = "queue" | "history" | "watch" | "settings";
 
@@ -35,9 +36,11 @@ export default function TabBar({ activeTab, onTabChange, isAdding, updateAvailab
       {isAdding && (
         <span className="tab-spinner" title="Adding files to the queue…" aria-label="Adding files" />
       )}
-      <button className="tab-btn close-tab-btn" onClick={() => commands.hideWindow()} title="Close">
-        &times;
-      </button>
+      {!isServerHead && (
+        <button className="tab-btn close-tab-btn" onClick={() => commands.hideWindow()} title="Close">
+          &times;
+        </button>
+      )}
     </div>
   );
 }

@@ -13,6 +13,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:web": "tsc && VITE_HEAD=server vite build --outDir dist-web --emptyOutDir",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",

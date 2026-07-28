@@ -1,13 +1,10 @@
 use std::sync::Arc;
-use std::time::Duration;
 use tauri::State;
 
 use crate::handbrake as hb;
 use crate::handbrake::PresetMetadata;
 use crate::types::HandbrakeStatus;
 use convertbar_core::ctx::Ctx;
-
-const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 // All four commands below reach a subprocess (HandBrakeCLI or `which`/`where`); as
 // sync commands they ran on the main thread and stalled the UI for the subprocess
@@ -59,7 +56,7 @@ pub async fn validate_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<HandbrakeSta
     let ctx = ctx.inner().clone();
     tauri::async_runtime::spawn_blocking(move || match hb::resolve_handbrake_path(&ctx)? {
         Some(p) => {
-            let version = handbrake_version(&p).unwrap_or_default();
+            let version = hb::handbrake_version(&p).unwrap_or_default();
             Ok(HandbrakeStatus {
                 found: true,
                 path: p,
@@ -82,28 +79,6 @@ pub async fn validate_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<HandbrakeSta
 #[tauri::command]
 pub fn resolve_suffix_template(template: String, metadata: PresetMetadata) -> String {
     hb::resolve_suffix_template(&template, &metadata)
-}
-
-/// `HandBrakeCLI --version` with a hard deadline — a binary on a hung network mount
-/// must not stall the validation thread indefinitely. `--version` output is tiny, so
-/// reading stderr after exit cannot hit the pipe-buffer limit.
-fn handbrake_version(path: &str) -> Option<String> {
-    use std::io::Read;
-
-    let mut child = std::process::Command::new(path)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
-    crate::probe::wait_with_timeout(&mut child, VERSION_CHECK_TIMEOUT)?;
-
-    let mut stderr = String::new();
-    child.stderr.take()?.read_to_string(&mut stderr).ok()?;
-    stderr
-        .lines()
-        .find(|l| l.contains("HandBrake"))
-        .map(|l| l.split_whitespace().nth(1).unwrap_or("unknown").to_string())
 }
 
 #[cfg(test)]

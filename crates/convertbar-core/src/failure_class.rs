@@ -164,7 +164,7 @@ pub fn diagnostic_headline<'a>(lines: &[&'a str]) -> Option<&'a str> {
 /// The bare failure prefixes written before the diagnostic headline was promoted. A
 /// stored message whose first line is exactly one of these predates the change and
 /// still leads with HandBrake's banner. Kept in sync with the `message_with_tail`
-/// callers below.
+/// callers in `converter.rs`.
 const LEGACY_ERROR_PREFIXES: [&str; 2] = [
     "Conversion failed:",
     "Conversion produced an empty output file:",

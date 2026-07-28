@@ -33,4 +33,4 @@ during the spec.
 
 **Next step:** brainstorm → spec → implementation plan (not started).
 
-**Status:** core extraction landed (workspace split, Plan 1); server head is Plan 2.
+**Status:** shipped — Plan 1 (workspace split, PR #124) + Plan 2 (server head). Remaining follow-ups tracked in the Plan 2 doc.

@@ -23,6 +23,18 @@ pub fn read_suffix_template(conn: &rusqlite::Connection, preset: &str) -> String
     }
 }
 
+/// Persists `preset`'s output-filename suffix override (upserting `preset_suffixes`). Moved
+/// from the desktop command layer so the server routes can call it too.
+pub fn set_preset_suffix(ctx: &Ctx, preset: &str, suffix: &str) -> Result<(), String> {
+    let conn = ctx.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO preset_suffixes (preset_name, suffix) VALUES (?1, ?2) ON CONFLICT(preset_name) DO UPDATE SET suffix = ?2",
+        params![preset, suffix],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub const ALLOWED_KEYS: &[&str] = &[
     "preset",
     "cleanup_mode",
@@ -282,6 +294,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_suffix_template(&conn, "P"), ".custom");
+    }
+
+    #[test]
+    fn set_preset_suffix_inserts_then_updates_on_conflict() {
+        let (ctx, _sink, _d) = test_ctx(test_conn());
+
+        set_preset_suffix(&ctx, "P", ".custom").unwrap();
+        assert_eq!(
+            read_suffix_template(&ctx.db.lock().unwrap(), "P"),
+            ".custom"
+        );
+
+        // A second write for the same preset must update the existing row (ON CONFLICT), not
+        // fail on the preset_suffixes UNIQUE constraint or insert a duplicate.
+        set_preset_suffix(&ctx, "P", ".updated").unwrap();
+        assert_eq!(
+            read_suffix_template(&ctx.db.lock().unwrap(), "P"),
+            ".updated"
+        );
     }
 
     #[test]

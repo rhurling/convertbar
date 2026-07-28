@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
 import UpdatePanel from "../components/UpdatePanel";
+import { isServerHead } from "../lib/head";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
@@ -36,6 +37,9 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   } = useSettings();
 
   const inputRef = useRef<HTMLInputElement>(null);
+  // Desktop's version display now lives inside UpdatePanel (via useUpdate/getUpdateState); this
+  // is only rendered on the server head, which has no updater UI of its own.
+  const [appVersion, setAppVersion] = useState<string>("");
 
   // Local drafts so text inputs echo keystrokes instantly and commit once (on blur/Enter),
   // instead of round-tripping an IPC write per character (which dropped/reordered characters).
@@ -45,6 +49,14 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [suffixDraft, setSuffixDraft] = useState(presetSuffix);
   const [resolvedSuffix, setResolvedSuffix] = useState("");
 
+  // getAppInfo() works on both heads (desktop composes it from getVersion() internally, server
+  // hits /api/info), but only the server head's render path uses the result — desktop's version
+  // display lives inside UpdatePanel instead.
+  useEffect(() => {
+    if (isServerHead) {
+      commands.getAppInfo().then((info) => setAppVersion(info.version)).catch(() => {});
+    }
+  }, []);
   useEffect(() => {
     if (settings) setHbDraft(settings.handbrake_path);
   }, [settings?.handbrake_path]);
@@ -218,26 +230,33 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
 
       <div className="setting-group">
         <label className="setting-label">After conversion</label>
-        <div className="setting-radios">
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="cleanup"
-              checked={settings.cleanup_mode === "trash"}
-              onChange={() => updateSetting("cleanup_mode", "trash")}
-            />
-            Move original to Trash
-          </label>
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="cleanup"
-              checked={settings.cleanup_mode === "delete"}
-              onChange={() => updateSetting("cleanup_mode", "delete")}
-            />
-            Delete permanently
-          </label>
-        </div>
+        {isServerHead ? (
+          <p className="setting-hint">
+            Originals are deleted permanently after conversion — the server has no Trash to
+            move them to.
+          </p>
+        ) : (
+          <div className="setting-radios">
+            <label className="radio-label">
+              <input
+                type="radio"
+                name="cleanup"
+                checked={settings.cleanup_mode === "trash"}
+                onChange={() => updateSetting("cleanup_mode", "trash")}
+              />
+              Move original to Trash
+            </label>
+            <label className="radio-label">
+              <input
+                type="radio"
+                name="cleanup"
+                checked={settings.cleanup_mode === "delete"}
+                onChange={() => updateSetting("cleanup_mode", "delete")}
+              />
+              Delete permanently
+            </label>
+          </div>
+        )}
       </div>
 
       <div className="setting-group">
@@ -246,26 +265,32 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           Files ConvertBar could not read, or that turned out to be incomplete
           downloads, are listed in History. Nothing is removed until you choose to.
         </p>
-        <div className="setting-radios">
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="badSource"
-              checked={settings.bad_source_action === "trash"}
-              onChange={() => updateSetting("bad_source_action", "trash")}
-            />
-            Move bad source files to Trash
-          </label>
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="badSource"
-              checked={settings.bad_source_action === "delete"}
-              onChange={() => updateSetting("bad_source_action", "delete")}
-            />
-            Delete bad source files permanently
-          </label>
-        </div>
+        {isServerHead ? (
+          <p className="setting-hint">
+            Bad source files are deleted permanently — the server has no Trash to move them to.
+          </p>
+        ) : (
+          <div className="setting-radios">
+            <label className="radio-label">
+              <input
+                type="radio"
+                name="badSource"
+                checked={settings.bad_source_action === "trash"}
+                onChange={() => updateSetting("bad_source_action", "trash")}
+              />
+              Move bad source files to Trash
+            </label>
+            <label className="radio-label">
+              <input
+                type="radio"
+                name="badSource"
+                checked={settings.bad_source_action === "delete"}
+                onChange={() => updateSetting("bad_source_action", "delete")}
+              />
+              Delete bad source files permanently
+            </label>
+          </div>
+        )}
       </div>
 
       <div className="setting-group">
@@ -346,67 +371,75 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         </p>
       </div>
 
-      <div className="setting-group">
-        <label className="setting-label">Menu bar display</label>
-        <p className="setting-hint">Choose what to show next to the icon during encoding</p>
-        <div className="setting-toggles">
-          {[
-            { key: "menubar_show_percent", label: "Percentage" },
-            { key: "menubar_show_eta", label: "ETA" },
-            { key: "menubar_show_queue", label: "Queue count" },
-            { key: "menubar_show_filename", label: "File name" },
-            { key: "menubar_show_fps", label: "Encoding speed" },
-          ].map(({ key, label }) => (
-            <label key={key} className="toggle-label">
-              <input
-                type="checkbox"
-                checked={settings[key as keyof AppSettings] === true}
-                onChange={(e) => updateSetting(key, String(e.target.checked))}
-              />
-              {label}
-            </label>
-          ))}
+      {/* Menu bar display, notifications, and launch-at-login are all macOS menu-bar-app
+          concepts with no equivalent on a headless server. */}
+      {!isServerHead && (
+        <div className="setting-group">
+          <label className="setting-label">Menu bar display</label>
+          <p className="setting-hint">Choose what to show next to the icon during encoding</p>
+          <div className="setting-toggles">
+            {[
+              { key: "menubar_show_percent", label: "Percentage" },
+              { key: "menubar_show_eta", label: "ETA" },
+              { key: "menubar_show_queue", label: "Queue count" },
+              { key: "menubar_show_filename", label: "File name" },
+              { key: "menubar_show_fps", label: "Encoding speed" },
+            ].map(({ key, label }) => (
+              <label key={key} className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={settings[key as keyof AppSettings] === true}
+                  onChange={(e) => updateSetting(key, String(e.target.checked))}
+                />
+                {label}
+              </label>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
-      <div className="setting-group">
-        <label className="setting-label">Notifications</label>
-        <div className="setting-toggles">
-          <label className="toggle-label">
-            <input type="checkbox"
-              checked={settings.notifications_per_file}
-              onChange={(e) => updateSetting("notifications_per_file", String(e.target.checked))} />
-            Notify per file
-          </label>
-          {settings.notifications_per_file && (
-            <label className="toggle-label toggle-sub">
+      {!isServerHead && (
+        <div className="setting-group">
+          <label className="setting-label">Notifications</label>
+          <div className="setting-toggles">
+            <label className="toggle-label">
               <input type="checkbox"
-                checked={settings.notifications_errors_only}
-                onChange={(e) => updateSetting("notifications_errors_only", String(e.target.checked))} />
-              Errors only
+                checked={settings.notifications_per_file}
+                onChange={(e) => updateSetting("notifications_per_file", String(e.target.checked))} />
+              Notify per file
             </label>
-          )}
-          <label className="toggle-label">
-            <input type="checkbox"
-              checked={settings.notifications_queue_done}
-              onChange={(e) => updateSetting("notifications_queue_done", String(e.target.checked))} />
-            Notify when queue finishes
+            {settings.notifications_per_file && (
+              <label className="toggle-label toggle-sub">
+                <input type="checkbox"
+                  checked={settings.notifications_errors_only}
+                  onChange={(e) => updateSetting("notifications_errors_only", String(e.target.checked))} />
+                Errors only
+              </label>
+            )}
+            <label className="toggle-label">
+              <input type="checkbox"
+                checked={settings.notifications_queue_done}
+                onChange={(e) => updateSetting("notifications_queue_done", String(e.target.checked))} />
+              Notify when queue finishes
+            </label>
+          </div>
+        </div>
+      )}
+
+      {!isServerHead && (
+        <div className="setting-group">
+          <label className="setting-label">
+            <input
+              type="checkbox"
+              checked={settings.launch_at_login}
+              onChange={(e) =>
+                updateSetting("launch_at_login", String(e.target.checked))
+              }
+            />
+            Launch at login
           </label>
         </div>
-      </div>
-
-      <div className="setting-group">
-        <label className="setting-label">
-          <input
-            type="checkbox"
-            checked={settings.launch_at_login}
-            onChange={(e) =>
-              updateSetting("launch_at_login", String(e.target.checked))
-            }
-          />
-          Launch at login
-        </label>
-      </div>
+      )}
 
       <div className="setting-group">
         <label className="setting-label">HandBrakeCLI path</label>
@@ -437,16 +470,30 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         </div>
       </div>
 
-      <UpdatePanel />
+      {/* The auto-updater (UpdatePanel) is a desktop-only concept — it downloads and relaunches
+          the app bundle. The server head has no equivalent; it just shows its running version,
+          updated by redeploying. */}
+      {isServerHead ? (
+        <div className="setting-group">
+          <label className="setting-label">
+            Version {appVersion && <span className="version-label">v{appVersion}</span>}
+          </label>
+        </div>
+      ) : (
+        <UpdatePanel />
+      )}
 
-      <div className="setting-group setting-group-quit">
-        <button
-          className="btn btn-quit"
-          onClick={() => commands.quitApp()}
-        >
-          Quit ConvertBar
-        </button>
-      </div>
+      {/* quitApp() has no server equivalent (there's no local app process for the user to quit). */}
+      {!isServerHead && (
+        <div className="setting-group setting-group-quit">
+          <button
+            className="btn btn-quit"
+            onClick={() => commands.quitApp()}
+          >
+            Quit ConvertBar
+          </button>
+        </div>
+      )}
     </div>
   );
 }

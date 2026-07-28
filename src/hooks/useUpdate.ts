@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "../lib/events";
 import { commands, type UpdateMode, type UpdateState, type UpdateStatus } from "../lib/tauri";
+import { isServerHead } from "../lib/head";
 
 // Statuses where the backend's `manual_check_block` (updater.rs) would refuse a fresh manual
 // check: an install is downloading, waiting for the queue to drain, or installed and awaiting
@@ -35,6 +36,12 @@ export function useUpdate() {
   latest.current = state;
 
   useEffect(() => {
+    // Desktop-only: the updater has no server-head equivalent (commands.getUpdateState() is a
+    // `notAvailable` stub there, which throws synchronously rather than rejecting — calling it
+    // would crash the effect). `state` stays null, so `useUpdate`'s callers see no update ever
+    // available, same as the other isServerHead-gated hooks (useFileIntake's drag-drop listener).
+    if (isServerHead) return;
+
     let alive = true;
     // If the update-state event fires before this seed resolves, the event is newer — the
     // seed must not clobber it (same stale-response guard as useQueue's getQueue race).
