@@ -86,3 +86,193 @@ describe("IPC contract", () => {
     expect(missing, `listened but never emitted in src-tauri: ${missing.join(", ")}`).toEqual([]);
   });
 });
+
+// --- Server-head sibling: HTTP transport <-> routes.json contract (Task 13) ----------------
+//
+// `src/lib/transport/http.ts` talks to the axum routes in `crates/convertbar-server/routes.json`
+// by string literal (method + path), not by symbol — renaming a route on either side breaks the
+// server head at runtime while every other suite, including the desktop contract above, stays
+// green. This pins that seam: every fetch call must hit a route that's actually registered, and
+// every registered command must have a frontend caller.
+
+interface RouteRow {
+  command: string;
+  method: string;
+  path: string;
+}
+
+const routesJson: RouteRow[] = JSON.parse(
+  readFileSync(join(root, "crates", "convertbar-server", "routes.json"), "utf8"),
+);
+
+const httpTsPath = join(root, "src", "lib", "transport", "http.ts");
+const httpTsSrc = readFileSync(httpTsPath, "utf8");
+
+/**
+ * Extracts every `api("METHOD", <path-expression>)` call in `http.ts`, returning the method and
+ * the raw (unquoted) text of the path argument — a plain string, or the full body of a template
+ * literal, backticks stripped, including any *nested* backticks (`getHistorySummary`'s path is a
+ * template literal containing another template literal inside a ternary). A hand-rolled scan
+ * rather than a single regex, because that nesting defeats a `` `([^`]*)` `` capture — it would
+ * stop at the first inner backtick.
+ */
+function extractHttpApiCalls(src: string): { method: string; rawPath: string }[] {
+  const calls: { method: string; rawPath: string }[] = [];
+  const callRe = /\bapi\(\s*["'](GET|POST|PUT|DELETE|PATCH)["'],\s*/g;
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(src))) {
+    const method = m[1];
+    const start = callRe.lastIndex;
+    const quote = src[start];
+    if (quote !== "`" && quote !== '"' && quote !== "'") continue;
+    let i = start + 1;
+    if (quote === "`") {
+      // Track `${`/`{`/`}` depth so a nested template literal's own backtick doesn't look
+      // like the close of the outer one.
+      let depth = 0;
+      while (i < src.length) {
+        if (src[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (depth === 0 && src[i] === "`") break;
+        if (src[i] === "$" && src[i + 1] === "{") {
+          depth++;
+          i += 2;
+          continue;
+        }
+        if (depth > 0 && src[i] === "{") {
+          depth++;
+          i++;
+          continue;
+        }
+        if (depth > 0 && src[i] === "}") {
+          depth--;
+          i++;
+          continue;
+        }
+        i++;
+      }
+    } else {
+      while (i < src.length && src[i] !== quote) {
+        if (src[i] === "\\") i++;
+        i++;
+      }
+    }
+    calls.push({ method, rawPath: src.slice(start + 1, i) });
+  }
+  return calls;
+}
+
+/**
+ * True if a `${...}` group's source builds an optional query string rather than a path segment —
+ * i.e. some backtick-quoted section inside it (with that section's own `${...}` expressions
+ * blanked out first) contains a literal `?`. Catches `getHistorySummary`'s
+ * `${search ? \`?search=${...}\` : ""}`, where the query-string `?` sits one template layer
+ * below the ternary's own `?`.
+ */
+function nestedGroupBuildsQueryString(groupSrc: string): boolean {
+  let i = 0;
+  while (i < groupSrc.length) {
+    const start = groupSrc.indexOf("`", i);
+    if (start === -1) return false;
+    const end = groupSrc.indexOf("`", start + 1);
+    if (end === -1) return false;
+    const inner = groupSrc.slice(start + 1, end).replace(/\$\{[^}]*\}/g, "");
+    if (inner.includes("?")) return true;
+    i = end + 1;
+  }
+  return false;
+}
+
+/**
+ * Normalizes a raw path expression (from `extractHttpApiCalls`) to a routes.json-comparable
+ * shape: every `${...}` interpolation becomes the single token `{}` (routes.json's `{id}` etc.
+ * normalize the same way in `normalizeRoutesPath`), and anything from a query string onward is
+ * dropped entirely — including one assembled conditionally, several `${}` layers deep. That's
+ * why this walks the template structurally instead of doing two independent
+ * string.replace passes: a plain "strip from the first `?`, then replace `${...}`" can't tell
+ * the `?` in `search ? ... : ""` (a ternary, not a query string) from the `?` that starts
+ * `?search=` one level further inside the same expression.
+ */
+function normalizeHttpPath(rawPath: string): string {
+  let result = "";
+  let i = 0;
+  while (i < rawPath.length) {
+    const nextGroup = rawPath.indexOf("${", i);
+    const staticPart = nextGroup === -1 ? rawPath.slice(i) : rawPath.slice(i, nextGroup);
+    const qIdx = staticPart.indexOf("?");
+    if (qIdx !== -1) return result + staticPart.slice(0, qIdx);
+    result += staticPart;
+    if (nextGroup === -1) break;
+    let depth = 1;
+    let j = nextGroup + 2;
+    while (j < rawPath.length && depth > 0) {
+      if (rawPath[j] === "{") depth++;
+      else if (rawPath[j] === "}") depth--;
+      j++;
+    }
+    const groupSrc = rawPath.slice(nextGroup + 2, j - 1);
+    if (groupSrc.includes("`") && nestedGroupBuildsQueryString(groupSrc)) return result;
+    result += "{}";
+    i = j;
+  }
+  return result;
+}
+
+function normalizeRoutesPath(path: string): string {
+  const qIdx = path.indexOf("?");
+  return (qIdx === -1 ? path : path.slice(0, qIdx)).replace(/\{[^}]*\}/g, "{}");
+}
+
+const httpCalls = extractHttpApiCalls(httpTsSrc).map((c) => ({
+  method: c.method,
+  path: normalizeHttpPath(c.rawPath),
+}));
+const normalizedRoutes = routesJson.map((r) => ({ ...r, path: normalizeRoutesPath(r.path) }));
+
+// `httpCommands`'s top-level keys, including the desktop-only `notAvailable` stubs (fine: this
+// set is only ever checked for routes.json COVERAGE — routes.json's commands must be a subset of
+// these names, never the reverse).
+function httpCommandsKeys(src: string): string[] {
+  const start = src.indexOf("export const httpCommands = {");
+  const end = src.indexOf("\n} satisfies", start);
+  const body = src.slice(start, end);
+  return [...body.matchAll(/^ {2}(\w+):/gm)].map((m) => m[1]);
+}
+
+const normalizeName = (s: string): string => s.replace(/_/g, "").toLowerCase();
+const httpKeyNames = new Set(httpCommandsKeys(httpTsSrc).map(normalizeName));
+
+describe("http transport <-> routes.json contract", () => {
+  it("extracts a non-empty surface from both sides (guards against a broken scan)", () => {
+    expect(httpCalls.length).toBeGreaterThan(10);
+    expect(routesJson.length).toBeGreaterThan(10);
+    expect(httpKeyNames.size).toBeGreaterThan(10);
+  });
+
+  it("every http.ts api() call matches a routes.json row (method + normalized path)", () => {
+    const unmatched = httpCalls.filter(
+      (c) => !normalizedRoutes.some((r) => r.method === c.method && r.path === c.path),
+    );
+    expect(unmatched, `http.ts calls with no routes.json row: ${JSON.stringify(unmatched)}`).toEqual(
+      [],
+    );
+  });
+
+  it("every routes.json command has a matching httpCommands member (routes.json only lists commands with a server route, so none are desktop-only)", () => {
+    const missing = routesJson.filter((r) => !httpKeyNames.has(normalizeName(r.command)));
+    expect(
+      missing,
+      `routes.json commands missing from http.ts: ${missing.map((r) => r.command).join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("the SSE stream route is registered (transport, not a routes.json command)", () => {
+    const eventsRs = readFileSync(
+      join(root, "crates", "convertbar-server", "src", "routes", "events.rs"),
+      "utf8",
+    );
+    expect(eventsRs.includes('"/api/events"')).toBe(true);
+  });
+});
