@@ -1,4 +1,8 @@
-# Open Issues
+# Open Issues *(archived 2026-07-28 — its only issue shipped)*
+
+Archived when the single item below landed. There is no live `docs/OPEN_ISSUES.md`
+any more; new larger ideas go in `docs/RECOMMENDATIONS.md` under an "Open" heading,
+which is where the server head's remaining follow-ups now live.
 
 ## Docker-based web-UI version for server use
 
