@@ -218,6 +218,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_leaves_keep_untouched() {
+        // The server forces trash -> delete because the `trash` crate litters .Trash-<uid>
+        // on NAS mounts. It must NOT touch 'keep', which is a deliberate user choice the
+        // web UI now offers. No production code enforces this — only the fact that the
+        // rewrite is scoped to the exact string 'trash'. This test is what keeps it scoped.
+        let conn = test_conn();
+        conn.execute(
+            "UPDATE settings SET value = 'keep' WHERE key = 'cleanup_mode'",
+            [],
+        )
+        .unwrap();
+        let ctx = test_ctx(conn);
+
+        normalize_server_settings(&ctx);
+
+        let conn = ctx.db.lock().unwrap();
+        assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("keep"));
+    }
+
     // --- boot ---
     //
     // The positive auto-resume path (a queued job + queue_paused='false') is deliberately
