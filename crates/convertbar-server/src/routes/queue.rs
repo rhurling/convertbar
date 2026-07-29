@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use convertbar_core::queue_ops;
 
-use super::{core_err, ServerState};
+use super::{core_err, join_err, ServerState};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,7 +26,7 @@ pub async fn add_files(State(s): State<ServerState>, Json(b): Json<AddFilesBody>
     match tokio::task::spawn_blocking(move || queue_ops::add_files(&ctx, &b.paths)).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }
 
@@ -41,7 +41,7 @@ pub async fn scan_folder(Json(b): Json<PathBody>) -> Response {
     match tokio::task::spawn_blocking(move || queue_ops::scan_folder(b.path)).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }
 
@@ -50,7 +50,7 @@ pub async fn confirm_folder_add(State(s): State<ServerState>, Json(b): Json<Path
     match tokio::task::spawn_blocking(move || queue_ops::confirm_folder_add(&ctx, b.path)).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }
 
@@ -64,7 +64,7 @@ pub async fn classify_paths(Json(b): Json<ClassifyPathsBody>) -> Response {
     match tokio::task::spawn_blocking(move || queue_ops::classify_paths(b.paths)).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }
 
@@ -126,6 +126,6 @@ pub async fn purge_bad_sources(
     match tokio::task::spawn_blocking(move || queue_ops::purge_bad_sources(&ctx, b.ids)).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }

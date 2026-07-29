@@ -22,11 +22,40 @@ pub mod queue;
 pub mod settings;
 pub mod watch;
 
-/// Maps a core `Err(String)` to the `500 {"error": ...}` shape shared by every route.
+/// Maps a core `Err(String)` — a failure the server means, such as a missing HandBrakeCLI —
+/// to the `500 {"error": ...}` shape shared by every route. A `spawn_blocking` join failure is
+/// NOT one of these: it goes through [`join_err`], which adds the discriminator that tells the
+/// two apart.
 pub fn core_err(e: String) -> (axum::http::StatusCode, Json<Value>) {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": e })),
+    )
+}
+
+/// Maps a `spawn_blocking` join failure — a panic in a blocking task, i.e. a bug in this
+/// server — to a 500 a client can tell apart from [`core_err`]'s deliberate failures.
+///
+/// Both shapes stay 500: both are genuinely "the server could not answer", and moving
+/// deliberate failures onto 4xx would be a far larger contract change than this distinction
+/// needs. The `kind` field is therefore the entire discriminator, and it appears on this shape
+/// only — `core_err` bodies carry `error` alone. Before it existed, the only way to tell a
+/// server bug from an expected condition was to pattern-match the message text
+/// (RECOMMENDATIONS item 16); this is the single definition, so a route cannot grow its own
+/// divergent copy.
+///
+/// The panic detail stays on the wire, as it was before: the API is auth-gated by default and
+/// the threat model is single-user LAN, so debuggability wins over withholding it.
+///
+/// A `JoinError` can in principle mean "cancelled" rather than "panicked". Nothing here aborts
+/// these handles — every one is awaited inline at its own call site — so in practice this is
+/// always a panic, and a runtime-shutdown cancellation would land in the same arm. Reporting
+/// both as `panic` is accepted: the client's conclusion (a server bug, not a condition to
+/// handle) is identical either way.
+pub fn join_err(e: tokio::task::JoinError) -> (axum::http::StatusCode, Json<Value>) {
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": format!("task panicked: {e}"), "kind": "panic" })),
     )
 }
 
@@ -256,6 +285,125 @@ pub(crate) mod tests {
             serde_json::from_slice(&bytes).expect("response body must be valid JSON")
         };
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn join_err_reports_the_panic_detail_alongside_the_discriminator() {
+        // A real `JoinError` from a real panicking blocking task — the same value every route's
+        // `Err(join)` arm receives. Constructing one instead of asserting on a hand-built body
+        // is what makes this a test of the mapping rather than of `json!`.
+        let handle: tokio::task::JoinHandle<()> = tokio::task::spawn_blocking(|| panic!("boom"));
+        let join = handle
+            .await
+            .expect_err("a panicking task joins as an error");
+
+        let (status, Json(body)) = join_err(join);
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        // Pinned as a literal on purpose, same tactic as `HANDBRAKE_NOT_FOUND`'s assertion:
+        // reading the discriminator back from the code that produces it would assert nothing,
+        // and this value is what a client branches on.
+        assert_eq!(body["kind"], "panic");
+        // The detail is deliberately still on the wire (auth-gated, single-user LAN): a client
+        // hitting the API directly keeps the same debuggability it had before the discriminator.
+        let message = body["error"].as_str().expect("error must be a string");
+        assert!(
+            message.starts_with("task panicked: "),
+            "the panic detail must survive the mapping, got: {message}"
+        );
+    }
+
+    /// RECOMMENDATIONS item 16: a `spawn_blocking` join failure is a server bug, and a client
+    /// must be able to tell it apart from an expected condition without pattern-matching the
+    /// message text. Both stay 500 — the status deliberately does not move, which is exactly
+    /// why the `kind` discriminator has to carry the distinction.
+    #[tokio::test]
+    async fn a_panicked_task_and_a_deliberate_failure_are_told_apart_by_kind() {
+        // `test_state()`'s PanickingLocator makes these routes panic INSIDE `spawn_blocking` —
+        // real join failures at real call sites, not simulated ones. Two different route
+        // modules (`handbrake.rs` and `queue.rs`), so the wiring is pinned at more than the one
+        // site a single-route test would reach. The panics' own messages hit stderr while this
+        // test runs; that noise is expected, not a failure.
+        let (panic_status, panic_body) = request_json(
+            api_router(test_state()),
+            "GET",
+            "/api/handbrake/detect",
+            None,
+        )
+        .await;
+        let (queue_panic_status, queue_panic_body) = request_json(
+            api_router(test_state()),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/tmp/clip.mp4"]})),
+        )
+        .await;
+
+        // The mirror world: a failure the server means. Same route and same request as the
+        // queue panic above — only the declared world differs — so the two bodies isolate the
+        // distinction itself rather than any difference between endpoints.
+        let (state, _tx) =
+            test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
+        let (core_status, core_body) = request_json(
+            api_router(state),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/tmp/clip.mp4"]})),
+        )
+        .await;
+
+        // The premise: status alone cannot separate them. If this ever stops holding, the
+        // discriminator below is no longer the only thing carrying the distinction.
+        assert_eq!(panic_status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(queue_panic_status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(core_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        assert_eq!(
+            panic_body["kind"], "panic",
+            "a panicked task must say so: {panic_body}"
+        );
+        assert_eq!(
+            queue_panic_body["kind"], "panic",
+            "the queue module's join arm must map the same way: {queue_panic_body}"
+        );
+        assert!(
+            core_body.get("kind").is_none(),
+            "a deliberate failure must not claim to be a server bug: {core_body}"
+        );
+    }
+
+    /// Tripwire, in the spirit of `contract_test`'s `EXPECTED_ROUTE_COUNT`. Item 16 counted the
+    /// join-error sites as nine before someone checked: `fs.rs` built the same body through its
+    /// own local helper, so `core_err` — the obvious thing to grep — missed it. `join_err` is
+    /// now the one definition, and this fails if a route module spells the shape out again.
+    ///
+    /// It walks the directory rather than listing modules, so a route module added later is
+    /// covered without anyone remembering to add it here.
+    #[test]
+    fn no_route_module_builds_the_panic_shape_by_hand() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("route module directory must be readable") {
+            let path = entry.expect("readable dir entry").path();
+            // `mod.rs` is where the phrase legitimately lives: `join_err` itself, and the tests
+            // that pin it.
+            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("mod.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("route module must be readable");
+            assert!(
+                !source.contains("task panicked"),
+                "{} builds the panic shape itself; call `join_err` so every join failure keeps \
+                 one definition",
+                path.display()
+            );
+            checked += 1;
+        }
+        // Guards the walk itself: a glob that matched nothing would pass every assertion above
+        // while checking no module at all.
+        assert!(
+            checked >= 8,
+            "expected to scan the route modules, only reached {checked} — did the walk break?"
+        );
     }
 
     #[tokio::test]

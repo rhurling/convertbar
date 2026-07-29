@@ -41,7 +41,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::ServerState;
+use super::{join_err, ServerState};
 
 #[derive(Deserialize)]
 pub struct FsListQuery {
@@ -84,10 +84,10 @@ pub async fn fs_list(State(s): State<ServerState>, Query(q): Query<FsListQuery>)
     let roots = s.config.browse_roots.clone();
     match tokio::task::spawn_blocking(move || fs_list_blocking(q.path, roots)).await {
         Ok(response) => response,
-        Err(join) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("task panicked: {join}"),
-        ),
+        // The shared mapping, not this module's local `json_err`: a join failure here is the
+        // same server bug it is on every other route, and the tenth copy of the shape was the
+        // one a `core_err` grep missed.
+        Err(join) => join_err(join).into_response(),
     }
 }
 

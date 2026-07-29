@@ -14,14 +14,14 @@ use convertbar_core::handbrake as hb;
 use convertbar_core::handbrake::PresetMetadata;
 use convertbar_core::types::HandbrakeStatus;
 
-use super::{core_err, ServerState};
+use super::{core_err, join_err, ServerState};
 
 pub async fn detect_handbrake(State(s): State<ServerState>) -> Response {
     let ctx = s.ctx.clone();
     match tokio::task::spawn_blocking(move || hb::resolve_handbrake_path(&ctx)).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }
 
@@ -35,7 +35,7 @@ pub async fn list_handbrake_presets(State(s): State<ServerState>) -> Response {
     {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }
 
@@ -60,7 +60,7 @@ pub async fn validate_handbrake(State(s): State<ServerState>) -> Response {
     {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }
 
@@ -85,7 +85,7 @@ pub async fn generate_preset_suffix(
     {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
+        Err(join) => join_err(join).into_response(),
     }
 }
 
