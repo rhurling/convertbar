@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { httpCommands } from "../lib/transport/http";
 import type { FsEntry } from "../lib/transport/types";
 import { errorText } from "../lib/errors";
+import { rangeBetween } from "../lib/pathSelection";
 
 const FALLBACK_ROOT = "/";
 
@@ -40,6 +41,7 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   const [path, setPath] = useState<string | null>(null);
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [anchor, setAnchor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -50,7 +52,10 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       const result = await httpCommands.fsList(target);
       setEntries(result.entries);
       setPath(target);
-      setSelected(new Set());
+      // The selection deliberately survives navigation — gathering from several folders
+      // in one pass is the point. The shift anchor does NOT: a range only means
+      // something within one listing.
+      setAnchor(null);
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -91,12 +96,22 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
 
   const selectable = mode === "files";
 
-  const handleRowClick = (entry: FsEntry) => {
+  const handleRowClick = (entry: FsEntry, shiftKey: boolean) => {
     // Directory mode keeps its original behavior: a folder click navigates, a file is inert.
     if (!selectable) {
       if (entry.is_dir) load(entry.path);
       return;
     }
+    if (shiftKey && anchor) {
+      const range = rangeBetween(entries, anchor, entry.path);
+      if (range.length > 0) {
+        // Additive by design: a range never deselects, so a mis-aimed shift-click
+        // cannot silently drop work the user did earlier.
+        setSelected((prev) => new Set([...prev, ...range]));
+        return;
+      }
+    }
+    setAnchor(entry.path);
     toggleSelect(entry.path);
   };
 
@@ -191,7 +206,7 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                   role={selectable ? "checkbox" : entry.is_dir ? "button" : undefined}
                   aria-checked={selectable ? isSelected : undefined}
                   tabIndex={rowInteractive ? 0 : undefined}
-                  onClick={() => handleRowClick(entry)}
+                  onClick={(e) => handleRowClick(entry, e.shiftKey)}
                   onKeyDown={
                     rowInteractive
                       ? (e) => {
@@ -206,7 +221,7 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                           // doesn't scroll.
                           if (e.key !== "Enter" && e.key !== " ") return;
                           if (e.key === " ") e.preventDefault();
-                          handleRowClick(entry);
+                          handleRowClick(entry, e.shiftKey);
                         }
                       : undefined
                   }
@@ -226,7 +241,7 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                       tabIndex={-1}
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleRowClick(entry);
+                        handleRowClick(entry, e.shiftKey);
                       }}
                     />
                   )}
@@ -252,6 +267,21 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
         </div>
 
         <div className="file-browser-footer">
+          {mode === "files" && selected.size > 0 && (
+            <span className="file-browser-count">
+              {selected.size} selected
+              <button
+                type="button"
+                className="btn btn-small btn-dim"
+                onClick={() => {
+                  setSelected(new Set());
+                  setAnchor(null);
+                }}
+              >
+                Clear
+              </button>
+            </span>
+          )}
           <button type="button" className="btn btn-small" onClick={onClose}>
             Cancel
           </button>

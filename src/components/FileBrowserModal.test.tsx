@@ -326,4 +326,88 @@ describe("FileBrowserModal", () => {
     await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/media"));
     expect(await screen.findByText("Movies")).toBeInTheDocument();
   });
+
+  it("keeps the selection when navigating between directories", async () => {
+    fsListMock.mockImplementation((path: string) => {
+      if (path === "/") {
+        return Promise.resolve({
+          entries: [
+            entry({ name: "Movies", path: "/Movies", is_dir: true }),
+            entry({ name: "root.mp4", path: "/root.mp4" }),
+          ],
+        });
+      }
+      return Promise.resolve({
+        entries: [entry({ name: "inner.mp4", path: "/Movies/inner.mp4" })],
+      });
+    });
+    const onSelect = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={onSelect} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("root.mp4"));
+    fireEvent.click(screen.getByRole("button", { name: "Open Movies" }));
+    fireEvent.click(await screen.findByText("inner.mp4"));
+
+    // The whole point of persistence: gather from more than one folder in one pass.
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Add 2 items/ }));
+    expect(onSelect).toHaveBeenCalledWith(["/root.mp4", "/Movies/inner.mp4"]);
+  });
+
+  it("shift-clicking selects the range and never deselects", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [
+        entry({ name: "2024", path: "/2024", is_dir: true }),
+        entry({ name: "a.mp4", path: "/a.mp4" }),
+        entry({ name: "b.mp4", path: "/b.mp4" }),
+        entry({ name: "c.mp4", path: "/c.mp4" }),
+      ],
+    });
+    const onSelect = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={onSelect} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("c.mp4"));      // an unrelated earlier pick
+    fireEvent.click(screen.getByText("2024"));               // anchor, and a folder
+    fireEvent.click(screen.getByText("b.mp4"), { shiftKey: true });
+
+    // Additive: c.mp4 survives even though it is outside the range. A mis-aimed
+    // shift-click must never silently drop earlier work.
+    fireEvent.click(screen.getByRole("button", { name: /^Add 4 items/ }));
+    expect(onSelect).toHaveBeenCalledWith(["/c.mp4", "/2024", "/a.mp4", "/b.mp4"]);
+  });
+
+  it("clears the selection from the footer", async () => {
+    fsListMock.mockResolvedValue({ entries: [entry({ name: "a.mp4", path: "/a.mp4" })] });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("a.mp4"));
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
+  });
+
+  it("passes a folder and a file inside it through untouched", async () => {
+    // Deliberately NOT deduped here. The backend already does it: useFileIntake enqueues
+    // files before folders, and add_files_to_db skips anything already queued. Deduping
+    // in the picker would silently lose the ticked file if the user skips the folder's
+    // >5-file confirm prompt.
+    fsListMock.mockResolvedValue({
+      entries: [
+        entry({ name: "Movies", path: "/Movies", is_dir: true }),
+        entry({ name: "clip.mp4", path: "/Movies/clip.mp4" }),
+      ],
+    });
+    const onSelect = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={onSelect} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("Movies"));
+    fireEvent.click(screen.getByText("clip.mp4"));
+    fireEvent.click(screen.getByRole("button", { name: /^Add 2 items/ }));
+
+    expect(onSelect).toHaveBeenCalledWith(["/Movies", "/Movies/clip.mp4"]);
+  });
 });
