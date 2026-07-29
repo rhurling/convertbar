@@ -203,24 +203,26 @@ The identity stays in the login keychain, which is what Task 3 uses.
 
 **Human task.** This replaces the Apple ID + app-specific password that notarization would otherwise need. The key is team-scoped, individually revocable, and carries no Apple ID login capability.
 
-- [ ] **Step 1: Open the Integrations page — this is a hard gate**
+- [x] **Step 1: Open the Integrations page — this is a hard gate**
 
-Go to <https://appstoreconnect.apple.com/access/integrations/api> and select the **Team Keys** tab.
+Go to <https://appstoreconnect.apple.com/access/integrations/api> — the **Integration** tab, sidebar entry **App Store Connect-API**. (Not **Schlüssel (Shared Secret)**, which is in-app-purchase receipt validation and unrelated.)
 
-**STOP if this page is unavailable to your account.** Do not fall back to `APPLE_ID` + app-specific password — that is explicitly out of scope. The fallback is instead **sign-only, no notarization** (see "Fallback" at the end of this plan): TCC grants still become stable, but downloaded builds keep showing Gatekeeper's "unidentified developer" warning. Raise it as a decision rather than substituting credentials.
+**On a first visit the API is not enabled yet.** Expect a panel reading *"Access to the App Store Connect API requires permission. You can request access on behalf of your organization"* with a **Request Access** button — this was the state on first execution of this plan. That is a one-time, no-cost enablement, not a rejection: click it, accept the terms, and the keys table with a **+** appears. Only then continue to Step 2.
 
-- [ ] **Step 2: Generate the key**
+**STOP if there is no path to keys at all** — no Request Access button and no keys table. Do not fall back to `APPLE_ID` + app-specific password — that is explicitly out of scope. The fallback is instead **sign-only, no notarization** (see "Fallback" at the end of this plan): TCC grants still become stable, but downloaded builds keep showing Gatekeeper's "unidentified developer" warning. Raise it as a decision rather than substituting credentials.
+
+- [x] **Step 2: Generate the key**
 
 **+** → Name: `ConvertBar Notarization` → Access: **Developer** → Generate.
 
 Developer is the least privilege that notarization accepts. Do not grant Admin.
 
-- [ ] **Step 3: Capture the two identifiers**
+- [x] **Step 3: Capture the two identifiers**
 
 - **Issuer ID** — the UUID printed above the keys table → `APPLE_API_ISSUER`
 - **Key ID** — the value in the *Key ID* column of the new row → `APPLE_API_KEY`
 
-- [ ] **Step 4: Download the private key — one chance only**
+- [x] **Step 4: Download the private key — one chance only**
 
 Reload the page; a **Download** button appears on the new row. It works exactly once. Save `AuthKey_<KEYID>.p8` and put it in 1Password before doing anything else.
 
@@ -597,7 +599,7 @@ git commit -m "chore: never commit code-signing material"
 **Files:**
 - Modify: `CLAUDE.md`
 
-- [ ] **Step 1: Add a section after "Version Bump Workflow"**
+- [x] **Step 1: Add a section after "Version Bump Workflow"**
 
 ```markdown
 ## Code Signing (macOS)
