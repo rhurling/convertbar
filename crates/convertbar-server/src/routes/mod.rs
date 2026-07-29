@@ -456,9 +456,10 @@ pub(crate) mod tests {
     ///
     /// The walk reads the tree rather than listing modules, so a route module added later is
     /// covered without anyone remembering to add it here. It is a backstop, not a proof: it
-    /// reads source text, so an aliased import (`use ... as run_blocking`) or a blocking helper
-    /// living outside `src/routes` would slip past it. Nothing outside `src/routes` spawns
-    /// blocking work today.
+    /// reads source text, so a blocking helper defined outside `src/routes` and merely called
+    /// from a handler would slip past it. An alias declared inside a route module would not —
+    /// its `use` line still names the identifier. Nothing outside `src/routes` spawns blocking
+    /// work today.
     #[test]
     fn route_modules_never_map_their_own_blocking_failures() {
         // Comments are stripped before matching, so these checks read code rather than prose:
@@ -554,8 +555,8 @@ pub(crate) mod tests {
         // `test_state()`'s PanickingLocator is the assertion: an empty add must return before it
         // reaches HandBrake resolution. Declaring an installed world here would hide a
         // regression — the route would resolve, succeed, and return this same body either way.
-        // A panic inside `spawn_blocking` surfaces as a 500 with `{"error": "task panicked:
-        // ..."}`, so the status assertion below catches it.
+        // A panic inside the blocking task surfaces as a 500 carrying `"kind": "panic"`, so the
+        // status assertion below catches it.
         let (status, json) = request_json(
             api_router(test_state()),
             "POST",
@@ -571,8 +572,9 @@ pub(crate) mod tests {
     async fn add_files_route_reports_the_error_when_handbrake_is_absent() {
         // The default suffix template needs HandBrake to expand. Absent, the route must return
         // the core error deliberately. Asserting the exact body (not just the status) is what
-        // separates that from an accidental 500: a panicking locator would unwind inside
-        // `spawn_blocking` and surface as `{"error": "task panicked: ..."}` with the same 500.
+        // separates that from an accidental 500: a panicking locator would unwind inside the
+        // blocking task and surface as `{"error": "task panicked: ...", "kind": "panic"}` with
+        // the same 500 — a difference this body assertion sees and a status check would not.
         let (state, _tx) =
             test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
         let (status, json) = request_json(

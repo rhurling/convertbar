@@ -120,8 +120,9 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   second endpoint in that same module. It covers a route module added later — including one
   added as a subdirectory, since the walk recurses and exempts `mod.rs` by full path rather
   than by name — and `mod.rs`, which must be exempt because the helpers live there, has its
-  spawn count pinned instead. It reads source text, so it is a backstop, not a proof: an
-  aliased import, or a blocking helper living outside `src/routes`, would still slip past.
+  spawn count pinned instead. It reads source text, so it is a backstop, not a proof: a
+  blocking helper defined outside `src/routes` and merely called from a handler would still
+  slip past it.
 - **Out of scope, recorded:** the desktop head has the same indistinguishability.
   `src-tauri/src/commands/*` map join failures with `.map_err(|e| e.to_string())?`, so the
   frontend receives a plain string with no channel to carry a discriminator. Fixing it there
