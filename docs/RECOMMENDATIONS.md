@@ -172,9 +172,12 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     `ctx.db.lock().map_err(|e| e.to_string())?`, and `From<String>` stamps that `PoisonError` with
     no discriminator. So the panic itself is labelled and its permanent consequence is not.
     Fixing it needs a typed error out of core, not a shape at the command boundary.
-  - **Some failures never become a command error at all** — `job-error` events carry a bare
-    string, and a panic in a background updater task produces no `Err`. Those are invisible rather
-    than mislabelled, which is a different problem from the one this item closes.
+  - **Some failures are never shown at all.** `job-error` events carry a bare string and a panic
+    in a background updater task produces no `Err`; separately, six frontend `catch` sites log to
+    the console and render nothing (`QueueItem`, `useQueue`, `useHistory` ×2, `useBadSources`, and
+    one `useSettings` path), so a panic reaching one of them is invisible however well it is
+    labelled. Invisible is a different problem from mislabelled, and not one a discriminator
+    fixes; the two sites that showed *wrong* copy were the ones in scope, and both now branch.
 - **Premise this rests on, not independently verified:** that Tauri rejects the JS promise with
   the *deserialized* `CommandError` object. The Rust side pins what is serialized and the frontend
   side pins what it does with that object, but nothing executes the real IPC boundary, so both

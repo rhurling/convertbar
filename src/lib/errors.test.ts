@@ -72,7 +72,6 @@ describe("display sites", () => {
     // with an object, so a new one renders "[object Object]" for every failure. Nothing else
     // catches that: the unit tests above only pin `errorText` itself.
     const root = join(process.cwd(), "src");
-    const banned = ["String(e)", "String(err)", "${e}", "${err}"];
 
     const walk = (dir: string, out: string[] = []): string[] => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -84,18 +83,39 @@ describe("display sites", () => {
     };
 
     const files = walk(root).filter((f) => !f.endsWith(join("lib", "errors.ts")));
+    let bindingsChecked = 0;
+
     for (const file of files) {
       const source = readFileSync(file, "utf8");
-      for (const needle of banned) {
-        expect(
-          source.includes(needle),
-          `${file} renders a caught error with ${needle}; use errorText(e) so a panic stays ` +
-            `distinguishable and an object body does not render as [object Object]`,
-        ).toBe(false);
+      // Derived from the file's own catch bindings rather than a fixed list of names: a fixed
+      // list is dodged by renaming the binding, which is a rename away from `${error}` — a
+      // spelling a hardcoded ["e", "err"] would wave straight through.
+      const bindings = new Set(
+        [...source.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*)\s*\)/g)].map((m) => m[1]),
+      );
+
+      for (const binding of bindings) {
+        bindingsChecked++;
+        // Every way to turn a value into display text. `errorText` and `isPanic` take the
+        // binding directly, so they are unaffected.
+        for (const needle of [
+          `String(${binding})`,
+          `\${${binding}}`,
+          `${binding}.toString()`,
+          `JSON.stringify(${binding})`,
+        ]) {
+          expect(
+            source.includes(needle),
+            `${file} renders a caught error with ${needle}; use errorText(${binding}) so a ` +
+              `panic stays distinguishable and an object body does not render as [object Object]`,
+          ).toBe(false);
+        }
       }
     }
 
-    // Guards the walk: one that matched nothing would pass while checking no file at all.
+    // Guards the walk and the binding scan: either matching nothing would pass every assertion
+    // above while checking no file, or no catch block, at all.
     expect(files.length).toBeGreaterThan(20);
+    expect(bindingsChecked).toBeGreaterThan(10);
   });
 });

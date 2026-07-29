@@ -560,7 +560,7 @@ describe("HistoryPage", () => {
         if (cmd === "get_history_summary") return Promise.resolve(summary);
         if (cmd === "get_settings") return Promise.resolve(settings);
         if (cmd === "get_bad_sources") return Promise.resolve(badSources);
-        if (cmd === "purge_bad_sources") return Promise.reject(new Error("IPC failed"));
+        if (cmd === "purge_bad_sources") return Promise.reject({ error: "IPC failed" });
         return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
       }) as typeof invoke);
 

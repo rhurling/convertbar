@@ -128,46 +128,118 @@ mod tests {
         );
     }
 
+    /// True when `body` calls the helper itself, rather than merely containing the word — a
+    /// sibling `fn scan_blocking(…)` would satisfy a plain `contains` while running the work
+    /// synchronously on the caller's thread.
+    fn calls_the_helper(body: &str) -> bool {
+        body.match_indices("blocking(").any(|(at, _)| {
+            body[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+    }
+
     #[test]
-    fn every_async_command_hands_its_work_to_the_blocking_helper() {
+    fn every_command_that_blocks_hands_its_work_to_the_helper() {
         // The tripwire above bans the *wrong* spellings; this one requires the right one.
-        // Without it, a command can drop `blocking` for a direct synchronous call — which
-        // compiles, names no banned identifier, and costs two things at once: the panic
-        // taxonomy, and the off-main-thread guarantee that the probe-hazard fix bought at four
-        // entry points (a deep folder scan would freeze the UI again).
+        // Without it, a command can drop `blocking` for a direct call — which compiles, names no
+        // banned identifier, and costs two things at once: the panic taxonomy, and the
+        // off-main-thread guarantee the probe-hazard fix bought at four entry points (a deep
+        // folder scan would freeze the UI again).
         //
-        // These three are async for a reason other than blocking work, so they are named here
-        // rather than silently tolerated: `pick_folder` must stay async because
-        // `blocking_pick_folder` dispatches to the main thread and would deadlock it, and the two
-        // updater commands await genuinely async work.
-        const NOT_BLOCKING_WORK: [&str; 3] = ["pick_folder", "check_for_update", "install_update"];
+        // Named rather than inferred, because inferring from `async` lets a command escape
+        // coverage simply by dropping the keyword: rewritten sync, it stops matching, stops
+        // being counted, and reinstates the freeze silently. Every entry here reaches a
+        // subprocess, an unbounded walk, or a per-file probe.
+        const MUST_BLOCK: [&str; 10] = [
+            "add_files",
+            "scan_folder",
+            "confirm_folder_add",
+            "purge_bad_sources",
+            "classify_paths",
+            "detect_handbrake",
+            "list_handbrake_presets",
+            "generate_preset_suffix",
+            "validate_handbrake",
+            "pick_folder",
+        ];
+        // Async for a reason other than blocking work: both await genuinely async updater work.
+        const NOT_BLOCKING_WORK: [&str; 2] = ["check_for_update", "install_update"];
 
         let (modules, _) = command_modules();
-        let mut checked = 0;
+        let mut seen = Vec::new();
         for (module, source) in &modules {
-            for chunk in source.split("pub async fn ").skip(1) {
-                let name = chunk
-                    .split(['(', '<'])
-                    .next()
-                    .expect("a command name")
-                    .trim();
+            // Split on `async fn` rather than `pub async fn`: a `pub(crate) async fn` registers
+            // in `generate_handler` exactly the same and would otherwise be silently exempt.
+            // Assembled so this file's own source is not one of its own matches.
+            for chunk in source.split(concat!("async ", "fn ")).skip(1) {
+                let name = chunk.split(['(', '<']).next().expect("a name").trim();
                 if NOT_BLOCKING_WORK.contains(&name) {
                     continue;
                 }
                 // Stop at the next item so a later command's call cannot vouch for this one.
                 let body = chunk.split("\n#[").next().unwrap_or(chunk);
                 assert!(
-                    body.contains("blocking("),
+                    calls_the_helper(body),
                     "{module}::{name} is async but never reaches `blocking`; either hand its \
                      work to the helper or add it to NOT_BLOCKING_WORK with a reason"
                 );
-                checked += 1;
+            }
+
+            for name in MUST_BLOCK {
+                let Some((_, chunk)) = source.split_once(&format!("fn {name}(")) else {
+                    continue;
+                };
+                assert!(
+                    calls_the_helper(chunk.split("\n#[").next().unwrap_or(chunk)),
+                    "{module}::{name} does work that must not run on the calling thread, but no \
+                     longer reaches `blocking`"
+                );
+                seen.push(name);
+            }
+        }
+
+        // Every named command must still exist somewhere. A rename that skipped this list would
+        // otherwise drop it from coverage without a word.
+        let mut missing: Vec<_> = MUST_BLOCK.iter().filter(|n| !seen.contains(n)).collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "MUST_BLOCK names commands that no longer exist: {missing:?} — renamed, or removed?"
+        );
+    }
+
+    #[test]
+    fn every_command_lives_where_the_tripwires_look() {
+        // Both tripwires above walk `src/commands` only. A `#[tauri::command]` defined anywhere
+        // else in this crate registers in `generate_handler` just the same and would be exempt
+        // from every check on this page without anyone deciding that.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let commands = src.join("commands");
+
+        let mut stray = Vec::new();
+        let mut pending = vec![src];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src must be readable") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path.starts_with(&commands) {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("readable");
+                if code_only(&source).contains(concat!("#[tauri::", "command]")) {
+                    stray.push(path.to_string_lossy().into_owned());
+                }
             }
         }
 
         assert!(
-            checked >= 8,
-            "expected to scan the async commands, only reached {checked} — did the split break?"
+            stray.is_empty(),
+            "commands defined outside src/commands escape both tripwires: {stray:?}"
         );
     }
 }

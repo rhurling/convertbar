@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
-use super::CommandError;
+use super::{blocking, CommandError};
 use crate::types::WatchedDirectory;
 
 #[tauri::command]
@@ -61,17 +61,25 @@ pub fn remove_watched_directory(ctx: State<'_, Arc<Ctx>>, id: String) -> Result<
 }
 
 /// Opens the native folder picker so the UI can add a directory to watch. Invoked from Rust, so
-/// no frontend `dialog` ACL permission is required. MUST stay `async`: Tauri runs sync commands
-/// on the main thread, and `blocking_pick_folder` dispatches the panel to the main thread and then
-/// blocks the calling thread — calling it on the main thread deadlocks the event loop. `async`
-/// runs the command on a worker thread, so the main thread stays free to service the panel.
+/// no frontend `dialog` ACL permission is required.
+///
+/// MUST NOT run on the main thread: `blocking_pick_folder` dispatches the panel to the main
+/// thread and then blocks the calling thread, so calling it there deadlocks the event loop —
+/// which is what a sync command would do, since Tauri runs those on the main thread.
+///
+/// It goes through `blocking` rather than merely being `async`, because the call blocks for as
+/// long as the panel is open — a user who walks away holds the thread for minutes. `async` alone
+/// parked that on a core runtime worker; the blocking pool exists for exactly this, is equally
+/// not-the-main-thread, and hands the command the same panic taxonomy as every other.
 #[tauri::command]
 pub async fn pick_folder(app: AppHandle) -> Result<Option<String>, CommandError> {
-    let folder = app
-        .dialog()
-        .file()
-        .blocking_pick_folder()
-        .and_then(|file_path| file_path.into_path().ok())
-        .map(|path| path.to_string_lossy().to_string());
-    Ok(folder)
+    blocking(move || {
+        Ok(app
+            .dialog()
+            .file()
+            .blocking_pick_folder()
+            .and_then(|file_path| file_path.into_path().ok())
+            .map(|path| path.to_string_lossy().to_string()))
+    })
+    .await
 }

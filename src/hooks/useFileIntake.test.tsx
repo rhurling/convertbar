@@ -205,7 +205,7 @@ describe("useFileIntake", () => {
     invokeMock.mockImplementation(((cmd: string) => {
       switch (cmd) {
         case "classify_paths":
-          return Promise.reject(new Error("scan failed"));
+          return Promise.reject({ error: "scan failed" });
         default:
           return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
       }
@@ -296,7 +296,7 @@ describe("useFileIntake", () => {
         case "classify_paths":
           return Promise.resolve(classified);
         case "confirm_folder_add":
-          return Promise.reject(new Error("scan failed"));
+          return Promise.reject({ error: "scan failed" });
         case "start_queue":
           return Promise.resolve(undefined);
         default:

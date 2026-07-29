@@ -57,19 +57,21 @@ where
         Ok(result) => result.map_err(CommandError::from),
         // Worded identically to the server head's `join_err`, so a panic reads the same on both.
         Err(join) => Err(CommandError {
-            error: format!("task panicked: {}", panic_detail(join)),
+            error: task_failure(join),
             kind: Some(PANIC),
         }),
     }
 }
 
-/// The message the task actually panicked with, rather than the runtime's description of it.
+/// What actually went wrong with the task, rather than the runtime's description of it.
 ///
 /// `JoinError`'s own `Display` is `task 12 panicked with message "boom"`, where the number is a
 /// tokio task counter: the same crash reads differently on every run, so two users reporting one
 /// bug produce two strings that do not group. Reaching past it to the payload also drops a second
-/// "panicked" from a message the frontend already labels as a panic.
-fn panic_detail(error: tauri::Error) -> String {
+/// "panicked" from a message the frontend already labels as a panic — and the cancelled arm below
+/// avoids it for the same reason, rather than deferring to a `Display` that would reintroduce the
+/// id and read as "task panicked: task 12 was cancelled".
+fn task_failure(error: tauri::Error) -> String {
     let join = match error {
         tauri::Error::JoinError(join) => join,
         // `spawn_blocking` cannot fail any other way; if that ever changes, say what happened
@@ -79,16 +81,19 @@ fn panic_detail(error: tauri::Error) -> String {
 
     match join.try_into_panic() {
         // `panic!("literal")` yields a `&str`; anything formatted yields a `String`.
-        Ok(payload) => payload
-            .downcast_ref::<&'static str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "a non-string panic payload".to_string()),
+        Ok(payload) => {
+            let detail = payload
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-string panic payload".to_string());
+            format!("task panicked: {detail}")
+        }
         // Not a panic, so the task was cancelled. Nothing here aborts a handle — every one is
-        // awaited inline at its own call site — so this is runtime shutdown, and reporting it as
-        // a panic is accepted: the frontend's conclusion (a bug, not a condition to handle) is
-        // the same either way.
-        Err(join) => join.to_string(),
+        // awaited inline at its own call site — so this is runtime shutdown. It still reports
+        // `kind: "panic"`, which is accepted: the frontend's conclusion (a bug, not a condition
+        // to handle) is the same either way, and only the message needs to stay honest.
+        Err(_) => "task was cancelled".to_string(),
     }
 }
 
@@ -147,5 +152,20 @@ mod tests {
             serde_json::to_value(&detail).expect("serializable")["error"],
             "task panicked: something went wrong"
         );
+    }
+
+    #[test]
+    fn a_cancelled_task_does_not_claim_to_have_panicked() {
+        // Unreachable today — nothing aborts a handle — but the arm exists, and deferring to
+        // `JoinError`'s Display there would ship "task panicked: task 12 was cancelled": both
+        // self-contradictory and carrying the per-run id the panic arm goes out of its way to
+        // drop. Constructing a real cancellation is the only way to see what that arm emits.
+        let message = tauri::async_runtime::block_on(async {
+            let handle = tauri::async_runtime::spawn(std::future::pending::<()>());
+            handle.abort();
+            task_failure(handle.await.expect_err("an aborted task joins as an error"))
+        });
+
+        assert_eq!(message, "task was cancelled");
     }
 }
