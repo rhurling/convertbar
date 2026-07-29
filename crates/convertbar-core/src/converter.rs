@@ -465,12 +465,7 @@ fn get_handbrake_path(
 }
 
 fn get_cleanup_mode(db: &Connection) -> String {
-    db.query_row(
-        "SELECT value FROM settings WHERE key = 'cleanup_mode'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .unwrap_or_else(|_| "trash".to_string())
+    crate::settings_ops::read_cleanup_mode(db)
 }
 
 fn get_low_disk_min_gb(db: &Connection) -> f64 {

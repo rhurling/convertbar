@@ -67,6 +67,31 @@ pub fn normalize_bad_source_action(value: &str) -> &'static str {
     }
 }
 
+/// Coerce a stored `cleanup_mode` to a known value. Exactly `"keep"` or `"delete"` pass
+/// through; anything else — corrupted, empty, or written by a newer version — reads as
+/// `"trash"`, which is what every pre-existing row already means. Sibling of
+/// [`normalize_bad_source_action`].
+pub fn normalize_cleanup_mode(value: &str) -> &'static str {
+    match value {
+        "keep" => "keep",
+        "delete" => "delete",
+        _ => "trash",
+    }
+}
+
+/// The stored `cleanup_mode`, normalized. The single read path — `converter` and
+/// `queue_ops` both go through this so no call site ever string-compares a raw column.
+pub fn read_cleanup_mode(conn: &rusqlite::Connection) -> String {
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'cleanup_mode'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    normalize_cleanup_mode(&raw).to_string()
+}
+
 /// Reads every stored setting into a [`Settings`] snapshot, falling back to defaults for keys
 /// that have no row yet. `launch_at_login` is the *stored* value here — on desktop the autostart
 /// plugin is the actual source of truth, and the desktop wrapper overlays that on top.
@@ -110,7 +135,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
         let (key, value) = row.map_err(|e| e.to_string())?;
         match key.as_str() {
             "preset" => preset = value,
-            "cleanup_mode" => cleanup_mode = value,
+            "cleanup_mode" => cleanup_mode = normalize_cleanup_mode(&value).to_string(),
             "launch_at_login" => launch_at_login = value == "true",
             "handbrake_path" => handbrake_path = value,
             "menubar_show_percent" => menubar_show_percent = value == "true",
@@ -333,5 +358,77 @@ mod tests {
         assert_eq!(normalize_bad_source_action(""), "trash");
         assert_eq!(normalize_bad_source_action("DELETE"), "trash");
         assert_eq!(normalize_bad_source_action("nonsense"), "trash");
+    }
+
+    #[test]
+    fn cleanup_mode_normalizes_to_three_known_values() {
+        // Exact matches pass through; everything else reads as "trash". The fallback is
+        // deliberately NOT "keep": it preserves the behavior every existing row already has,
+        // and mirrors normalize_bad_source_action's convention.
+        assert_eq!(normalize_cleanup_mode("keep"), "keep");
+        assert_eq!(normalize_cleanup_mode("delete"), "delete");
+        assert_eq!(normalize_cleanup_mode("trash"), "trash");
+        assert_eq!(normalize_cleanup_mode(""), "trash");
+        assert_eq!(normalize_cleanup_mode("KEEP"), "trash");
+        assert_eq!(normalize_cleanup_mode("nonsense"), "trash");
+    }
+
+    #[test]
+    fn read_cleanup_mode_normalizes_what_it_reads() {
+        let conn = test_conn();
+        // init_db seeds 'trash'.
+        assert_eq!(read_cleanup_mode(&conn), "trash");
+
+        conn.execute(
+            "UPDATE settings SET value = 'keep' WHERE key = 'cleanup_mode'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read_cleanup_mode(&conn), "keep");
+
+        // A corrupted row must never reach a call site as a raw string.
+        conn.execute(
+            "UPDATE settings SET value = 'garbage' WHERE key = 'cleanup_mode'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read_cleanup_mode(&conn), "trash");
+    }
+
+    #[test]
+    fn get_settings_normalizes_cleanup_mode() {
+        let (ctx, _sink, _d) = test_ctx(test_conn());
+
+        // Default init_db value.
+        let settings = get_settings(&ctx).unwrap();
+        assert_eq!(settings.cleanup_mode, "trash");
+
+        // Valid value passes through.
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value = 'keep' WHERE key = 'cleanup_mode'",
+                [],
+            )
+            .unwrap();
+        let settings = get_settings(&ctx).unwrap();
+        assert_eq!(settings.cleanup_mode, "keep");
+
+        // Corrupted row: the Settings struct must never surface a raw garbage value.
+        // It must normalize to trash, just like read_cleanup_mode does.
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value = 'garbage' WHERE key = 'cleanup_mode'",
+                [],
+            )
+            .unwrap();
+        let settings = get_settings(&ctx).unwrap();
+        assert_eq!(
+            settings.cleanup_mode, "trash",
+            "get_settings must normalize corrupted cleanup_mode to trash"
+        );
     }
 }
