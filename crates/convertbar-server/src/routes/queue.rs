@@ -1,9 +1,10 @@
 //! Queue and bad-source routes: `/api/queue*`, `/api/folders/scan`, `/api/paths/classify`,
 //! `/api/bad-sources*`.
 //!
-//! `add_files`/`scan_folder`/`confirm_folder_add`/`classify_paths`/`purge_bad_sources` run
-//! inside `spawn_blocking` — they probe files or shell out, same discipline the desktop's
-//! async commands follow. The rest are short DB-only calls and run inline.
+//! `add_files`/`scan_folder`/`confirm_folder_add`/`classify_paths`/`purge_bad_sources` go
+//! through `blocking_json` — they probe files or shell out, the same discipline the desktop's
+//! async commands follow, and the shared helper owns the blocking-pool outcome mapping so no
+//! handler spells its own. The rest are short DB-only calls and run inline.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -13,7 +14,7 @@ use serde::Deserialize;
 
 use convertbar_core::queue_ops;
 
-use super::{core_err, join_err, ServerState};
+use super::{blocking_json, core_err, ServerState};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,11 +24,7 @@ pub struct AddFilesBody {
 
 pub async fn add_files(State(s): State<ServerState>, Json(b): Json<AddFilesBody>) -> Response {
     let ctx = s.ctx.clone();
-    match tokio::task::spawn_blocking(move || queue_ops::add_files(&ctx, &b.paths)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => join_err(join).into_response(),
-    }
+    blocking_json(move || queue_ops::add_files(&ctx, &b.paths)).await
 }
 
 /// Shared by `scan_folder` and `confirm_folder_add` — both bodies are just `{"path": "..."}`.
@@ -38,20 +35,12 @@ pub struct PathBody {
 }
 
 pub async fn scan_folder(Json(b): Json<PathBody>) -> Response {
-    match tokio::task::spawn_blocking(move || queue_ops::scan_folder(b.path)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => join_err(join).into_response(),
-    }
+    blocking_json(move || queue_ops::scan_folder(b.path)).await
 }
 
 pub async fn confirm_folder_add(State(s): State<ServerState>, Json(b): Json<PathBody>) -> Response {
     let ctx = s.ctx.clone();
-    match tokio::task::spawn_blocking(move || queue_ops::confirm_folder_add(&ctx, b.path)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => join_err(join).into_response(),
-    }
+    blocking_json(move || queue_ops::confirm_folder_add(&ctx, b.path)).await
 }
 
 #[derive(Deserialize)]
@@ -61,11 +50,7 @@ pub struct ClassifyPathsBody {
 }
 
 pub async fn classify_paths(Json(b): Json<ClassifyPathsBody>) -> Response {
-    match tokio::task::spawn_blocking(move || queue_ops::classify_paths(b.paths)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => join_err(join).into_response(),
-    }
+    blocking_json(move || queue_ops::classify_paths(b.paths)).await
 }
 
 pub async fn get_queue(State(s): State<ServerState>) -> Response {
@@ -123,9 +108,5 @@ pub async fn purge_bad_sources(
     Json(b): Json<PurgeBadSourcesBody>,
 ) -> Response {
     let ctx = s.ctx.clone();
-    match tokio::task::spawn_blocking(move || queue_ops::purge_bad_sources(&ctx, b.ids)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => join_err(join).into_response(),
-    }
+    blocking_json(move || queue_ops::purge_bad_sources(&ctx, b.ids)).await
 }

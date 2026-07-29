@@ -41,7 +41,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{join_err, ServerState};
+use super::{blocking_response, ServerState};
 
 #[derive(Deserialize)]
 pub struct FsListQuery {
@@ -82,13 +82,10 @@ fn io_err_status(e: &std::io::Error) -> StatusCode {
 
 pub async fn fs_list(State(s): State<ServerState>, Query(q): Query<FsListQuery>) -> Response {
     let roots = s.config.browse_roots.clone();
-    match tokio::task::spawn_blocking(move || fs_list_blocking(q.path, roots)).await {
-        Ok(response) => response,
-        // The shared mapping, not this module's local `json_err`: a join failure here is the
-        // same server bug it is on every other route, and the tenth copy of the shape was the
-        // one a `core_err` grep missed.
-        Err(join) => join_err(join).into_response(),
-    }
+    // `blocking_response`, not a local match: a join failure here is the same server bug it is
+    // on every other route, and this handler's own copy of that mapping was the tenth site —
+    // the one a `core_err` grep missed.
+    blocking_response(move || fs_list_blocking(q.path, roots)).await
 }
 
 fn fs_list_blocking(requested: String, roots: Vec<PathBuf>) -> Response {

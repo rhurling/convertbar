@@ -59,6 +59,44 @@ pub fn join_err(e: tokio::task::JoinError) -> (axum::http::StatusCode, Json<Valu
     )
 }
 
+/// Runs `f` on the blocking pool and maps its three outcomes to this API's three shapes:
+/// `Json` on success, [`core_err`] on a failure the server means, [`join_err`] on a panic.
+///
+/// Handlers call this instead of writing the `spawn_blocking` match out themselves, which is
+/// what makes item 16's fix enforceable rather than merely applied. When ten handlers each
+/// spelled their own join arm, nine agreed and the tenth quietly differed; a handler that
+/// cannot write the arm cannot disagree with it. A handler whose blocking work produces a
+/// ready `Response` rather than a `Result` uses [`blocking_response`] — between the two, no
+/// route module needs to spawn anything itself.
+pub async fn blocking_json<T, F>(f: F) -> axum::response::Response
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => core_err(e).into_response(),
+        Err(join) => join_err(join).into_response(),
+    }
+}
+
+/// [`blocking_json`]'s sibling for blocking work that builds its own `Response` — `fs::fs_list`
+/// chooses between 200/403/404/500 itself, so there is no `Result` for `blocking_json` to map.
+///
+/// It exists so that handler needs no exemption from the "never spawn your own" rule. It was
+/// the tenth site — the one that diverged and that a `core_err` grep missed — so leaving it as
+/// the one allowed exception would have left the tripwire blind to a second endpoint in exactly
+/// the module where the divergence happened before.
+pub async fn blocking_response<F>(f: F) -> axum::response::Response
+where
+    F: FnOnce() -> axum::response::Response + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(response) => response,
+        Err(join) => join_err(join).into_response(),
+    }
+}
+
 /// State threaded through every axum handler. `events_tx` is fed by `ServerSink` (the
 /// `EventSink` the converter emits through) and consumed fresh per-request by the SSE
 /// route. `shutdown_rx` flips to `true` when the server begins graceful shutdown; the
@@ -305,10 +343,39 @@ pub(crate) mod tests {
         assert_eq!(body["kind"], "panic");
         // The detail is deliberately still on the wire (auth-gated, single-user LAN): a client
         // hitting the API directly keeps the same debuggability it had before the discriminator.
+        // The payload itself is asserted, not just the prefix — asserting the prefix alone let
+        // a mapping that dropped the payload entirely pass (verified by mutation).
         let message = body["error"].as_str().expect("error must be a string");
         assert!(
             message.starts_with("task panicked: "),
             "the panic detail must survive the mapping, got: {message}"
+        );
+        assert!(
+            message.contains("boom"),
+            "the panicking task's own message is the debuggable part, got: {message}"
+        );
+    }
+
+    /// `fs::fs_list`'s join arm, which no request can reach: `fs_list_blocking` is written not
+    /// to panic (it maps every io error itself), so there is no input that produces a real
+    /// `JoinError` through that route. Testing the arm where it actually lives is what
+    /// `blocking_response` bought — before it existed, this site was pinned only by grepping
+    /// the source for `join_err`.
+    #[tokio::test]
+    async fn blocking_response_reports_a_panic_with_the_same_discriminator() {
+        let response = blocking_response(|| panic!("boom")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let body: Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+        assert_eq!(body["kind"], "panic");
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error string")
+                .contains("boom"),
+            "the panic detail must survive here too, got: {body}"
         );
     }
 
@@ -371,34 +438,56 @@ pub(crate) mod tests {
         );
     }
 
-    /// Tripwire, in the spirit of `contract_test`'s `EXPECTED_ROUTE_COUNT`. Item 16 counted the
-    /// join-error sites as nine before someone checked: `fs.rs` built the same body through its
-    /// own local helper, so `core_err` — the obvious thing to grep — missed it. `join_err` is
-    /// now the one definition, and this fails if a route module spells the shape out again.
+    /// Tripwire, in the spirit of `contract_test`'s `EXPECTED_ROUTE_COUNT`, pinning the thing
+    /// that makes item 16 stay fixed: a handler that cannot write the join arm cannot spell it
+    /// differently. Two invariants, both learned from how the tenth site came to differ.
     ///
-    /// It walks the directory rather than listing modules, so a route module added later is
-    /// covered without anyone remembering to add it here.
+    /// 1. No route module runs its own blocking task — `blocking_json`/`blocking_response` own
+    ///    that mapping. Without this, a new handler could map its join arm through `core_err`
+    ///    with fresh wording and silently reintroduce the indistinguishability, passing every
+    ///    other test here (verified: that exact mutation survived the suite before this
+    ///    assertion existed).
+    /// 2. No route module hand-builds the panic body, which is how `fs.rs` diverged.
+    ///
+    /// There is no exemption. `fs::fs_list` had the only blocking work that `blocking_json`
+    /// could not express, and it got `blocking_response` rather than an allowlist entry —
+    /// exempting the file would have left this blind to a *second* endpoint in the very module
+    /// where the divergence happened before.
+    ///
+    /// The walk reads the directory rather than listing modules, so a route module added later
+    /// is covered without anyone remembering to add it here. It is a backstop, not a proof: it
+    /// reads source text, so an aliased import or a blocking helper living outside `src/routes`
+    /// would slip past it. Nothing outside `src/routes` spawns blocking work today.
     #[test]
-    fn no_route_module_builds_the_panic_shape_by_hand() {
+    fn route_modules_never_map_their_own_blocking_failures() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).expect("route module directory must be readable") {
             let path = entry.expect("readable dir entry").path();
-            // `mod.rs` is where the phrase legitimately lives: `join_err` itself, and the tests
-            // that pin it.
+            // `mod.rs` is where both legitimately live: the helper, and the tests that pin it.
             if path.extension().is_none_or(|e| e != "rs") || path.ends_with("mod.rs") {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("route module must be readable");
+            let module = path.file_name().expect("named file").to_string_lossy();
+
             assert!(
                 !source.contains("task panicked"),
-                "{} builds the panic shape itself; call `join_err` so every join failure keeps \
-                 one definition",
-                path.display()
+                "{module} builds the panic body itself; go through `join_err` so every join \
+                 failure keeps one definition"
+            );
+
+            // Matches the call `spawn_blocking(`, not prose: several modules legitimately
+            // mention `spawn_blocking` in their doc comments to say they do NOT use it.
+            assert!(
+                !source.contains("spawn_blocking("),
+                "{module} runs its own blocking task; call `blocking_json` (or \
+                 `blocking_response`, if the work builds its own Response) instead, so the \
+                 panic-vs-deliberate-failure distinction cannot be spelled a second way"
             );
             checked += 1;
         }
-        // Guards the walk itself: a glob that matched nothing would pass every assertion above
+        // Guards the walk itself: a walk that matched nothing would pass every assertion above
         // while checking no module at all.
         assert!(
             checked >= 8,
