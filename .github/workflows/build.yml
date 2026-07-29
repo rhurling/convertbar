@@ -151,6 +151,53 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
+      # tauri-action has already uploaded to the draft by now, but publish-release
+      # needs every matrix leg green, so failing here leaves the release a draft.
+      #
+      # Notarization itself is already gated: the bundler waits for Apple's verdict
+      # and fails the build on rejection. So this asserts only what is decidable
+      # offline and deterministically, and reports the network-dependent Gatekeeper
+      # verdict as a warning. Every threshold below was measured on a real signed
+      # build (2026-07-29): app stapled, dmg NOT stapled (signed but never
+      # submitted), updater tarball stapled.
+      - name: Verify the macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # -print -quit, not `| head -1`: no pipe means no SIGPIPE interaction
+          # with pipefail, and it cannot silently pick an arbitrary bundle.
+          app=$(find target -maxdepth 6 -name 'ConvertBar.app' -type d -print -quit)
+          [ -n "$app" ] || { echo "::error::no ConvertBar.app found"; exit 1; }
+
+          codesign --verify --strict --verbose=2 "$app"
+
+          desc=$(codesign -dvv "$app" 2>&1)
+          grep -q 'flags=.*runtime' <<<"$desc" \
+            || { echo "::error::hardened runtime missing"; exit 1; }
+          grep -q 'Authority=Developer ID Application' <<<"$desc" \
+            || { echo "::error::not signed with a Developer ID Application cert"; exit 1; }
+
+          xcrun stapler validate "$app" \
+            || { echo "::error::notarization ticket is not stapled to the app"; exit 1; }
+
+          # Advisory, not gating: an unstapled updater artifact still works, it just
+          # costs auto-updating users an online Gatekeeper check on first launch.
+          updater=$(find target -maxdepth 6 -name 'ConvertBar.app.tar.gz' -print -quit)
+          if [ -n "$updater" ]; then
+            work=$(mktemp -d)
+            tar -xzf "$updater" -C "$work"
+            xcrun stapler validate "$work/ConvertBar.app" \
+              || echo "::warning::updater tarball is not stapled (Tauri bundling order may have changed)"
+          fi
+
+          # Advisory: needs network. Captured rather than piped, because
+          # `spctl | tee | grep -q` goes non-zero under pipefail when grep exits
+          # early and tee takes SIGPIPE — printing this on a healthy build.
+          verdict=$(spctl -a -vvv --type execute "$app" 2>&1) || true
+          echo "$verdict"
+          grep -q 'source=Notarized Developer ID' <<<"$verdict" \
+            || echo "::warning::spctl did not report a notarized Developer ID"
+
   # Publishing is the event that seals an immutable release, so it runs once,
   # after every platform has uploaded to the draft.
   publish-release:

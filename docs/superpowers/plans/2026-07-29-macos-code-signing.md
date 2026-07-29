@@ -213,9 +213,13 @@ Go to <https://appstoreconnect.apple.com/access/integrations/api> — the **Inte
 
 - [x] **Step 2: Generate the key**
 
-**+** → Name: `ConvertBar Notarization` → Access: **Developer** → Generate.
+**It must be a Team key, not an Individual key** — the page offers both tabs. Only Team keys have an Issuer ID, and `notarytool` rejects `--issuer` for Individual keys (*"Required for Team API Keys. Do not provide for Individual API Keys"*). Since Tauri's notarization path requires `APPLE_API_ISSUER`, an Individual key is unusable here.
+
+On the **Team Keys** tab: **+** → Name: `ConvertBar Notarization` → Access: **Developer** → Generate.
 
 Developer is the least privilege that notarization accepts. Do not grant Admin.
+
+The creation dialog asks for a **role**, not a list of Apple services. If a future version of the UI asks for services instead, note that the choice is permanent after creation and must include the Developer ID Notary Service.
 
 - [x] **Step 3: Capture the two identifiers**
 
@@ -226,7 +230,7 @@ Developer is the least privilege that notarization accepts. Do not grant Admin.
 
 Reload the page; a **Download** button appears on the new row. It works exactly once. Save `AuthKey_<KEYID>.p8` and put it in 1Password before doing anything else.
 
-- [ ] **Step 5: Prove the key authenticates**
+- [x] **Step 5: Prove the key authenticates**
 
 ```bash
 xcrun notarytool history \
@@ -258,7 +262,7 @@ Add at <https://github.com/rhurling/convertbar/settings/secrets/actions>:
 
 `APPLE_API_KEY_P8` is a name of our own choosing — Tauri reads a *path* (`APPLE_API_KEY_PATH`), so the workflow decodes this secret to a file and points that variable at it (Task 4).
 
-- [ ] **Step 7: Keep the `.p8` locally for Task 3, then remove it**
+- [x] **Step 7: Keep the `.p8` locally for Task 3, then remove it**
 
 Task 3 needs the file. Move it somewhere stable for now:
 
@@ -276,18 +280,41 @@ The point of this task is a **fast failing test**. A full `tauri build` takes ma
 
 **Files:** none in the repo — this task produces knowledge, recorded in Step 6.
 
-- [ ] **Step 1: Set up the shell**
+- [x] **Step 1: Set up the credentials**
+
+Put them in a file rather than `export`ing them into one interactive shell. An agent executing this plan gets a **fresh shell per command**, so plain exports reach nothing it runs afterwards — and a file lets it `source` the credentials without the issuer UUID ever appearing in a transcript.
+
+Write placeholders, then fill the issuer in an editor:
 
 ```bash
-export APPLE_SIGNING_IDENTITY="Developer ID Application: Rouven Hurling (ABCDE12345)"
-export APPLE_API_ISSUER="<ISSUER-UUID>"
-export APPLE_API_KEY="<KEYID>"
-export APPLE_API_KEY_PATH="$HOME/private_keys/AuthKey_<KEYID>.p8"
+printf '%s\n' \
+  'export APPLE_SIGNING_IDENTITY="Developer ID Application: NAME (TEAMID)"' \
+  'export APPLE_API_ISSUER="PASTE_ISSUER_HERE"' \
+  'export APPLE_API_KEY="<KEYID>"' \
+  'export APPLE_API_KEY_PATH="$HOME/private_keys/AuthKey_<KEYID>.p8"' \
+  > ~/.convertbar-signing.env
+chmod 600 ~/.convertbar-signing.env
+open -e ~/.convertbar-signing.env    # replace PASTE_ISSUER_HERE, save, close
 ```
+
+**Do not build this file from `$(pbpaste)`.** That was tried first and failed in a way that looked like success: the operator had copied the *command* to paste it into the terminal, which evicted the Issuer ID from the clipboard, so `pbpaste` interpolated the command text into line 2. Sourcing the file then died with `no matches found: (TEAMID)'; echo export`.
+
+Validate with a check that can actually fail — a UUID is 36 characters:
+
+```bash
+source ~/.convertbar-signing.env
+echo "issuer length: ${#APPLE_API_ISSUER} (expect 36)"
+echo "key file: $([ -f "$APPLE_API_KEY_PATH" ] && echo present || echo MISSING)"
+[ ${#APPLE_API_ISSUER} -eq 36 ] && echo OK || echo FAIL
+```
+
+Counting `export` lines is **not** a valid check: the clipboard mishap above still produced exactly four lines containing the word `export`, so the count passed while the file was garbage. Assert on the shape of the value, not the shape of the file.
+
+The file lives outside the repo, mode 600, and is deleted in Step 7. Every later command in this task begins `source ~/.convertbar-signing.env &&`.
 
 `APPLE_CERTIFICATE` is deliberately **not** set locally — the identity is already in the login keychain, and setting it would send Tauri down the CI keychain-import path for no reason.
 
-- [ ] **Step 2: Sign a throwaway binary**
+- [x] **Step 2: Sign a throwaway binary**
 
 ```bash
 printf 'int main(void){return 0;}\n' > /tmp/signtest.c
@@ -302,7 +329,7 @@ Expected in the `codesign -dvv` output:
 - `flags=0x10000(runtime)` — this is the hardened runtime, which notarization requires
 - a `Timestamp=` line — a *secure* timestamp, which notarization also requires
 
-- [ ] **Step 3: Notarize it**
+- [x] **Step 3: Notarize it**
 
 ```bash
 ditto -c -k --keepParent /tmp/signtest /tmp/signtest.zip
@@ -328,7 +355,7 @@ xcrun notarytool log <submission-id> \
 
 Do **not** try to staple this binary. `stapler` only works on bundles, disk images and installer packages; a bare Mach-O has nowhere to put the ticket. That is expected, not a failure.
 
-- [ ] **Step 4: Build the real thing, signed and notarized**
+- [x] **Step 4: Build the real thing, signed and notarized**
 
 ```bash
 npm ci
@@ -347,7 +374,7 @@ If notarization is *silently absent* from the output, that is the real failure: 
 
 This step is slow — a full release build plus a notarization round trip — which is why Steps 2–3 came first.
 
-- [ ] **Step 5: Verify the built bundle**
+- [x] **Step 5: Verify the built bundle**
 
 ```bash
 APP="target/aarch64-apple-darwin/release/bundle/macos/ConvertBar.app"
@@ -359,7 +386,7 @@ spctl -a -vvv --type execute "$APP"
 
 Expected from `spctl`: `accepted` and `source=Notarized Developer ID`. Anything else — particularly `source=Unnotarized Developer ID` — means signing worked but notarization did not reach the bundle.
 
-- [ ] **Step 6: Record where the notarization ticket actually landed**
+- [x] **Step 6: Record where the notarization ticket actually landed**
 
 This determines what Task 4's CI verification is allowed to assert. **Run all four and write down the result of each** — do not assume.
 
@@ -381,6 +408,18 @@ rm -rf /tmp/updchk
 Whatever the four exit codes actually are, **Task 4 and Task 7 assert exactly that and nothing more.** A CI check asserting an unstapled artifact is stapled would block every future release; an acceptance test asserting the DMG is notarized would fail on a perfectly healthy build.
 
 An unstapled artifact is not a disaster: Gatekeeper falls back to an online notarization check on first launch, so it only affects a user who is offline the very first time they open the app. Record all four results in the PR description.
+
+**Measured 2026-07-29** (Tauri CLI 2.x, `aarch64-apple-darwin`):
+
+| Probe | Exit | Meaning |
+|---|---|---|
+| `app` | **0** | stapled |
+| `dmg` | **65** | not stapled — signed, never submitted |
+| `updater app` | **0** | stapled (tarred after the staple) |
+
+Confirmed by the build log's ordering: `Stapling app...` → `Bundling …dmg` → `Signing …dmg` → `Bundling …app.tar.gz`. The DMG is signed but never notarized on its own; both the DMG's payload and the updater tarball inherit the already-stapled app.
+
+Also recorded from the same build: `codesign --verify --strict` reports *valid on disk* and *satisfies its Designated Requirement*; `flags=0x10000(runtime)`; chain `Developer ID Application → Developer ID Certification Authority → Apple Root CA`; `spctl` reports `accepted` / `source=Notarized Developer ID`.
 
 - [ ] **Step 7: Clean up**
 
@@ -475,7 +514,7 @@ Extend the `env:` block of the `tauri-apps/tauri-action` step (`.github/workflow
 
 The Tauri 2 CLI imports `APPLE_CERTIFICATE` into a temporary keychain itself — the manual `security create-keychain` dance in the Tauri docs is not needed and is not added here.
 
-- [ ] **Step 4: Assert the shipped bundle is really signed and notarized**
+- [x] **Step 4: Assert the shipped bundle is really signed and notarized**
 
 After the `tauri-action` step:
 
@@ -517,11 +556,11 @@ a live CDN lookup from the runner.
             || echo "::warning::spctl did not report a notarized Developer ID"
 ```
 
-**Adjust to Task 3 Step 6's findings before committing:** for each artifact that
-Step 6 showed as stapled (exit code 0), add a hard `xcrun stapler validate <path>`
-line. Stapling is offline-decidable, so anything observed stapled locally is safe
-to assert. Add nothing for artifacts Step 6 showed as unstapled — asserting those
-would block every future release.
+**Resolved against Task 3 Step 6's measurements:**
+
+- `stapler validate` on the **`.app`** is a **hard** assertion. Measured 0, offline-decidable, and it is the primary artifact.
+- `stapler validate` on the **updater tarball's app** is a **warning**. Measured 0, so it is asserted, but its absence degrades gracefully — an unstapled updater artifact still installs and runs, costing only an online Gatekeeper check on first launch. Blocking a release over that would be disproportionate, and the likeliest cause would be a Tauri bundling-order change rather than a broken signature.
+- The **`.dmg`** gets **no** stapling assertion. Measured 65: Tauri signs the disk image but never submits it. Asserting it would fail every healthy release.
 
 - [x] **Step 5: Lint the workflow**
 
