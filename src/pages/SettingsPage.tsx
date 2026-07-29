@@ -222,6 +222,15 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
               <div className="suffix-inplace-note">
                 Empty suffix: mp4 files are re-encoded in place, replacing the original. The fast
                 &quot;already converted&quot; skip-by-suffix is also disabled.
+                {settings.cleanup_mode === "keep" && (
+                  <>
+                    {" "}
+                    <strong>
+                      An in-place re-encode cannot keep the original — there is only one file. These
+                      files will be skipped until you choose Delete or set a suffix.
+                    </strong>
+                  </>
+                )}
               </div>
             )}
           </>
@@ -230,13 +239,10 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
 
       <div className="setting-group">
         <label className="setting-label">After conversion</label>
-        {isServerHead ? (
-          <p className="setting-hint">
-            Originals are deleted permanently after conversion — the server has no Trash to
-            move them to.
-          </p>
-        ) : (
-          <div className="setting-radios">
+        <div className="setting-radios">
+          {/* No Trash on the server head: the `trash` crate litters .Trash-<uid>
+              directories on the NAS mounts a headless deployment runs against. */}
+          {!isServerHead && (
             <label className="radio-label">
               <input
                 type="radio"
@@ -246,17 +252,31 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
               />
               Move original to Trash
             </label>
-            <label className="radio-label">
-              <input
-                type="radio"
-                name="cleanup"
-                checked={settings.cleanup_mode === "delete"}
-                onChange={() => updateSetting("cleanup_mode", "delete")}
-              />
-              Delete permanently
-            </label>
-          </div>
-        )}
+          )}
+          <label className="radio-label">
+            <input
+              type="radio"
+              name="cleanup"
+              checked={settings.cleanup_mode === "delete"}
+              onChange={() => updateSetting("cleanup_mode", "delete")}
+            />
+            Delete original permanently
+          </label>
+          <label className="radio-label">
+            <input
+              type="radio"
+              name="cleanup"
+              checked={settings.cleanup_mode === "keep"}
+              onChange={() => updateSetting("cleanup_mode", "keep")}
+            />
+            Keep both files
+          </label>
+        </div>
+        <p className="setting-hint">
+          Keep both files deletes nothing. Use it to check the encodes are good on this
+          machine, remove the originals yourself, then switch to Delete once you trust the
+          results.
+        </p>
       </div>
 
       <div className="setting-group">

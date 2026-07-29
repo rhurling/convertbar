@@ -92,7 +92,27 @@ the destination volume.
    Available variables: `{codec}`, `{resolution}`, `{quality}`, `{preset}`,
    `{device}` — all read from the preset's own metadata.
 3. When the encode finishes, the two files are compared and the larger one is
-   removed — moved to the Trash by default, or deleted permanently if you prefer.
+   removed, according to your **After conversion** setting.
+
+**After conversion** — what happens to the file that loses on size:
+
+- **Move original to Trash** (desktop only) — recoverable from the OS Trash.
+- **Delete original permanently** — the default on the server head; a headless
+  deployment has no Trash, and the `trash` crate litters `.Trash-<uid>` folders on
+  NAS mounts.
+- **Keep both files** — nothing is deleted. This is an evaluation mode: run a batch,
+  check the encodes are good on your hardware, delete the originals yourself, then
+  switch to Delete. History still shows how much each encode saved, so you can judge
+  the result before committing to it.
+
+Two things to know about Keep:
+
+- An empty output suffix re-encodes in place, so there is no second file to keep.
+  Those files are skipped with a note until you choose Delete or set a suffix.
+- While originals are kept, ConvertBar avoids re-converting them by remembering each
+  file's size and modification time in History. Clearing History forgets that, and a
+  watched folder will convert those files again into renumbered outputs
+  (`movie (1).1080p-h265.mp4`).
 
 Encoding is deliberately sequential: hardware encoders would just contend for the
 same silicon if run in parallel, so two at once is usually slower overall.

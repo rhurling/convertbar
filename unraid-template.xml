@@ -28,9 +28,10 @@
     replaces originals with smaller re-encodes). Give it read/write access only to the
     media you actually want it to touch, and set Browse Roots to confine the file browser.
 
-    This server build always deletes replaced files rather than moving them to a trash
-    folder, and its Settings page hides the desktop-only options (menu bar, notifications,
-    auto-update, launch at login).
+    This server build deletes replaced files by default rather than moving them to a
+    trash folder; the Settings page can switch that to keeping both files while you
+    evaluate the results. Its Settings page hides the desktop-only options (menu bar,
+    notifications, auto-update, launch at login).
   </Overview>
   <Category>MediaApp:Video Tools:</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>

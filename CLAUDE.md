@@ -10,6 +10,26 @@ Cargo workspace: `crates/convertbar-core` (head-agnostic engine: converter, watc
 
 Never emit a Tauri event while holding `ctx.db`'s lock (`crates/convertbar-core/src/control.rs:80-82` and sibling call sites): the desktop tray listener re-locks `ctx.db` synchronously on the same thread to read settings, and `std::sync::Mutex` is not reentrant, so holding the guard across an emit self-deadlocks. Pause/resume/cancel drop the `db` guard before emitting; `LockProbeSink` (a test double in `control.rs`) fails loud instead of hanging if this regresses. Two shipped deadlocks came from violating it.
 
+## Cleanup Modes and the In-Place Rule
+
+`cleanup_mode` is `trash | delete | keep`, always read through
+`settings_ops::read_cleanup_mode` (never a raw column compare); an unrecognized value
+normalizes to `trash`.
+
+`keep` and an in-place job (empty suffix, so `output_path == source_path`) are mutually
+exclusive, and that is enforced by PREVENTION, not refusal: `add_files_to_db` never
+queues such a job, and `update_setting` drops queued ones when the mode becomes `keep`.
+Do not "simplify" this into an error recorded in `process_queue` — an `error` row is
+invisible to both `queue_ops::fetch_skip_sets` and `watcher::filter_known_bad_sources`,
+so a watched folder would re-queue and re-fail every file on every boot. The
+`"keep" => RemoveTemp` arm in `in_place_action` covers the setting-change race and must
+stay a real arm, not a `debug_assert!` — the branch it replaces permanently deletes the
+user's source on the server head.
+
+Under `keep` the source survives, so re-ingestion protection rests entirely on the
+`(size, mtime)` fingerprint in completed rows. Clearing history therefore re-converts
+kept sources.
+
 ## HandBrake Locator Test Fixtures
 
 Test fixtures default to `PanickingLocator` (`crates/convertbar-core/src/handbrake.rs`): a test that reaches HandBrake resolution without declaring its world fails loud instead of silently reading whatever the host has installed. Declare the world explicitly — `AbsentLocator` for the CI world, `StubLocator` for the installed world, `PathLocator` only in `#[ignore]`d tests that genuinely want the host binary. On the queue thread (`process_queue` runs on a spawned thread), a `PanickingLocator` panic poisons `ctx.db`, so the test thread's own `.lock().unwrap()` on that mutex can surface a `PoisonError` instead of the locator's message — a confusing poison error there is a hint to check for a missing locator declaration before chasing something else.
