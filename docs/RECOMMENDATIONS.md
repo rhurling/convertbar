@@ -91,6 +91,28 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   deliberate (a mechanism that always honoured a correct token would still
   answer every guess); the operator-facing guidance is to wait, not retry.
 
+### 16. Server — Panics No Longer Masquerade as Deliberate Errors — *shipped, branch `fix/server-error-taxonomy`*
+- The gap this closes: all ten `spawn_blocking` join-error sites returned a 500 with an
+  `{"error": ...}` body identical in shape to an ordinary core failure, so a client could not
+  tell a server bug from an expected condition such as a missing HandBrakeCLI — and tests could
+  separate them only by matching on the message text.
+- Fixed by `routes::join_err`: one definition, still 500, carrying a `"kind": "panic"`
+  discriminator that appears on that shape alone. Deliberate failures keep `core_err`'s bare
+  `{"error": ...}` body. The panic detail stays on the wire exactly as before — the API is
+  auth-gated by default and the threat model is single-user LAN, so debuggability wins.
+- **Why both stay 500:** each really is "the server could not answer". Moving deliberate
+  failures onto 4xx is the semantically cleaner design, but it is a far larger contract change
+  (all 39 routes, the frontend transport, every route test) and this item asked for a
+  distinction, not a re-taxonomy.
+- Nine sites went through `core_err`; the tenth (`fs.rs`) built the same body through that
+  module's local `json_err`, which is why grepping `core_err` found nine. A directory-walking
+  tripwire test now fails if any route module spells the shape out again — including a route
+  module added later, since it walks `src/routes` rather than listing the modules.
+- **Out of scope, recorded:** the desktop head has the same indistinguishability.
+  `src-tauri/src/commands/*` map join failures with `.map_err(|e| e.to_string())?`, so the
+  frontend receives a plain string with no channel to carry a discriminator. Fixing it there
+  means changing the commands' return type — its own change, with its own argument.
+
 ---
 
 ## Open — High Impact
@@ -187,17 +209,6 @@ event loop), and being Rust-invoked it needs **no** frontend `dialog` ACL grant.
 - Allow dragging files directly onto the menu bar icon to queue them
 - Requires modifying the Tauri tray event handler to accept drag-drop events
 - Note: Tauri v2 may not support this natively — would need a native macOS plugin
-
-### 16. Server: panics masquerade as deliberate errors
-- All ten `spawn_blocking` join-error sites in `crates/convertbar-server/src/routes/` return an
-  HTTP 500 with an `{"error": ...}` body — identical in shape to an ordinary core failure. Nine
-  go through `core_err` (`queue.rs:29,44,53,67,129`, `handbrake.rs:24,38,63,88`); the tenth,
-  `fs.rs:89`, goes through that module's local `json_err` with the same shape. Grepping for
-  `core_err` alone finds nine and misses one.
-- A client cannot distinguish a server bug from an expected condition such as a missing
-  HandBrakeCLI, and tests can only tell them apart by matching on the message text.
-- Consider a distinct status or body shape for join failures. Surfaced 2026-07-29 while giving
-  the HandBrake-missing error one definition (`handbrake::HANDBRAKE_NOT_FOUND`).
 
 ---
 
