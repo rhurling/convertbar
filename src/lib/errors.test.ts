@@ -93,17 +93,27 @@ describe("display sites", () => {
         .join("\n")
         .replace(/\$\{\s*([\w$]+)\s*\}/g, "${$1}");
 
-    // `.toString()` needles begin with the binding, so `e.toString()` would otherwise match
-    // any identifier ending in "e" — `fileSize.toString()` is not a caught error. The Rust twin
-    // guards the preceding character for the same reason.
+    // A needle that begins with an identifier character can match the tail of a longer name:
+    // `e.toString()` occurs inside `fileSize.toString()`, and `String(e)` inside `toString(e)`.
+    // Neither is a caught error, so those needles only count when the character before them ends
+    // a token. The Rust twin guards the same way.
+    //
+    // `${e}` is the exception and must NOT be guarded: inside a template literal `${` opens an
+    // interpolation whatever precedes it, so guarding it silently waved through `` `Error${e}` ``
+    // — a real offence, caught by round three's plainer check and missed by this one until a
+    // probe went looking for the difference between "before a space" and "before a letter".
     const usesToken = (source: string, needle: string): boolean => {
+      const guarded = !needle.startsWith("${");
       for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
-        if (at === 0 || !/[\w$.]/.test(source[at - 1])) return true;
+        if (!guarded || at === 0 || !/[\w$.]/.test(source[at - 1])) return true;
       }
       return false;
     };
 
-    const files = walk(root).filter((f) => !f.endsWith(join("lib", "errors.ts")));
+    // Compared whole, not by suffix: `endsWith("lib/errors.ts")` would also exempt a future
+    // `src/datalib/errors.ts`. The Rust twin avoids the same trap by not using `Path::ends_with`.
+    const helper = join(root, "lib", "errors.ts");
+    const files = walk(root).filter((f) => f !== helper);
     let bindingsChecked = 0;
 
     for (const file of files) {
@@ -114,12 +124,15 @@ describe("display sites", () => {
       // `.catch(cb)` count: several files have only the latter, and "surface this error" lands
       // there just as easily.
       const bindings = new Set([
-        ...[...source.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*)\s*(?::[^)]*)?\)/g)].map(
-          (m) => m[1],
-        ),
+        // The lookbehind keeps `p.catch(refresh)` from reading as a catch *block* binding `refresh`
+        // — which would then fail the file for interpolating its own handler's name, exactly the
+        // cry-wolf this scan is supposed to avoid.
+        ...[
+          ...source.matchAll(/(?<![.\w$])catch\s*\(\s*([A-Za-z_$][\w$]*)\s*(?::[^)]*)?\)/g),
+        ].map((m) => m[1]),
         ...[
           ...source.matchAll(
-            /\.catch\s*\(\s*\(?\s*([A-Za-z_$][\w$]*)\s*(?::[^)=]*)?\)?\s*=>/g,
+            /\.catch\s*\(\s*(?:async\s+)?\(?\s*([A-Za-z_$][\w$]*)\s*(?::[^)=]*)?\)?\s*=>/g,
           ),
         ].map((m) => m[1]),
       ]);
@@ -127,8 +140,9 @@ describe("display sites", () => {
       for (const binding of bindings) {
         bindingsChecked++;
         // Every way to turn a value into display text. `errorText` and `isPanic` take the
-        // binding directly, so they are unaffected. Known miss: string concatenation
-        // (`"failed: " + e`), which cannot be told from arithmetic without parsing.
+        // binding directly, so they are unaffected. Known misses, none present today: string
+        // concatenation (`"failed: " + e`), which cannot be told from arithmetic without
+        // parsing; `catch ({ message })` destructuring; and `.catch(function (e) {…})`.
         for (const needle of [
           `String(${binding})`,
           `\${${binding}}`,

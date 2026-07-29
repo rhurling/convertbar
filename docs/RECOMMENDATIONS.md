@@ -175,7 +175,10 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     queue thread, which poisons `ctx.db` (see CLAUDE.md). Every later command then fails at
     `ctx.db.lock().map_err(|e| e.to_string())?`, and `From<String>` stamps that `PoisonError` with
     no discriminator. So the panic itself is labelled and its permanent consequence is not.
-    Fixing it needs a typed error out of core, not a shape at the command boundary.
+    Fixing it needs a typed error out of core, not a shape at the command boundary. Worth naming
+    where the two limits meet: once `ctx.db` is poisoned, `list_handbrake_presets` fails as a
+    deliberate error and the settings page again reads "Could not load presets. Is HandBrakeCLI
+    installed?" — the exact misleading copy this item removed for the panic itself.
   - **Two commands still stat paths on the main thread.** `check_paths_exist` (fired when the
     history context menu opens) and `open_path` are sync, so Tauri runs them on the main thread,
     and a `Path::exists()` against a dead network mount hangs for tens of seconds — the same
