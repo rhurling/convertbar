@@ -143,6 +143,18 @@ fn apply_in_place_action(
                 // silently skipping the dispose call and falling through to the rename.
                 debug_assert!(false, "source paths come from the DB as UTF-8 Strings");
             }
+            // The rename is only safe once the source has actually left: renaming over a
+            // source that is still there overwrites the user's only copy with the re-encode,
+            // and in trash mode there is then nothing in the Trash to recover. Refuse instead
+            // — the original stays put and the temp keeps the re-encoded content. Checked on
+            // the filesystem rather than on the dispose bool, for the same reason the
+            // distinct-file cleanup is: it is the end state that matters.
+            if source.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "source could not be moved to Trash; refusing to overwrite it",
+                ));
+            }
             std::fs::rename(temp, source)
         }
         InPlaceAction::RemoveTemp => std::fs::remove_file(temp),
@@ -1216,9 +1228,12 @@ fn process_queue(ctx: &Ctx) {
                 // file out of place. A failed temp *removal* is benign and handled as success.
                 if in_place_apply_is_fatal(kept, in_place_apply_failed) {
                     had_errors = true;
-                    // In trash mode the original was moved to Trash before the rename failed; in
-                    // delete mode the rename-over-source failed and the original is untouched.
-                    let err_msg = if cleanup_mode == "delete" {
+                    // Which of the two shapes this is, read off the filesystem rather than
+                    // inferred from the mode: the original is still in place both when the
+                    // rename failed (delete mode) and when the Trash step was refused, and is
+                    // in the Trash only when it genuinely left. Keying this on cleanup_mode
+                    // sent trash-mode users hunting in the Trash for a file still on disk.
+                    let err_msg = if std::path::Path::new(&job.source_path).exists() {
                         "In-place replacement failed; original left unchanged"
                     } else {
                         "In-place replacement failed; original may be in Trash"
@@ -1231,8 +1246,8 @@ fn process_queue(ctx: &Ctx) {
                         crate::failure_class::FailureClass::Environment,
                     );
                     // Intentionally leave the temp (`.{stem}.convertbar-tmp.mp4`): it holds the
-                    // re-encoded content, and in trash mode it is the only in-place copy (the
-                    // original is in Trash), so removing it would force trash recovery. The marker
+                    // re-encoded content, and when the original did reach the Trash it is the
+                    // only in-place copy, so removing it would force trash recovery. The marker
                     // keeps it out of scans, and the next in-place encode pre-clears it.
                     continue;
                 }
@@ -3436,6 +3451,79 @@ HandBrake has exited.";
             std::fs::read(&source).unwrap(),
             b"original",
             "the source is left intact when the rename could not happen"
+        );
+    }
+
+    // TrashSourceThenRename disposes the source, then renames the temp onto its path. Those
+    // two steps are only safe in that order if the first one actually happened: when the
+    // Trash is refused the source is still sitting there, and the rename then overwrites the
+    // user's only copy with the re-encode — destroying it outright, with nothing in the Trash
+    // to recover. Data loss, not just a bad status row.
+    #[test]
+    fn in_place_trash_refused_preserves_the_original_instead_of_renaming_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        let temp = dir.path().join(".clip.convertbar-tmp.mp4");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::write(&temp, b"reencoded").unwrap();
+
+        let result = apply_in_place_action(
+            InPlaceAction::TrashSourceThenRename,
+            &temp,
+            &source,
+            &crate::dispose::FailingDisposer,
+        );
+
+        assert!(
+            result.is_err(),
+            "a refused Trash must surface so the job fails, not be swallowed"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"original",
+            "THE POINT OF THIS GUARD: the original must survive a refused Trash — renaming \
+             the temp over it here destroys the user's only copy"
+        );
+        assert!(
+            temp.exists(),
+            "the temp still holds the re-encoded content and must be kept for recovery"
+        );
+    }
+
+    // End-to-end counterpart, and the reason the message is derived from the filesystem: the
+    // mode alone would report "original may be in Trash" here and send the user hunting in
+    // the Trash for a file that never left its folder.
+    #[test]
+    fn an_in_place_job_whose_trash_is_refused_keeps_the_original_and_says_where_it_is() {
+        let (ctx, _sink) =
+            test_ctx_with_disposer(test_conn(), Arc::new(crate::dispose::FailingDisposer));
+        set_setting(&ctx.db, "cleanup_mode", "trash");
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let src = dir.path().join("in.mp4");
+        std::fs::write(&src, b"0123456789").unwrap();
+        let original_bytes = std::fs::read(&src).unwrap();
+        let p = src.to_str().unwrap();
+        queue_job(&ctx.db, "j1", p, p, 10); // in-place: output_path == source_path
+
+        process_queue(&ctx);
+
+        let (status, msg) = job_row(&ctx.db, "j1");
+        assert_eq!(
+            status, "error",
+            "an in-place job that could not replace the source is not a success"
+        );
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            original_bytes,
+            "the original must survive byte-identical, not be replaced by the re-encode"
+        );
+        let msg = msg.unwrap_or_default();
+        assert!(
+            msg.contains("left unchanged") && !msg.contains("Trash"),
+            "the original never reached the Trash, so the message must not send the user \
+             looking for it there — got: {msg}"
         );
     }
 
