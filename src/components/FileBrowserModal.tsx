@@ -107,7 +107,11 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       if (range.length > 0) {
         // Additive by design: a range never deselects, so a mis-aimed shift-click
         // cannot silently drop work the user did earlier.
-        setSelected((prev) => new Set([...prev, ...range]));
+        setSelected((prev) => {
+          const next = new Set(prev);
+          for (const p of range) next.add(p);
+          return next;
+        });
         return;
       }
     }

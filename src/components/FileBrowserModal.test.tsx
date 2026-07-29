@@ -410,4 +410,59 @@ describe("FileBrowserModal", () => {
 
     expect(onSelect).toHaveBeenCalledWith(["/Movies", "/Movies/clip.mp4"]);
   });
+
+  it("resets the shift anchor on navigation, even back to the same directory", async () => {
+    fsListMock.mockImplementation((path: string) => {
+      if (path === "/") {
+        return Promise.resolve({
+          entries: [
+            entry({ name: "Movies", path: "/Movies", is_dir: true }),
+            entry({ name: "a.mp4", path: "/a.mp4" }),
+            entry({ name: "b.mp4", path: "/b.mp4" }),
+            entry({ name: "c.mp4", path: "/c.mp4" }),
+          ],
+        });
+      }
+      return Promise.resolve({ entries: [] });
+    });
+    const onSelect = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={onSelect} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("a.mp4")); // sets the anchor to /a.mp4
+    fireEvent.click(screen.getByRole("button", { name: "Open Movies" }));
+    await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/Movies"));
+    fireEvent.click(screen.getByRole("button", { name: "/" })); // back to the same directory
+    await screen.findByText("a.mp4");
+
+    fireEvent.click(screen.getByText("c.mp4"), { shiftKey: true });
+
+    // Without the anchor reset, a.mp4 would still resolve inside this listing and this
+    // shift-click would sweep in b.mp4 as a stale range instead of toggling only c.mp4.
+    fireEvent.click(screen.getByRole("button", { name: /^Add 2 items/ }));
+    expect(onSelect).toHaveBeenCalledWith(["/a.mp4", "/c.mp4"]);
+  });
+
+  it("clearing the selection also resets the shift anchor", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [
+        entry({ name: "a.mp4", path: "/a.mp4" }),
+        entry({ name: "b.mp4", path: "/b.mp4" }),
+        entry({ name: "c.mp4", path: "/c.mp4" }),
+      ],
+    });
+    const onSelect = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={onSelect} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("a.mp4")); // sets the anchor to /a.mp4
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+
+    fireEvent.click(screen.getByText("c.mp4"), { shiftKey: true });
+
+    // Without the anchor reset, this would resolve as a stale range from the cleared
+    // a.mp4 anchor through to c.mp4, resurrecting a.mp4 and sweeping in b.mp4 too.
+    fireEvent.click(screen.getByRole("button", { name: /^Add 1 item/ }));
+    expect(onSelect).toHaveBeenCalledWith(["/c.mp4"]);
+  });
 });
