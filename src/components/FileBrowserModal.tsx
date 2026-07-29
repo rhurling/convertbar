@@ -44,6 +44,7 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   const [anchor, setAnchor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [gotoDraft, setGotoDraft] = useState("");
 
   const load = useCallback(async (target: string) => {
     setLoading(true);
@@ -150,8 +151,8 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       : `Add ${selected.size} item${selected.size === 1 ? "" : "s"}`;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="file-browser-modal" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-overlay">
+      <div className="file-browser-modal">
         <div className="file-browser-header">
           <span>{mode === "directory" ? "Choose a folder" : "Add files"}</span>
           <button type="button" className="btn btn-small" onClick={onClose} title="Close">
@@ -172,6 +173,27 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
             </span>
           ))}
         </div>
+
+        <form
+          className="file-browser-goto"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const target = gotoDraft.trim();
+            if (target) load(target);
+          }}
+        >
+          <input
+            className="setting-input"
+            type="text"
+            aria-label="Go to path"
+            placeholder="/media/movies"
+            value={gotoDraft}
+            onChange={(e) => setGotoDraft(e.target.value)}
+          />
+          <button type="submit" className="btn btn-small">
+            Go
+          </button>
+        </form>
 
         {error && <div className="setting-error">{error}</div>}
 

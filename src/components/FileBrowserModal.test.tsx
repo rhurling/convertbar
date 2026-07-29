@@ -465,4 +465,57 @@ describe("FileBrowserModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Add 1 item/ }));
     expect(onSelect).toHaveBeenCalledWith(["/c.mp4"]);
   });
+
+  it("navigates to a typed path", async () => {
+    fsListMock.mockImplementation((path: string) =>
+      path === "/media/movies"
+        ? Promise.resolve({ entries: [entry({ name: "deep.mp4", path: "/media/movies/deep.mp4" })] })
+        : Promise.resolve({ entries: [] }),
+    );
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const input = await screen.findByLabelText("Go to path");
+    fireEvent.change(input, { target: { value: "/media/movies" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(await screen.findByText("deep.mp4")).toBeInTheDocument();
+  });
+
+  it("shows the server's error for a forbidden path and keeps the current listing", async () => {
+    fsListMock.mockImplementation((path: string) =>
+      path === "/"
+        ? Promise.resolve({ entries: [entry({ name: "visible.mp4", path: "/visible.mp4" })] })
+        : Promise.reject(new Error("path outside allowed roots")),
+    );
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+    expect(await screen.findByText("visible.mp4")).toBeInTheDocument();
+
+    const input = screen.getByLabelText("Go to path");
+    fireEvent.change(input, { target: { value: "/etc" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(await screen.findByText("path outside allowed roots")).toBeInTheDocument();
+    // A rejected jump must not blank the listing the user was looking at.
+    expect(screen.getByText("visible.mp4")).toBeInTheDocument();
+  });
+
+  it("does not close when the backdrop is clicked", async () => {
+    fsListMock.mockResolvedValue({ entries: [] });
+    const onClose = vi.fn();
+
+    const { container } = render(
+      <FileBrowserModal mode="files" onSelect={vi.fn()} onClose={onClose} />,
+    );
+    await waitFor(() => expect(fsListMock).toHaveBeenCalled());
+
+    fireEvent.click(container.querySelector(".modal-overlay")!);
+
+    // A stray backdrop click used to discard the whole selection. The accident class is
+    // removed outright rather than guarded with a confirm dialog.
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onClose).toHaveBeenCalled();
+  });
 });

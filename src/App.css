@@ -1240,6 +1240,18 @@ select.setting-input {
   color: var(--text-dim);
 }
 
+.file-browser-goto {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.file-browser-goto .setting-input {
+  flex: 1;
+  min-width: 0;
+}
+
 .file-browser-list {
   flex: 1;
   overflow-y: auto;
