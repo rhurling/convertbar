@@ -100,6 +100,10 @@ pub enum SkipReason {
     OutputExists,
     /// Source codec + resolution already meet/exceed the target preset (skip-by-source-media).
     AlreadyAtTarget,
+    /// The output path equals the source (empty suffix) while `cleanup_mode` is `keep`.
+    /// Keeping "both" files is meaningless when there is one file, so the job is never
+    /// created — see `queue_ops::add_files_to_db`.
+    InPlaceKeepBlocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

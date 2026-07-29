@@ -6,10 +6,12 @@ const SKIP_LABELS: Record<SkipReason, string> = {
   already_queued: "already queued",
   not_video: "not a video",
   already_at_target: "already at target",
+  in_place_keep_blocked: "in-place encode needs Delete",
 };
 
 // Fixed order so the rendered summary is deterministic regardless of backend ordering.
 const REASON_ORDER: SkipReason[] = [
+  "in_place_keep_blocked",
   "output_exists",
   "already_converted",
   "already_at_target",

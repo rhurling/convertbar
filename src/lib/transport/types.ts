@@ -22,7 +22,8 @@ export type SkipReason =
   | "already_queued"
   | "already_converted"
   | "output_exists"
-  | "already_at_target";
+  | "already_at_target"
+  | "in_place_keep_blocked";
 
 export interface SkipCount {
   reason: SkipReason;

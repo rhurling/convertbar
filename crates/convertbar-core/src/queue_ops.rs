@@ -908,7 +908,15 @@ pub fn add_files_inner(
 
     // Re-acquire db lock and hand the resolved suffix to the DB-only core.
     let conn = ctx.db.lock().map_err(|e| e.to_string())?;
-    let mut result = add_files_to_db(&conn, &survivors, &preset, &suffix, skip_already_converted)?;
+    let cleanup_mode = crate::settings_ops::read_cleanup_mode(&conn);
+    let mut result = add_files_to_db(
+        &conn,
+        &survivors,
+        &preset,
+        &suffix,
+        skip_already_converted,
+        &cleanup_mode,
+    )?;
     if !media_skipped.is_empty() {
         result.skipped.push(SkipCount {
             reason: SkipReason::AlreadyAtTarget,
@@ -927,6 +935,7 @@ fn add_files_to_db(
     preset: &str,
     suffix: &str,
     skip_already_converted: bool,
+    cleanup_mode: &str,
 ) -> Result<AddResult, String> {
     let (queued_paths, legacy_history_paths, converted_identities) =
         fetch_skip_sets(conn, skip_already_converted)?;
@@ -937,6 +946,7 @@ fn add_files_to_db(
     let mut assigned: HashSet<String> = HashSet::new();
     let (mut n_not_video, mut n_queued, mut n_converted, mut n_output_exists) =
         (0u32, 0u32, 0u32, 0u32);
+    let mut n_in_place_keep = 0u32;
 
     for path_str in paths {
         let identity = crate::probe_cache::file_identity(path_str);
@@ -956,6 +966,9 @@ fn add_files_to_db(
                 SkipReason::OutputExists => n_output_exists += 1,
                 // The cheap checks never produce AlreadyAtTarget — that needs a probe.
                 SkipReason::AlreadyAtTarget => {}
+                // Nor InPlaceKeepBlocked: that decision needs the resolved output path, so it is
+                // counted at its own site below rather than here.
+                SkipReason::InPlaceKeepBlocked => {}
             }
             continue;
         }
@@ -979,6 +992,15 @@ fn add_files_to_db(
             };
             choose_output_path(path_str, suffix, &is_taken)
         };
+
+        // In-place under keep is impossible by construction: output_path == source_path, so
+        // there is no "both" to keep. Blocked here rather than refused in process_queue —
+        // an error row is invisible to both re-ingestion guards, so a watched folder would
+        // re-queue it forever (see the design doc, Part 3).
+        if cleanup_mode == "keep" && crate::converter::is_in_place(path_str, &output_str) {
+            n_in_place_keep += 1;
+            continue;
+        }
         assigned.insert(output_str.clone());
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -1033,6 +1055,7 @@ fn add_files_to_db(
         (SkipReason::AlreadyQueued, n_queued),
         (SkipReason::AlreadyConverted, n_converted),
         (SkipReason::OutputExists, n_output_exists),
+        (SkipReason::InPlaceKeepBlocked, n_in_place_keep),
     ] {
         if count > 0 {
             skipped.push(SkipCount { reason, count });
@@ -1542,12 +1565,108 @@ mod tests {
     // ---- add_files_to_db skip rules ----
 
     #[test]
+    fn an_in_place_source_is_not_queued_under_keep() {
+        let conn = test_conn();
+        // An empty suffix makes the output path equal the source path: an in-place
+        // re-encode. "Keep both files" has no meaning when there is only one file, so the
+        // job must never be created — an error row here would be invisible to
+        // fetch_skip_sets and filter_known_bad_sources, and a watched folder would
+        // re-queue and re-fail it on every single boot.
+        let source = "/movies/clip.mp4".to_string();
+
+        let blocked =
+            add_files_to_db(&conn, &[source.clone()], "preset", "", false, "keep").unwrap();
+        assert!(
+            blocked.added.is_empty(),
+            "no in-place job may be queued under keep"
+        );
+        assert_eq!(
+            blocked.skipped,
+            vec![SkipCount {
+                reason: SkipReason::InPlaceKeepBlocked,
+                count: 1
+            }]
+        );
+
+        // The same source under delete still queues: the block is scoped to keep, not to
+        // in-place encoding in general.
+        let queued = add_files_to_db(&conn, &[source], "preset", "", false, "delete").unwrap();
+        assert_eq!(queued.added.len(), 1);
+    }
+
+    #[test]
+    fn a_distinct_output_still_queues_under_keep() {
+        let conn = test_conn();
+        // Non-empty suffix -> output != source -> keep is perfectly meaningful.
+        let result = add_files_to_db(
+            &conn,
+            &["/movies/clip.mp4".to_string()],
+            "preset",
+            "-conv",
+            false,
+            "keep",
+        )
+        .unwrap();
+        assert_eq!(result.added.len(), 1);
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_kept_source_is_not_requeued_while_its_history_row_survives() {
+        // THE load-bearing test for keep. Under trash/delete the source is gone after a
+        // successful conversion, so a watched-folder rescan cannot re-ingest it. Under keep
+        // the source is still sitting there, and the ONLY thing preventing an infinite
+        // re-convert loop is the (size, mtime) fingerprint on the completed row. Nothing
+        // else in the suite pins that.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        std::fs::write(&source, b"0123456789").unwrap();
+        let source_str = source.to_string_lossy().into_owned();
+
+        let conn = test_conn();
+        let id = crate::probe_cache::file_identity(&source_str).expect("stat the source");
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, source_size, source_mtime, queue_order, created_at)
+             VALUES ('j1', ?1, ?2, 'preset', 'done', ?3, ?4, 0, '2020-01-01T00:00:00Z')",
+            params![
+                source_str,
+                format!("{source_str}-conv.mp4"),
+                id.size,
+                id.mtime
+            ],
+        )
+        .unwrap();
+
+        let result =
+            add_files_to_db(&conn, &[source_str], "preset", "-conv", false, "keep").unwrap();
+
+        assert!(
+            result.added.is_empty(),
+            "a kept source must not be re-queued"
+        );
+        assert_eq!(
+            result.skipped,
+            vec![SkipCount {
+                reason: SkipReason::AlreadyConverted,
+                count: 1
+            }]
+        );
+    }
+
+    #[test]
     fn add_files_skips_paths_already_in_queue() {
         let conn = test_conn();
         insert_queued(&conn, "j1", "/movies/a.mp4", "queued", 1);
 
-        let result =
-            add_files_to_db(&conn, &["/movies/a.mp4".to_string()], "preset", "", false).unwrap();
+        let result = add_files_to_db(
+            &conn,
+            &["/movies/a.mp4".to_string()],
+            "preset",
+            "",
+            false,
+            "trash",
+        )
+        .unwrap();
 
         assert!(
             result.added.is_empty(),
@@ -1577,7 +1696,7 @@ mod tests {
         std::fs::write(dir.path().join("clip-conv.mp4"), b"x").unwrap();
         let source = dir.path().join("clip.mov").to_string_lossy().to_string();
 
-        let result = add_files_to_db(&conn, &[source], "preset", "-conv", false).unwrap();
+        let result = add_files_to_db(&conn, &[source], "preset", "-conv", false, "trash").unwrap();
 
         assert_eq!(
             result.added.len(),
@@ -1601,6 +1720,7 @@ mod tests {
             "preset",
             "-conv",
             false,
+            "trash",
         )
         .unwrap();
 
@@ -1634,8 +1754,15 @@ mod tests {
             "2020-01-01T00:00:00Z",
         );
 
-        let with_flag =
-            add_files_to_db(&conn, &["/movies/done.mkv".to_string()], "preset", "", true).unwrap();
+        let with_flag = add_files_to_db(
+            &conn,
+            &["/movies/done.mkv".to_string()],
+            "preset",
+            "",
+            true,
+            "trash",
+        )
+        .unwrap();
         assert!(with_flag.added.is_empty());
         assert_eq!(
             with_flag.skipped,
@@ -1651,6 +1778,7 @@ mod tests {
             "preset",
             "",
             false,
+            "trash",
         )
         .unwrap();
         assert_eq!(
@@ -1765,7 +1893,8 @@ mod tests {
         std::fs::write(&src, b"x").unwrap();
         let src_str = src.to_string_lossy().to_string();
 
-        let result = add_files_to_db(&conn, &[src_str.clone()], "preset", "", false).unwrap();
+        let result =
+            add_files_to_db(&conn, &[src_str.clone()], "preset", "", false, "trash").unwrap();
 
         assert_eq!(
             result.added.len(),
@@ -2026,7 +2155,7 @@ mod tests {
             id.mtime,
         );
 
-        let result = add_files_to_db(&conn, &[src_str], "preset", ".h265", false).unwrap();
+        let result = add_files_to_db(&conn, &[src_str], "preset", ".h265", false, "trash").unwrap();
 
         assert!(
             result.added.is_empty(),
@@ -2067,7 +2196,7 @@ mod tests {
         // A different video B recycles the same path.
         std::fs::write(&src, b"B is a completely different, longer video").unwrap();
 
-        let result = add_files_to_db(&conn, &[src_str], "preset", ".h265", false).unwrap();
+        let result = add_files_to_db(&conn, &[src_str], "preset", ".h265", false, "trash").unwrap();
 
         assert_eq!(
             result.added.len(),
