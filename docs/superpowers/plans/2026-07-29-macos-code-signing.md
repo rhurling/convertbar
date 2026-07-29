@@ -46,7 +46,7 @@
 - An **active paid** Apple Developer Program membership. Confirmed by the user; verify in 10 seconds at <https://developer.apple.com/account> — the Membership panel must show an active enrollment. A free Apple ID developer account cannot issue Developer ID certificates, and the portal simply will not offer the option in Step 3.
 - Developer ID certificates can only be created by the Account Holder. On an individual membership you are the Account Holder, so this is satisfied.
 
-- [ ] **Step 1: Confirm the starting state**
+- [x] **Step 1: Confirm the starting state**
 
 ```bash
 security find-identity -v -p codesigning
@@ -54,7 +54,7 @@ security find-identity -v -p codesigning
 
 Expected right now: `0 valid identities found`. This is the "test" for this task — it must go from zero identities to exactly one Developer ID Application identity.
 
-- [ ] **Step 2: Generate a Certificate Signing Request**
+- [x] **Step 2: Generate a Certificate Signing Request**
 
 Open **Keychain Access** (`/System/Applications/Utilities/Keychain Access.app`) → menu **Keychain Access → Certificate Assistant → Request a Certificate From a Certificate Authority…**
 
@@ -67,7 +67,7 @@ Open **Keychain Access** (`/System/Applications/Utilities/Keychain Access.app`) 
 
 This writes the CSR to disk *and* creates the matching private key in your login keychain. The private key never leaves your machine during this step — that pairing is what makes the downloaded certificate usable.
 
-- [ ] **Step 3: Issue the certificate in the developer portal**
+- [x] **Step 3: Issue the certificate in the developer portal**
 
 Go to <https://developer.apple.com/account/resources/certificates/list> → **+** → under **Software**, select **Developer ID Application** → Continue.
 
@@ -78,7 +78,7 @@ The portal's exact follow-up prompts are not pinned down here (Apple changes the
 
 Note: Apple caps how many Developer ID Application certificates an account may hold (historically 5). Do not create spares.
 
-- [ ] **Step 4: Install the certificate and verify the identity exists**
+- [x] **Step 4: Install the certificate and verify the identity exists**
 
 Double-click the downloaded `developerID_application.cer`. It installs into the login keychain and pairs with the private key from Step 2.
 
@@ -95,7 +95,26 @@ Expected: exactly one line, of the form
 
 **If it says `Apple Development` instead of `Developer ID Application`, the wrong certificate type was issued — go back to Step 3.** The value inside the quotes, verbatim including the team ID in parentheses, is `APPLE_SIGNING_IDENTITY`.
 
-- [ ] **Step 5: Confirm the certificate's validity window**
+**If it says `0 valid identities found`, the issuing intermediate is missing.** This is the expected outcome on a Command Line Tools–only machine — hit during the first execution of this plan. Keychain Access shows the certificate with a red *"is not trusted"* banner, and both keys present. macOS's trust store carries Apple's *roots* but not the Developer ID issuing CA, which normally arrives with Xcode.
+
+Confirm and fix in one go. The certificate names its own issuer's download URL in its Authority Information Access extension, so there is no need to guess which of Apple's Developer ID intermediates applies:
+
+```bash
+CER=~/Downloads/developerID_application.cer
+security find-certificate -a -c "Developer ID Certification Authority" 2>/dev/null | grep -c "keychain:"   # 0 == missing
+
+URL=$(openssl x509 -inform DER -in "$CER" -noout -text | awk -F'URI:' '/CA Issuers/{print $2}')
+echo "intermediate: $URL"
+curl -sSL -o /tmp/DeveloperIDCA.cer "$URL"
+security import /tmp/DeveloperIDCA.cer -k ~/Library/Keychains/login.keychain-db
+security find-identity -v -p codesigning     # now 1 valid identity
+```
+
+If `security import` errors, `open /tmp/DeveloperIDCA.cer` and accept the Keychain Access prompt instead.
+
+This is a **local trust-store gap only**. The certificate Apple issued is fine, the `.p12` exported in Step 6 carries the leaf and private key regardless, and GitHub's macOS runners ship full Xcode and already have the intermediate — so this never surfaces in CI. It blocks only Task 3's local signing test.
+
+- [x] **Step 5: Confirm the certificate's validity window** — expires **2031-07-30**
 
 ```bash
 security find-certificate -c "Developer ID Application" -p | openssl x509 -noout -subject -dates
@@ -103,13 +122,13 @@ security find-certificate -c "Developer ID Application" -p | openssl x509 -noout
 
 Expected: a `notAfter` roughly five years out. Record that date — Task 6 documents it as the renewal deadline.
 
-- [ ] **Step 6: Export the `.p12`**
+- [x] **Step 6: Export the `.p12`**
 
 In **Keychain Access → login → My Certificates**, right-click **Developer ID Application: …** → **Export "Developer ID Application: …"** → File Format **Personal Information Exchange (.p12)** → save to `~/Desktop/ConvertBar-DeveloperID.p12`.
 
 Set a strong export password and **store it in 1Password immediately** — that password is `APPLE_CERTIFICATE_PASSWORD`. macOS will then also ask for your login-keychain password to release the private key; that one is not needed again.
 
-- [ ] **Step 7: Encode the `.p12` for GitHub**
+- [x] **Step 7: Encode the `.p12` for GitHub**
 
 ```bash
 base64 -i ~/Desktop/ConvertBar-DeveloperID.p12 | pbcopy
@@ -117,7 +136,7 @@ base64 -i ~/Desktop/ConvertBar-DeveloperID.p12 | pbcopy
 
 The clipboard now holds `APPLE_CERTIFICATE`.
 
-- [ ] **Step 8: Store the three values as repository secrets**
+- [x] **Step 8: Store the three values as repository secrets**
 
 At <https://github.com/rhurling/convertbar/settings/secrets/actions>, create:
 
@@ -129,34 +148,46 @@ At <https://github.com/rhurling/convertbar/settings/secrets/actions>, create:
 
 `APPLE_SIGNING_IDENTITY` is not cryptographically secret, but it carries a legal name and team ID; keeping it a secret rather than an inline literal keeps both out of public build logs.
 
-- [ ] **Step 9: Prove the CI import path works, before CI depends on it**
+- [x] **Step 9: Prove the CI import path works, before CI depends on it**
 
 The base64 `.p12` + password pair is the one mechanism that no other step exercises — Task 3 signs from the login keychain instead. A truncated paste or a mistyped password would otherwise surface for the first time during a real release. Replay locally exactly what Tauri does in CI (`create-keychain` → `import` → `set-key-partition-list`):
 
-```bash
-P12_B64_FILE=~/Desktop/cert.b64            # paste the Step 7 clipboard here first
-KC="$HOME/Library/Keychains/signtest.keychain-db"
+Read the password interactively rather than putting it in the command — an inline `-P '<password>'` lands in shell history and in any transcript.
 
-base64 --decode < "$P12_B64_FILE" > /tmp/roundtrip.p12
+**The prompt syntax is shell-specific.** This project's shell is zsh, where the prompt goes inside the variable spec as `"VAR?prompt"`. Bash's `read -p "prompt" VAR` is a *different* flag in zsh (`-p` means read from a coprocess), so the bash form silently leaves the variable empty and `security import` then reports `MAC verification failed` — which reads as a wrong password but is really an empty one. Hit during the first execution of this plan.
+
+```zsh
+# zsh (this project). Bash equivalent: read -rs -p "p12 export password: " P12PW
+security delete-keychain signtest.keychain 2>/dev/null   # in case a previous run left one
+read -rs "P12PW?p12 export password: "; echo
+
+base64 -i ~/Desktop/ConvertBar-DeveloperID.p12 > /tmp/cert.b64
+base64 --decode < /tmp/cert.b64 > /tmp/roundtrip.p12
+
 security create-keychain -p testpw signtest.keychain
 security unlock-keychain -p testpw signtest.keychain
-security import /tmp/roundtrip.p12 -k signtest.keychain -P '<APPLE_CERTIFICATE_PASSWORD>' -T /usr/bin/codesign
+security import /tmp/roundtrip.p12 -k signtest.keychain -P "$P12PW" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k testpw signtest.keychain
 security find-identity -v -p codesigning signtest.keychain
+unset P12PW
 ```
 
-Expected: the same `Developer ID Application: …` identity as Step 4, found in the throwaway keychain.
+Expected: the same `Developer ID Application: …` identity as Step 4, this time found in the throwaway keychain — proving the base64-and-password pair is importable by exactly the sequence Tauri runs in CI.
 
-`security import` failing with `MAC verification failed` means the password is wrong; an `unable to read` error means the base64 is truncated. Either way, fix it now rather than during a release.
+- `MAC verification failed` → wrong export password.
+- `unable to read` / decode error → the base64 is truncated.
+- `A keychain with the same name already exists` → delete `signtest.keychain` from a previous run first.
+
+**What this does not prove:** that the value actually *pasted into the GitHub secret* is complete. A secret cannot be read back, so the paste itself stays unverified until the first release build — which is why the Task 4 preflight and the Task 4 Step 4 signature assertion both exist.
 
 Then remove every trace:
 
 ```bash
 security delete-keychain signtest.keychain
-rm -f /tmp/roundtrip.p12 "$P12_B64_FILE"
+rm -f /tmp/roundtrip.p12 /tmp/cert.b64
 ```
 
-- [ ] **Step 10: Clean up the disk**
+- [x] **Step 10: Clean up the disk**
 
 Put `ConvertBar-DeveloperID.p12` in 1Password, then:
 
@@ -370,7 +401,7 @@ The `.p8` is in 1Password and in the `APPLE_API_KEY_P8` secret; nothing needs it
 
 **Consumes:** the six repository secrets from Tasks 1–2, and the stapling findings from Task 3 Step 6.
 
-- [ ] **Step 1: Add a credential preflight that fails loud**
+- [x] **Step 1: Add a credential preflight that fails loud**
 
 Insert immediately after the `Install Linux dependencies` step (`.github/workflows/build.yml:58-62`):
 
@@ -400,7 +431,7 @@ Insert immediately after the `Install Linux dependencies` step (`.github/workflo
 
 This step is the reason the whole change is safe to land: without it, a revoked certificate degrades a release to unsigned without anyone noticing until users' permissions break again.
 
-- [ ] **Step 2: Materialize the API key file**
+- [x] **Step 2: Materialize the API key file**
 
 Directly after the preflight:
 
@@ -422,7 +453,7 @@ Directly after the preflight:
 
 `$RUNNER_TEMP` is outside the checkout, so the key cannot be picked up by a bundler glob or committed by accident.
 
-- [ ] **Step 3: Pass the signing environment to the bundler**
+- [x] **Step 3: Pass the signing environment to the bundler**
 
 Extend the `env:` block of the `tauri-apps/tauri-action` step (`.github/workflows/build.yml:89-93`) to:
 
@@ -490,7 +521,7 @@ line. Stapling is offline-decidable, so anything observed stapled locally is saf
 to assert. Add nothing for artifacts Step 6 showed as unstapled — asserting those
 would block every future release.
 
-- [ ] **Step 5: Lint the workflow**
+- [x] **Step 5: Lint the workflow**
 
 ```bash
 npx --yes @action-validator/cli --verbose .github/workflows/build.yml
@@ -519,7 +550,7 @@ EOF
 **Files:**
 - Modify: `.gitignore`
 
-- [ ] **Step 1: Confirm the gap is real**
+- [x] **Step 1: Confirm the gap is real**
 
 ```bash
 grep -nE 'p12|\.p8|\.cer|certSigningRequest' .gitignore || echo "no cert patterns — gap confirmed"
@@ -527,7 +558,7 @@ grep -nE 'p12|\.p8|\.cer|certSigningRequest' .gitignore || echo "no cert pattern
 
 Expected: `no cert patterns — gap confirmed`.
 
-- [ ] **Step 2: Add the patterns**
+- [x] **Step 2: Add the patterns**
 
 Append to `.gitignore`:
 
@@ -540,13 +571,17 @@ Append to `.gitignore`:
 *.certSigningRequest
 ```
 
-- [ ] **Step 3: Verify the ignore actually matches**
+- [x] **Step 3: Verify the ignore actually matches**
+
+`git check-ignore` matches pathnames, not files on disk, so nothing needs creating or deleting:
 
 ```bash
-touch AuthKey_TEST.p8 && git check-ignore -v AuthKey_TEST.p8; rm AuthKey_TEST.p8
+for p in AuthKey_TEST.p8 cert.p12 developerID_application.cer ConvertBar.certSigningRequest; do
+  git check-ignore -v "$p" || echo "NOT IGNORED: $p"
+done
 ```
 
-Expected: a line naming `.gitignore` and the `*.p8` rule. A silent exit means the pattern did not match — fix it before moving on.
+Expected: four lines each naming `.gitignore` and the matching rule, and no `NOT IGNORED` output.
 
 - [ ] **Step 4: Commit**
 
@@ -592,7 +627,7 @@ password exists in CI. The key is team-scoped and revocable on its own.
 including the rebuild inside `scripts/release.sh`, stay ad-hoc and need no
 private key. Only CI signs.
 
-**Renewal:** the certificate expires <DATE FROM TASK 1 STEP 5>. Re-run Task 1 of
+**Renewal:** the certificate expires **2031-07-30**. Re-run Task 1 of
 `docs/superpowers/plans/2026-07-29-macos-code-signing.md` and replace the first
 three secrets. A renewed certificate under the same Team ID does **not** cost
 users their permissions again — the designated requirement anchors to the team
