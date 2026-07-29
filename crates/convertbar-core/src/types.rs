@@ -109,7 +109,8 @@ pub struct SkipCount {
 }
 
 /// Result of an add operation: the jobs actually queued, plus per-reason counts of paths skipped.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Default` is the empty result — `add_files_inner` returns it for an intake with no paths.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AddResult {
     pub added: Vec<JobInfo>,
     pub skipped: Vec<SkipCount>,

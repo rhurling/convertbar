@@ -777,6 +777,15 @@ pub fn add_files_inner(
     paths: &[String],
     progress: Option<&dyn Fn(u32, u32)>,
 ) -> Result<AddResult, String> {
+    // Nothing to add decides nothing: there is no output name to build, so there is no reason to
+    // reach HandBrake. Without this, intake resolved the suffix template first and an empty
+    // intake failed outright when HandBrakeCLI was absent — including "add a folder that turned
+    // out to hold no videos". `watcher::enqueue_and_start` already guards emptiness at its own
+    // call site; `add_files`, `confirm_folder_add`, and the server route did not.
+    if paths.is_empty() {
+        return Ok(AddResult::default());
+    }
+
     // First, read preset and suffix template from DB
     let (preset, suffix_template, hb_path, skip_already_converted, skip_by_source_media) = {
         let conn = ctx.db.lock().map_err(|e| e.to_string())?;
@@ -1413,7 +1422,7 @@ mod tests {
     use super::*;
     use crate::dispose::{DeleteDisposer, RecordingDisposer};
     use crate::events::TestSink;
-    use crate::handbrake::{AbsentLocator, StubLocator};
+    use crate::handbrake::AbsentLocator;
     use rusqlite::Connection;
     use std::path::Path;
 
@@ -1677,20 +1686,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn add_files_inner_with_no_paths_never_reaches_handbrake_resolution() {
+        // Built with the plain `test_ctx` (the `PanickingLocator` default) on purpose: it
+        // asserts the negative directly. If the empty-intake guard regresses, resolution is
+        // reached and the fixture panics — rather than this quietly passing on any machine that
+        // happens to have HandBrakeCLI installed, which is exactly how the bug survived until
+        // the locator seam made the absent world expressible.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        let result = add_files_inner(&ctx, &[], None).expect("an empty intake cannot fail");
+        assert!(
+            result.added.is_empty(),
+            "nothing was offered, so nothing can be added"
+        );
+        assert!(
+            result.skipped.is_empty(),
+            "nothing was offered, so nothing can be skipped"
+        );
+    }
+
     // Pins the RAII bracketing Plan 1 preserved by hand: `AddOp`'s `add-finished` fires on Drop
     // (before the `queue-updated` emit that follows it in `add_files`), so the UI spinner always
     // clears before the queue refetch signal — even for a trivially empty add.
     #[test]
     fn add_files_emits_finished_before_queue_updated() {
-        // The installed world, exercising the real default (templated) suffix — the pinned
-        // literal suffix this test used to carry meant it never expanded a template at all.
-        let (ctx, sink, _d) = test_ctx_with_locator(
-            test_conn(),
-            Arc::new(StubLocator("/opt/fake/HandBrakeCLI".into())),
-        );
-        // Without the seed the stub path would be shelled out to and intake would return Err,
-        // swallowing the queue-updated emit this test asserts on.
-        crate::handbrake::seed_preset_cache(&ctx);
+        // The plain `test_ctx` (PanickingLocator) default is load-bearing here: an empty add
+        // returns before it reaches HandBrake resolution, so this asserts the event bracketing
+        // AND that the early return is intact. It previously needed a StubLocator plus a seeded
+        // preset cache purely because intake resolved the suffix template before looking at
+        // `paths` — scaffolding for a bug, not for this test's subject.
+        let (ctx, sink, _d) = test_ctx(test_conn());
 
         // an empty add still brackets: add-started → add-finished → queue-updated
         let _ = add_files(&ctx, &[]);
