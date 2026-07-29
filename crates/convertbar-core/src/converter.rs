@@ -1285,9 +1285,18 @@ fn process_queue(ctx: &Ctx) {
                     continue;
                 }
 
-                let kept_file = match kept {
-                    KeptFile::Converted => "converted",
-                    KeptFile::Original | KeptFile::Neither => "original",
+                // In-place + keep never applies the size decision: in_place_action maps every
+                // KeptFile variant to RemoveTemp there (output IS source, so there is no "keep
+                // both"), discarding the temp regardless of what `kept` says. The record must
+                // match what is actually still on disk — the untouched original — never
+                // "converted", which the RemoveTemp step just deleted.
+                let kept_file = if in_place && cleanup_mode == "keep" {
+                    "original"
+                } else {
+                    match kept {
+                        KeptFile::Converted => "converted",
+                        KeptFile::Original | KeptFile::Neither => "original",
+                    }
                 };
 
                 let now = chrono::Utc::now().to_rfc3339();
@@ -3353,6 +3362,9 @@ HandBrake has exited.";
             in_place_action(KeptFile::Converted, "keep"),
             InPlaceAction::RemoveTemp
         );
+        // Original already falls into the catch-all `KeptFile::Original | KeptFile::Neither
+        // => RemoveTemp` arm for every mode string, "keep" included — this call pins that
+        // catch-all, not keep-specific behavior, and cannot fail for any cleanup_mode.
         assert_eq!(
             in_place_action(KeptFile::Original, "keep"),
             InPlaceAction::RemoveTemp
@@ -3994,8 +4006,12 @@ HandBrake has exited.";
             "nothing may be routed to the disposer under keep"
         );
 
-        let (status, _) = job_row(&ctx.db, "j1");
+        let (status, error) = job_row(&ctx.db, "j1");
         assert_eq!(status, "done");
+        assert_eq!(
+            error, None,
+            "a keep job that left both files as designed is not an error"
+        );
         // Derived from the encode's real size, never a literal: the fake script writes
         // "done\n" on Unix but "done\r\n" on Windows.
         let encoded = std::fs::metadata(&out).unwrap().len() as i64;
@@ -4032,12 +4048,99 @@ HandBrake has exited.";
         assert!(out.exists(), "even a losing output survives under keep");
         assert!(disposer.0.lock().unwrap().is_empty());
 
-        let (status, _) = job_row(&ctx.db, "j1");
+        let (status, error) = job_row(&ctx.db, "j1");
         assert_eq!(status, "skipped");
+        assert_eq!(
+            error, None,
+            "a keep job that left both files as designed is not an error"
+        );
         // The negative delta, identical to what delete would record for the same sizes: keep
         // changed the disposal and nothing else.
         let encoded = std::fs::metadata(&out).unwrap().len() as i64;
         assert_eq!(saved_of(&ctx.db, "j1"), Some(3 - encoded));
+    }
+
+    // The end-to-end counterpart to `in_place_action_never_disposes_under_keep`: that test only
+    // checks the pure mapping, which is why the kept_file mis-record (Finding 1 of the review)
+    // was invisible to it — the wrong record is produced downstream, in process_queue itself.
+    // Output IS source for an in-place job, so "keep both" is impossible; in_place_action maps
+    // every KeptFile variant to RemoveTemp under keep, discarding the temp unconditionally. The
+    // re-encode "winning" the size comparison must not survive into the record as kept_file =
+    // "converted" — the converted file no longer exists once RemoveTemp has run.
+    #[test]
+    fn in_place_keep_discards_the_temp_and_records_the_original_as_kept() {
+        let (ctx, _sink, disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "cleanup_mode", "keep");
+
+        let source = real_source(dir.path(), "movie.mkv"); // 10 real bytes on disk
+        let original_bytes = std::fs::read(&source).unwrap();
+        let p = source.to_str().unwrap();
+        // in-place: output_path == source_path. The fake encode's few-byte output is smaller
+        // than the 10-byte source, so decide_cleanup says KeptFile::Converted — the exact case
+        // Finding 1 was about.
+        queue_job(&ctx.db, "j1", p, p, 10);
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            original_bytes,
+            "the source must survive byte-identical; in-place + keep never touches it"
+        );
+        let temp = in_place_temp_path(p);
+        assert!(
+            !temp.exists(),
+            "the temp must be discarded, not left as a .convertbar-tmp. leftover"
+        );
+        assert!(
+            disposer.0.lock().unwrap().is_empty(),
+            "nothing may be routed to the disposer under keep"
+        );
+
+        let (status, error) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "done");
+        assert_eq!(
+            error, None,
+            "a keep job that left the source in place is not an error"
+        );
+
+        let (kept_file, space_saved): (Option<String>, Option<i64>) = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT kept_file, space_saved FROM jobs WHERE id = 'j1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            kept_file.as_deref(),
+            Some("original"),
+            "the temp was discarded, so the record must say the ORIGINAL survived, not the \
+             converted re-encode that no longer exists on disk"
+        );
+        // The temp is gone by the time the test can look, so measure the fake script's real
+        // output size on this platform via a throwaway probe run rather than assuming a byte
+        // count ("done\n" on Unix, "done\r\n" on Windows — the exact literal this suite was
+        // already burned by once).
+        let probe = dir.path().join("probe-output");
+        std::process::Command::new(&script)
+            .arg(&probe)
+            .status()
+            .unwrap();
+        let encoded = std::fs::metadata(&probe).unwrap().len() as i64;
+        std::fs::remove_file(&probe).unwrap();
+        assert_eq!(
+            space_saved,
+            Some(original_bytes.len() as i64 - encoded),
+            "space_saved must still carry the optimization delta decide_cleanup computed — \
+             keep only changes disposal, never this number"
+        );
     }
 
     #[test]
