@@ -91,7 +91,7 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   deliberate (a mechanism that always honoured a correct token would still
   answer every guess); the operator-facing guidance is to wait, not retry.
 
-### 16. Server — Panics No Longer Masquerade as Deliberate Errors — *shipped, branch `fix/server-error-taxonomy`*
+### 16. Panics No Longer Masquerade as Deliberate Errors — *shipped, both heads*
 - The gap this closes: all ten `spawn_blocking` join-error sites returned a 500 with an
   `{"error": ...}` body identical in shape to an ordinary core failure, so a client could not
   tell a server bug from an expected condition such as a missing HandBrakeCLI — and tests could
@@ -123,10 +123,39 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   spawn count pinned instead. It reads source text, so it is a backstop, not a proof: a
   blocking helper defined outside `src/routes` and merely called from a handler would still
   slip past it.
-- **Out of scope, recorded:** the desktop head has the same indistinguishability.
-  `src-tauri/src/commands/*` map join failures with `.map_err(|e| e.to_string())?`, so the
-  frontend receives a plain string with no channel to carry a discriminator. Fixing it there
-  means changing the commands' return type — its own change, with its own argument.
+- **The desktop head, since closed** (branch `fix/desktop-error-taxonomy`). It had the same
+  indistinguishability for the same reason: `src-tauri/src/commands/*` mapped its nine join
+  failures with `.map_err(|e| e.to_string())?`, and `Result<T, String>` has no field to carry a
+  discriminator — which is why the HTTP head, whose JSON body already had room, was fixed first.
+  - Every fallible command now fails with `commands::CommandError`, serializing to the server's
+    exact shape: `{"error": …}` for a failure the backend means, `{"error": …, "kind": "panic"}`
+    when the blocking task died. The field is *absent* rather than null on the ordinary path, so
+    the two heads match byte for byte and one frontend helper reads both.
+  - The nine join arms collapse into one `commands::blocking` helper, and a tripwire mirroring
+    the server's walks `src/commands` recursively over comment-stripped source. Same reasoning as
+    above: applied is not enforced.
+  - **The frontend was the other half.** Every display site spelled `String(e)`, which is correct
+    only while the backend fails with a bare string — the moment it gained a field, the whole UI
+    would have rendered `[object Object]` for *ordinary* errors, not just panics. `errorText()`
+    (`src/lib/errors.ts`) reads the failure body from either head and prefixes a panic as an
+    internal error, so a Rust panic string is not read as something the user misconfigured. The
+    HTTP transport now hangs `kind` off the `Error` it throws; without that it would have dropped
+    the very distinction the route helpers exist to make, and the same UI code would have labelled
+    a bug on desktop but not on the server.
+  - **Accepted cosmetic cost:** the rendered text is
+    `Internal error (this is a bug): task panicked: task 12 panicked with message "…"` — the word
+    appears three times because the frontend prefix, the shared backend wording, and tokio's own
+    `JoinError` display each contribute one. Shortening it would mean either stripping a
+    backend-owned prefix in the frontend (a new cross-language coupling) or letting the two heads
+    word a panic differently. Neither is worth it for a string only a bug produces.
+- **Still open, and genuinely out of scope:** only a panic *inside a `blocking` closure* becomes
+  a `JoinError`, so only those nine commands can produce `kind: "panic"`. A panic in a sync
+  command body, or in an async command's own body outside the closure, never reaches this mapping
+  — Tauri has no `catch_unwind` on the desktop command path (verified against `tauri` 2.11.5 and
+  `tauri-macros` 2.6.3; the only one is in `mobile.rs`), so it unwinds past the IPC handler
+  instead of arriving as an `Err`. Closing that gap means catching unwinds at the command
+  boundary, a different mechanism from this item and one with its own argument about whether a
+  panicked process should keep serving at all.
 
 ---
 

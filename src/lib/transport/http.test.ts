@@ -64,6 +64,20 @@ describe("http transport", () => {
     await expect(httpCommands.getQueue()).rejects.toThrow("boom");
   });
 
+  it("carries the server's panic discriminator onto the thrown error", async () => {
+    // Both shapes are 500s with an `error` field, so the status and the message cannot tell
+    // them apart — `kind` is the entire distinction, and dropping it here would silently
+    // undo the route helpers' work: `errorText` would label a bug on desktop and not on this
+    // head, from the same UI code.
+    fetchMock.mockResolvedValue(
+      mockResponse(500, { error: "task panicked: task 3 panicked", kind: "panic" }),
+    );
+    await expect(httpCommands.getQueue()).rejects.toMatchObject({ kind: "panic" });
+
+    fetchMock.mockResolvedValue(mockResponse(500, { error: "HandBrakeCLI not found" }));
+    await expect(httpCommands.getQueue()).rejects.not.toHaveProperty("kind");
+  });
+
   it("dispatches convertbar:unauthorized and throws on a 401", async () => {
     fetchMock.mockResolvedValue(mockResponse(401, { error: "unauthorized" }));
     const handler = vi.fn();
