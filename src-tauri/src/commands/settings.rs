@@ -3,10 +3,11 @@ use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
 
+use super::CommandError;
 use crate::types::Settings;
 
 #[tauri::command]
-pub fn get_settings(app: AppHandle, ctx: State<'_, Arc<Ctx>>) -> Result<Settings, String> {
+pub fn get_settings(app: AppHandle, ctx: State<'_, Arc<Ctx>>) -> Result<Settings, CommandError> {
     let mut settings = convertbar_core::settings_ops::get_settings(&ctx)?;
     // Autostart plugin is the source of truth on desktop; core returns the stored value.
     settings.launch_at_login = app
@@ -28,7 +29,7 @@ pub fn update_setting(
     ctx: State<'_, Arc<Ctx>>,
     key: String,
     value: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     convertbar_core::settings_ops::update_setting(&ctx, &key, &value)?;
 
     // --- Post-write hooks. Core released the settings connection before returning and no hook
@@ -55,7 +56,7 @@ pub fn update_setting(
 }
 
 #[tauri::command]
-pub fn get_preset_suffix(ctx: State<'_, Arc<Ctx>>, preset: String) -> Result<String, String> {
+pub fn get_preset_suffix(ctx: State<'_, Arc<Ctx>>, preset: String) -> Result<String, CommandError> {
     let conn = ctx.db.lock().map_err(|e| e.to_string())?;
     Ok(convertbar_core::settings_ops::read_suffix_template(
         &conn, &preset,
@@ -67,6 +68,8 @@ pub fn set_preset_suffix(
     ctx: State<'_, Arc<Ctx>>,
     preset: String,
     suffix: String,
-) -> Result<(), String> {
-    convertbar_core::settings_ops::set_preset_suffix(&ctx, &preset, &suffix)
+) -> Result<(), CommandError> {
+    Ok(convertbar_core::settings_ops::set_preset_suffix(
+        &ctx, &preset, &suffix,
+    )?)
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { commands, type AppSettings, type PresetMetadata } from "../lib/tauri";
+import { errorText } from "../lib/errors";
 
 // `update_setting` is stringly-typed on the wire ("true"/"false" for booleans); the
 // optimistic merge must land booleans as real booleans so `checked={value === true}` works.
@@ -79,7 +80,7 @@ export function useSettings() {
       try {
         await commands.updateSetting(key, value);
       } catch (e) {
-        setError(`Couldn't save ${key}: ${e}`);
+        setError(`Couldn't save ${key}: ${errorText(e)}`);
         // Restore only the failed key. A whole-object get_settings refetch can resolve out
         // of order and clobber a concurrent optimistic edit to a *different* key.
         setSettings((prev) =>
@@ -104,7 +105,7 @@ export function useSettings() {
       try {
         await commands.setPresetSuffix(settings.preset, suffix);
       } catch (e) {
-        setError(`Couldn't save suffix: ${e}`);
+        setError(`Couldn't save suffix: ${errorText(e)}`);
         // Roll back like updateSetting does, so SettingsPage's `suffixDraft !== presetSuffix`
         // commit guard still sees a diff and a re-blur retries instead of no-op'ing.
         setPresetSuffix(previous);

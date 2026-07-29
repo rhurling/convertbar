@@ -6,36 +6,35 @@ use crate::handbrake::PresetMetadata;
 use crate::types::HandbrakeStatus;
 use convertbar_core::ctx::Ctx;
 
+use super::{blocking, CommandError};
+
 // All four commands below reach a subprocess (HandBrakeCLI or `which`/`where`); as
 // sync commands they ran on the main thread and stalled the UI for the subprocess
-// duration. async + spawn_blocking moves them off it, mirroring add_files.
+// duration. `blocking` moves them off it, mirroring add_files.
 
 #[tauri::command]
-pub async fn detect_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<Option<String>, String> {
+pub async fn detect_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<Option<String>, CommandError> {
     let ctx = ctx.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || hb::resolve_handbrake_path(&ctx))
-        .await
-        .map_err(|e| e.to_string())?
+    blocking(move || hb::resolve_handbrake_path(&ctx)).await
 }
 
 #[tauri::command]
-pub async fn list_handbrake_presets(ctx: State<'_, Arc<Ctx>>) -> Result<Vec<String>, String> {
+pub async fn list_handbrake_presets(ctx: State<'_, Arc<Ctx>>) -> Result<Vec<String>, CommandError> {
     let ctx = ctx.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         let path = hb::require_handbrake_path(&ctx)?;
         hb::list_presets(&path)
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn generate_preset_suffix(
     ctx: State<'_, Arc<Ctx>>,
     preset: String,
-) -> Result<PresetMetadata, String> {
+) -> Result<PresetMetadata, CommandError> {
     let ctx = ctx.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         // Cache hit skips path resolution entirely (no DB lock, no `which`).
         {
             let cache = ctx.preset_cache.lock().map_err(|e| e.to_string())?;
@@ -48,13 +47,12 @@ pub async fn generate_preset_suffix(
         hb::cached_preset_metadata(&ctx, &handbrake_path, &preset)
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn validate_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<HandbrakeStatus, String> {
+pub async fn validate_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<HandbrakeStatus, CommandError> {
     let ctx = ctx.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || match hb::resolve_handbrake_path(&ctx)? {
+    blocking(move || match hb::resolve_handbrake_path(&ctx)? {
         Some(p) => {
             let version = hb::handbrake_version(&p).unwrap_or_default();
             Ok(HandbrakeStatus {
@@ -70,7 +68,6 @@ pub async fn validate_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<HandbrakeSta
         }),
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
 /// Resolve an output-suffix template against preset metadata. The settings preview

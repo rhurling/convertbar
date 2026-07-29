@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { JobInfo, ConversionProgress } from "../lib/tauri";
 import { commands } from "../lib/tauri";
 import { fileName, formatEta } from "../lib/format";
+import { errorText } from "../lib/errors";
 
 interface ActiveJobProps {
   job: JobInfo;
@@ -38,7 +39,7 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
       setActionError(null);
       await fn();
     } catch (e) {
-      setActionError(String(e));
+      setActionError(errorText(e));
     }
   };
 

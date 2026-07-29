@@ -3,36 +3,37 @@ use convertbar_core::ctx::Ctx;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 
+use super::CommandError;
 use crate::converter::ConverterState;
 
 #[tauri::command]
-pub fn start_queue(ctx: State<'_, Arc<Ctx>>) -> Result<(), String> {
-    control::start_queue(&ctx)
+pub fn start_queue(ctx: State<'_, Arc<Ctx>>) -> Result<(), CommandError> {
+    Ok(control::start_queue(&ctx)?)
 }
 
 #[tauri::command]
-pub fn pause_conversion(ctx: State<'_, Arc<Ctx>>) -> Result<(), String> {
-    control::pause_conversion(&ctx)
+pub fn pause_conversion(ctx: State<'_, Arc<Ctx>>) -> Result<(), CommandError> {
+    Ok(control::pause_conversion(&ctx)?)
 }
 
 #[tauri::command]
-pub fn resume_conversion(ctx: State<'_, Arc<Ctx>>) -> Result<(), String> {
-    control::resume_conversion(&ctx)
+pub fn resume_conversion(ctx: State<'_, Arc<Ctx>>) -> Result<(), CommandError> {
+    Ok(control::resume_conversion(&ctx)?)
 }
 
 #[tauri::command]
-pub fn cancel_conversion(ctx: State<'_, Arc<Ctx>>) -> Result<(), String> {
-    control::cancel_conversion(&ctx)
+pub fn cancel_conversion(ctx: State<'_, Arc<Ctx>>) -> Result<(), CommandError> {
+    Ok(control::cancel_conversion(&ctx)?)
 }
 
 #[tauri::command]
-pub fn pause_after_current(ctx: State<'_, Arc<Ctx>>) -> Result<(), String> {
-    control::pause_after_current(&ctx)
+pub fn pause_after_current(ctx: State<'_, Arc<Ctx>>) -> Result<(), CommandError> {
+    Ok(control::pause_after_current(&ctx)?)
 }
 
 #[tauri::command]
-pub fn cancel_pause_after_current(ctx: State<'_, Arc<Ctx>>) -> Result<(), String> {
-    control::cancel_pause_after_current(&ctx)
+pub fn cancel_pause_after_current(ctx: State<'_, Arc<Ctx>>) -> Result<(), CommandError> {
+    Ok(control::cancel_pause_after_current(&ctx)?)
 }
 
 #[tauri::command]

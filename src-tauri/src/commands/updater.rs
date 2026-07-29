@@ -2,23 +2,24 @@ use convertbar_core::ctx::Ctx;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
+use super::CommandError;
 use crate::updater::{self, UpdateState, UpdaterRuntime};
 
 #[tauri::command]
-pub fn get_update_state(app: AppHandle) -> Result<UpdateState, String> {
-    updater::build_state_public(&app)
+pub fn get_update_state(app: AppHandle) -> Result<UpdateState, CommandError> {
+    Ok(updater::build_state_public(&app)?)
 }
 
 #[tauri::command]
-pub async fn check_for_update(app: AppHandle) -> Result<(), String> {
+pub async fn check_for_update(app: AppHandle) -> Result<(), CommandError> {
     // Manual: forced regardless of mode, and never installs (U7). Refused outright while an
     // install is pending or installed — see `updater::manual_check_block`.
-    updater::run_cycle(app, true).await
+    Ok(updater::run_cycle(app, true).await?)
 }
 
 #[tauri::command]
-pub async fn install_update(app: AppHandle) -> Result<(), String> {
-    updater::install_pending(app, updater::InstallTrigger::UserRequested).await
+pub async fn install_update(app: AppHandle) -> Result<(), CommandError> {
+    Ok(updater::install_pending(app, updater::InstallTrigger::UserRequested).await?)
 }
 
 /// Generic over the runtime so a `MockRuntime` test can drive the real command — the
@@ -27,7 +28,7 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
 pub fn skip_update_version<R: tauri::Runtime>(
     app: AppHandle<R>,
     version: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     {
         let ctx = app
             .try_state::<Arc<Ctx>>()

@@ -1,3 +1,4 @@
+use super::CommandError;
 use crate::types::PathsExist;
 
 /// One stat per path, called when the history context menu opens so it can
@@ -11,13 +12,13 @@ pub fn check_paths_exist(source_path: String, output_path: String) -> PathsExist
 }
 
 #[tauri::command]
-pub fn open_path(path: String) -> Result<(), String> {
-    tauri_plugin_opener::open_path(path, None::<&str>).map_err(|e| e.to_string())
+pub fn open_path(path: String) -> Result<(), CommandError> {
+    Ok(tauri_plugin_opener::open_path(path, None::<&str>).map_err(|e| e.to_string())?)
 }
 
 #[tauri::command]
-pub fn reveal_in_dir(path: String) -> Result<(), String> {
-    tauri_plugin_opener::reveal_item_in_dir(path).map_err(|e| e.to_string())
+pub fn reveal_in_dir(path: String) -> Result<(), CommandError> {
+    Ok(tauri_plugin_opener::reveal_item_in_dir(path).map_err(|e| e.to_string())?)
 }
 
 #[cfg(test)]

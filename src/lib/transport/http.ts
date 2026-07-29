@@ -29,7 +29,15 @@ const api = async <T>(method: string, path: string, body?: unknown): Promise<T> 
     credentials: "same-origin",
   });
   if (res.status === 401) { window.dispatchEvent(new Event("convertbar:unauthorized")); throw new Error("unauthorized"); }
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? `HTTP ${res.status}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    const failure = new Error(body.error ?? `HTTP ${res.status}`);
+    // Carry the server's panic discriminator through, or this head would drop on the floor the
+    // very distinction the route helpers exist to make and `errorText` would render a bug and
+    // an expected condition identically here while telling them apart on desktop.
+    if (typeof body.kind === "string") (failure as { kind?: string }).kind = body.kind;
+    throw failure;
+  }
   return res.status === 204 ? (undefined as T) : res.json();
 };
 

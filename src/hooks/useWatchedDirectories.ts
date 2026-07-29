@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { commands, type WatchedDirectory } from "../lib/tauri";
+import { errorText } from "../lib/errors";
 
 const DEFAULT_RECURSIVE = false;
 const DEFAULT_DELAY_SECS = 5;
@@ -15,7 +16,7 @@ export function useWatchedDirectories() {
       const dirs = await commands.getWatchedDirectories();
       if (mounted.current) setDirectories(dirs);
     } catch (e) {
-      if (mounted.current) setError(String(e));
+      if (mounted.current) setError(errorText(e));
     } finally {
       if (mounted.current) setLoading(false);
     }
@@ -43,7 +44,7 @@ export function useWatchedDirectories() {
         );
         await refresh();
       } catch (e) {
-        setError(String(e));
+        setError(errorText(e));
       }
     },
     [refresh],
@@ -58,7 +59,7 @@ export function useWatchedDirectories() {
       if (!path) return;
       await addDirectoryAtPath(path);
     } catch (e) {
-      setError(String(e));
+      setError(errorText(e));
     }
   }, [addDirectoryAtPath]);
 
@@ -73,7 +74,7 @@ export function useWatchedDirectories() {
         );
         await refresh();
       } catch (e) {
-        setError(String(e));
+        setError(errorText(e));
       }
     },
     [refresh],
@@ -86,7 +87,7 @@ export function useWatchedDirectories() {
         await commands.setWatchedDirectoryEnabled(id, enabled);
         await refresh();
       } catch (e) {
-        setError(String(e));
+        setError(errorText(e));
       }
     },
     [refresh],
@@ -99,7 +100,7 @@ export function useWatchedDirectories() {
         await commands.removeWatchedDirectory(id);
         await refresh();
       } catch (e) {
-        setError(String(e));
+        setError(errorText(e));
       }
     },
     [refresh],
