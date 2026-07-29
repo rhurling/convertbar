@@ -464,16 +464,21 @@ Rust, `convertbar-core`:
   (the `try_lock` assertion `update_setting`'s existing deadlock test uses).
 - `in_place_action(KeptFile::Converted, "keep") == RemoveTemp` — a table row on
   the release-mode backstop, so the safe arm cannot be dropped as "unreachable".
-- Watcher rescan under keep: a converted-and-kept source with a fingerprinted
-  `done` row is **not** re-added by a second `scan_all_enabled`. This is the
-  loop the whole design turns on; nothing else pins it.
+- Re-ingestion under keep: a converted-and-kept source with a fingerprinted
+  `done` row is **not** re-added. This is the loop the whole design turns on;
+  nothing else pins it. Asserted at `add_files_to_db`, which is the chokepoint
+  every watcher rescan funnels through (`watcher.rs:438` → `add_files_inner` →
+  `add_files_to_db`) — a `scan_all_enabled`-level test would add filesystem and
+  timing setup without covering a single additional line of the skip rule.
 - `trash` and `delete` regression tests unchanged and still green.
 
 Fixture note: `get_handbrake_path` runs at `converter.rs:807`, *before* any
 per-job gate, so no converter test can assert "HandBrake was never resolved".
-These tests declare `StubLocator` (the installed world) per CLAUDE.md's locator
-contract; `PanickingLocator` there would panic at `:807` and surface as a
-`ctx.db` `PoisonError`, not as a useful failure.
+These tests follow the pattern the existing converter tests already use — pin
+`handbrake_path` to a fake script, which makes `resolve_with_locator`
+short-circuit before consulting the locator at all (`handbrake.rs:136-146`).
+The fixture default `PanickingLocator` is therefore correct and `StubLocator`
+is unnecessary; declaring the world here means declaring the *path*.
 
 Rust, `convertbar-server`:
 

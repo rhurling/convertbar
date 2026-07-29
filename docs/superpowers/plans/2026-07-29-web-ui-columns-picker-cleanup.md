@@ -6,7 +6,7 @@
 
 **Architecture:** Four independent slices, each its own PR. The only core change is a third `cleanup_mode` value, enforced so an impossible in-place+keep job is never created rather than refused after the fact. Everything else is frontend: a `matchMedia` hook that decides which pages mount, a rewritten selection model in `FileBrowserModal`, and an intake surface that stops advertising drag-and-drop.
 
-**Tech Stack:** Rust (rusqlite, axum), React 18 + TypeScript, vitest + React Testing Library, Vite. Cargo workspace: `crates/convertbar-core` (head-agnostic), `src-tauri` (desktop), `crates/convertbar-server` (headless).
+**Tech Stack:** Rust (rusqlite, axum), React 19 + TypeScript, vitest + React Testing Library, Vite. Cargo workspace: `crates/convertbar-core` (head-agnostic), `src-tauri` (desktop), `crates/convertbar-server` (headless).
 
 **Spec:** `docs/superpowers/specs/2026-07-29-web-ui-columns-picker-cleanup-design.md`
 
@@ -115,7 +115,7 @@ fn read_cleanup_mode_normalizes_what_it_reads() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p convertbar-core normalize_cleanup_mode read_cleanup_mode`
+Run: `cargo test -p convertbar-core -- normalize_cleanup_mode read_cleanup_mode`
 Expected: FAIL — `cannot find function 'normalize_cleanup_mode' in this scope`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -307,7 +307,7 @@ fn keep_with_a_larger_output_keeps_both_and_still_records_skipped() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p convertbar-core keep_leaves_both in_place_action_never_disposes keep_with_a_larger`
+Run: `cargo test -p convertbar-core -- keep_leaves_both in_place_action_never_disposes keep_with_a_larger`
 Expected: FAIL — the source file is gone (the `_` arm disposed it) and `in_place_action` returns `TrashSourceThenRename`.
 
 - [ ] **Step 3: Add the `keep` arm to `in_place_action`**
@@ -469,7 +469,7 @@ fn a_kept_source_is_not_requeued_while_its_history_row_survives() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cargo test -p convertbar-core an_in_place_source_is_not_queued a_distinct_output_still_queues a_kept_source_is_not_requeued`
+Run: `cargo test -p convertbar-core -- an_in_place_source_is_not_queued a_distinct_output_still_queues a_kept_source_is_not_requeued`
 Expected: FAIL — `add_files_to_db` takes 5 arguments, and `SkipReason::InPlaceKeepBlocked` does not exist. (The third test will pass once it compiles; it is a characterization test. Verify it can fail by temporarily blanking `source_mtime` in its INSERT — that drops the row into the legacy bucket, which `skip_already_converted = false` does not honor, and the source gets re-queued. Revert after confirming RED.)
 
 - [ ] **Step 3: Add the enum variant**
@@ -512,6 +512,26 @@ Add a counter beside the existing four:
 let (mut n_not_video, mut n_queued, mut n_converted, mut n_output_exists) =
     (0u32, 0u32, 0u32, 0u32);
 let mut n_in_place_keep = 0u32;
+```
+
+**Then fix the exhaustive match at `queue_ops.rs:952-959`, or the crate will not compile.**
+It matches every `SkipReason` variant with no wildcard arm, so adding one to the enum is an
+E0004 that blocks the entire test binary — not just this module's tests. `cheap_skip_reason`
+can never return the new variant (the block lives outside it, after the output path is
+resolved), so the arm is unreachable-but-required:
+
+```rust
+match reason {
+    SkipReason::NotVideo => n_not_video += 1,
+    SkipReason::AlreadyQueued => n_queued += 1,
+    SkipReason::AlreadyConverted => n_converted += 1,
+    SkipReason::OutputExists => n_output_exists += 1,
+    // The cheap checks never produce AlreadyAtTarget — that needs a probe.
+    SkipReason::AlreadyAtTarget => {}
+    // Nor InPlaceKeepBlocked: that decision needs the resolved output path, so it is
+    // counted at its own site below rather than here.
+    SkipReason::InPlaceKeepBlocked => {}
+}
 ```
 
 Insert the block immediately after `output_str` is computed and **before** `assigned.insert(output_str.clone())` (around `:982`), so a blocked path never claims an output name:
@@ -648,43 +668,57 @@ Add to `crates/convertbar-core/src/settings_ops.rs`'s tests module:
 
 ```rust
 #[test]
-fn switching_to_keep_drops_queued_in_place_jobs_without_holding_the_lock() {
-    let (ctx, sink, _d) = test_ctx(test_conn());
-    {
-        let conn = ctx.db.lock().unwrap();
-        // One in-place job (source == output) and one normal job.
-        conn.execute(
-            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
-             VALUES ('inplace', '/m/a.mp4', '/m/a.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
-             VALUES ('normal', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'queued', 1, '2020-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-    }
+fn switching_to_keep_drops_queued_in_place_jobs() {
+    // Run on a worker thread with a bounded join, exactly like the sibling deadlock test
+    // above (`update_setting_hands_the_connection_back_before_the_hooks_run`). This hook
+    // re-locks ctx.db, so if the write scope's guard ever stops being dropped first, the
+    // failure mode is a SELF-DEADLOCK — an unbounded hang that would freeze the whole
+    // suite rather than fail. The timeout turns that into a legible failure.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (ctx, sink, _d) = test_ctx(test_conn());
+        {
+            let conn = ctx.db.lock().unwrap();
+            // One in-place job (source == output) and one normal job.
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('inplace', '/m/a.mp4', '/m/a.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('normal', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'queued', 1, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
 
-    update_setting(&ctx, "cleanup_mode", "keep").unwrap();
+        let result = update_setting(&ctx, "cleanup_mode", "keep");
 
-    let conn = ctx.db.lock().unwrap();
-    let ids: Vec<String> = conn
-        .prepare("SELECT id FROM jobs ORDER BY id")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        let ids: Vec<String> = ctx
+            .db
+            .lock()
+            .unwrap()
+            .prepare("SELECT id FROM jobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let emits = sink.payloads("queue-updated").len();
+        let lock_free = ctx.db.try_lock().is_ok();
+        let _ = tx.send((result, ids, emits, lock_free));
+    });
+
+    let (result, ids, emits, lock_free) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("update_setting deadlocked against its own post-write hook");
+    result.unwrap();
     assert_eq!(ids, vec!["normal".to_string()], "only the in-place job is dropped");
-    drop(conn);
-
-    // The Queue panel must learn about the removal, and the emit must happen with the
-    // db guard released — the tray listener re-locks ctx.db synchronously on this same
-    // thread, and std's Mutex is not reentrant.
-    assert_eq!(sink.payloads("queue-updated").len(), 1);
-    assert!(ctx.db.try_lock().is_ok());
+    // The Queue panel must learn about the removal.
+    assert_eq!(emits, 1);
+    assert!(lock_free, "a hook running after the write must not strand the connection");
 }
 
 #[test]
@@ -712,8 +746,8 @@ fn switching_to_delete_leaves_queued_in_place_jobs_alone() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p convertbar-core switching_to_keep switching_to_delete`
-Expected: FAIL — both jobs still present.
+Run: `cargo test -p convertbar-core -- switching_to_keep switching_to_delete`
+Expected: FAIL on the assertion — both jobs still present. (Note the test name changed from an earlier draft: it no longer claims to pin "without holding the lock". `TestSink` does not re-lock `ctx.db`, so it cannot observe an emit made under the guard; `LockProbeSink` in `control.rs` is the double built for that property, and the real protection here is the bounded join, which converts a self-deadlock from a hang into a failure.)
 
 - [ ] **Step 3: Write `drop_queued_in_place_jobs`**
 
@@ -755,7 +789,17 @@ pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
 
 - [ ] **Step 4: Hook it into `update_setting`**
 
-In `crates/convertbar-core/src/settings_ops.rs`, extend the existing post-write hook block. The write scope already drops its guard before the hooks run — keep it that way:
+First add the trait import at the top of `crates/convertbar-core/src/settings_ops.rs` — `emit_t` is on the `EventSinkExt` extension trait (`events.rs:13-23`), not on `EventSink` itself, and this file imports neither today. Without it the hook below is an E0599, "items from traits can only be used if the trait is in scope":
+
+```rust
+use rusqlite::params;
+
+use crate::ctx::Ctx;
+use crate::events::EventSinkExt;
+use crate::types::Settings;
+```
+
+Then extend the existing post-write hook block. The write scope already drops its guard before the hooks run — keep it that way:
 
 ```rust
     } // conn must be dropped before the hooks below: they re-lock ctx.db on this same
@@ -839,7 +883,13 @@ Expected: PASS immediately — it is a characterization test, pinning behavior t
 
 - [ ] **Step 3: Verify it can fail**
 
-Temporarily change `startup.rs:30` from `Some("trash")` to `Some("trash") | Some("keep")`, re-run, confirm RED, then revert. A test that cannot fail is not protecting anything.
+Temporarily rewrite the condition at `startup.rs:30` to also catch `keep`, re-run, confirm RED, then revert. A test that cannot fail is not protecting anything.
+
+The line is an `==` comparison, not a match, so an or-pattern does **not** compile there (`Some("trash") | Some("keep")` parses as `BitOr` on `Option<&str>`) — and this repo has been bitten before by a non-compiling mutation reading as "survived". Use:
+
+```rust
+if matches!(value.as_deref(), Some("trash") | Some("keep")) {
+```
 
 Run: `cargo test -p convertbar-server normalize_leaves_keep_untouched`
 Expected: FAIL while mutated, PASS after reverting.
@@ -1070,7 +1120,7 @@ Expected: PASS
 
 - [ ] **Step 6: Update the docs**
 
-`README.md` — in the settings section, document the three modes, and add the two caveats the design accepted:
+`README.md` — extend the "How a conversion works" section (`:95`), which is where the current Trash behaviour is described. Document the three modes and the two caveats the design accepted:
 
 ```markdown
 **After conversion** — what happens to the file that loses on size:
@@ -1272,9 +1322,23 @@ git commit -m "feat: a pure range-between helper for picker shift-selection"
 **Interfaces:**
 - Produces: the `mode: "files"` row contract — every row toggles selection on click; folder rows carry a separate navigate button with accessible name `Open <name>`. Tasks 9 and 10 build on it.
 
-- [ ] **Step 1: Update the existing navigation test first**
+- [ ] **Step 1: Update the four existing tests this task breaks**
 
-`FileBrowserModal.test.tsx:48-69` clicks the folder *name* to navigate. That is exactly the behavior this task changes, so the existing test must move to the new affordance or it will fail for the right reason and be "fixed" wrongly:
+Changing the row model breaks **four** files-mode tests, not one. Fix them all in this step, before writing anything new — otherwise Step 5's suite run is red for reasons that have nothing to do with the new code:
+
+| Test | Line | Why it breaks | Fix |
+|---|---|---|---|
+| "navigates into a directory on click" | `:48` | clicks the folder row to navigate | retarget to the Open button (rewritten below) |
+| "multi-selects files and calls onSelect…" | `:71` | asserts `/add 2 files/i` | label is now `Add 2 items` |
+| "navigates back up via the breadcrumb" | `:107` | clicks the folder row as a *setup* step to get deeper | retarget that one click to the Open button; the breadcrumb assertions are unchanged |
+| "disables the Add-files confirm button…" | `:145` | asserts `/add 0 files/i` | label is now `Add 0 items` |
+| "stops breadcrumb up-navigation at the containing root…" | `:170` | same setup-step click | same fix as `:107` |
+
+`:86` ("directory mode confirms the current directory") is **not** affected — directory mode keeps row-click navigation.
+
+⚠️ `:107` and `:170` are the dangerous ones. They only use the folder click to *get somewhere*, so the tempting fix is to make row text navigate again — which silently reverts this entire task. Change the setup click, never the component.
+
+The rewritten navigation test:
 
 ```ts
 it("navigates into a directory via its open button, not by clicking the row", async () => {
@@ -1321,6 +1385,30 @@ it("selects every row in the listing from the select-all control", async () => {
   expect(onSelect).toHaveBeenCalledWith(["/2024", "/a.mp4"]);
 });
 
+it("shows the select-all box as indeterminate when only some rows are selected", async () => {
+  fsListMock.mockResolvedValue({
+    entries: [
+      entry({ name: "a.mp4", path: "/a.mp4" }),
+      entry({ name: "b.mp4", path: "/b.mp4" }),
+    ],
+  });
+
+  render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+  const selectAll = (await screen.findByLabelText("Select all")) as HTMLInputElement;
+  expect(selectAll.checked).toBe(false);
+  expect(selectAll.indeterminate).toBe(false);
+
+  fireEvent.click(screen.getByText("a.mp4"));
+  // Partial selection reads as indeterminate, not unchecked — otherwise the header
+  // claims nothing is selected while a row is ticked right below it.
+  expect(selectAll.indeterminate).toBe(true);
+
+  fireEvent.click(screen.getByText("b.mp4"));
+  expect(selectAll.checked).toBe(true);
+  expect(selectAll.indeterminate).toBe(false);
+});
+
 it("keeps directory mode free of checkboxes", async () => {
   fsListMock.mockResolvedValue({
     entries: [entry({ name: "Movies", path: "/Movies", is_dir: true })],
@@ -1339,7 +1427,7 @@ it("keeps directory mode free of checkboxes", async () => {
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `npm test -- FileBrowserModal`
-Expected: FAIL — no "Open Movies" button, no "Select all" control.
+Expected: FAIL — no "Open Movies" button, no "Select all" control. The four retargeted tests above also fail at this point, which is correct: they are asserting the new behavior before it exists.
 
 - [ ] **Step 3: Replace the click handler and the row renderer**
 
@@ -1405,12 +1493,15 @@ entries.map((entry) => {
       onClick={() => handleRowClick(entry)}
     >
       {selectable && (
+        {/* readOnly, not onChange: the row's click handler owns the state transition
+            (it needs the shiftKey modifier, which a change event does not carry). Without
+            readOnly React warns on every row about a checked input with no onChange. */}
         <input
           type="checkbox"
           className="file-browser-entry-check"
           checked={isSelected}
+          readOnly
           aria-label={entry.name}
-          onChange={() => toggleSelect(entry.path)}
           onClick={(e) => e.stopPropagation()}
         />
       )}
@@ -1650,7 +1741,7 @@ const handleRowClick = (entry: FsEntry, shiftKey: boolean) => {
 };
 ```
 
-Pass the modifier through from the row: `onClick={(e) => handleRowClick(entry, e.shiftKey)}`, and from the checkbox: `onClick={(e) => { e.stopPropagation(); handleRowClick(entry, e.shiftKey); }}` with the `onChange` handler removed so the click path is single.
+Pass the modifier through from the row: `onClick={(e) => handleRowClick(entry, e.shiftKey)}`. The checkbox (already `readOnly` from Task 8) routes to the same handler instead of merely swallowing the click: `onClick={(e) => { e.stopPropagation(); handleRowClick(entry, e.shiftKey); }}`. One click path, one state transition — clicking the box and clicking the row must not diverge.
 
 Import it: `import { rangeBetween } from "../lib/pathSelection";`
 
@@ -2062,6 +2153,8 @@ it("pins Queue and tabs the rest at two-col", async () => {
   // activeTab defaults to "queue", which is pinned — the derived fallback must land on
   // the first tab still in the bar rather than rendering an empty column.
   expect(screen.getByTestId("history-page")).toBeInTheDocument();
+  // The pinned panel names itself; the tabbed one is already named by its tab button.
+  expect(screen.getByRole("heading", { name: "Queue" })).toBeInTheDocument();
 });
 
 it("renders every panel and no tab buttons at three-col", async () => {
@@ -2098,16 +2191,23 @@ Expected: FAIL — only one page ever renders.
 
 - [ ] **Step 3: Give `TabBar` a tab subset**
 
+`Tab` is currently declared **twice** — `App.tsx:15` and `TabBar.tsx:4`. Make `TabBar` the single owner: export the type and the labels from there, and delete the duplicate declaration in `App.tsx` in favour of `import TabBar, { type Tab, TAB_LABELS } from "./components/TabBar";`.
+
+Note `activeTab` becomes optional. In `three-col` no tab is active at all, and typing it `Tab` while passing `tabbed[0]` from an empty array would be a lie that only survives because `noUncheckedIndexedAccess` is off:
+
 ```tsx
+export type Tab = "queue" | "history" | "watch" | "settings";
+
 interface TabBarProps {
   tabs: Tab[];
-  activeTab: Tab;
+  /** Undefined in three-col, where every panel is pinned and nothing is tabbed. */
+  activeTab: Tab | undefined;
   onTabChange: (tab: Tab) => void;
   isAdding: boolean;
   updateAvailable: boolean;
 }
 
-const TAB_LABELS: Record<Tab, string> = {
+export const TAB_LABELS: Record<Tab, string> = {
   queue: "Queue",
   history: "History",
   watch: "Watch",
@@ -2158,14 +2258,18 @@ const ALL_TABS: Tab[] = ["queue", "history", "watch", "settings"];
 
 function App() {
   const layout = useLayoutMode();
-  const [requestedTab, setRequestedTab] = useState<Tab>("queue");
+  // Deliberately still named setActiveTab: `useFileIntake({ onDrop: () => setActiveTab("queue") })`
+  // at App.tsx:22 stays exactly as it is. Renaming the setter here would break that line,
+  // and the derived `activeTab` below already absorbs a request for a pinned tab.
+  const [requestedTab, setActiveTab] = useState<Tab>("queue");
   // ... existing hbStatus / unauthorized / intake / update state, unchanged
 
   const pinned = PINNED[layout];
   const tabbed = ALL_TABS.filter((t) => !pinned.includes(t));
   // Derived, never stored: selecting a pinned tab resolves to a visible one instead of
   // blanking the tabbed column. This also covers useFileIntake's drop-to-Queue switch.
-  const activeTab = tabbed.includes(requestedTab) ? requestedTab : tabbed[0];
+  // Undefined only in three-col, where `tabbed` is empty and nothing is tabbed at all.
+  const activeTab: Tab | undefined = tabbed.includes(requestedTab) ? requestedTab : tabbed[0];
 
   const panel = (tab: Tab) => {
     switch (tab) {
@@ -2187,7 +2291,7 @@ function App() {
       <TabBar
         tabs={tabbed}
         activeTab={activeTab}
-        onTabChange={setRequestedTab}
+        onTabChange={setActiveTab}
         isAdding={isAdding}
         updateAvailable={updateState?.status === "available"}
       />
@@ -2228,7 +2332,7 @@ function App() {
 }
 ```
 
-Export `TAB_LABELS` and the `Tab` type from `TabBar.tsx` and import both here, so the two files cannot drift.
+The `{activeTab && panel(activeTab)}` guard in the else-branch is what makes the optional type safe: in `two-col` `tabbed` is never empty so it always renders, and the branch is unreachable in `three-col`.
 
 - [ ] **Step 5: Add the CSS**
 
@@ -2313,8 +2417,10 @@ Branch from updated `main`: `git checkout -b feature/web-intake-picker`.
 
 - [ ] **Step 1: Write the failing tests**
 
+`DropZone.test.tsx` drives clicks with `userEvent`, not `fireEvent` (its imports are `render, screen` plus `userEvent`). Match that — do not add a `fireEvent` import for these three:
+
 ```ts
-it("renders a pick button instead of the drop label when onPick is given", () => {
+it("renders a pick button instead of the drop label when onPick is given", async () => {
   const onPick = vi.fn();
   render(
     <DropZone pendingConfirm={null} onAdd={vi.fn()} onSkip={vi.fn()} status={null} isDragOver={false} onPick={onPick} />,
@@ -2322,7 +2428,7 @@ it("renders a pick button instead of the drop label when onPick is given", () =>
 
   // There is no OS drag-drop event in a browser tab, so advertising one is a lie.
   expect(screen.queryByText(/Drop video files/)).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: /Add files or folders/ }));
+  await userEvent.click(screen.getByRole("button", { name: /Add files or folders/ }));
   expect(onPick).toHaveBeenCalled();
 });
 
@@ -2382,7 +2488,30 @@ Replace only the final label branch:
 )}
 ```
 
-- [ ] **Step 4: Wire up `QueuePage`**
+- [ ] **Step 4: Pin the QueuePage side in its own test**
+
+`QueuePage.test.tsx` currently only covers the desktop empty state, which survives this change untouched. Add the server-head assertion, using the same `stubEnv` + `resetModules` pattern `SettingsPage.test.tsx` uses (`isServerHead` is a module-level const):
+
+```ts
+it("has no separate intake button on the server head — the drop surface is the picker", async () => {
+  vi.stubEnv("VITE_HEAD", "server");
+  vi.resetModules();
+  const { default: FreshQueuePage } = await import("./QueuePage");
+
+  render(
+    <FreshQueuePage hbStatus={{ found: true, path: "/usr/bin/HandBrakeCLI" }} adding={null} isAdding={false} intake={stubIntake()} />,
+  );
+
+  expect(await screen.findByRole("button", { name: /Add files or folders/ })).toBeInTheDocument();
+  // The old standalone "Add files…" button is gone: two controls for one action was the
+  // thing this task removes.
+  expect(screen.queryByRole("button", { name: /^Add files…$/ })).not.toBeInTheDocument();
+});
+```
+
+`stubIntake()` is a local helper returning the same inert `FileIntake` shape the file's existing tests already build; reuse theirs rather than adding a second one.
+
+- [ ] **Step 5: Wire up `QueuePage`**
 
 Pass `onPick` only on the server head, and delete the now-redundant `.intake-actions` block at `:96-102`:
 
@@ -2412,7 +2541,7 @@ And the empty state at `:172-177`:
 )}
 ```
 
-- [ ] **Step 5: Add the CSS**
+- [ ] **Step 6: Add the CSS**
 
 ```css
 .drop-zone-pick {
@@ -2426,9 +2555,9 @@ And the empty state at `:172-177`:
 }
 ```
 
-- [ ] **Step 6: Document it**
+- [ ] **Step 7: Document it**
 
-Add to the README's web-UI section:
+Add to the README under `## Server (Docker)` (there is no `settings` heading; the nearest neighbours are `## Server (Docker)` at :100 and "How a conversion works" at :95):
 
 ```markdown
 The web UI takes files through the picker, not by dragging them onto the page — a
@@ -2439,12 +2568,12 @@ a range, and the selection survives moving between folders. Reordering the queue
 dragging still works.
 ```
 
-- [ ] **Step 7: Run everything**
+- [ ] **Step 8: Run everything**
 
 Run: `npm test && npm run build && cargo test --workspace`
 Expected: PASS
 
-- [ ] **Step 8: Commit and open PR 4**
+- [ ] **Step 9: Commit and open PR 4**
 
 ```bash
 git add src/components/DropZone.tsx src/components/DropZone.test.tsx src/pages/QueuePage.tsx src/App.css README.md
