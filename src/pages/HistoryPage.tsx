@@ -178,7 +178,12 @@ export default function HistoryPage() {
       (exists) =>
         // Guard against a slow stat landing after the menu moved to another row.
         setMenu((m) => (m && m.job.id === job.id ? { ...m, exists } : m)),
-      () => {},
+      // The stat itself cannot fail, so the only rejection here is a panicked task. The menu
+      // degrades on its own — file actions stay disabled, as they are while the stat is in
+      // flight — but a bug that leaves no trace anywhere is the thing the discriminator exists
+      // to prevent, so log it rather than dropping it.
+      (failure) =>
+        console.error("Failed to stat paths for the history menu:", failure),
     );
   };
 
