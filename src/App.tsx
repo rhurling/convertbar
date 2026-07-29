@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import TabBar from "./components/TabBar";
+import TabBar, { type Tab, TAB_LABELS } from "./components/TabBar";
 import QueuePage from "./pages/QueuePage";
 import HistoryPage from "./pages/HistoryPage";
 import WatchedFoldersPage from "./pages/WatchedFoldersPage";
@@ -10,12 +10,23 @@ import { isServerHead } from "./lib/head";
 import { useAddProgress } from "./hooks/useAddProgress";
 import { useFileIntake } from "./hooks/useFileIntake";
 import { useUpdate } from "./hooks/useUpdate";
+import { useLayoutMode, type LayoutMode } from "./hooks/useLayoutMode";
 import "./App.css";
 
-type Tab = "queue" | "history" | "watch" | "settings";
+const PINNED: Record<LayoutMode, Tab[]> = {
+  tabs: [],
+  "two-col": ["queue"],
+  "three-col": ["queue", "history", "watch", "settings"],
+};
+
+const ALL_TABS: Tab[] = ["queue", "history", "watch", "settings"];
 
 function App() {
-  const [activeTab, setActiveTab] = useState<Tab>("queue");
+  const layout = useLayoutMode();
+  // Deliberately still named setActiveTab: `useFileIntake({ onDrop: () => setActiveTab("queue") })`
+  // below stays exactly as it is. Renaming the setter here would break that line,
+  // and the derived `activeTab` below already absorbs a request for a pinned tab.
+  const [requestedTab, setActiveTab] = useState<Tab>("queue");
   const [hbStatus, setHbStatus] = useState<HandbrakeStatus | null>(null);
   const [unauthorized, setUnauthorized] = useState(false);
   const { isAdding, activity } = useAddProgress();
@@ -51,23 +62,68 @@ function App() {
     return () => document.removeEventListener("keydown", handler);
   }, []);
 
+  const pinned = PINNED[layout];
+  const tabbed = ALL_TABS.filter((t) => !pinned.includes(t));
+  // Derived, never stored: selecting a pinned tab resolves to a visible one instead of
+  // blanking the tabbed column. This also covers useFileIntake's drop-to-Queue switch.
+  // Undefined only in three-col, where `tabbed` is empty and nothing is tabbed at all.
+  const activeTab: Tab | undefined = tabbed.includes(requestedTab) ? requestedTab : tabbed[0];
+
+  const panel = (tab: Tab) => {
+    switch (tab) {
+      case "queue":
+        return <QueuePage hbStatus={hbStatus} adding={activity} isAdding={isAdding} intake={intake} />;
+      case "history":
+        return <HistoryPage />;
+      case "watch":
+        return <WatchedFoldersPage />;
+      case "settings":
+        return <SettingsPage onHbPathChanged={refreshHbStatus} />;
+    }
+  };
+
   if (unauthorized) return <LoginScreen />;
 
   return (
-    <div className="app">
+    <div className={`app app-${layout}`}>
       <TabBar
+        tabs={tabbed}
         activeTab={activeTab}
         onTabChange={setActiveTab}
         isAdding={isAdding}
         updateAvailable={updateState?.status === "available"}
       />
-      <div className="page">
-        {activeTab === "queue" && (
-          <QueuePage hbStatus={hbStatus} adding={activity} isAdding={isAdding} intake={intake} />
+      <div className="app-columns">
+        {/* three-col groups Watch and Settings into one column: Settings is by far the
+            longest panel, and pairing it with the shortest balances the row. */}
+        {layout === "three-col" ? (
+          <>
+            <section className="app-column">
+              <h2 className="app-column-title">Queue</h2>
+              {panel("queue")}
+            </section>
+            <section className="app-column">
+              <h2 className="app-column-title">History</h2>
+              {panel("history")}
+            </section>
+            <section className="app-column">
+              <h2 className="app-column-title">Watch</h2>
+              {panel("watch")}
+              <h2 className="app-column-title">Settings</h2>
+              {panel("settings")}
+            </section>
+          </>
+        ) : (
+          <>
+            {pinned.map((tab) => (
+              <section className="app-column" key={tab}>
+                <h2 className="app-column-title">{TAB_LABELS[tab]}</h2>
+                {panel(tab)}
+              </section>
+            ))}
+            <section className="app-column page">{activeTab && panel(activeTab)}</section>
+          </>
         )}
-        {activeTab === "history" && <HistoryPage />}
-        {activeTab === "watch" && <WatchedFoldersPage />}
-        {activeTab === "settings" && <SettingsPage onHbPathChanged={refreshHbStatus} />}
       </div>
     </div>
   );

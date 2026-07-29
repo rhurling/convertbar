@@ -93,6 +93,50 @@ body {
   overflow-x: hidden;
 }
 
+/* Columns */
+.app-columns {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.app-column {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+}
+
+.app-column:last-child {
+  border-right: none;
+}
+
+/* The tabs layout keeps a single scroll container, exactly as before. */
+.app-tabs .app-columns {
+  display: block;
+  overflow-y: auto;
+}
+
+.app-column-title {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+/* Only ever visible in the browser: the desktop window is a fixed 400x500. */
+.app-tabs .app-column-title {
+  display: none;
+}
+
 /* Drop Zone */
 .drop-zone {
   margin: 12px;
