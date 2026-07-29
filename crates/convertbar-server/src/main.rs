@@ -91,11 +91,7 @@ async fn main() {
     let app = routes::app(state);
 
     let shutdown_ctx = ctx.clone();
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    startup::serve(listener, app, async move {
         startup::shutdown_signal().await;
         // Kill the active child AT signal time (not after `serve` returns): this is
         // what flips every SSE stream's shutdown watch (via the send below) after the

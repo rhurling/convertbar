@@ -800,6 +800,41 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_denied_cookie_request_is_not_evaluated_so_even_the_correct_token_is_refused() {
+            // The cookie channel twin of the bearer test above. `/api/events` can
+            // only authenticate via this cookie (EventSource sends no headers), so
+            // it is just as browser-reachable a guessing channel as the bearer
+            // header and must be gated the same way.
+            let app = app_from(gated_state("abcdefghijklmnop"), "10.0.0.1:5555");
+            let first = send(
+                app.clone(),
+                "GET",
+                "/api/queue",
+                &[("Host", "localhost"), ("Cookie", "convertbar_token=wrong")],
+                None,
+            )
+            .await;
+            assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+
+            let correct = send(
+                app,
+                "GET",
+                "/api/queue",
+                &[
+                    ("Host", "localhost"),
+                    ("Cookie", "convertbar_token=abcdefghijklmnop"),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(
+                correct.status(),
+                StatusCode::UNAUTHORIZED,
+                "the gate was open, so the cookie credential was still being evaluated"
+            );
+        }
+
+        #[tokio::test]
         async fn a_denied_response_is_indistinguishable_from_a_wrong_credential() {
             let app = app_from(gated_state("abcdefghijklmnop"), "10.0.0.1:5555");
             let evaluated = send(

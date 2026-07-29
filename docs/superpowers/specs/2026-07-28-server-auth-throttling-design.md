@@ -234,9 +234,11 @@ a connection, and holds no server resource by keeping one open.
 
 Lock poisoning is swallowed (`.lock().unwrap_or_else(|e| e.into_inner())`) — this
 lock sits on a global request path, so one panic must not 500 every subsequent
-request forever. The map is bounded at `PRUNE_THRESHOLD` keys, evicting expired
-entries first and then lowest-`count` entries, so hot attackers are retained and
-the long tail is shed.
+request forever. The map is bounded at `PRUNE_THRESHOLD` keys, evicting the
+lowest-`count` entries first, so hot attackers are retained and the long tail is
+shed. (An earlier expiry-first pruning pass was removed as dead code: eviction
+already restores `len <= PRUNE_THRESHOLD` after every insert, so the map can
+never exceed the threshold on entry to the next `check` call.)
 
 ### 5. Enforcement — `routes/login.rs` and `auth.rs::auth_guard`
 
@@ -313,9 +315,11 @@ the log a flood amplifier.
   lines** (the §3 bypass); malformed entry → `MalformedChain`, *not* the peer;
   IPv4-mapped IPv6 peer matches an IPv4 trusted entry; two IPv6 addresses in one
   /64 share a bucket; bare IPv6 and `[v6]:port` both parse; whitespace.
-- `LoginThrottle`: delay doubles per failure and pins at `cap`; no overflow at
-  high counts; window rollover resets; `record_success` clears; distinct ids are
-  independent buckets; pruning drops expired and keeps live entries.
+- `LoginThrottle`: spacing doubles per evaluation and pins at `cap`; no overflow
+  at high counts; window rollover resets; `record_success` clears; distinct ids
+  are independent buckets; a live flood of distinct sources stays bounded at
+  `PRUNE_THRESHOLD` and keeps the hottest bucket (count-based eviction, not
+  expiry-based — nothing is old enough to expire under a live flood).
 
 **Integration through `app()` (the real guard composition, with an
 `Extension(ConnectInfo(addr))` layer — never `MockConnectInfo`, which inserts a
@@ -421,7 +425,7 @@ chosen: a mechanism that always honours a correct token also always answers the
 attacker, which is exactly how revision 2 failed. Revision 3 therefore
 subordinates the old goal 3 and bounds the cost instead of eliminating it:
 
-- The first `free` (3) failures are ungated, so typos, a stale cookie, and the
+- The first `free` (8) failures are ungated, so typos, a stale cookie, and the
   web UI's concurrent page-load fan-out never see a denial.
 - A successful evaluation clears the bucket outright.
 - A bucket is forgotten 15 minutes after its *first* attempt — a window, not an
@@ -472,13 +476,23 @@ the ten existing tests that break (Testing).
   It only arises when the owner shares a source address with an attacker.
 
 - **Shared bucket.** Where clients share a source address, one attacker's
-  failures slow everyone's *failed* attempts on that address. A correct token
-  still succeeds, so this is degradation, not denial. `CONVERTBAR_TRUSTED_PROXIES`
-  fixes it for real proxies; it cannot help with L3 NAT, where there is no
-  forwarded header to read.
-- **The delay leaks a bucket's failure count** to anyone sharing it. It reveals
-  nothing about the token, and the alternative (a constant delay) is a weaker
-  throttle.
+  evaluations gate everyone on that address — including their *correct* token,
+  per the point above. This is **denial, not mere degradation**: an attacker who
+  keeps the bucket gated (one evaluation per spacing interval is enough) can hold
+  a legitimate co-tenant's correct token refused indefinitely. `CONVERTBAR_TRUSTED_PROXIES`
+  fixes it for real proxies by giving each client its own bucket; it cannot help
+  with L3 NAT, where there is no forwarded header to read.
+- **A shared bucket's ramp is reset by anyone's success, including the
+  attacker's.** `record_success` deletes the whole bucket (`map.remove(&id)`),
+  not just the request that succeeded. Where an attacker shares a `ClientId`
+  with a legitimate user, every one of that user's successful authenticated
+  requests hands the attacker a fresh `free` (8) allowance on the same bucket —
+  and the web UI fires 4 authenticated requests per page load, so one page load
+  can gift the attacker roughly 32 evaluations. This is an accepted trade-off,
+  not a bug: wiping the bucket on success is correct in the normal, unshared
+  case (a legitimate sign-in should clear its own ramp), and shared buckets are
+  already degraded per the point above. It is another reason to set
+  `CONVERTBAR_TRUSTED_PROXIES` to the proxy's exact address rather than a range.
 - **Distinct-character rule is not entropy.** `1234567890123456` passes. It is a
   floor against pathology, not a strength meter.
 - **`MalformedChain` is one shared bucket**, so clients sending garbage headers
@@ -486,8 +500,11 @@ the ten existing tests that break (Testing).
   the garbage) is worse.
 - **A stale cookie after a token rotation shares the bucket's ramp.** The old
   cookie is a credential like any other, so a rejected one is throttled the
-  same as a guessed token. If the owner's source address also belongs to an
-  attacker who has driven that bucket to the cap, the owner's login screen can
-  take up to 30 s to render — the frontend only shows it once the 401 arrives
-  (`convertbar:unauthorized`). Recovery is fast once they type the new token:
-  a successful `POST /api/login` never sleeps.
+  same as a guessed token. Nothing sleeps, so this is not a delay: the login
+  screen renders immediately regardless (the frontend shows it as soon as any
+  401 arrives, via `convertbar:unauthorized`). But each open tab re-fires the
+  same ~4-request authenticated fan-out with its stale cookie, so 3+ open tabs
+  (~12 evaluations) already exceed the free allowance (8) on their own, and if
+  the owner's source address is gated when they then type the new, correct
+  token, that attempt is *refused*, not slow — they need to retry after the
+  spacing interval elapses.

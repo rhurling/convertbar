@@ -150,8 +150,9 @@ startup rather than warned about. Generate one with:
 openssl rand -base64 24
 ```
 
-**Failed-attempt throttling.** Each source — identified at `/api/login` or via
-an `Authorization` header — gets 8 free attempts. After that it may be
+**Failed-attempt throttling.** Each source — identified at `/api/login`, via an
+`Authorization` header, or via the session cookie (used by `/api/events`,
+which can't send headers) — gets 8 free attempts. After that it may be
 evaluated only once per interval: 500 ms, then 1 s, 2 s, 4 s, and so on to a
 30-second ceiling. Every attempt outside that interval is refused with 401
 **without comparing the credential at all — even a correct token is refused
@@ -168,10 +169,14 @@ permits a memorable passphrase like `Sommer2026!Berlin`, which is not
 comfortable at any guess rate.
 
 Rotating the token means changing the variable and restarting the container.
-Open browser tabs will be signed out and can log in again immediately. A script
-looping on an outdated token will quickly ramp itself into the same gating any
-attacker gets — refused outright, not merely slowed — which is working as
-intended and indistinguishable from one.
+Open browser tabs will be signed out and can usually log in again immediately —
+but each tab retries its stale cookie against the same ~4-request fan-out, so
+with 3 or more tabs open the retries alone (~12) can exceed the free allowance
+(8) and gate the source; if that happens, the first login attempt with the
+correct token is refused and needs a retry after a short wait. A script looping
+on an outdated token will quickly ramp itself into the same gating any attacker
+gets — refused outright, not merely slowed — which is working as intended and
+indistinguishable from one.
 
 **Behind a reverse proxy**, every request appears to come from the proxy, so all
 clients share one throttling ramp. Set `CONVERTBAR_TRUSTED_PROXIES` to the
@@ -187,6 +192,14 @@ CONVERTBAR_TRUSTED_PROXIES=172.18.0.5
 > worse than leaving it unset. Do not use a whole Docker bridge network
 > (`172.18.0.0/16`) or a LAN range; pin the proxy to a static address and list
 > that. This cannot help behind plain NAT, where there is no forwarded header.
+>
+> Without it, everyone behind the proxy shares one bucket, so one attacker's
+> guesses can gate — and, if sustained, keep gated — every legitimate user's
+> login on that address, not just slow their failed attempts. It also means a
+> legitimate user's successful request resets the *whole* shared bucket (a
+> successful login clears its own ramp outright), handing the attacker a fresh
+> 8-guess allowance each time someone else logs in — another reason to trust
+> only the proxy's exact address.
 
 ### Reverse proxy / HTTPS
 

@@ -692,10 +692,13 @@ pub(crate) mod tests {
         assert_eq!(json["error"], "not found");
     }
 
-    /// The one line `oneshot` cannot cover. Without
-    /// `into_make_service_with_connect_info` there is no `ConnectInfo`, so
-    /// `client_id` cannot recognise 127.0.0.1 as a trusted proxy, never reads
-    /// `X-Forwarded-For`, and every client collapses into one shared bucket.
+    /// The one line `oneshot` cannot cover. Goes through `startup::serve` — the
+    /// SAME function `main.rs` calls — rather than a duplicated `axum::serve(...)`
+    /// call, so a regression that drops `into_make_service_with_connect_info` from
+    /// the production wiring is actually caught here instead of only in a copy of
+    /// it. Without that wiring there is no `ConnectInfo`, so `client_id` cannot
+    /// recognise 127.0.0.1 as a trusted proxy, never reads `X-Forwarded-For`, and
+    /// every client collapses into one shared bucket.
     #[tokio::test]
     async fn served_requests_are_bucketed_per_forwarded_client() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -732,12 +735,7 @@ pub(crate) mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .await
-            .unwrap();
+            crate::startup::serve(listener, app(state), std::future::pending()).await
         });
 
         async fn request_from(addr: std::net::SocketAddr, forwarded: &str, token: &str) -> String {

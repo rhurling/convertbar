@@ -27,7 +27,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use axum::http::{header::HeaderMap, HeaderValue};
+use axum::http::header::HeaderMap;
 use ipnet::IpNet;
 
 /// A throttling bucket key. IPv6 is keyed on its /64 network, not the address:
@@ -89,14 +89,16 @@ pub fn client_id(peer: Option<IpAddr>, headers: &HeaderMap, trusted: &[IpNet]) -
 
     // ALL header lines, in order: proxies append a new line rather than merging,
     // so `get` alone would read only the attacker's own line.
-    let chain: Vec<&str> = headers
-        .get_all(XFF)
-        .iter()
-        .filter_map(|v: &HeaderValue| v.to_str().ok())
-        .flat_map(|line| line.split(','))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut chain: Vec<&str> = Vec::new();
+    for v in headers.get_all(XFF).iter() {
+        // An undecodable line is malformed, NOT absent. Dropping it would let a
+        // client empty the chain on purpose and fall through to the peer — the
+        // proxy's own bucket, shared by every client behind it.
+        let Ok(line) = v.to_str() else {
+            return ClientId::MalformedChain;
+        };
+        chain.extend(line.split(',').map(str::trim).filter(|s| !s.is_empty()));
+    }
 
     for entry in chain.iter().rev() {
         match parse_entry(entry) {
@@ -181,7 +183,6 @@ impl LoginThrottle {
     /// the reservation for a legitimate user afterwards.
     pub fn check(&self, id: ClientId, now: Instant) -> Gate {
         let mut map = self.lock();
-        self.prune_if_needed(&mut map, now);
         let entry = map.entry(id).or_insert(Failures {
             count: 0,
             first_at: now,
@@ -244,22 +245,11 @@ impl LoginThrottle {
         }
     }
 
-    /// Expiry-based pruning, checked before every insert. Paired with
-    /// `evict_if_needed` (checked after every insert): a live flood of
-    /// distinct sources has nothing old enough to expire, so expiry alone
-    /// cannot bound the map.
-    fn prune_if_needed(&self, map: &mut HashMap<ClientId, Failures>, now: Instant) {
-        if map.len() > PRUNE_THRESHOLD {
-            let window = self.policy.window;
-            map.retain(|_, f| now.duration_since(f.first_at) <= window);
-        }
-    }
-
-    /// Count-based eviction: a hot attacker's bucket is the one actually
-    /// worth remembering, and evicting the lowest counts first is harder to
-    /// game than oldest-first — flooding fresh sources to force an eviction
-    /// only spends the flood's own low-count buckets, never one it doesn't
-    /// control.
+    /// Count-based eviction, checked after every insert: a hot attacker's bucket
+    /// is the one actually worth remembering, and evicting the lowest counts
+    /// first is harder to game than oldest-first — flooding fresh sources to
+    /// force an eviction only spends the flood's own low-count buckets, never
+    /// one it doesn't control.
     fn evict_if_needed(&self, map: &mut HashMap<ClientId, Failures>) {
         if map.len() > PRUNE_THRESHOLD {
             let mut by_count: Vec<(ClientId, u32)> =
@@ -290,7 +280,7 @@ impl LoginThrottle {
 #[cfg(test)]
 mod client_id_tests {
     use super::*;
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, HeaderValue};
 
     fn nets(entries: &[&str]) -> Vec<IpNet> {
         entries
@@ -399,6 +389,20 @@ mod client_id_tests {
                 &nets(&["172.18.0.0/24"])
             ),
             ClientId::Addr(ip("172.18.0.5"))
+        );
+    }
+
+    #[test]
+    fn an_undecodable_forwarded_line_is_malformed_not_absent() {
+        // A merged line (nginx's canonical `proxy_add_x_forwarded_for`) that fails
+        // to_str() must not be silently dropped from the chain: an empty chain
+        // falls through to the peer's own bucket — the one shared by every client
+        // behind that proxy — letting an attacker choose to land there on purpose.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_bytes(&[0xFF]).unwrap());
+        assert_eq!(
+            client_id(Some(ip("172.18.0.5")), &h, &nets(&["172.18.0.5"])),
+            ClientId::MalformedChain
         );
     }
 
