@@ -36,10 +36,10 @@ behavior changes in exactly one way: it gains the same new cleanup option.
 | Layout gating | Width-driven, not head-gated. The desktop window is fixed 400×500 and non-resizable, so it always resolves to `tabs` |
 | "Keep original" scope | Both heads. Core learns `cleanup_mode = "keep"`; desktop offers Trash/Delete/Keep, server offers Delete/Keep |
 | Keep + larger output | Nothing is ever removed, either direction. `decide_cleanup` still records `"skipped"` |
-| Keep + in-place (empty suffix) | Refuse the job before encoding, record an error naming the fix |
+| Keep + in-place (empty suffix) | Prevented at add time and at setting-change time, so the job never exists; a non-destructive converter arm covers the race |
 | Unknown `cleanup_mode` value | Falls back to `"trash"` — preserves today's behavior and mirrors `normalize_bad_source_action` |
 | Whole-directory selection | One model: a checkbox per row (files and folders) plus a header "Select all" over the current listing |
-| Selection persistence | Persists across navigation, with a visible count and Clear; descendants of a selected folder are dropped at confirm time |
+| Selection persistence | Persists across navigation, with a visible count and Clear |
 | Backdrop click | Inert. Only ×, Cancel close the modal. No confirm dialog, and no new Esc handler |
 | Drag-and-drop removal | Intake only. The drop surface becomes a click-to-pick target on the server head; queue-item drag-reordering is untouched |
 
@@ -58,6 +58,14 @@ behavior changes in exactly one way: it gains the same new cleanup option.
 - **"Keep" replaces in place anyway when the suffix is empty.** Jobs always
   complete, but a setting named "keep the original" would overwrite the
   original — the worst possible surprise on a destructive path.
+- **Refusing an in-place job inside `process_queue` with an error row.** The
+  first draft of this spec; it creates an unbounded watched-folder loop. See
+  Part 3 for the full trace — it is the single biggest change the adversarial
+  review forced.
+- **Dropping selected paths that live under other selected paths.** Also a
+  first-draft idea, and also removed: the backend already dedupes, and doing
+  it in the picker silently loses an explicitly ticked file when the user
+  skips its parent folder's confirm prompt.
 - **Always confirm on backdrop click** (the literal original request). Making
   the backdrop inert removes the accident class outright, with no dialog to
   build and no nag when nothing is selected.
@@ -96,12 +104,16 @@ from `activeTab`, in a `.app-columns` flex/grid container. Two derived rules:
 
 - **Active-tab fallback.** When the current `activeTab` becomes pinned (Queue
   at ≥900px, History at ≥1300px), it falls back to the first tab still in the
-  bar — Watch in `two-col`. Computed from the mode, not stored, so shrinking
-  the window back restores a sensible tab without a second effect. In
-  `three-col` nothing is tabbed, so `activeTab` is simply unused.
-- **Drop-to-Queue is conditional.** `useFileIntake({ onDrop: () => setActiveTab("queue") })`
-  becomes a no-op when Queue is pinned — switching to a tab that is not in the
-  bar would blank the tabbed column.
+  bar — History in `two-col`. **Derived from the mode, not stored**, so any
+  attempt to select a pinned tab resolves to a visible one instead of blanking
+  the tabbed column, and shrinking the window back restores a sensible tab
+  without a second effect. In `three-col` nothing is tabbed, so `activeTab` is
+  simply unused.
+
+  This subsumes the drop-to-Queue case: `useFileIntake({ onDrop: () => setActiveTab("queue") })`
+  needs no guard, because the derived fallback already handles a pinned target.
+  It could not fire anyway — `onDrop` comes from the desktop drag listener
+  (`useFileIntake.ts:131-139`), and desktop is always `tabs`.
 
 **`TabBar`** takes the tab subset as a prop. It stays mounted in every mode:
 it carries `data-tauri-drag-region`, the adding-spinner, and the desktop close
@@ -110,8 +122,13 @@ buttons — just the spacer and the status affordances.
 
 **Panel headers.** Each pinned *panel* gets a header with its name — so the
 third `three-col` column shows two of them, "Watch" above "Settings" — and a
-four-panel view is self-describing. The update badge follows Settings: on its
-tab button when Settings is tabbed, in the Settings panel header when pinned.
+four-panel view is self-describing.
+
+The update badge stays on the Settings **tab button only**, and does not follow
+Settings into a pinned header. It cannot fire there: `useUpdate` returns early
+on the server head (`useUpdate.ts:40-44`), leaving `state` null forever, and the
+server head is the only one that ever reaches a multi-column mode. A badge in a
+pinned header would be code for an impossible head × width combination.
 
 **CSS.** `.app-columns` is the flex row; each column is a `flex: 1` scroll
 container (`overflow-y: auto`), replacing `.page` as the scroll owner in the
@@ -123,10 +140,19 @@ multi-column modes. `.page` is retained unchanged for `tabs`.
   `resizable: false`, so the hook always resolves to `tabs`.
 - Web ≥900px: Queue is always visible; the tab bar loses the Queue button.
 - Web ≥1300px: no tab bar buttons at all; all four panels live.
-- **Mount cost:** `three-col` mounts all four pages simultaneously, so
-  `useQueue`, `useHistory`, `useWatchedDirectories`, and `useSettings` all fire
-  their initial fetch on load. That is four HTTP requests, not four SSE
-  connections — `lib/events.ts` shares one stream. Accepted.
+- **Mount cost:** `three-col` mounts all four pages simultaneously, so every
+  page hook fires its initial fetch on load. It is not four requests:
+  `HistoryPage` also calls `useSettings` (`HistoryPage.tsx:72`), so two
+  `useSettings` instances mount, each issuing `getSettings`,
+  `listHandbrakePresets`, `getPresetSuffix` and `generatePresetSuffix` — and
+  the last two shell out to HandBrakeCLI on the server. Two duplicate
+  HandBrake spawns per page load is ugly but harmless, and the two instances
+  drive no conflicting UI (the only setting `HistoryPage` reads is
+  `bad_source_action`, which the server fixes at boot). Accepted; lifting
+  `useSettings` to `App` and passing it down is listed as a follow-up.
+- No SSE cost: `lib/events.ts` holds one module-level `EventSource`, and all
+  six hooks are fetch-plus-listen with per-instance cleanup — none assumes it
+  is the only listener.
 
 ### Testing
 
@@ -138,8 +164,8 @@ multi-column modes. `.page` is retained unchanged for `tabs`.
 - `App` in `three-col` renders all four panels and no tab buttons.
 - Active-tab fallback: with `activeTab === "queue"`, entering `two-col` renders
   History (not a blank column) in the tabbed slot.
-- The update badge appears in the Settings *column header* in `three-col` and
-  on the Settings *tab button* in `tabs`.
+- Each pinned panel renders its own header; the `three-col` third column
+  renders both "Watch" and "Settings" headers.
 
 ---
 
@@ -154,7 +180,7 @@ this reaches the desktop native dialog.
 
 - `handleEntryClick` (`FileBrowserModal.tsx:92-98`): a directory navigates, a
   file toggles. Directories are never selectable.
-- `load()` calls `setSelected(new Set())` (`:52`), so navigating anywhere
+- `load()` calls `setSelected(new Set())` (`:53`), so navigating anywhere
   discards the selection.
 - The only way to reach a path is to click down to it from a configured root.
 - `.modal-overlay` has `onClick={onClose}` (`:117`), so a backdrop click
@@ -197,9 +223,21 @@ inclusive, across mixed types. It is **additive**: it never deselects, so a
 mis-aimed shift-click cannot silently drop earlier work. The anchor resets on
 navigation — ranges are per-listing.
 
-**Confirm-time dedup.** Any selected path that lives under another selected
-path is dropped before `onSelect`, so selecting a folder and a file inside it
-does not queue the file twice.
+**No confirm-time dedup.** An earlier draft dropped any selected path living
+under another selected path, to stop a folder-plus-a-file-inside-it from
+queueing twice. That is both unnecessary and harmful:
+
+- Unnecessary, because the backend already dedupes. `useFileIntake` enqueues
+  `classified.files` *before* `classified.folders` (`useFileIntake.ts:107-117`)
+  through a serialized pipeline, and `add_files_to_db` skips any source already
+  in `queued_paths` (`queue_ops.rs:932`, `fetch_skip_sets` at `:691-741`). The
+  explicit file lands first; the folder scan then skips it.
+- Harmful, because a folder over `AUTO_ADD_MAX` files goes to the confirm
+  queue, and **Skip** (`useFileIntake.ts:157-161`) discards it — taking the
+  individually-ticked file with it, silently, if dedup had already removed it
+  from the direct-file batch.
+
+So the selection is passed through as-is. `dropDescendants` is not built.
 
 **Inert backdrop.** `.modal-overlay` loses its `onClick`; the inner
 `stopPropagation` on `.file-browser-modal` becomes unnecessary and is removed
@@ -207,16 +245,13 @@ with it. × and Cancel remain. No Esc handler is added: `App.tsx:41-52` binds
 Esc to `hideWindow()` on desktop only, and adding a browser Esc-closes-modal
 binding would re-introduce the accidental-close class this change removes.
 
-**New module — `src/lib/pathSelection.ts`.** The two pure functions live
-outside the component so they are testable without rendering:
+**New module — `src/lib/pathSelection.ts`.** One pure function, outside the
+component so it is testable without rendering:
 
 - `rangeBetween(entries, anchorPath, targetPath): string[]` — the inclusive
   slice of `entries` between two paths, in listing order; empty when either is
-  absent.
-- `dropDescendants(paths): string[]` — removes any path that is a descendant of
-  another path in the set. Uses component-boundary comparison (`a === b` or
-  `b.startsWith(a + "/")`), so `/media` never swallows `/media2` — the same
-  trap `fs.rs`'s `path_allowed` documents.
+  absent. Order-agnostic (anchor may follow target) and separator-agnostic, so
+  it holds if a server head ever runs on Windows.
 
 ### Behavior delta
 
@@ -232,9 +267,9 @@ outside the component so they are testable without rendering:
 
 - `rangeBetween`: forward range, reverse range (anchor after target), single
   row, anchor absent from the listing.
-- `dropDescendants`: file under a selected folder is dropped; two sibling
-  folders both survive; `/media` does not swallow `/media2`; the selected
-  folder itself is kept.
+- A folder and a file inside it both reach `onSelect` — pinning that the
+  component does not dedupe, and that the "Skip the folder, lose the file"
+  hole stays closed.
 - Select-all ticks every row and reflects tri-state after one is unticked.
 - Shift-click selects a mixed file/folder range and does not deselect anything
   already selected outside it.
@@ -243,8 +278,8 @@ outside the component so they are testable without rendering:
 - Jump-to-path loads a valid path; a 403 renders the server's error and leaves
   the current listing intact.
 - A click on `.modal-overlay` does **not** call `onClose`.
-- Confirming with a folder and a file inside it passes only the folder to
-  `onSelect`.
+- `mode: "directory"` is unchanged: no checkboxes, no select-all, folders still
+  navigate on click, "Choose this folder" still returns the current path.
 
 ---
 
@@ -280,26 +315,64 @@ as it does today. (A `keep` fallback would be strictly non-destructive but
 would let a corrupt row silently change conversion outcomes.)
 
 **Distinct-file path** (`converter.rs:1185-1203`). A third arm: `"keep"`
-removes nothing, in either `KeptFile` direction. `decide_cleanup` is untouched,
-so a larger output still records `space_saved` as the negative delta and status
-`"skipped"` — the user simply keeps both files.
+removes nothing, in either `KeptFile` direction. `decide_cleanup` stays pure
+and untouched, so status is still `done`/`skipped` on the same size rule.
 
-**In-place refusal, before the encode.** `in_place` is computed at
-`converter.rs:955`; `cleanup_mode` is already in scope from `:808`. The guard
-goes immediately after `:955` — before the stale-temp cleanup at `:961-964`
-and before the HandBrake spawn at `:967`, so a job that will be refused never
-burns an encode. It follows the shape of the existing spawn-failure arm
-(`:979-993`): `record_job_error` with `FailureClass::Environment`, clear
-`current_job_id`, `continue`.
+**`space_saved` is zeroed under keep**, at the write site (`:1244`), not inside
+`decide_cleanup`. Nothing was freed: the source is still on disk. Leaving the
+delta in place would feed a false number into `get_history_summary`'s "Total
+saved" (`queue_ops.rs:1388-1397`, rendered at `HistoryPage.tsx:200`), the green
+"Saved" badge on each history row, and the per-file completion notification
+(`converter.rs:1297-1301`) — three places claiming disk space that was never
+recovered. The size delta remains derivable from the recorded `original_size`
+and `converted_size`. The completion notification gets a keep-mode wording that
+does not say "saved".
 
-The message names the fix rather than describing the fault:
+**In-place under keep is prevented, never refused.** The obvious design — let
+the job run and error out in `process_queue` — is wrong, and the reason is
+worth recording because it is not obvious.
 
-> In-place re-encode (empty output suffix) cannot keep the original — choose
-> Delete in Settings, or set an output suffix for this preset.
+A per-job `error` row is invisible to both re-ingestion guards.
+`fetch_skip_sets` (`queue_ops.rs:691-741`) suppresses only `queued`/`encoding`/
+`paused` rows and `done`/`skipped` fingerprints; `filter_known_bad_sources`
+(`watcher.rs:391-397`) filters only `bad_source[_truncated]`. So a watched
+folder of N files, under keep with an empty-suffix preset, would re-queue and
+re-refuse all N on every `scan_all_enabled` — a new error row and a "failed"
+notification each, forever, with `enqueue_and_start` (`watcher.rs:470-473`)
+clearing the user's queue pause each time. That is precisely the failure
+`watcher.rs:382-390` documents as the reason `filter_known_bad_sources` exists.
+Unlike a transient Environment fault, keep + empty suffix is a *stable
+configuration* the user can sit in indefinitely.
 
-`in_place_action` (`:116-127`) is therefore never reached with `"keep"`; it
-gains a `debug_assert!` documenting that, rather than a silent fallthrough into
-`TrashSourceThenRename`.
+So the impossible job is never created. Two enforcement points, both at the
+moment the user acts, both reportable:
+
+1. **At add time.** `add_files_to_db` (`queue_ops.rs:925-940`) already computes
+   the output path and carries skip counters (`n_not_video`, `n_queued`,
+   `n_converted`, `n_output_exists`). It gains one more: a source whose output
+   path equals itself is not queued while `cleanup_mode == "keep"`, and is
+   counted as `n_inplace_keep_blocked`. No row is created, so no watcher loop
+   is possible — a rescan re-skips it as cheaply as any other skip. `AddResult`
+   and `summarizeAdds` (`src/lib/addSummary.ts`) surface it in the intake
+   summary, at exactly the moment the user can fix it.
+2. **At setting-change time.** Writing `cleanup_mode = "keep"` drops any
+   already-`queued` in-place job in the same `update_setting` post-write hook
+   that `watch_skip_marker` uses (`settings_ops.rs:161-181`), then emits
+   `queue-updated` so the Queue panel refreshes. **The db guard must be dropped
+   before that emit** — `update_setting` already scopes it for this exact
+   reason, and violating it is the shipped-twice deadlock CLAUDE.md documents.
+
+**The converter keeps one non-destructive backstop.** A job can flip to
+`encoding` in the window between the setting write and the dequeue. For that
+race, `in_place_action` (`:116-127`) gains a real arm — `"keep" => RemoveTemp`
+— not the `debug_assert!` I first specified. `debug_assert!` compiles out in
+release, and the `else` branch it would have guarded is `TrashSourceThenRename`,
+which on the server routes through `DeleteDisposer` and permanently removes the
+user's source. One line buys a release-mode guarantee that the worst case is a
+wasted encode rather than a destroyed original.
+
+No new event, no new Ctx state, no new command, no new banner — and no error
+rows for the watcher to trip over.
 
 **Server boot.** `FORCED_DELETE_KEYS` needs no code change — it only rewrites
 rows equal to `'trash'`, so `'keep'` survives. That gets a regression test,
@@ -318,11 +391,39 @@ keep-specific warning when `cleanup_mode === "keep"`, so the impossible
 combination is visible at the moment it is configured rather than at the moment
 a job fails.
 
+### Accepted consequence: kept sources rely on history fingerprints
+
+Under `trash`/`delete` the source is gone after a successful conversion, so
+re-ingestion is structurally impossible. Under `keep` the source survives in
+the watched folder, and the *only* thing preventing a re-convert is its
+`(size, mtime)` fingerprint recorded in the `done`/`skipped` row
+(`queue_ops.rs:709-741`, `cheap_skip_reason` at `:627-634`). That is a real
+behavioral shift, and it has two edges we accept rather than fix:
+
+- **Clearing history re-converts kept sources.** `clear_history`
+  (`queue_ops.rs:1181-1187`) deletes the rows that carry the fingerprints; the
+  next scan re-adds the still-present source, and `choose_output_path`
+  (`:655-682`) finds the old output name taken and renumbers —
+  `movie (1).1080p-h265.mp4`. Clearing history is the user saying "forget
+  this", so re-converting is arguably correct; the disk cost is not obvious,
+  so it goes in the README.
+- **A NULL fingerprint falls back to the legacy bucket.** If `file_identity`
+  fails at add time (`queue_ops.rs:942`), the completed row is honored only
+  when `in_place || skip_already_converted` (`:729-739`). With the default
+  `skip_already_converted = false`, a kept source in that state is re-added and
+  re-converted on every scan, renumbering each time. The precondition is rare
+  (an unreadable mtime), the consequence is disk-filling, and the fix belongs
+  to the fingerprint layer rather than to this change. Documented, not built.
+
+The mainline case — fingerprinted row, source still present — does **not** loop,
+and gets a test that says so.
+
 ### Behavior delta
 
 - A new terminal state exists: both files on disk, job status `done` or
-  `skipped`, nothing disposed.
-- A new refusal exists: in-place + keep errors out without encoding.
+  `skipped`, `space_saved = 0`, nothing disposed.
+- In-place sources are no longer queued while keep is active, and switching to
+  keep drops already-queued in-place jobs.
 - Existing `trash` and `delete` rows behave identically to today.
 - The desktop UI gains one radio; the server UI gains a real choice where it
   previously had a sentence.
@@ -334,14 +435,28 @@ Rust, `convertbar-core`:
 - `normalize_cleanup_mode` table test: `keep`, `delete`, `trash`, `""`,
   `"KEEP"`, `"nonsense"`.
 - Keep, converted smaller: both files still exist after the job, the
-  `RecordingDisposer` recorded nothing, status `done`.
+  `RecordingDisposer` recorded nothing, status `done`, `space_saved` is 0.
 - Keep, converted larger: both files still exist, status `skipped`,
-  `space_saved` is the negative delta (pins that `decide_cleanup` was not
-  touched).
-- In-place + keep: the job is recorded as an error, the source is byte-identical
-  afterwards, no temp is left, and no HandBrake resolution is attempted — using
-  `PanickingLocator` so a regression that reaches the spawn fails loud.
+  `space_saved` is 0 — and `decide_cleanup`'s own unit test still pins the
+  negative delta, proving the zeroing happens at the write site and the
+  decision function stayed pure.
+- Add time: an in-place source under keep produces no job row and increments
+  the new skip counter; the same source under `delete` still queues.
+- Setting change: with an in-place job `queued`, writing `cleanup_mode=keep`
+  removes it, emits `queue-updated`, and leaves `ctx.db` unlocked afterwards
+  (the `try_lock` assertion `update_setting`'s existing deadlock test uses).
+- `in_place_action(KeptFile::Converted, "keep") == RemoveTemp` — a table row on
+  the release-mode backstop, so the safe arm cannot be dropped as "unreachable".
+- Watcher rescan under keep: a converted-and-kept source with a fingerprinted
+  `done` row is **not** re-added by a second `scan_all_enabled`. This is the
+  loop the whole design turns on; nothing else pins it.
 - `trash` and `delete` regression tests unchanged and still green.
+
+Fixture note: `get_handbrake_path` runs at `converter.rs:807`, *before* any
+per-job gate, so no converter test can assert "HandBrake was never resolved".
+These tests declare `StubLocator` (the installed world) per CLAUDE.md's locator
+contract; `PanickingLocator` there would panic at `:807` and surface as a
+`ctx.db` `PoisonError`, not as a useful failure.
 
 Rust, `convertbar-server`:
 
@@ -392,12 +507,17 @@ HTML5 drag works in a browser and there is no replacement worth building.
 
 ## Part 5 — Documentation
 
-- **README**: the new "keep" cleanup option, its in-place restriction, and the
-  picker's selection model (checkboxes, select-all, shift-range, jump-to-path).
-- **CLAUDE.md**: a short section on the three-mode cleanup contract and the
-  in-place refusal invariant — it belongs with the other destructive-path
-  invariants already documented there (emit-under-db-lock, HandBrake locator
-  fixtures).
+- **README**: the new "keep" cleanup option, its in-place restriction, the
+  picker's selection model (checkboxes, select-all, shift-range, jump-to-path),
+  and the "clearing history re-converts kept sources" caveat from Part 3.
+- **`unraid-template.xml:27-31`**: currently states "This server build always
+  deletes replaced files rather than moving them to a trash folder." Part 3
+  makes that false — it is the container's own destructive-behavior warning, so
+  it must say that deletion is now the *default*, not the only option.
+- **CLAUDE.md**: a short section on the three-mode cleanup contract, the
+  two-point in-place prevention, and the non-destructive `in_place_action` arm —
+  it belongs with the other destructive-path invariants already documented there
+  (emit-under-db-lock, HandBrake locator fixtures).
 
 ---
 
@@ -424,6 +544,12 @@ most attention available and nothing depends on unmerged work:
 - Replacing queue-item drag-reordering with buttons.
 - Any change to `bad_source_action` or to the purge flow.
 - Trash support on the server.
+- Lifting `useSettings` out of `HistoryPage` into `App` to collapse the
+  duplicate mount in `three-col` (see Part 1's mount cost). Worth doing, not
+  worth entangling with this change.
+- Re-ingestion protection for kept sources with a NULL identity fingerprint
+  (Part 3's second accepted consequence) — that belongs to the fingerprint
+  layer.
 
 ## Acceptance criteria
 
@@ -438,9 +564,13 @@ most attention available and nothing depends on unmerged work:
 4. Clicking the picker's backdrop does nothing.
 5. Selecting "Keep" and converting leaves both the source and the output on
    disk, with the job recorded as `done` (or `skipped` when the output is
-   larger).
-6. Selecting "Keep" with an empty output suffix produces a job error naming the
-   fix, with the source untouched and no encode attempted.
-7. A server restart does not rewrite a stored `keep` to `delete`.
-8. The web UI never invites a drag-and-drop that cannot work.
-9. `cargo test --workspace` and `npm test` are green; `npm run build` passes.
+   larger) and `space_saved` of 0 — "Total saved" never counts a file that was
+   not actually freed.
+6. Under "Keep", an empty-suffix source is never queued: adding it reports a
+   skip, switching to Keep drops it from the queue, and no error row is ever
+   written — so a watched folder cannot re-queue it on the next scan.
+7. A watched folder rescan does not re-convert a source that was kept by a
+   previous successful conversion.
+8. A server restart does not rewrite a stored `keep` to `delete`.
+9. The web UI never invites a drag-and-drop that cannot work.
+10. `cargo test --workspace` and `npm test` are green; `npm run build` passes.
