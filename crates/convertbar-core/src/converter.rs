@@ -3816,7 +3816,7 @@ HandBrake has exited.";
         let script = successful_fake_handbrake_script(dir.path());
         set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let src = dir.path().join("in.mp4");
-        std::fs::write(&src, b"0123456789").unwrap(); // 10 bytes; the fake encode writes 5
+        std::fs::write(&src, b"0123456789").unwrap(); // 10 bytes; the fake encode writes fewer
         let out = dir.path().join("out.mp4");
         queue_job(
             &ctx.db,
@@ -3866,7 +3866,7 @@ HandBrake has exited.";
         let script = successful_fake_handbrake_script(dir.path());
         set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
         let src = dir.path().join("in.mp4");
-        std::fs::write(&src, b"0").unwrap(); // 1 byte, so the 5-byte encode loses
+        std::fs::write(&src, b"0").unwrap(); // 1 byte, so the larger fake encode loses
         let out = dir.path().join("out.mp4");
         queue_job(
             &ctx.db,
@@ -3920,10 +3920,14 @@ HandBrake has exited.";
             "the original is gone, which is all 'done' promises"
         );
         assert!(!src.exists(), "fixture check: the disposer did delete it");
+        // Derived from the encode's real size, never a literal: the fake script writes
+        // "done\n" on Unix but "done\r\n" on Windows, so a hardcoded delta is a
+        // platform-dependent failure rather than a statement about the behavior.
+        let encoded = std::fs::metadata(&out).unwrap().len() as i64;
         assert_eq!(
             saved_of(&ctx.db, "j1"),
-            Some(5),
-            "10 - 5 bytes really freed"
+            Some(10 - encoded),
+            "space_saved must be the real delta between the 10-byte source and the encode"
         );
     }
 
