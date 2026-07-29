@@ -454,39 +454,85 @@ pub(crate) mod tests {
     /// exempting the file would have left this blind to a *second* endpoint in the very module
     /// where the divergence happened before.
     ///
-    /// The walk reads the directory rather than listing modules, so a route module added later
-    /// is covered without anyone remembering to add it here. It is a backstop, not a proof: it
-    /// reads source text, so an aliased import or a blocking helper living outside `src/routes`
-    /// would slip past it. Nothing outside `src/routes` spawns blocking work today.
+    /// The walk reads the tree rather than listing modules, so a route module added later is
+    /// covered without anyone remembering to add it here. It is a backstop, not a proof: it
+    /// reads source text, so an aliased import (`use ... as run_blocking`) or a blocking helper
+    /// living outside `src/routes` would slip past it. Nothing outside `src/routes` spawns
+    /// blocking work today.
     #[test]
     fn route_modules_never_map_their_own_blocking_failures() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
-        let mut checked = 0;
-        for entry in std::fs::read_dir(&dir).expect("route module directory must be readable") {
-            let path = entry.expect("readable dir entry").path();
-            // `mod.rs` is where both legitimately live: the helper, and the tests that pin it.
-            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("mod.rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).expect("route module must be readable");
-            let module = path.file_name().expect("named file").to_string_lossy();
-
-            assert!(
-                !source.contains("task panicked"),
-                "{module} builds the panic body itself; go through `join_err` so every join \
-                 failure keeps one definition"
-            );
-
-            // Matches the call `spawn_blocking(`, not prose: several modules legitimately
-            // mention `spawn_blocking` in their doc comments to say they do NOT use it.
-            assert!(
-                !source.contains("spawn_blocking("),
-                "{module} runs its own blocking task; call `blocking_json` (or \
-                 `blocking_response`, if the work builds its own Response) instead, so the \
-                 panic-vs-deliberate-failure distinction cannot be spelled a second way"
-            );
-            checked += 1;
+        // Comments are stripped before matching, so these checks read code rather than prose:
+        // several modules mention `spawn_blocking` in their docs precisely to say they do not
+        // call it. Stripping also means the bare identifier can be matched, which a turbofish
+        // (`spawn_blocking::<_>(`) would otherwise slip past.
+        fn code_only(source: &str) -> String {
+            source
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(i) => &line[..i],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         }
+
+        // Assembled rather than written out, so this test's own source does not read as a call
+        // site — `mod.rs`'s count below would otherwise include the needles searched for here.
+        let spawn = concat!("spawn_", "blocking");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
+        // Only THIS file is exempt, matched by full path rather than by name: `Path::ends_with`
+        // matches a trailing component, so a later `queue/mod.rs` would silently inherit an
+        // exemption meant for the file holding the helpers.
+        let helpers = root.join("mod.rs");
+
+        let mut checked = 0;
+        let mut pending = vec![root.clone()];
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir).expect("route module directory must be readable");
+            for entry in entries {
+                let path = entry.expect("readable dir entry").path();
+                // Splitting a grown module into a directory is a routine refactor; a
+                // non-recursive walk would drop it from coverage without saying a word.
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path == helpers {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("route module must be readable");
+                let source = code_only(&source);
+                let module = path.file_name().expect("named file").to_string_lossy();
+
+                assert!(
+                    !source.contains("task panicked"),
+                    "{module} builds the panic body itself; go through `join_err` so every join \
+                     failure keeps one definition"
+                );
+                assert!(
+                    !source.contains(spawn),
+                    "{module} runs its own blocking task; call `blocking_json` (or \
+                     `blocking_response`, if the work builds its own Response) instead, so the \
+                     panic-vs-deliberate-failure distinction cannot be spelled a second way"
+                );
+                checked += 1;
+            }
+        }
+
+        // `mod.rs` is exempt because the two helpers — and the test that panics a task on
+        // purpose — must spawn. Pin how many times, so a handler added to THIS file cannot
+        // quietly bring its own: `api_not_found` already lives here, so handler code in
+        // `mod.rs` is precedent rather than hypothesis.
+        let helper_source =
+            code_only(&std::fs::read_to_string(&helpers).expect("mod.rs must be readable"));
+        assert_eq!(
+            helper_source.matches(spawn).count(),
+            3,
+            "mod.rs should spawn in exactly three places (`blocking_json`, `blocking_response`, \
+             and the test that forces a real JoinError) — a fourth means something here maps a \
+             blocking failure without going through the two helpers"
+        );
+
         // Guards the walk itself: a walk that matched nothing would pass every assertion above
         // while checking no module at all.
         assert!(

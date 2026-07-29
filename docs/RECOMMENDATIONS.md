@@ -115,9 +115,11 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   handlers stopped spelling their failure arms, and the tripwire checks the class instead of
   the phrase: no route module may call `spawn_blocking(`, with no exemption. Exempting
   `fs.rs` (the tenth site, and the one that diverged) would have left the tripwire blind to a
-  second endpoint in that same module. It covers a route module added later, since it walks
-  `src/routes` rather than listing modules; it reads source text, so it is a backstop rather
-  than a proof.
+  second endpoint in that same module. It covers a route module added later — including one
+  added as a subdirectory, since the walk recurses and exempts `mod.rs` by full path rather
+  than by name — and `mod.rs`, which must be exempt because the helpers live there, has its
+  spawn count pinned instead. It reads source text, so it is a backstop, not a proof: an
+  aliased import, or a blocking helper living outside `src/routes`, would still slip past.
 - **Out of scope, recorded:** the desktop head has the same indistinguishability.
   `src-tauri/src/commands/*` map join failures with `.map_err(|e| e.to_string())?`, so the
   frontend receives a plain string with no channel to carry a discriminator. Fixing it there
