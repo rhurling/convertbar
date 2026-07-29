@@ -36,6 +36,7 @@ behavior changes in exactly one way: it gains the same new cleanup option.
 | Layout gating | Width-driven, not head-gated. The desktop window is fixed 400×500 and non-resizable, so it always resolves to `tabs` |
 | "Keep original" scope | Both heads. Core learns `cleanup_mode = "keep"`; desktop offers Trash/Delete/Keep, server offers Delete/Keep |
 | Keep + larger output | Nothing is ever removed, either direction. `decide_cleanup` still records `"skipped"` |
+| What Keep is for | An evaluation mode — verify the encodes, delete originals by hand, then switch to Trash/Delete. `space_saved` keeps its normal value: it is the optimization delta, not a claim about freed bytes |
 | Keep + in-place (empty suffix) | Prevented at add time and at setting-change time, so the job never exists; a non-destructive converter arm covers the race |
 | Unknown `cleanup_mode` value | Falls back to `"trash"` — preserves today's behavior and mirrors `normalize_bad_source_action` |
 | Whole-directory selection | One model: a checkbox per row (files and folders) plus a header "Select all" over the current listing |
@@ -58,6 +59,9 @@ behavior changes in exactly one way: it gains the same new cleanup option.
 - **"Keep" replaces in place anyway when the suffix is empty.** Jobs always
   complete, but a setting named "keep the original" would overwrite the
   original — the worst possible surprise on a destructive path.
+- **Zeroing `space_saved` under keep.** Rejected by the user, correctly: the
+  field is the optimization delta, not a bytes-freed claim, and it is the
+  number Keep exists to let you evaluate before deleting anything.
 - **Refusing an in-place job inside `process_queue` with an error row.** The
   first draft of this spec; it creates an unbounded watched-folder loop. See
   Part 3 for the full trace — it is the single biggest change the adversarial
@@ -318,15 +322,20 @@ would let a corrupt row silently change conversion outcomes.)
 removes nothing, in either `KeptFile` direction. `decide_cleanup` stays pure
 and untouched, so status is still `done`/`skipped` on the same size rule.
 
-**`space_saved` is zeroed under keep**, at the write site (`:1244`), not inside
-`decide_cleanup`. Nothing was freed: the source is still on disk. Leaving the
-delta in place would feed a false number into `get_history_summary`'s "Total
-saved" (`queue_ops.rs:1388-1397`, rendered at `HistoryPage.tsx:200`), the green
-"Saved" badge on each history row, and the per-file completion notification
-(`converter.rs:1297-1301`) — three places claiming disk space that was never
-recovered. The size delta remains derivable from the recorded `original_size`
-and `converted_size`. The completion notification gets a keep-mode wording that
-does not say "saved".
+**`space_saved` keeps its normal value under keep.** An earlier draft zeroed it
+on the grounds that nothing was freed. That misreads the field: it records how
+much the encode *optimized*, whether or not the original has been removed yet.
+`get_history_summary` (`queue_ops.rs:1388-1397`), the "Saved" badge, and the
+completion notification (`converter.rs:1297-1301`) all continue to work
+unchanged — which also means zero new code on this path.
+
+This follows from what Keep is **for**. It is an evaluation mode, not a steady
+state: run a batch, verify the encodes are actually good on this hardware,
+delete the originals by hand, then switch to Trash or Delete for normal
+operation. Under that lifecycle the delta is exactly the number the user is
+evaluating — "was this worth it?" — and zeroing it would blank the only
+column that answers the question. The Settings copy says so, so Keep does not
+read as a permanent "never clean up" setting.
 
 **In-place under keep is prevented, never refused.** The obvious design — let
 the job run and error out in `process_queue` — is wrong, and the reason is
@@ -385,7 +394,15 @@ presses purge, so "no delete" is already its default; the server keeps forcing
 **Settings UI** (`SettingsPage.tsx:231-260`). The "After conversion" group
 becomes three radios on desktop (Trash / Delete / Keep) and two on the server
 (Delete / Keep), replacing the server's current static "originals are deleted
-permanently" hint. The existing empty-suffix note (`:221-226`) already renders
+permanently" hint.
+
+Keep's label carries its lifecycle, so it does not read as "never clean up":
+
+> **Keep both files** — nothing is deleted. Use this to check the encodes are
+> good on this machine, remove the originals yourself, then switch to
+> Delete once you trust the results.
+
+The existing empty-suffix note (`:221-226`) already renders
 when the active preset's resolved suffix is blank; it extends with the
 keep-specific warning when `cleanup_mode === "keep"`, so the impossible
 combination is visible at the moment it is configured rather than at the moment
@@ -421,7 +438,7 @@ and gets a test that says so.
 ### Behavior delta
 
 - A new terminal state exists: both files on disk, job status `done` or
-  `skipped`, `space_saved = 0`, nothing disposed.
+  `skipped`, `space_saved` as usual, nothing disposed.
 - In-place sources are no longer queued while keep is active, and switching to
   keep drops already-queued in-place jobs.
 - Existing `trash` and `delete` rows behave identically to today.
@@ -435,11 +452,11 @@ Rust, `convertbar-core`:
 - `normalize_cleanup_mode` table test: `keep`, `delete`, `trash`, `""`,
   `"KEEP"`, `"nonsense"`.
 - Keep, converted smaller: both files still exist after the job, the
-  `RecordingDisposer` recorded nothing, status `done`, `space_saved` is 0.
+  `RecordingDisposer` recorded nothing, status `done`, `space_saved` is the
+  positive delta — identical to what `delete` records for the same sizes.
 - Keep, converted larger: both files still exist, status `skipped`,
-  `space_saved` is 0 — and `decide_cleanup`'s own unit test still pins the
-  negative delta, proving the zeroing happens at the write site and the
-  decision function stayed pure.
+  `space_saved` is the negative delta. Together these pin that keep changed
+  *only* the disposal, and that `decide_cleanup` stayed pure.
 - Add time: an in-place source under keep produces no job row and increments
   the new skip counter; the same source under `delete` still queues.
 - Setting change: with an in-place job `queued`, writing `cleanup_mode=keep`
@@ -507,7 +524,9 @@ HTML5 drag works in a browser and there is no replacement worth building.
 
 ## Part 5 — Documentation
 
-- **README**: the new "keep" cleanup option, its in-place restriction, the
+- **README**: the new "keep" cleanup option *and its intended lifecycle*
+  (evaluate → delete originals by hand → switch to Delete), its in-place
+  restriction, the
   picker's selection model (checkboxes, select-all, shift-range, jump-to-path),
   and the "clearing history re-converts kept sources" caveat from Part 3.
 - **`unraid-template.xml:27-31`**: currently states "This server build always
@@ -564,8 +583,8 @@ most attention available and nothing depends on unmerged work:
 4. Clicking the picker's backdrop does nothing.
 5. Selecting "Keep" and converting leaves both the source and the output on
    disk, with the job recorded as `done` (or `skipped` when the output is
-   larger) and `space_saved` of 0 — "Total saved" never counts a file that was
-   not actually freed.
+   larger) and the same `space_saved` any other mode would record — so History
+   answers "was this encode worth it?" before anything is deleted.
 6. Under "Keep", an empty-suffix source is never queued: adding it reports a
    skip, switching to Keep drops it from the queue, and no error row is ever
    written — so a watched folder cannot re-queue it on the next scan.
