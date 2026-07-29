@@ -74,6 +74,30 @@ pub fn boot(ctx: &Arc<Ctx>) {
     convertbar_core::watcher::start(ctx.clone());
 }
 
+/// The production serve wiring. Factored out so the real-listener test exercises
+/// THIS call rather than a copy of it: without `into_make_service_with_connect_info`
+/// there is no `ConnectInfo`, every request collapses into one shared throttle
+/// bucket, and no `oneshot`-based test can see it.
+///
+/// Takes the graceful-shutdown future as a parameter (rather than returning the
+/// `Serve` builder for the caller to chain `.with_graceful_shutdown()` onto)
+/// because naming `Serve`'s exact generic parameters against this axum version
+/// is awkward — the per-connection service type isn't `IntoMakeServiceWithConnectInfo`
+/// itself. Owning the chain here still runs it identically: `main.rs` passes the
+/// same shutdown-signal-then-kill-active-child future it always did.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+}
+
 /// Resolves on SIGTERM (unix) or Ctrl-C — the trigger axum's graceful shutdown awaits.
 /// Kept trivial by design: SIGTERM/Ctrl-C delivery isn't unit-tested here, it's covered by
 /// the Task 13/14 container smoke test (docker stop / ctrl-c against a running server).

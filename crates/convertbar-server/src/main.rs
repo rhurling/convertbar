@@ -4,6 +4,7 @@ mod embed;
 mod routes;
 mod sink;
 mod startup;
+mod throttle;
 
 use std::sync::Arc;
 
@@ -23,6 +24,21 @@ async fn main() {
         Err(ConfigError::MissingAuth) => {
             eprintln!(
                 "convertbar-server: set CONVERTBAR_AUTH_TOKEN or CONVERTBAR_NO_AUTH=1 (see docs)"
+            );
+            std::process::exit(1);
+        }
+        Err(ConfigError::WeakToken) => {
+            eprintln!(
+                "convertbar-server: CONVERTBAR_AUTH_TOKEN is too weak — it must be at least 16 \
+                 characters long and use at least 8 distinct characters.\n\
+                 Generate one with:  openssl rand -base64 24"
+            );
+            std::process::exit(1);
+        }
+        Err(ConfigError::BadTrustedProxy(entry)) => {
+            eprintln!(
+                "convertbar-server: invalid CONVERTBAR_TRUSTED_PROXIES entry: {entry} \
+                 (expected an IP address or CIDR range, e.g. 172.18.0.5 or 10.0.0.0/8)"
             );
             std::process::exit(1);
         }
@@ -68,23 +84,25 @@ async fn main() {
         config: Arc::new(config),
         events_tx,
         shutdown_rx,
+        login_throttle: Arc::new(throttle::LoginThrottle::new(
+            throttle::ThrottlePolicy::default(),
+        )),
     };
 
     let app = routes::app(state);
 
     let shutdown_ctx = ctx.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            startup::shutdown_signal().await;
-            // Kill the active child AT signal time (not after `serve` returns): this is
-            // what flips every SSE stream's shutdown watch (via the send below) after the
-            // child is already down, so the graceful drain doesn't wait on an in-flight
-            // encode as well as the open connections.
-            convertbar_core::converter::kill_active_child(&shutdown_ctx.converter);
-            let _ = shutdown_tx.send(true);
-        })
-        .await
-        .expect("server error");
+    startup::serve(listener, app, async move {
+        startup::shutdown_signal().await;
+        // Kill the active child AT signal time (not after `serve` returns): this is
+        // what flips every SSE stream's shutdown watch (via the send below) after the
+        // child is already down, so the graceful drain doesn't wait on an in-flight
+        // encode as well as the open connections.
+        convertbar_core::converter::kill_active_child(&shutdown_ctx.converter);
+        let _ = shutdown_tx.send(true);
+    })
+    .await
+    .expect("server error");
 
     // Belt: harmless even if the signal-time kill above already ran (kill_active_child is
     // idempotent — a no-op when no child is active, and a second kill()/wait() on an

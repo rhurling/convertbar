@@ -71,38 +71,29 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   in `src/App.css`, plus `:active` states on `.btn-icon` / `.btn-quit`
 - `cursor: pointer` applied consistently across interactive classes
 
+### 15. Server Head — Close the Login-Throttle Throughput Gap — *shipped, branch `feature/server-auth-throttling`*
+- The gap this closes: the original throttle evaluated the credential before
+  sleeping (`token_matches`, then `sleep`, then 401), so concurrent and
+  abandon-early guesses paid nothing — a tight loop reached ~18,000
+  guesses/sec against it. Fixed by gating the *comparison*, not the response:
+  `LoginThrottle::check` (`crates/convertbar-server/src/throttle.rs`) reserves
+  a source's evaluation slot — inside the one lock that reads it — before the
+  credential is compared. A denied source gets 401 with no comparison at all,
+  and nothing sleeps; every response is immediate.
+- Also shipped: the 16-character/8-distinct-character token strength floor
+  (`config.rs`) and `CONVERTBAR_TRUSTED_PROXIES` support for identifying real
+  clients behind a reverse proxy.
+- Policy (`ThrottlePolicy::default()`): 8 free evaluations per source, then
+  one evaluation per interval doubling 500ms → 30s cap, 15-minute forget
+  window, cleared immediately on a successful sign-in.
+- **Accepted trade-off:** while a source is gated, even the correct token is
+  refused — there is no exception for the legitimate owner. This is
+  deliberate (a mechanism that always honoured a correct token would still
+  answer every guess); the operator-facing guidance is to wait, not retry.
+
 ---
 
 ## Open — High Impact
-
-### 15. Server Head — Login Throttling and a Token-Entropy Floor
-**Why:** the server head (`crates/convertbar-server`, shipped in PR #130) authenticates with a
-single static token, and neither end of that is currently defended. `POST /api/login` accepts
-unlimited attempts at HTTP speed, and `ServerConfig::from_vars` accepts any non-empty
-`CONVERTBAR_AUTH_TOKEN` — `"1"` starts the server just as happily as a 32-byte random string.
-An authenticated session can browse the mounted filesystem, permanently delete files
-(`purge_bad_sources` under the server's forced-delete disposer), and point `handbrake_path` at
-an arbitrary binary that the next encode executes. The whole-branch review called this the
-weakest link in the auth posture; it is acceptable for a trusted LAN and not acceptable for
-anything wider.
-
-**What:**
-- Reject (or loudly warn at startup about) tokens below a minimum length/entropy — a hard floor
-  is friendlier than a warning nobody reads, but a warning avoids breaking existing deployments.
-- Rate-limit failed logins: a small fixed delay after a failure plus a per-IP failure counter is
-  enough; the threat is online guessing, not a distributed attack.
-- Consider a constant-time-safe generic failure response so throttling can't be used to
-  distinguish "wrong token" from "throttled".
-
-**How:** both live in the auth layer — `crates/convertbar-server/src/auth.rs` (the `login`
-handler and `token_matches`) and `crates/convertbar-server/src/config.rs` (the
-`AuthMode::Token` construction in `from_vars`). The middleware order and cookie handling do not
-need to change.
-
-**Files:** `crates/convertbar-server/src/auth.rs`, `crates/convertbar-server/src/config.rs`,
-`crates/convertbar-server/src/routes/login.rs`, README's Auth section.
-
----
 
 ### 3. Keyboard Shortcuts
 **Why:** Power users want to control the app without clicking.

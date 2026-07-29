@@ -41,6 +41,9 @@ pub struct ServerState {
     pub config: Arc<ServerConfig>,
     pub events_tx: broadcast::Sender<(String, Value)>,
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Per-source failed-credential ramp, shared by `auth_guard` and the login route
+    /// so failures at either accumulate together.
+    pub login_throttle: Arc<crate::throttle::LoginThrottle>,
 }
 
 /// Nests all `/api` routes; the caller (`main.rs`) adds the static/embed fallback.
@@ -198,6 +201,14 @@ pub(crate) mod tests {
             ),
             events_tx,
             shutdown_rx,
+            // Zero base delay so the existing suite does not sleep. Tests that
+            // exercise the ramp construct their own policy.
+            login_throttle: Arc::new(crate::throttle::LoginThrottle::new(
+                crate::throttle::ThrottlePolicy {
+                    base: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+            )),
         };
         (state, shutdown_tx)
     }
@@ -743,5 +754,89 @@ pub(crate) mod tests {
         let json: Value =
             serde_json::from_slice(&body).expect("api fallback must return a JSON body");
         assert_eq!(json["error"], "not found");
+    }
+
+    /// The one line `oneshot` cannot cover. Goes through `startup::serve` — the
+    /// SAME function `main.rs` calls — rather than a duplicated `axum::serve(...)`
+    /// call, so a regression that drops `into_make_service_with_connect_info` from
+    /// the production wiring is actually caught here instead of only in a copy of
+    /// it. Without that wiring there is no `ConnectInfo`, so `client_id` cannot
+    /// recognise 127.0.0.1 as a trusted proxy, never reads `X-Forwarded-For`, and
+    /// every client collapses into one shared bucket.
+    #[tokio::test]
+    async fn served_requests_are_bucketed_per_forwarded_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut state, _shutdown_tx) = test_state_with_shutdown();
+        // Same code path production uses for CONVERTBAR_TRUSTED_PROXIES, rather than
+        // duplicating IpNet parsing here (a bare "127.0.0.1" has no prefix to parse).
+        state.config = Arc::new(
+            ServerConfig::from_vars(
+                &[
+                    (
+                        "CONVERTBAR_AUTH_TOKEN".to_string(),
+                        "abcdefghijklmnop".to_string(),
+                    ),
+                    (
+                        "CONVERTBAR_TRUSTED_PROXIES".to_string(),
+                        "127.0.0.1".to_string(),
+                    ),
+                ]
+                .into(),
+            )
+            .expect("valid test config"),
+        );
+        // `free: 0` and a long base close the gate after one failure and keep it
+        // shut — the test asserts on status alone and needs no clock control.
+        state.login_throttle = Arc::new(crate::throttle::LoginThrottle::new(
+            crate::throttle::ThrottlePolicy {
+                free: 0,
+                base: std::time::Duration::from_secs(3600),
+                ..Default::default()
+            },
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            crate::startup::serve(listener, app(state), std::future::pending()).await
+        });
+
+        async fn request_from(addr: std::net::SocketAddr, forwarded: &str, token: &str) -> String {
+            let request = format!(
+                "GET /api/queue HTTP/1.1\r\nHost: localhost\r\n\
+                 Authorization: Bearer {token}\r\nX-Forwarded-For: {forwarded}\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        }
+
+        // Close the first forwarded client's gate with one wrong-credential attempt.
+        let response = request_from(addr, "203.0.113.1", "wrong").await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "unexpected: {response}"
+        );
+
+        // The gate is shut, so even the CORRECT token is refused for this source.
+        let response = request_from(addr, "203.0.113.1", "abcdefghijklmnop").await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "gate was open, so the same source's correct token was still evaluated: {response}"
+        );
+
+        // A DIFFERENT forwarded client is a separate bucket: its correct token is
+        // still evaluated and succeeds. Without connect info both collapse into
+        // the Unknown bucket and this would also be refused — the discrimination
+        // this test exists to prove.
+        let response = request_from(addr, "203.0.113.2", "abcdefghijklmnop").await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "second forwarded client inherited the first's shut gate: {response}"
+        );
     }
 }

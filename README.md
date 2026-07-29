@@ -133,13 +133,73 @@ caveats it also documents inline:
 | `CONVERTBAR_PORT` | `8080` | Port to listen on. |
 | `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; needed if you browse by hostname instead of IP (e.g. `nas.local`) or use a reverse proxy. |
 | `CONVERTBAR_BROWSE_ROOTS` | `/` | Colon-separated paths the web file browser may navigate. Restrict it to your media mount(s), e.g. `/media`. |
+| `CONVERTBAR_TRUSTED_PROXIES` | *(none)* | Comma-separated IPs or CIDR ranges whose `X-Forwarded-For` header is believed, so login throttling counts real client addresses instead of the proxy's. **Set this as narrowly as possible** — see [Auth](#auth). |
 
 ### Auth
 
 The server refuses to start unless `CONVERTBAR_AUTH_TOKEN` or
 `CONVERTBAR_NO_AUTH=1` is set — there is no unauthenticated-by-default mode.
-Always set a real token in the compose example; `CONVERTBAR_NO_AUTH=1` is only
-for a trusted LAN or a deployment where a reverse proxy already gates access.
+`CONVERTBAR_NO_AUTH=1` is only for a trusted LAN or a deployment where a reverse
+proxy already gates access.
+
+**Token requirements.** `CONVERTBAR_AUTH_TOKEN` must be at least 16 characters
+long and use at least 8 distinct characters; anything weaker is refused at
+startup rather than warned about. Generate one with:
+
+```sh
+openssl rand -base64 24
+```
+
+**Failed-attempt throttling.** Each source — identified at `/api/login`, via an
+`Authorization` header, or via the session cookie (used by `/api/events`,
+which can't send headers) — gets 8 free attempts. After that it may be
+evaluated only once per interval: 500 ms, then 1 s, 2 s, 4 s, and so on to a
+30-second ceiling. Every attempt outside that interval is refused with 401
+**without comparing the credential at all — even a correct token is refused
+while a source is gated.** That refusal is the rate limit working as intended,
+not a bug: if you're locked out, wait for the next interval, since retrying
+faster does not help. A successful sign-in clears the source immediately, and
+a source's history is forgotten 15 minutes after its first attempt. Nothing
+sleeps — every response, allowed or refused, is immediate.
+
+This bounds a single source; it does not stop an attacker spread across many
+source addresses, since each gets its own free allowance. **A randomly
+generated token is what actually protects the server** — the floor above
+permits a memorable passphrase like `Sommer2026!Berlin`, which is not
+comfortable at any guess rate.
+
+Rotating the token means changing the variable and restarting the container.
+Open browser tabs will be signed out and can usually log in again immediately —
+but each tab retries its stale cookie against the same ~4-request fan-out, so
+with 3 or more tabs open the retries alone (~12) can exceed the free allowance
+(8) and gate the source; if that happens, the first login attempt with the
+correct token is refused and needs a retry after a short wait. A script looping
+on an outdated token will quickly ramp itself into the same gating any attacker
+gets — refused outright, not merely slowed — which is working as intended and
+indistinguishable from one.
+
+**Behind a reverse proxy**, every request appears to come from the proxy, so all
+clients share one throttling ramp. Set `CONVERTBAR_TRUSTED_PROXIES` to the
+proxy's address to have `X-Forwarded-For` believed instead:
+
+```
+CONVERTBAR_TRUSTED_PROXIES=172.18.0.5
+```
+
+> Set it as narrowly as possible. Every address listed is trusted to assert who
+> it is, so a range that contains *clients* rather than only the proxy lets each
+> of them forge a fresh identity per request and skip throttling entirely —
+> worse than leaving it unset. Do not use a whole Docker bridge network
+> (`172.18.0.0/16`) or a LAN range; pin the proxy to a static address and list
+> that. This cannot help behind plain NAT, where there is no forwarded header.
+>
+> Without it, everyone behind the proxy shares one bucket, so one attacker's
+> guesses can gate — and, if sustained, keep gated — every legitimate user's
+> login on that address, not just slow their failed attempts. It also means a
+> legitimate user's successful request resets the *whole* shared bucket (a
+> successful login clears its own ramp outright), handing the attacker a fresh
+> 8-guess allowance each time someone else logs in — another reason to trust
+> only the proxy's exact address.
 
 ### Reverse proxy / HTTPS
 
