@@ -22,12 +22,79 @@ pub mod queue;
 pub mod settings;
 pub mod watch;
 
-/// Maps a core `Err(String)` to the `500 {"error": ...}` shape shared by every route.
+/// Maps a core `Err(String)` — a failure the server means, such as a missing HandBrakeCLI —
+/// to the `500 {"error": ...}` shape shared by every route. A `spawn_blocking` join failure is
+/// NOT one of these: it goes through [`join_err`], which adds the discriminator that tells the
+/// two apart.
 pub fn core_err(e: String) -> (axum::http::StatusCode, Json<Value>) {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": e })),
     )
+}
+
+/// Maps a `spawn_blocking` join failure — a panic in a blocking task, i.e. a bug in this
+/// server — to a 500 a client can tell apart from [`core_err`]'s deliberate failures.
+///
+/// Both shapes stay 500: both are genuinely "the server could not answer", and moving
+/// deliberate failures onto 4xx would be a far larger contract change than this distinction
+/// needs. The `kind` field is therefore the entire discriminator, and it appears on this shape
+/// only — `core_err` bodies carry `error` alone. Before it existed, the only way to tell a
+/// server bug from an expected condition was to pattern-match the message text
+/// (RECOMMENDATIONS item 16); this is the single definition, so a route cannot grow its own
+/// divergent copy.
+///
+/// The panic detail stays on the wire, as it was before: the API is auth-gated by default and
+/// the threat model is single-user LAN, so debuggability wins over withholding it.
+///
+/// A `JoinError` can in principle mean "cancelled" rather than "panicked". Nothing here aborts
+/// these handles — every one is awaited inline at its own call site — so in practice this is
+/// always a panic, and a runtime-shutdown cancellation would land in the same arm. Reporting
+/// both as `panic` is accepted: the client's conclusion (a server bug, not a condition to
+/// handle) is identical either way.
+pub fn join_err(e: tokio::task::JoinError) -> (axum::http::StatusCode, Json<Value>) {
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": format!("task panicked: {e}"), "kind": "panic" })),
+    )
+}
+
+/// Runs `f` on the blocking pool and maps its three outcomes to this API's three shapes:
+/// `Json` on success, [`core_err`] on a failure the server means, [`join_err`] on a panic.
+///
+/// Handlers call this instead of writing the `spawn_blocking` match out themselves, which is
+/// what makes item 16's fix enforceable rather than merely applied. When ten handlers each
+/// spelled their own join arm, nine agreed and the tenth quietly differed; a handler that
+/// cannot write the arm cannot disagree with it. A handler whose blocking work produces a
+/// ready `Response` rather than a `Result` uses [`blocking_response`] — between the two, no
+/// route module needs to spawn anything itself.
+pub async fn blocking_json<T, F>(f: F) -> axum::response::Response
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => core_err(e).into_response(),
+        Err(join) => join_err(join).into_response(),
+    }
+}
+
+/// [`blocking_json`]'s sibling for blocking work that builds its own `Response` — `fs::fs_list`
+/// chooses between 200/403/404/500 itself, so there is no `Result` for `blocking_json` to map.
+///
+/// It exists so that handler needs no exemption from the "never spawn your own" rule. It was
+/// the tenth site — the one that diverged and that a `core_err` grep missed — so leaving it as
+/// the one allowed exception would have left the tripwire blind to a second endpoint in exactly
+/// the module where the divergence happened before.
+pub async fn blocking_response<F>(f: F) -> axum::response::Response
+where
+    F: FnOnce() -> axum::response::Response + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(response) => response,
+        Err(join) => join_err(join).into_response(),
+    }
 }
 
 /// State threaded through every axum handler. `events_tx` is fed by `ServerSink` (the
@@ -259,6 +326,223 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn join_err_reports_the_panic_detail_alongside_the_discriminator() {
+        // A real `JoinError` from a real panicking blocking task — the same value every route's
+        // `Err(join)` arm receives. Constructing one instead of asserting on a hand-built body
+        // is what makes this a test of the mapping rather than of `json!`.
+        let handle: tokio::task::JoinHandle<()> = tokio::task::spawn_blocking(|| panic!("boom"));
+        let join = handle
+            .await
+            .expect_err("a panicking task joins as an error");
+
+        let (status, Json(body)) = join_err(join);
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        // Pinned as a literal on purpose, same tactic as `HANDBRAKE_NOT_FOUND`'s assertion:
+        // reading the discriminator back from the code that produces it would assert nothing,
+        // and this value is what a client branches on.
+        assert_eq!(body["kind"], "panic");
+        // The detail is deliberately still on the wire (auth-gated, single-user LAN): a client
+        // hitting the API directly keeps the same debuggability it had before the discriminator.
+        // The payload itself is asserted, not just the prefix — asserting the prefix alone let
+        // a mapping that dropped the payload entirely pass (verified by mutation).
+        let message = body["error"].as_str().expect("error must be a string");
+        assert!(
+            message.starts_with("task panicked: "),
+            "the panic detail must survive the mapping, got: {message}"
+        );
+        assert!(
+            message.contains("boom"),
+            "the panicking task's own message is the debuggable part, got: {message}"
+        );
+    }
+
+    /// `fs::fs_list`'s join arm, which no request can reach: `fs_list_blocking` is written not
+    /// to panic (it maps every io error itself), so there is no input that produces a real
+    /// `JoinError` through that route. Testing the arm where it actually lives is what
+    /// `blocking_response` bought — before it existed, this site was pinned only by grepping
+    /// the source for `join_err`.
+    #[tokio::test]
+    async fn blocking_response_reports_a_panic_with_the_same_discriminator() {
+        let response = blocking_response(|| panic!("boom")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let body: Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+        assert_eq!(body["kind"], "panic");
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error string")
+                .contains("boom"),
+            "the panic detail must survive here too, got: {body}"
+        );
+    }
+
+    /// RECOMMENDATIONS item 16: a `spawn_blocking` join failure is a server bug, and a client
+    /// must be able to tell it apart from an expected condition without pattern-matching the
+    /// message text. Both stay 500 — the status deliberately does not move, which is exactly
+    /// why the `kind` discriminator has to carry the distinction.
+    #[tokio::test]
+    async fn a_panicked_task_and_a_deliberate_failure_are_told_apart_by_kind() {
+        // `test_state()`'s PanickingLocator makes these routes panic INSIDE `spawn_blocking` —
+        // real join failures at real call sites, not simulated ones. Two different route
+        // modules (`handbrake.rs` and `queue.rs`), so the wiring is pinned at more than the one
+        // site a single-route test would reach. The panics' own messages hit stderr while this
+        // test runs; that noise is expected, not a failure.
+        let (panic_status, panic_body) = request_json(
+            api_router(test_state()),
+            "GET",
+            "/api/handbrake/detect",
+            None,
+        )
+        .await;
+        let (queue_panic_status, queue_panic_body) = request_json(
+            api_router(test_state()),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/tmp/clip.mp4"]})),
+        )
+        .await;
+
+        // The mirror world: a failure the server means. Same route and same request as the
+        // queue panic above — only the declared world differs — so the two bodies isolate the
+        // distinction itself rather than any difference between endpoints.
+        let (state, _tx) =
+            test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
+        let (core_status, core_body) = request_json(
+            api_router(state),
+            "POST",
+            "/api/queue/files",
+            Some(json!({"paths": ["/tmp/clip.mp4"]})),
+        )
+        .await;
+
+        // The premise: status alone cannot separate them. If this ever stops holding, the
+        // discriminator below is no longer the only thing carrying the distinction.
+        assert_eq!(panic_status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(queue_panic_status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(core_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        assert_eq!(
+            panic_body["kind"], "panic",
+            "a panicked task must say so: {panic_body}"
+        );
+        assert_eq!(
+            queue_panic_body["kind"], "panic",
+            "the queue module's join arm must map the same way: {queue_panic_body}"
+        );
+        assert!(
+            core_body.get("kind").is_none(),
+            "a deliberate failure must not claim to be a server bug: {core_body}"
+        );
+    }
+
+    /// Tripwire, in the spirit of `contract_test`'s `EXPECTED_ROUTE_COUNT`, pinning the thing
+    /// that makes item 16 stay fixed: a handler that cannot write the join arm cannot spell it
+    /// differently. Two invariants, both learned from how the tenth site came to differ.
+    ///
+    /// 1. No route module runs its own blocking task — `blocking_json`/`blocking_response` own
+    ///    that mapping. Without this, a new handler could map its join arm through `core_err`
+    ///    with fresh wording and silently reintroduce the indistinguishability, passing every
+    ///    other test here (verified: that exact mutation survived the suite before this
+    ///    assertion existed).
+    /// 2. No route module hand-builds the panic body, which is how `fs.rs` diverged.
+    ///
+    /// There is no exemption. `fs::fs_list` had the only blocking work that `blocking_json`
+    /// could not express, and it got `blocking_response` rather than an allowlist entry —
+    /// exempting the file would have left this blind to a *second* endpoint in the very module
+    /// where the divergence happened before.
+    ///
+    /// The walk reads the tree rather than listing modules, so a route module added later is
+    /// covered without anyone remembering to add it here. It is a backstop, not a proof: it
+    /// reads source text, so a blocking helper defined outside `src/routes` and merely called
+    /// from a handler would slip past it. An alias declared inside a route module would not —
+    /// its `use` line still names the identifier. Nothing outside `src/routes` spawns blocking
+    /// work today.
+    #[test]
+    fn route_modules_never_map_their_own_blocking_failures() {
+        // Comments are stripped before matching, so these checks read code rather than prose:
+        // several modules mention `spawn_blocking` in their docs precisely to say they do not
+        // call it. Stripping also means the bare identifier can be matched, which a turbofish
+        // (`spawn_blocking::<_>(`) would otherwise slip past.
+        fn code_only(source: &str) -> String {
+            source
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(i) => &line[..i],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        // Assembled rather than written out, so this test's own source does not read as a call
+        // site — `mod.rs`'s count below would otherwise include the needles searched for here.
+        let spawn = concat!("spawn_", "blocking");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
+        // Only THIS file is exempt, matched by full path rather than by name: `Path::ends_with`
+        // matches a trailing component, so a later `queue/mod.rs` would silently inherit an
+        // exemption meant for the file holding the helpers.
+        let helpers = root.join("mod.rs");
+
+        let mut checked = 0;
+        let mut pending = vec![root.clone()];
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir).expect("route module directory must be readable");
+            for entry in entries {
+                let path = entry.expect("readable dir entry").path();
+                // Splitting a grown module into a directory is a routine refactor; a
+                // non-recursive walk would drop it from coverage without saying a word.
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path == helpers {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("route module must be readable");
+                let source = code_only(&source);
+                let module = path.file_name().expect("named file").to_string_lossy();
+
+                assert!(
+                    !source.contains("task panicked"),
+                    "{module} builds the panic body itself; go through `join_err` so every join \
+                     failure keeps one definition"
+                );
+                assert!(
+                    !source.contains(spawn),
+                    "{module} runs its own blocking task; call `blocking_json` (or \
+                     `blocking_response`, if the work builds its own Response) instead, so the \
+                     panic-vs-deliberate-failure distinction cannot be spelled a second way"
+                );
+                checked += 1;
+            }
+        }
+
+        // `mod.rs` is exempt because the two helpers — and the test that panics a task on
+        // purpose — must spawn. Pin how many times, so a handler added to THIS file cannot
+        // quietly bring its own: `api_not_found` already lives here, so handler code in
+        // `mod.rs` is precedent rather than hypothesis.
+        let helper_source =
+            code_only(&std::fs::read_to_string(&helpers).expect("mod.rs must be readable"));
+        assert_eq!(
+            helper_source.matches(spawn).count(),
+            3,
+            "mod.rs should spawn in exactly three places (`blocking_json`, `blocking_response`, \
+             and the test that forces a real JoinError) — a fourth means something here maps a \
+             blocking failure without going through the two helpers"
+        );
+
+        // Guards the walk itself: a walk that matched nothing would pass every assertion above
+        // while checking no module at all.
+        assert!(
+            checked >= 8,
+            "expected to scan the route modules, only reached {checked} — did the walk break?"
+        );
+    }
+
+    #[tokio::test]
     async fn get_queue_when_empty_returns_an_empty_array() {
         let (status, json) =
             request_json(api_router(test_state()), "GET", "/api/queue", None).await;
@@ -271,8 +555,8 @@ pub(crate) mod tests {
         // `test_state()`'s PanickingLocator is the assertion: an empty add must return before it
         // reaches HandBrake resolution. Declaring an installed world here would hide a
         // regression — the route would resolve, succeed, and return this same body either way.
-        // A panic inside `spawn_blocking` surfaces as a 500 with `{"error": "task panicked:
-        // ..."}`, so the status assertion below catches it.
+        // A panic inside the blocking task surfaces as a 500 carrying `"kind": "panic"`, so the
+        // status assertion below catches it.
         let (status, json) = request_json(
             api_router(test_state()),
             "POST",
@@ -288,8 +572,9 @@ pub(crate) mod tests {
     async fn add_files_route_reports_the_error_when_handbrake_is_absent() {
         // The default suffix template needs HandBrake to expand. Absent, the route must return
         // the core error deliberately. Asserting the exact body (not just the status) is what
-        // separates that from an accidental 500: a panicking locator would unwind inside
-        // `spawn_blocking` and surface as `{"error": "task panicked: ..."}` with the same 500.
+        // separates that from an accidental 500: a panicking locator would unwind inside the
+        // blocking task and surface as `{"error": "task panicked: ...", "kind": "panic"}` with
+        // the same 500 — a difference this body assertion sees and a status check would not.
         let (state, _tx) =
             test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
         let (status, json) = request_json(
@@ -458,13 +743,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn purge_bad_sources_with_no_ids_returns_an_empty_array() {
-        // purge_bad_sources resolves HandBrake once up front even for an empty batch, so the
-        // world has to be declared; ids=[] then never consumes the answer, which is why either
-        // world would do and AbsentLocator (the CI world) is the honest one to name.
-        let (state, _tx) =
-            test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
+        // `test_state()`'s PanickingLocator is the assertion, as it is for the empty add above:
+        // an empty batch must return before it resolves HandBrake. This test used to declare
+        // AbsentLocator because the route resolved unconditionally — a world it named but never
+        // consumed, which is precisely the tell that the resolution was pointless.
         let (status, json) = request_json(
-            api_router(state),
+            api_router(test_state()),
             "POST",
             "/api/bad-sources/purge",
             Some(json!({"ids": []})),

@@ -91,6 +91,43 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   deliberate (a mechanism that always honoured a correct token would still
   answer every guess); the operator-facing guidance is to wait, not retry.
 
+### 16. Server — Panics No Longer Masquerade as Deliberate Errors — *shipped, branch `fix/server-error-taxonomy`*
+- The gap this closes: all ten `spawn_blocking` join-error sites returned a 500 with an
+  `{"error": ...}` body identical in shape to an ordinary core failure, so a client could not
+  tell a server bug from an expected condition such as a missing HandBrakeCLI — and tests could
+  separate them only by matching on the message text.
+- Fixed by `routes::join_err`: one definition, still 500, carrying a `"kind": "panic"`
+  discriminator that appears on that shape alone. Deliberate failures keep `core_err`'s bare
+  `{"error": ...}` body. The panic detail stays on the wire exactly as before — the API is
+  auth-gated by default and the threat model is single-user LAN, so debuggability wins.
+- **Why both stay 500:** each really is "the server could not answer". Moving deliberate
+  failures onto 4xx is the semantically cleaner design, but it is a far larger contract change
+  (all 39 routes, the frontend transport, every route test) and this item asked for a
+  distinction, not a re-taxonomy.
+- Nine sites went through `core_err`; the tenth (`fs.rs`) built the same body through that
+  module's local `json_err`, which is why grepping `core_err` found nine.
+- **Applied is not enforced.** The first cut left each handler writing its own
+  `spawn_blocking` match and guarded them with a tripwire matching the literal text
+  `task panicked` — so a handler mapping its join arm through `core_err` with *fresh wording*
+  reintroduced the gap with the whole suite green. That was confirmed by mutation, not assumed.
+  Two helpers now own the mapping — `blocking_json` for work returning a `Result`, and
+  `blocking_response` for `fs::fs_list`, which picks its own 200/403/404/500 — so all ten
+  handlers stopped spelling their failure arms, and the tripwire checks the class instead of
+  the phrase: no route module may name `spawn_blocking` in code at all — matched over
+  comment-stripped source, so an aliased spelling or a turbofish cannot slip past a literal
+  `spawn_blocking(` the way it once could — with no exemption. Exempting
+  `fs.rs` (the tenth site, and the one that diverged) would have left the tripwire blind to a
+  second endpoint in that same module. It covers a route module added later — including one
+  added as a subdirectory, since the walk recurses and exempts `mod.rs` by full path rather
+  than by name — and `mod.rs`, which must be exempt because the helpers live there, has its
+  spawn count pinned instead. It reads source text, so it is a backstop, not a proof: a
+  blocking helper defined outside `src/routes` and merely called from a handler would still
+  slip past it.
+- **Out of scope, recorded:** the desktop head has the same indistinguishability.
+  `src-tauri/src/commands/*` map join failures with `.map_err(|e| e.to_string())?`, so the
+  frontend receives a plain string with no channel to carry a discriminator. Fixing it there
+  means changing the commands' return type — its own change, with its own argument.
+
 ---
 
 ## Open — High Impact
@@ -187,17 +224,6 @@ event loop), and being Rust-invoked it needs **no** frontend `dialog` ACL grant.
 - Allow dragging files directly onto the menu bar icon to queue them
 - Requires modifying the Tauri tray event handler to accept drag-drop events
 - Note: Tauri v2 may not support this natively — would need a native macOS plugin
-
-### 16. Server: panics masquerade as deliberate errors
-- All ten `spawn_blocking` join-error sites in `crates/convertbar-server/src/routes/` return an
-  HTTP 500 with an `{"error": ...}` body — identical in shape to an ordinary core failure. Nine
-  go through `core_err` (`queue.rs:29,44,53,67,129`, `handbrake.rs:24,38,63,88`); the tenth,
-  `fs.rs:89`, goes through that module's local `json_err` with the same shape. Grepping for
-  `core_err` alone finds nine and misses one.
-- A client cannot distinguish a server bug from an expected condition such as a missing
-  HandBrakeCLI, and tests can only tell them apart by matching on the message text.
-- Consider a distinct status or body shape for join failures. Surfaced 2026-07-29 while giving
-  the HandBrake-missing error one definition (`handbrake::HANDBRAKE_NOT_FOUND`).
 
 ---
 

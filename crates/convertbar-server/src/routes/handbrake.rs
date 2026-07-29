@@ -1,12 +1,12 @@
 //! Handbrake probe/scan routes: `/api/handbrake/*`, preset-suffix generation, and suffix-template
 //! resolution. `detect_handbrake`/`list_handbrake_presets`/`validate_handbrake`/
-//! `generate_preset_suffix` all shell out (to HandBrakeCLI or `which`/`where`) and run inside
-//! `spawn_blocking`, mirroring the desktop's async commands
+//! `generate_preset_suffix` all shell out (to HandBrakeCLI or `which`/`where`) and so go through
+//! `blocking_json`, mirroring the desktop's async commands
 //! (`src-tauri/src/commands/handbrake.rs`). `resolve_suffix_template` is a pure string transform
 //! and runs inline.
 
 use axum::extract::{Path, State};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
 
@@ -14,34 +14,25 @@ use convertbar_core::handbrake as hb;
 use convertbar_core::handbrake::PresetMetadata;
 use convertbar_core::types::HandbrakeStatus;
 
-use super::{core_err, ServerState};
+use super::{blocking_json, ServerState};
 
 pub async fn detect_handbrake(State(s): State<ServerState>) -> Response {
     let ctx = s.ctx.clone();
-    match tokio::task::spawn_blocking(move || hb::resolve_handbrake_path(&ctx)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
-    }
+    blocking_json(move || hb::resolve_handbrake_path(&ctx)).await
 }
 
 pub async fn list_handbrake_presets(State(s): State<ServerState>) -> Response {
     let ctx = s.ctx.clone();
-    match tokio::task::spawn_blocking(move || {
+    blocking_json(move || {
         let path = hb::require_handbrake_path(&ctx)?;
         hb::list_presets(&path)
     })
     .await
-    {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
-    }
 }
 
 pub async fn validate_handbrake(State(s): State<ServerState>) -> Response {
     let ctx = s.ctx.clone();
-    match tokio::task::spawn_blocking(move || match hb::resolve_handbrake_path(&ctx)? {
+    blocking_json(move || match hb::resolve_handbrake_path(&ctx)? {
         Some(p) => {
             let version = hb::handbrake_version(&p).unwrap_or_default();
             Ok(HandbrakeStatus {
@@ -57,11 +48,6 @@ pub async fn validate_handbrake(State(s): State<ServerState>) -> Response {
         }),
     })
     .await
-    {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
-    }
 }
 
 pub async fn generate_preset_suffix(
@@ -69,7 +55,7 @@ pub async fn generate_preset_suffix(
     Path(preset): Path<String>,
 ) -> Response {
     let ctx = s.ctx.clone();
-    match tokio::task::spawn_blocking(move || {
+    blocking_json(move || {
         // Cache hit skips path resolution entirely (no DB lock, no `which`).
         {
             let cache = ctx.preset_cache.lock().map_err(|e| e.to_string())?;
@@ -82,11 +68,6 @@ pub async fn generate_preset_suffix(
         hb::cached_preset_metadata(&ctx, &handbrake_path, &preset)
     })
     .await
-    {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => core_err(e).into_response(),
-        Err(join) => core_err(format!("task panicked: {join}")).into_response(),
-    }
 }
 
 /// Resolve an output-suffix template against preset metadata. The settings preview calls this

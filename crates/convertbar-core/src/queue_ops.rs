@@ -1244,6 +1244,14 @@ pub fn get_bad_sources(ctx: &Ctx) -> Result<Vec<JobInfo>, String> {
 /// `purge_one_locked` additionally releases the DB mutex around each scan so a slow purge can't
 /// stall the converter thread too.
 pub fn purge_bad_sources(ctx: &Arc<Ctx>, ids: Vec<String>) -> Result<Vec<PurgeResult>, String> {
+    // An empty batch decides nothing: the settings read and the per-batch HandBrake path below
+    // exist only to be threaded into `purge_one_locked` once per id, and with no ids they reach
+    // nobody. Returning first skips two DB acquisitions and, under `PathLocator`, a `which`
+    // spawn — the same shape the empty-intake guard fixed in `add_files_inner`.
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let action: String = {
         let conn = ctx.db.lock().map_err(|e| e.to_string())?;
         conn.query_row(
@@ -2923,6 +2931,22 @@ mod tests {
             "purge_bad_sources must destroy through ctx.disposer, not some other hardcoded \
              primitive — a mutation swapping in DeleteDisposer (or a raw remove_file) still \
              deletes the file, but leaves the ctx-wired RecordingDisposer's record empty"
+        );
+    }
+
+    #[test]
+    fn purge_bad_sources_with_no_ids_never_reaches_handbrake_resolution() {
+        // The same tactic as `add_files_inner_with_no_paths_never_reaches_handbrake_resolution`,
+        // for the same shape: the `PanickingLocator` default IS the assertion. A batch of no
+        // ids threads the resolved path to nobody, so resolving it up front was work done for
+        // no one — a DB acquisition and, under `PathLocator`, a `which`/`where` spawn. Declaring
+        // a world here instead would hide a regression: either world returns this same empty
+        // result, which is exactly why the server-side test that covered this could not tell.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        let results = purge_bad_sources(&ctx, vec![]).expect("an empty purge cannot fail");
+        assert!(
+            results.is_empty(),
+            "nothing was offered, so nothing can be purged"
         );
     }
 
