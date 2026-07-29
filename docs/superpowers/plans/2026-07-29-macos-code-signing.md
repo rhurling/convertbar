@@ -246,7 +246,7 @@ Expected failures and their meanings:
 - `The provided entity includes an attribute with an invalid value` → the issuer UUID has a typo
 - `Unable to find file` → wrong path to the `.p8`
 
-- [ ] **Step 6: Encode the key and store all three secrets**
+- [x] **Step 6: Encode the key and store all three secrets**
 
 ```bash
 base64 -i ~/Downloads/AuthKey_<KEYID>.p8 | pbcopy
@@ -423,13 +423,19 @@ Also recorded from the same build: `codesign --verify --strict` reports *valid o
 
 - [ ] **Step 7: Clean up**
 
+**Confirm first that the `.p8` is in 1Password *and* that `APPLE_API_KEY_P8` is set in GitHub.** The private key is downloadable exactly once; if neither copy exists, deleting it means revoking the key and creating a replacement.
+
 ```bash
 rm -f /tmp/signtest /tmp/signtest.c /tmp/signtest.zip
+rm -rf /tmp/updchk
+rm -f ~/.convertbar-signing.env
 rm -f ~/private_keys/AuthKey_<KEYID>.p8
 rmdir ~/private_keys 2>/dev/null || true
 ```
 
-Delete the one file, not the directory — `~/private_keys` is one of the locations Apple tooling searches for App Store Connect keys by convention, so an `rm -rf` there could take out an unrelated key.
+Delete the one key file, not the directory — `~/private_keys` is one of the locations Apple tooling searches for App Store Connect keys by convention, so a recursive delete there could take out an unrelated key.
+
+The signing identity stays in the login keychain, so nothing local breaks. `/tmp/cbbuild.log` holds no secrets (paths and compile output only) and can stay or go.
 
 The `.p8` is in 1Password and in the `APPLE_API_KEY_P8` secret; nothing needs it on disk.
 
