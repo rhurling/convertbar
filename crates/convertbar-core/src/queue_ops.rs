@@ -100,6 +100,38 @@ fn get_handbrake_path(
         .ok_or_else(|| handbrake::HANDBRAKE_NOT_FOUND.to_string())
 }
 
+/// Deletes every `queued` job whose output path is its own source (an in-place re-encode),
+/// returning how many rows went. Called when `cleanup_mode` becomes `keep`, where such a
+/// job is impossible: there is no second file to keep.
+///
+/// Filtered in Rust rather than SQL because in-place-ness is a *normalized* path
+/// comparison (`converter::is_in_place` collapses `//` and `/./`), which a `WHERE
+/// source_path = output_path` would miss.
+pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
+    let rows: Vec<(String, String, String)> = match conn
+        .prepare("SELECT id, source_path, output_path FROM jobs WHERE status = 'queued'")
+    {
+        Ok(mut stmt) => match stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return 0,
+        },
+        Err(_) => return 0,
+    };
+
+    let mut dropped = 0;
+    for (id, source, output) in rows {
+        if crate::converter::is_in_place(&source, &output) {
+            if conn
+                .execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![id])
+                .is_ok()
+            {
+                dropped += 1;
+            }
+        }
+    }
+    dropped
+}
+
 /// Whether a row's verdict should be re-verified with a fresh scan before its file is
 /// destroyed.
 ///

@@ -1,6 +1,7 @@
 use rusqlite::params;
 
 use crate::ctx::Ctx;
+use crate::events::EventSinkExt;
 use crate::types::Settings;
 
 /// The output-filename suffix template applied to a preset the user has never
@@ -202,6 +203,19 @@ pub fn update_setting(ctx: &Ctx, key: &str, value: &str) -> Result<(), String> {
         crate::watcher::refresh_skip_marker(ctx);
     }
 
+    // Switching to keep makes any queued in-place job impossible (its output IS its
+    // source). Drop them here, at the moment the user makes the choice, so no such job
+    // can reach the converter and no error row is ever written.
+    if key == "cleanup_mode" && normalize_cleanup_mode(value) == "keep" {
+        let dropped = {
+            let conn = ctx.db.lock().map_err(|e| e.to_string())?;
+            crate::queue_ops::drop_queued_in_place_jobs(&conn)
+        }; // guard released before the emit below — see the comment above.
+        if dropped > 0 {
+            ctx.events.emit_t("queue-updated", ());
+        }
+    }
+
     Ok(())
 }
 
@@ -270,6 +284,89 @@ mod tests {
             ctx.db.try_lock().is_ok(),
             "a rejected write must still release the connection"
         );
+    }
+
+    #[test]
+    fn switching_to_keep_drops_queued_in_place_jobs() {
+        // Run on a worker thread with a bounded join, exactly like the sibling deadlock test
+        // above (`update_setting_hands_the_connection_back_before_the_hooks_run`). This hook
+        // re-locks ctx.db, so if the write scope's guard ever stops being dropped first, the
+        // failure mode is a SELF-DEADLOCK — an unbounded hang that would freeze the whole
+        // suite rather than fail. The timeout turns that into a legible failure.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (ctx, sink, _d) = test_ctx(test_conn());
+            {
+                let conn = ctx.db.lock().unwrap();
+                // One in-place job (source == output) and one normal job.
+                conn.execute(
+                    "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                     VALUES ('inplace', '/m/a.mp4', '/m/a.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                     VALUES ('normal', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'queued', 1, '2020-01-01T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
+            }
+
+            let result = update_setting(&ctx, "cleanup_mode", "keep");
+
+            let ids: Vec<String> = ctx
+                .db
+                .lock()
+                .unwrap()
+                .prepare("SELECT id FROM jobs ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let emits = sink.payloads("queue-updated").len();
+            let lock_free = ctx.db.try_lock().is_ok();
+            let _ = tx.send((result, ids, emits, lock_free));
+        });
+
+        let (result, ids, emits, lock_free) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("update_setting deadlocked against its own post-write hook");
+        result.unwrap();
+        assert_eq!(
+            ids,
+            vec!["normal".to_string()],
+            "only the in-place job is dropped"
+        );
+        // The Queue panel must learn about the removal.
+        assert_eq!(emits, 1);
+        assert!(
+            lock_free,
+            "a hook running after the write must not strand the connection"
+        );
+    }
+
+    #[test]
+    fn switching_to_delete_leaves_queued_in_place_jobs_alone() {
+        let (ctx, _sink, _d) = test_ctx(test_conn());
+        {
+            let conn = ctx.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('inplace', '/m/a.mp4', '/m/a.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        update_setting(&ctx, "cleanup_mode", "delete").unwrap();
+
+        let conn = ctx.db.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "in-place jobs are only impossible under keep");
     }
 
     #[test]
