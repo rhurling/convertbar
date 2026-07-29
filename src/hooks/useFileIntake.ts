@@ -3,6 +3,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { commands, type FolderScanResult, type AddResult } from "../lib/tauri";
 import { isServerHead } from "../lib/head";
 import { summarizeAdds } from "../lib/addSummary";
+import { errorText } from "../lib/errors";
 
 /** Folders with this many files or fewer are added without a confirm prompt. */
 const AUTO_ADD_MAX = 5;
@@ -76,7 +77,7 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
           // summarizeAdds returns string | null; a null status renders nothing.
           setStatusMsg(summarizeAdds([res]), true);
         } catch (e) {
-          setStatusMsg(`Error: ${e}`, true);
+          setStatusMsg(`Error: ${errorText(e)}`, true);
         }
       }
     } finally {
@@ -99,7 +100,7 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
       try {
         classified = await commands.classifyPaths(paths);
       } catch (e) {
-        setStatusMsg(`Error: ${e}`, true);
+        setStatusMsg(`Error: ${errorText(e)}`, true);
         return;
       }
       setStatusMsg(null); // clear the placeholder; tasks report via the scanner + summaries

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "../lib/events";
 import { commands, type UpdateMode, type UpdateState, type UpdateStatus } from "../lib/tauri";
 import { isServerHead } from "../lib/head";
+import { errorText } from "../lib/errors";
 
 // Statuses where the backend's `manual_check_block` (updater.rs) would refuse a fresh manual
 // check: an install is downloading, waiting for the queue to drain, or installed and awaiting
@@ -69,7 +70,7 @@ export function useUpdate() {
     try {
       await action();
     } catch (e) {
-      setActionError(String(e));
+      setActionError(errorText(e));
     }
   }, []);
 

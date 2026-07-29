@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { httpCommands } from "../lib/transport/http";
 import type { FsEntry } from "../lib/transport/types";
+import { errorText } from "../lib/errors";
 
 const FALLBACK_ROOT = "/";
 
@@ -51,7 +52,7 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       setPath(target);
       setSelected(new Set());
     } catch (e) {
-      setError(String(e));
+      setError(errorText(e));
     } finally {
       setLoading(false);
     }

@@ -55,8 +55,37 @@ pub fn core_err(e: String) -> (axum::http::StatusCode, Json<Value>) {
 pub fn join_err(e: tokio::task::JoinError) -> (axum::http::StatusCode, Json<Value>) {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": format!("task panicked: {e}"), "kind": "panic" })),
+        Json(json!({ "error": task_failure(e), "kind": "panic" })),
     )
+}
+
+/// What actually went wrong with the task, rather than the runtime's description of it.
+///
+/// `JoinError`'s own `Display` is `task 12 panicked with message "boom"`, where the number is a
+/// tokio task counter: the same crash reads differently on every run, so two clients reporting
+/// one bug produce two strings that do not group. Reaching past it to the payload also drops a
+/// second "panicked" from a message [`join_err`] already labels as a panic — and the cancelled
+/// arm avoids it for the same reason, rather than deferring to a `Display` that would put the id
+/// back and read as "task panicked: task 12 was cancelled".
+///
+/// Kept identical to the desktop head's copy (`src-tauri/src/commands/error.rs`) so a panic reads
+/// the same wherever the shared frontend is running. Nothing enforces that across the two crates
+/// — the wording is pinned by a test on each side.
+fn task_failure(join: tokio::task::JoinError) -> String {
+    match join.try_into_panic() {
+        // `panic!("literal")` yields a `&str`; anything formatted yields a `String`.
+        Ok(payload) => {
+            let detail = payload
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-string panic payload".to_string());
+            format!("task panicked: {detail}")
+        }
+        // Not a panic, so the task was cancelled. It still reports `kind: "panic"` — the
+        // client's conclusion (a server bug) is the same — but the message stays honest.
+        Err(_) => "task was cancelled".to_string(),
+    }
 }
 
 /// Runs `f` on the blocking pool and maps its three outcomes to this API's three shapes:
@@ -343,17 +372,51 @@ pub(crate) mod tests {
         assert_eq!(body["kind"], "panic");
         // The detail is deliberately still on the wire (auth-gated, single-user LAN): a client
         // hitting the API directly keeps the same debuggability it had before the discriminator.
-        // The payload itself is asserted, not just the prefix — asserting the prefix alone let
-        // a mapping that dropped the payload entirely pass (verified by mutation).
-        let message = body["error"].as_str().expect("error must be a string");
-        assert!(
-            message.starts_with("task panicked: "),
-            "the panic detail must survive the mapping, got: {message}"
-        );
-        assert!(
-            message.contains("boom"),
-            "the panicking task's own message is the debuggable part, got: {message}"
-        );
+        // Pinned whole rather than by prefix: asserting the prefix alone let a mapping that
+        // dropped the payload entirely pass (verified by mutation), and the whole-string form
+        // additionally pins that tokio's task id is NOT here — it is a per-run counter, so
+        // leaking it would give two clients two different strings for one bug.
+        //
+        // This exact value is also what the desktop head produces (`commands::error::blocking`),
+        // so the shared frontend renders a panic identically wherever it runs. Nothing across
+        // the two crates enforces that; it is pinned by this assertion and its desktop twin.
+        assert_eq!(body["error"], "task panicked: boom");
+    }
+
+    #[tokio::test]
+    async fn join_err_keeps_a_formatted_panic_message() {
+        // `panic!("{}", x)` boxes a String where `panic!("literal")` boxes a &str, and every
+        // other test here panics with a literal — so the String arm of `task_failure` was
+        // unexercised on this head even after the desktop twin pinned it.
+        //
+        // `black_box` is load-bearing: with a literal argument rustc flattens `format_args!` to
+        // one static piece, and the payload is a &str again — which is exactly how the desktop
+        // version of this test passed while testing nothing.
+        let reason = std::hint::black_box(String::from("something"));
+        let handle: tokio::task::JoinHandle<()> =
+            tokio::task::spawn_blocking(move || panic!("{reason} went wrong"));
+        let join = handle
+            .await
+            .expect_err("a panicking task joins as an error");
+
+        let (_, Json(body)) = join_err(join);
+        assert_eq!(body["error"], "task panicked: something went wrong");
+    }
+
+    #[tokio::test]
+    async fn join_err_does_not_call_a_cancelled_task_a_panic() {
+        // Unreachable in this server — every handle is awaited inline — but the arm exists, and
+        // deferring to `JoinError`'s Display there would ship "task panicked: task 12 was
+        // cancelled": self-contradictory, and carrying the per-run id the panic arm drops.
+        let handle = tokio::task::spawn(std::future::pending::<()>());
+        handle.abort();
+        let join = handle.await.expect_err("an aborted task joins as an error");
+
+        let (status, Json(body)) = join_err(join);
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "task was cancelled");
+        // Still a bug from the client's point of view, so the discriminator stays.
+        assert_eq!(body["kind"], "panic");
     }
 
     /// `fs::fs_list`'s join arm, which no request can reach: `fs_list_blocking` is written not
@@ -528,10 +591,11 @@ pub(crate) mod tests {
             code_only(&std::fs::read_to_string(&helpers).expect("mod.rs must be readable"));
         assert_eq!(
             helper_source.matches(spawn).count(),
-            3,
-            "mod.rs should spawn in exactly three places (`blocking_json`, `blocking_response`, \
-             and the test that forces a real JoinError) — a fourth means something here maps a \
-             blocking failure without going through the two helpers"
+            4,
+            "mod.rs should reach the blocking pool in exactly four places (`blocking_json`, \
+             `blocking_response`, and the two tests that panic a real task — one with a literal, \
+             one with a formatted String, because the payload arms differ) — a fifth means \
+             something here maps a blocking failure without going through the two helpers"
         );
 
         // Guards the walk itself: a walk that matched nothing would pass every assertion above

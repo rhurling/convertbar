@@ -36,12 +36,16 @@ function job(overrides: Partial<JobInfo> = {}): JobInfo {
 let canPause: boolean;
 let pauseAfter: boolean;
 let rejectCancel: boolean;
+// The rejected value, shaped as the desktop backend actually rejects: the serialized
+// `CommandError`, not an `Error`. A test may swap in the panic variant.
+let cancelFailure: unknown;
 
 beforeEach(() => {
   vi.clearAllMocks();
   canPause = true;
   pauseAfter = false;
   rejectCancel = false;
+  cancelFailure = { error: "no active process" };
   invokeMock.mockImplementation(((cmd: string) => {
     switch (cmd) {
       case "get_platform_capabilities":
@@ -50,7 +54,7 @@ beforeEach(() => {
         return Promise.resolve(pauseAfter);
       case "cancel_conversion":
         return rejectCancel
-          ? Promise.reject(new Error("no active process"))
+          ? Promise.reject(cancelFailure)
           : Promise.resolve(undefined);
       case "pause_conversion":
       case "resume_conversion":
@@ -85,7 +89,28 @@ describe("ActiveJob", () => {
     fireEvent.click(screen.getByText("Cancel"));
 
     await waitFor(() =>
-      expect(screen.getByText(/no active process/)).toBeInTheDocument(),
+      expect(screen.getByText("no active process")).toBeInTheDocument(),
+    );
+  });
+
+  it("tells the user a panicked command is a bug, not something they did", async () => {
+    // The only end-to-end check that the discriminator survives the whole trip: backend shape →
+    // transport → catch → rendered text. Without it, every guarantee in the chain is pinned only
+    // by a unit test of errorText, and a display site reverting to String(e) stays green while
+    // showing "[object Object]" to the user.
+    rejectCancel = true;
+    cancelFailure = { error: "task panicked: boom", kind: "panic" };
+    render(<ActiveJob job={job()} progress={null} />);
+    await waitFor(() =>
+      expect(screen.getByText("Cancel")).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByText("Cancel"));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Internal error (this is a bug): task panicked: boom"),
+      ).toBeInTheDocument(),
     );
   });
 });
