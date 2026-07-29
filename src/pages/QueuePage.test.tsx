@@ -1,4 +1,4 @@
-import { it, expect, vi, beforeEach } from "vitest";
+import { it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 
 // Per-test controllable queue state (reset in beforeEach).
@@ -10,7 +10,18 @@ let queueMock: {
 };
 
 vi.mock("../hooks/useQueue", () => ({ useQueue: () => queueMock }));
-vi.mock("../components/DropZone", () => ({ default: () => <div data-testid="dropzone" /> }));
+// Mirrors DropZone's own onPick branch closely enough to prove QueuePage wires it —
+// the real branch behavior is DropZone.test.tsx's job, not this file's.
+vi.mock("../components/DropZone", () => ({
+  default: ({ onPick }: { onPick?: () => void }) =>
+    onPick ? (
+      <button type="button" onClick={onPick}>
+        Add files or folders…
+      </button>
+    ) : (
+      <div data-testid="dropzone" />
+    ),
+}));
 vi.mock("../components/ActiveJob", () => ({ default: () => <div data-testid="active-job" /> }));
 vi.mock("../components/QueueItem", () => ({ default: () => <div data-testid="queue-item" /> }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -45,6 +56,22 @@ beforeEach(() => {
   vi.mocked(listen).mockImplementation(() => Promise.resolve(() => {}));
   queueMock = { activeJob: null, pendingJobs: [], progress: null, refresh: vi.fn() };
 });
+
+afterEach(() => {
+  // Only armed by the server-head test below (stubEnv/resetModules/stubGlobal) — a no-op
+  // otherwise.
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+});
+
+// The server head's ../lib/events opens a real EventSource at module load — jsdom has no such
+// global, so loading QueuePage (which listens for queue-paused-low-disk) under
+// VITE_HEAD=server throws ReferenceError without this stub. Same shape as events.test.ts's
+// MockEventSource, trimmed to what this file needs (no event is ever emitted here).
+class StubEventSource {
+  addEventListener() {}
+  removeEventListener() {}
+}
 
 it("suppresses the empty-state while an add is in progress", () => {
   render(
@@ -129,4 +156,25 @@ it("seeds the low-disk banner from backend state on mount, without the event fir
   };
   render(<QueuePage hbStatus={null} adding={null} isAdding={false} intake={intakeStub} />);
   expect(await screen.findByText(/free on the destination/i)).toBeInTheDocument();
+});
+
+it("has no separate intake button on the server head — the drop surface is the picker", async () => {
+  vi.stubEnv("VITE_HEAD", "server");
+  vi.stubGlobal("EventSource", StubEventSource);
+  vi.resetModules();
+  const { default: FreshQueuePage } = await import("./QueuePage");
+
+  render(
+    <FreshQueuePage
+      hbStatus={{ found: true, path: "/usr/bin/HandBrakeCLI", version: "1.9.0" }}
+      adding={null}
+      isAdding={false}
+      intake={intakeStub}
+    />,
+  );
+
+  expect(await screen.findByRole("button", { name: /Add files or folders/ })).toBeInTheDocument();
+  // The old standalone "Add files…" button is gone: two controls for one action was the
+  // thing this task removes.
+  expect(screen.queryByRole("button", { name: /^Add files…$/ })).not.toBeInTheDocument();
 });

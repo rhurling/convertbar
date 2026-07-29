@@ -164,6 +164,16 @@ body {
   font-size: 12px;
 }
 
+.drop-zone-pick {
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+}
+
 /* Active Job */
 .active-job {
   margin: 0 12px 8px;
@@ -1223,12 +1233,6 @@ select.setting-input {
 }
 
 /* File-browser modal (server head only) */
-.intake-actions {
-  display: flex;
-  justify-content: center;
-  margin: 0 12px 12px;
-}
-
 .modal-overlay {
   position: fixed;
   inset: 0;

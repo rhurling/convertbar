@@ -129,6 +129,13 @@ docker pull ghcr.io/rhurling/convertbar:latest
 See [`docker-compose.example.yml`](docker-compose.example.yml) for a ready-to-copy
 compose file.
 
+The web UI takes files through the picker, not by dragging them onto the page — a
+browser tab receives no OS drag-drop event. Click the intake panel on the Queue tab
+to browse. Inside the picker, every row has a checkbox (folders included, added
+recursively), the header selects everything in the current folder, shift-click selects
+a range, and the selection survives moving between folders. Reordering the queue by
+dragging still works.
+
 ### Unraid
 
 [`unraid-template.xml`](unraid-template.xml) is a container template for Unraid's
