@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { commands, type AppSettings, type PresetMetadata } from "../lib/tauri";
-import { errorText } from "../lib/errors";
+import { errorText, isPanic } from "../lib/errors";
 
 // `update_setting` is stringly-typed on the wire ("true"/"false" for booleans); the
 // optimistic merge must land booleans as real booleans so `checked={value === true}` works.
@@ -48,8 +48,14 @@ export function useSettings() {
         const p = await commands.listHandbrakePresets();
         setPresets(p);
         setPresetsError(null);
-      } catch {
-        setPresetsError("Could not load presets. Is HandBrakeCLI installed?");
+      } catch (e) {
+        // A panic here is a bug in ConvertBar, not a missing binary. Blaming the install would
+        // send the user after the wrong thing — which is precisely the confusion the
+        // discriminator exists to end, and this site swallowed the error entirely, so the fix
+        // reached it only once the swallow was opened up.
+        setPresetsError(
+          isPanic(e) ? errorText(e) : "Could not load presets. Is HandBrakeCLI installed?",
+        );
         setPresets([]);
       }
 

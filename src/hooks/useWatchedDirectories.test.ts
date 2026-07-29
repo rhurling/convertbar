@@ -119,12 +119,12 @@ describe("useWatchedDirectories", () => {
     });
   });
 
-  it("surfaces a backend error from add as a string", async () => {
+  it("surfaces a backend error from add", async () => {
     invokeMock.mockImplementation(((cmd: string) => {
       if (cmd === "get_watched_directories") return Promise.resolve([]);
       if (cmd === "pick_folder") return Promise.resolve("/dupe");
       if (cmd === "add_watched_directory")
-        return Promise.reject("This folder is already being watched");
+        return Promise.reject({ error: "This folder is already being watched" });
       return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
     }) as typeof invoke);
 

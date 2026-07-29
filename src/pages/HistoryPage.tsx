@@ -12,6 +12,7 @@ import {
 } from "../lib/tauri";
 import { resolveTargetPath } from "../lib/historyTarget";
 import { isServerHead } from "../lib/head";
+import { errorText, isPanic } from "../lib/errors";
 import HistoryItem from "../components/HistoryItem";
 import ContextMenu from "../components/ContextMenu";
 
@@ -159,7 +160,11 @@ export default function HistoryPage() {
       if (!mountedRef.current) return;
       setArmedIds(null);
       setPurging(false);
-      setPurgeOutcomeNote("Failed to process bad sources. Please try again.");
+      // "Please try again" is advice for a transient failure; a panic will not be fixed by
+      // retrying, so say what it is instead of inviting a loop.
+      setPurgeOutcomeNote(
+        isPanic(e) ? errorText(e) : "Failed to process bad sources. Please try again.",
+      );
     }
   };
 

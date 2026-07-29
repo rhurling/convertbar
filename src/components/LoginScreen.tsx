@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { httpCommands } from "../lib/transport/http";
+import { errorText } from "../lib/errors";
 
 // Rendered by App.tsx when a `convertbar:unauthorized` event fires (server head only).
 export default function LoginScreen() {
@@ -17,7 +18,10 @@ export default function LoginScreen() {
       // page's initial fetch run again against the now-cookied session.
       window.location.reload();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+      // Through the shared helper like every other display site: login has no blocking work
+      // today, so it cannot produce a panic — but keeping its own extraction here made
+      // errors.ts's "single place" claim false and left the trap armed for whoever adds one.
+      setError(errorText(err));
       setSubmitting(false);
     }
   };

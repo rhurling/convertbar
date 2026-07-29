@@ -55,8 +55,31 @@ pub fn core_err(e: String) -> (axum::http::StatusCode, Json<Value>) {
 pub fn join_err(e: tokio::task::JoinError) -> (axum::http::StatusCode, Json<Value>) {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": format!("task panicked: {e}"), "kind": "panic" })),
+        Json(json!({ "error": format!("task panicked: {}", panic_detail(e)), "kind": "panic" })),
     )
+}
+
+/// The message the task actually panicked with, rather than the runtime's description of it.
+///
+/// `JoinError`'s own `Display` is `task 12 panicked with message "boom"`, where the number is a
+/// tokio task counter: the same crash reads differently on every run, so two clients reporting
+/// one bug produce two strings that do not group. Reaching past it to the payload also drops a
+/// second "panicked" from a message [`join_err`] already labels as a panic.
+///
+/// Kept identical to the desktop head's copy (`src-tauri/src/commands/error.rs`) so a panic reads
+/// the same wherever the shared frontend is running. Nothing enforces that across the two crates
+/// — the wording is pinned by a test on each side.
+fn panic_detail(join: tokio::task::JoinError) -> String {
+    match join.try_into_panic() {
+        // `panic!("literal")` yields a `&str`; anything formatted yields a `String`.
+        Ok(payload) => payload
+            .downcast_ref::<&'static str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a non-string panic payload".to_string()),
+        // Not a panic, so the task was cancelled — see the note above.
+        Err(join) => join.to_string(),
+    }
 }
 
 /// Runs `f` on the blocking pool and maps its three outcomes to this API's three shapes:
@@ -343,17 +366,15 @@ pub(crate) mod tests {
         assert_eq!(body["kind"], "panic");
         // The detail is deliberately still on the wire (auth-gated, single-user LAN): a client
         // hitting the API directly keeps the same debuggability it had before the discriminator.
-        // The payload itself is asserted, not just the prefix — asserting the prefix alone let
-        // a mapping that dropped the payload entirely pass (verified by mutation).
-        let message = body["error"].as_str().expect("error must be a string");
-        assert!(
-            message.starts_with("task panicked: "),
-            "the panic detail must survive the mapping, got: {message}"
-        );
-        assert!(
-            message.contains("boom"),
-            "the panicking task's own message is the debuggable part, got: {message}"
-        );
+        // Pinned whole rather than by prefix: asserting the prefix alone let a mapping that
+        // dropped the payload entirely pass (verified by mutation), and the whole-string form
+        // additionally pins that tokio's task id is NOT here — it is a per-run counter, so
+        // leaking it would give two clients two different strings for one bug.
+        //
+        // This exact value is also what the desktop head produces (`commands::error::blocking`),
+        // so the shared frontend renders a panic identically wherever it runs. Nothing across
+        // the two crates enforces that; it is pinned by this assertion and its desktop twin.
+        assert_eq!(body["error"], "task panicked: boom");
     }
 
     /// `fs::fs_list`'s join arm, which no request can reach: `fs_list_blocking` is written not

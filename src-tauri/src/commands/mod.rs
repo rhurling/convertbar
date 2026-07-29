@@ -1,6 +1,8 @@
 //! The desktop head's IPC adapters. Every fallible `#[tauri::command]` in these modules fails
 //! with [`CommandError`] — the desktop twin of the server head's `{"error": …, "kind": …}` body.
 
+mod error;
+
 pub mod converter;
 pub mod files;
 pub mod handbrake;
@@ -9,136 +11,40 @@ pub mod settings;
 pub mod updater;
 pub mod watch;
 
-use serde::Serialize;
-
-/// The one shape a command failure takes on the way to the frontend.
-///
-/// `kind` is absent for a failure the backend means (HandBrakeCLI missing, an id that matches no
-/// row) and `"panic"` when the blocking task died. Without it both arrive as the same opaque
-/// string and the frontend cannot tell a bug in ConvertBar from a condition the user can act on —
-/// the desktop half of `docs/RECOMMENDATIONS.md` item 16, which fixed the HTTP head first because
-/// its JSON body already had room for the field and `Result<T, String>` here did not.
-///
-/// The field is absent rather than null on a deliberate failure, matching the server byte for
-/// byte, so one frontend helper reads both heads.
-///
-/// Build the panic variant only through [`blocking`]. A second hand-written copy is exactly how
-/// the wording diverges — nine of the server's ten sites agreed and the tenth quietly did not —
-/// so `command_modules_never_map_their_own_blocking_failures` holds that door shut.
-#[derive(Debug, Serialize)]
-pub struct CommandError {
-    error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kind: Option<&'static str>,
-}
-
-/// Lets a command body `?` straight through on a core `Result<_, String>`: every deliberate
-/// failure in this crate is already a `String`, and all of them mean the same thing here.
-impl From<String> for CommandError {
-    fn from(error: String) -> Self {
-        Self { error, kind: None }
-    }
-}
-
-/// Runs `f` on the blocking pool and gives its two failure modes different shapes: `f`'s own
-/// `Err` is a failure the backend means, a `JoinError` means `f` panicked and is a bug.
-///
-/// Commands call this instead of writing the `spawn_blocking` match out themselves, which is what
-/// makes the distinction enforceable rather than merely applied: a command that cannot write the
-/// join arm cannot disagree with it.
-///
-/// The panic detail stays in the message, as it did before this existed — the payload never
-/// leaves the machine on this head, so debuggability wins over withholding it.
-///
-/// A `JoinError` can in principle mean "cancelled" rather than "panicked". Nothing here aborts
-/// these handles — every one is awaited inline at its own call site — so in practice this is
-/// always a panic, and a runtime-shutdown cancellation would land in the same arm. Reporting both
-/// as `panic` is accepted: the frontend's conclusion (a bug, not a condition to handle) is the
-/// same either way.
-pub async fn blocking<T, F>(f: F) -> Result<T, CommandError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-{
-    match tauri::async_runtime::spawn_blocking(f).await {
-        Ok(result) => result.map_err(CommandError::from),
-        // Worded identically to the server head's `join_err`, so a panic reads the same on both.
-        Err(join) => Err(CommandError {
-            error: format!("task panicked: {join}"),
-            kind: Some("panic"),
-        }),
-    }
-}
+pub use error::{blocking, CommandError};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn a_deliberate_failure_and_a_panic_are_told_apart_by_kind() {
-        // Both go through the same helper, so this is the distinction as a command actually
-        // produces it — not two hand-built structs that happen to differ.
-        let deliberate = tauri::async_runtime::block_on(blocking(|| -> Result<(), String> {
-            Err("HandBrakeCLI not found".to_string())
-        }))
-        .expect_err("a failing task must fail");
-        let panicked =
-            tauri::async_runtime::block_on(blocking(|| -> Result<(), String> { panic!("boom") }))
-                .expect_err("a panicking task must fail");
-
-        let deliberate = serde_json::to_value(&deliberate).expect("serializable");
-        let panicked = serde_json::to_value(&panicked).expect("serializable");
-
-        // Absent, not null: the frontend's `kind === "panic"` test and the server's JSON body
-        // both depend on the field simply not being there for an ordinary failure.
-        assert_eq!(
-            deliberate,
-            serde_json::json!({ "error": "HandBrakeCLI not found" }),
-            "a failure the backend means must carry no discriminator at all"
-        );
-
-        assert_eq!(panicked["kind"], "panic");
-        let message = panicked["error"].as_str().expect("a message");
-        assert!(
-            message.starts_with("task panicked: "),
-            "the panic message shape is shared with the server head, got {message:?}"
-        );
-        // The detail is the whole reason the message survives the mapping; a bare
-        // "task panicked" would be honest about the kind and useless for fixing it.
-        assert!(
-            message.contains("boom"),
-            "the panic payload must reach the frontend, got {message:?}"
-        );
+    /// Comments are stripped before matching, so these checks read code rather than prose: a
+    /// module may well mention a banned name in its docs precisely to say it no longer calls it.
+    /// Stripping also means the bare identifier can be matched, which a turbofish
+    /// (`spawn_blocking::<_>(`) would otherwise slip past.
+    ///
+    /// It strips line comments only. A `/* */` block or a `//` inside a string literal is not
+    /// understood, which can produce a loud false positive (a block comment quoting a banned
+    /// name) or hide code that follows a string containing `//` on the same line. Both are
+    /// accepted: this is a backstop against drift, not a parser.
+    fn code_only(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    #[test]
-    fn command_modules_never_map_their_own_blocking_failures() {
-        // Comments are stripped before matching, so these checks read code rather than prose:
-        // a module may well mention `spawn_blocking` in its docs precisely to say it no longer
-        // calls it. Stripping also means the bare identifier can be matched, which a turbofish
-        // (`spawn_blocking::<_>(`) would otherwise slip past.
-        fn code_only(source: &str) -> String {
-            source
-                .lines()
-                .map(|line| match line.find("//") {
-                    Some(i) => &line[..i],
-                    None => line,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-
-        // Assembled rather than written out, so this test's own source does not read as a call
-        // site — `mod.rs`'s count below would otherwise include the needles searched for here.
-        let spawn = concat!("spawn_", "blocking");
+    /// Every command module, plus `mod.rs` itself — only `error.rs`, which owns the mapping, is
+    /// exempt. Matched by full path rather than by name: `Path::ends_with` matches a trailing
+    /// component, so a later `queue/error.rs` would silently inherit an exemption meant for the
+    /// file holding the helper.
+    fn command_modules() -> (Vec<(String, String)>, std::path::PathBuf) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
-        // Only THIS file is exempt, matched by full path rather than by name: `Path::ends_with`
-        // matches a trailing component, so a later `queue/mod.rs` would silently inherit an
-        // exemption meant for the file holding the helper.
-        let helpers = root.join("mod.rs");
+        let helpers = root.join("error.rs");
 
-        let mut checked = 0;
-        let mut pending = vec![root.clone()];
+        let mut modules = Vec::new();
+        let mut pending = vec![root];
         while let Some(dir) = pending.pop() {
             let entries =
                 std::fs::read_dir(&dir).expect("command module directory must be readable");
@@ -155,39 +61,113 @@ mod tests {
                 }
                 let source =
                     std::fs::read_to_string(&path).expect("command module must be readable");
-                let source = code_only(&source);
-                let module = path.file_name().expect("named file").to_string_lossy();
+                let name = path
+                    .file_name()
+                    .expect("named file")
+                    .to_string_lossy()
+                    .into_owned();
+                modules.push((name, code_only(&source)));
+            }
+        }
+        (modules, helpers)
+    }
 
+    #[test]
+    fn command_modules_never_map_their_own_blocking_failures() {
+        // Assembled rather than written out — and named so that neither the needles nor these
+        // bindings read as a call site, because this file is scanned like any other module.
+        let pool_needle = concat!("spawn_", "blocking");
+        let panic_needle = concat!("task ", "panicked");
+        // Both other ways to get work off this thread, and neither reaches `blocking`: a join
+        // failure from either would be mapped by hand and land as an ordinary failure again.
+        let async_needle = concat!("async_runtime::", "spawn");
+        let thread_needle = concat!("thread::", "spawn");
+
+        let (modules, helpers) = command_modules();
+        for (module, source) in &modules {
+            assert!(
+                !source.contains(panic_needle),
+                "{module} builds the panic message itself; go through `blocking` so every join \
+                 failure keeps one definition"
+            );
+            for banned in [pool_needle, async_needle, thread_needle] {
                 assert!(
-                    !source.contains("task panicked"),
-                    "{module} builds the panic message itself; go through `blocking` so every \
-                     join failure keeps one definition"
-                );
-                assert!(
-                    !source.contains(spawn),
-                    "{module} runs its own blocking task; call `blocking` instead, so the \
+                    !source.contains(banned),
+                    "{module} runs its own task via `{banned}`; call `blocking` instead, so the \
                      panic-vs-deliberate-failure distinction cannot be spelled a second way"
+                );
+            }
+            // A new command cannot opt back out of the shared shape. Without this, declaring
+            // `-> Result<(), String>` compiles, registers, and reinstates exactly the gap this
+            // module closed — for that one command, silently.
+            assert!(
+                !source.contains(concat!(", String", "> {")),
+                "{module} has a command failing with a bare String; fail with `CommandError` so \
+                 the frontend can still tell a bug from a condition"
+            );
+        }
+
+        // `error.rs` is exempt because the helper itself must spawn. Pin how many times, so a
+        // command added to THAT file cannot quietly bring its own join arm.
+        let helper_source =
+            code_only(&std::fs::read_to_string(&helpers).expect("error.rs must be readable"));
+        assert_eq!(
+            helper_source.matches(pool_needle).count(),
+            1,
+            "error.rs should spawn in exactly one place (`blocking`) — a second means something \
+             there maps a blocking failure without going through the helper"
+        );
+
+        // Guards the walk itself: a walk that matched nothing would pass every assertion above
+        // while checking no module at all. Kept well below the current count so that merging or
+        // deleting a module is not reported as a broken walk.
+        assert!(
+            modules.len() >= 4,
+            "expected to scan the command modules, only reached {} — did the walk break?",
+            modules.len()
+        );
+    }
+
+    #[test]
+    fn every_async_command_hands_its_work_to_the_blocking_helper() {
+        // The tripwire above bans the *wrong* spellings; this one requires the right one.
+        // Without it, a command can drop `blocking` for a direct synchronous call — which
+        // compiles, names no banned identifier, and costs two things at once: the panic
+        // taxonomy, and the off-main-thread guarantee that the probe-hazard fix bought at four
+        // entry points (a deep folder scan would freeze the UI again).
+        //
+        // These three are async for a reason other than blocking work, so they are named here
+        // rather than silently tolerated: `pick_folder` must stay async because
+        // `blocking_pick_folder` dispatches to the main thread and would deadlock it, and the two
+        // updater commands await genuinely async work.
+        const NOT_BLOCKING_WORK: [&str; 3] = ["pick_folder", "check_for_update", "install_update"];
+
+        let (modules, _) = command_modules();
+        let mut checked = 0;
+        for (module, source) in &modules {
+            for chunk in source.split("pub async fn ").skip(1) {
+                let name = chunk
+                    .split(|c: char| c == '(' || c == '<')
+                    .next()
+                    .expect("a command name")
+                    .trim();
+                if NOT_BLOCKING_WORK.contains(&name) {
+                    continue;
+                }
+                // Stop at the next item so a later command's call cannot vouch for this one.
+                let body = chunk.split("\n#[").next().unwrap_or(chunk);
+                assert!(
+                    body.contains("blocking("),
+                    "{module}::{name} is async but never reaches `blocking`; either hand its \
+                     work to the helper or add it to NOT_BLOCKING_WORK with a reason"
                 );
                 checked += 1;
             }
         }
 
-        // `mod.rs` is exempt because the helper itself must spawn. Pin how many times, so a
-        // command added to THIS file cannot quietly bring its own join arm.
-        let helper_source =
-            code_only(&std::fs::read_to_string(&helpers).expect("mod.rs must be readable"));
-        assert_eq!(
-            helper_source.matches(spawn).count(),
-            1,
-            "mod.rs should spawn in exactly one place (`blocking`) — a second means something \
-             here maps a blocking failure without going through the helper"
-        );
-
-        // Guards the walk itself: a walk that matched nothing would pass every assertion above
-        // while checking no module at all.
         assert!(
-            checked >= 7,
-            "expected to scan the command modules, only reached {checked} — did the walk break?"
+            checked >= 8,
+            "expected to scan the async commands, only reached {checked} — did the split break?"
         );
     }
 }

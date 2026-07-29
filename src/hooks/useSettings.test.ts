@@ -60,7 +60,7 @@ beforeEach(() => {
         return Promise.resolve(makeSettings(currentPreset));
       case "list_handbrake_presets":
         return presetsShouldThrow
-          ? Promise.reject(new Error("no cli"))
+          ? Promise.reject({ error: "no cli" })
           : Promise.resolve(presetList);
       case "get_preset_suffix":
         // Backend supplies the default template when a preset has no stored row,
@@ -156,7 +156,7 @@ describe("useSettings", () => {
 
     invokeMock.mockImplementationOnce(((cmd: string) =>
       cmd === "update_setting"
-        ? Promise.reject(new Error("db locked"))
+        ? Promise.reject({ error: "db locked" })
         : Promise.reject(new Error(`unexpected: ${cmd}`))) as typeof invoke);
 
     await act(async () => {
@@ -260,7 +260,7 @@ describe("useSettings", () => {
     // The next write fails.
     invokeMock.mockImplementationOnce(((cmd: string) =>
       cmd === "update_setting"
-        ? Promise.reject(new Error("db locked"))
+        ? Promise.reject({ error: "db locked" })
         : Promise.reject(new Error(`unexpected: ${cmd}`))) as typeof invoke);
 
     await act(async () => {
@@ -286,7 +286,7 @@ describe("useSettings", () => {
 
     invokeMock.mockImplementationOnce(((cmd: string) =>
       cmd === "set_preset_suffix"
-        ? Promise.reject(new Error("db locked"))
+        ? Promise.reject({ error: "db locked" })
         : Promise.reject(new Error(`unexpected: ${cmd}`))) as typeof invoke);
 
     await act(async () => {

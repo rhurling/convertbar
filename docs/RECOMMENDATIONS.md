@@ -133,29 +133,53 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     the two heads match byte for byte and one frontend helper reads both.
   - The nine join arms collapse into one `commands::blocking` helper, and a tripwire mirroring
     the server's walks `src/commands` recursively over comment-stripped source. Same reasoning as
-    above: applied is not enforced.
-  - **The frontend was the other half.** Every display site spelled `String(e)`, which is correct
-    only while the backend fails with a bare string — the moment it gained a field, the whole UI
-    would have rendered `[object Object]` for *ordinary* errors, not just panics. `errorText()`
-    (`src/lib/errors.ts`) reads the failure body from either head and prefixes a panic as an
-    internal error, so a Rust panic string is not read as something the user misconfigured. The
-    HTTP transport now hangs `kind` off the `Error` it throws; without that it would have dropped
-    the very distinction the route helpers exist to make, and the same UI code would have labelled
-    a bug on desktop but not on the server.
-  - **Accepted cosmetic cost:** the rendered text is
-    `Internal error (this is a bug): task panicked: task 12 panicked with message "…"` — the word
-    appears three times because the frontend prefix, the shared backend wording, and tokio's own
-    `JoinError` display each contribute one. Shortening it would mean either stripping a
-    backend-owned prefix in the frontend (a new cross-language coupling) or letting the two heads
-    word a panic differently. Neither is worth it for a string only a bug produces.
-- **Still open, and genuinely out of scope:** only a panic *inside a `blocking` closure* becomes
-  a `JoinError`, so only those nine commands can produce `kind: "panic"`. A panic in a sync
-  command body, or in an async command's own body outside the closure, never reaches this mapping
-  — Tauri has no `catch_unwind` on the desktop command path (verified against `tauri` 2.11.5 and
-  `tauri-macros` 2.6.3; the only one is in `mobile.rs`), so it unwinds past the IPC handler
-  instead of arriving as an `Err`. Closing that gap means catching unwinds at the command
-  boundary, a different mechanism from this item and one with its own argument about whether a
-  panicked process should keep serving at all.
+    above: applied is not enforced. It lives in `commands::error` rather than `commands` **because
+    Rust privacy reaches descendants**: with the fields declared one module up, `commands::queue`
+    could write `CommandError { kind: Some("panic") }` by hand — mislabelling in either direction
+    — and a tripwire that greps for call sites would never see a struct literal. As a sibling, it
+    cannot. The tripwire also bans `async_runtime::spawn` and `thread::spawn` (both reach a join
+    arm without reaching `blocking`) and a command declared `-> Result<_, String>` (which would
+    otherwise silently opt one command back out of the shared shape), and a second test requires
+    every async command to actually reach `blocking` — dropping it for a direct call costs the
+    taxonomy *and* the off-main-thread guarantee the probe-hazard fix bought at four entry points.
+  - **The frontend was the other half.** Every display site spelled `String(e)` (or `${e}`), which
+    is correct only while the backend fails with a bare string — the moment it gained a field, the
+    whole UI would have rendered `[object Object]` for *ordinary* errors, not just panics.
+    `errorText()` (`src/lib/errors.ts`) reads the failure body from either head and prefixes a
+    panic as an internal error, so a Rust panic string is not read as something the user
+    misconfigured. The HTTP transport now hangs `kind` off the `Error` it throws; without that it
+    would have dropped the very distinction the route helpers exist to make, and the same UI code
+    would have labelled a bug on desktop but not on the server.
+  - **The sweep needed enforcing too, and needed to be behavioural rather than textual.** Three
+    sites did not spell `String(e)` at all — they discarded the error and showed fixed copy. The
+    worst reproduced this item's own bug verbatim: a panic inside `list_handbrake_presets`
+    rendered "Could not load presets. Is HandBrakeCLI installed?", sending the user after a
+    missing binary to explain a crash. Those now branch on `isPanic`. A frontend tripwire
+    (`no_display_site_stringifies_a_caught_error`) bans the old spellings outright, and one
+    component test renders a panic end to end — before it, the entire frontend half was pinned
+    only by unit tests of `errorText`, so any display site could revert with the suite green.
+- **Still open, and genuinely out of scope.** Only a panic *inside a `blocking` closure* becomes a
+  `JoinError`, so only those nine commands can produce `kind: "panic"`. Three gaps remain, and
+  none is a regression — each was equally true before this item:
+  - **A panic elsewhere in a command never reaches the mapping.** Tauri has no `catch_unwind` on
+    the desktop command path (verified against `tauri` 2.11.5 and `tauri-macros` 2.6.3; the only
+    one is in `mobile.rs`). A *sync* command's panic unwinds past the IPC handler; an *async*
+    command's panic is caught by tokio at the task boundary and the invoke promise simply never
+    settles — a silent hang rather than an error. Closing this means catching unwinds at the
+    command boundary, with its own argument about whether a panicked process should keep serving.
+  - **A panic's aftermath still reads as deliberate.** The likeliest real panic is on the spawned
+    queue thread, which poisons `ctx.db` (see CLAUDE.md). Every later command then fails at
+    `ctx.db.lock().map_err(|e| e.to_string())?`, and `From<String>` stamps that `PoisonError` with
+    no discriminator. So the panic itself is labelled and its permanent consequence is not.
+    Fixing it needs a typed error out of core, not a shape at the command boundary.
+  - **Some failures never become a command error at all** — `job-error` events carry a bare
+    string, and a panic in a background updater task produces no `Err`. Those are invisible rather
+    than mislabelled, which is a different problem from the one this item closes.
+- **Premise this rests on, not independently verified:** that Tauri rejects the JS promise with
+  the *deserialized* `CommandError` object. The Rust side pins what is serialized and the frontend
+  side pins what it does with that object, but nothing executes the real IPC boundary, so both
+  suites would stay green if the premise were wrong. It matches Tauri 2's documented
+  `Result<T, E: Serialize>` behaviour; confirming it needs the desktop smoke test.
 
 ---
 

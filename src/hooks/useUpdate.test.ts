@@ -88,9 +88,9 @@ describe("useUpdate", () => {
     // check_for_update deliberately rejects with a user-facing message (e.g. a manual check
     // refused while an install is pending). The hook must catch it and expose the message,
     // not let the promise reject out from under a button's onClick.
-    vi.spyOn(commands, "checkForUpdate").mockRejectedValue(
-      "an update is already waiting to install",
-    );
+    vi.spyOn(commands, "checkForUpdate").mockRejectedValue({
+      error: "an update is already waiting to install",
+    });
     const { result } = renderHook(() => useUpdate());
     await waitFor(() => expect(result.current.state).not.toBeNull());
 
@@ -102,7 +102,7 @@ describe("useUpdate", () => {
   });
 
   it("clears a previous actionError when a new action is attempted", async () => {
-    vi.spyOn(commands, "checkForUpdate").mockRejectedValueOnce("boom");
+    vi.spyOn(commands, "checkForUpdate").mockRejectedValueOnce({ error: "boom" });
     const { result } = renderHook(() => useUpdate());
     await waitFor(() => expect(result.current.state).not.toBeNull());
 
@@ -122,7 +122,7 @@ describe("useUpdate", () => {
     // current state, so no push is entitled to remove it — checked here across a progression of
     // statuses, ending at "available", the exact one from the original bug this guarded.
     const message = "an update is already waiting to install once the queue is idle";
-    vi.spyOn(commands, "checkForUpdate").mockRejectedValue(message);
+    vi.spyOn(commands, "checkForUpdate").mockRejectedValue({ error: message });
     const { result } = renderHook(() => useUpdate());
     await waitFor(() => expect(result.current.state).not.toBeNull());
 
@@ -161,9 +161,9 @@ describe("useUpdate", () => {
       status: "available",
       available: { version: "1.1.0", date: null, notes: null },
     });
-    vi.spyOn(commands, "installUpdate").mockRejectedValue(
-      "an update operation is already running",
-    );
+    vi.spyOn(commands, "installUpdate").mockRejectedValue({
+      error: "an update operation is already running",
+    });
     const { result } = renderHook(() => useUpdate());
     await waitFor(() => expect(result.current.state?.status).toBe("available"));
 
@@ -186,7 +186,7 @@ describe("useUpdate", () => {
       status: "available",
       available: { version: "1.1.0", date: null, notes: null },
     });
-    vi.spyOn(commands, "skipUpdateVersion").mockRejectedValue("app state unavailable");
+    vi.spyOn(commands, "skipUpdateVersion").mockRejectedValue({ error: "app state unavailable" });
     const { result } = renderHook(() => useUpdate());
     await waitFor(() => expect(result.current.state?.status).toBe("available"));
 
@@ -203,7 +203,7 @@ describe("useUpdate", () => {
   it("clears actionError when the user dismisses it", async () => {
     // The only two ways actionError is meant to go away: the user tries again (already covered
     // above), or the user explicitly dismisses it. No push-based path exists any more.
-    vi.spyOn(commands, "checkForUpdate").mockRejectedValue("network unreachable");
+    vi.spyOn(commands, "checkForUpdate").mockRejectedValue({ error: "network unreachable" });
     const { result } = renderHook(() => useUpdate());
     await waitFor(() => expect(result.current.state).not.toBeNull());
 

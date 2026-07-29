@@ -1,13 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { errorText, INTERNAL_ERROR_PREFIX } from "./errors";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { errorText, isPanic } from "./errors";
 
 // The desktop head rejects with the serialized `CommandError` itself, so these objects are the
 // literal values `invoke` hands a `catch` block.
 const deliberate = { error: "HandBrakeCLI not found" };
-const panicked = {
-  error: 'task panicked: task 12 panicked with message "boom"',
-  kind: "panic",
-};
+const panicked = { error: "task panicked: boom", kind: "panic" };
 
 describe("errorText", () => {
   it("renders a failure the backend means as its message alone", () => {
@@ -17,19 +16,23 @@ describe("errorText", () => {
   });
 
   it("marks a panic as a bug and keeps the detail", () => {
-    const text = errorText(panicked);
-    expect(text.startsWith(INTERNAL_ERROR_PREFIX)).toBe(true);
-    // The detail is what makes the bug reportable — a prefix on its own would tell the user
-    // something broke and give them nothing to send.
-    expect(text).toContain('panicked with message "boom"');
+    // Pinned as a literal rather than by interpolating INTERNAL_ERROR_PREFIX: a test that
+    // interpolates the same constant the implementation does tracks any change to it, including
+    // emptying it — which would silently delete the one thing separating the two renderings.
+    expect(errorText(panicked)).toBe(
+      "Internal error (this is a bug): task panicked: boom",
+    );
+    // And the two really do render differently — the property the prefix exists for.
+    expect(errorText(panicked)).not.toBe(errorText(deliberate));
   });
 
   it("never renders a failure body as [object Object]", () => {
     // The regression this helper exists to prevent. Every display site used to spell this
     // `String(e)`, which is correct only while the backend fails with a bare string; the moment
     // it gained a `kind` field the whole UI would have shown "[object Object]" instead of the
-    // error — for ordinary failures, not just panics.
-    for (const failure of [deliberate, panicked]) {
+    // error — for ordinary failures, not just panics. The empty object is here because it is
+    // the one input that reaches the fallback: `String({})` is exactly that string.
+    for (const failure of [deliberate, panicked, {}, { error: 42 }]) {
       expect(errorText(failure)).not.toContain("[object Object]");
     }
   });
@@ -37,24 +40,62 @@ describe("errorText", () => {
   it("reads the server head's Error the same way", () => {
     // The HTTP transport throws a real Error and hangs `kind` off it, so one helper covers both
     // heads and a panic reads identically wherever the UI is running.
-    const bug = Object.assign(new Error("task panicked: task 3 panicked"), {
-      kind: "panic",
-    });
-    expect(errorText(bug)).toBe(`${INTERNAL_ERROR_PREFIX}task panicked: task 3 panicked`);
+    const bug = Object.assign(new Error("task panicked: boom"), { kind: "panic" });
+    expect(errorText(bug)).toBe("Internal error (this is a bug): task panicked: boom");
     expect(errorText(new Error("unauthorized"))).toBe("unauthorized");
   });
 
-  it("falls back to stringifying anything that is not a failure body", () => {
-    // A rejection can come from outside the transport entirely (a thrown string, a null from a
-    // library); the UI still has to show something rather than crash in the catch block.
+  it("shows a thrown string but refuses to render a value carrying no message", () => {
+    // A thrown string is someone's message and survives; null/undefined/a bare object are not,
+    // and "null" or "[object Object]" on screen is worse than admitting we do not know. The raw
+    // value still reaches the console at every site that logs one.
     expect(errorText("plain string")).toBe("plain string");
-    expect(errorText(null)).toBe("null");
-    expect(errorText(undefined)).toBe("undefined");
+    for (const nothing of [null, undefined, {}, 42, []]) {
+      expect(errorText(nothing)).toBe("Unknown error");
+    }
   });
 
   it("treats only the exact panic discriminator as a bug", () => {
     // Guards against a truthiness check creeping in: an unknown kind is not something the UI
     // may relabel as an internal error.
     expect(errorText({ error: "nope", kind: "validation" })).toBe("nope");
+    expect(isPanic({ error: "nope", kind: "validation" })).toBe(false);
+    expect(isPanic(panicked)).toBe(true);
+  });
+});
+
+describe("display sites", () => {
+  it("no_display_site_stringifies_a_caught_error", () => {
+    // The frontend twin of the Rust tripwire in src-tauri/src/commands/mod.rs, and it exists for
+    // the same reason: the 13-site sweep that introduced `errorText` was applied, not enforced.
+    // `String(e)` is now actively wrong rather than merely kind-blind — desktop `invoke` rejects
+    // with an object, so a new one renders "[object Object]" for every failure. Nothing else
+    // catches that: the unit tests above only pin `errorText` itself.
+    const root = join(process.cwd(), "src");
+    const banned = ["String(e)", "String(err)", "${e}", "${err}"];
+
+    const walk = (dir: string, out: string[] = []): string[] => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) walk(path, out);
+        else if (/\.tsx?$/.test(path) && !/\.(test|spec)\.tsx?$/.test(path)) out.push(path);
+      }
+      return out;
+    };
+
+    const files = walk(root).filter((f) => !f.endsWith(join("lib", "errors.ts")));
+    for (const file of files) {
+      const source = readFileSync(file, "utf8");
+      for (const needle of banned) {
+        expect(
+          source.includes(needle),
+          `${file} renders a caught error with ${needle}; use errorText(e) so a panic stays ` +
+            `distinguishable and an object body does not render as [object Object]`,
+        ).toBe(false);
+      }
+    }
+
+    // Guards the walk: one that matched nothing would pass while checking no file at all.
+    expect(files.length).toBeGreaterThan(20);
   });
 });
