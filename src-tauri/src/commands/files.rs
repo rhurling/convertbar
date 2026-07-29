@@ -61,4 +61,25 @@ mod tests {
         let both = stat_paths(&existing.to_string_lossy(), &existing.to_string_lossy());
         assert!(both.source_exists && both.output_exists);
     }
+
+    #[test]
+    fn check_paths_exist_maps_each_argument_to_its_own_field() {
+        // Drives the real command, not `stat_paths`. Moving the stat down a layer left the
+        // wrapper itself unpinned: transposing its two arguments would have passed the whole
+        // workspace suite and every frontend test, while the history menu offered to open the
+        // source where the output was meant to be.
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("clip.mp4");
+        std::fs::write(&existing, b"x").unwrap();
+        let missing = dir.path().join("gone.mp4");
+
+        let result = tauri::async_runtime::block_on(check_paths_exist(
+            existing.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ))
+        .expect("stat'ing two paths cannot fail");
+
+        assert!(result.source_exists, "the first argument is the source");
+        assert!(!result.output_exists, "the second argument is the output");
+    }
 }

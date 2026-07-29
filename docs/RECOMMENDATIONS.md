@@ -139,8 +139,8 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     — and a tripwire that greps for call sites would never see a struct literal. As a sibling, it
     cannot. The tripwire also bans `async_runtime::spawn` and `thread::spawn` (both reach a join
     arm without reaching `blocking`) and a command declared `-> Result<_, String>` (which would
-    otherwise silently opt one command back out of the shared shape). A second test names the ten
-    commands that must reach `blocking` — named rather than inferred from `async`, because a
+    otherwise silently opt one command back out of the shared shape). A second test names the
+    thirteen commands that must reach `blocking` — named rather than inferred from `async`, because a
     command that drops the keyword stops matching, stops being counted, and reinstates the freeze
     the probe-hazard fix removed at four entry points, silently. A third refuses a
     `#[tauri::command]` defined outside `src/commands`, which would escape both of the others.
@@ -152,7 +152,7 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     misconfigured. The HTTP transport now hangs `kind` off the `Error` it throws; without that it
     would have dropped the very distinction the route helpers exist to make, and the same UI code
     would have labelled a bug on desktop but not on the server.
-  - **The last three main-thread stats went with it.** `check_paths_exist`, `open_path` and
+  - **Three more main-thread stats went with it.** `check_paths_exist`, `open_path` and
     `reveal_in_dir` were sync, so Tauri ran them on the main thread, where `exists()`,
     `metadata()` and `canonicalize()` each wait on the mount — opening the history context menu on
     a job whose source lived on a disconnected share froze the whole UI until the mount timed out.
@@ -171,10 +171,11 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     component test renders a panic end to end — before it, the entire frontend half was pinned
     only by unit tests of `errorText`, so any display site could revert with the suite green.
 - **Still open, and genuinely out of scope.** Only a panic *inside a `blocking` closure* becomes a
-  `JoinError`, so only those ten commands can produce `kind: "panic"` (nine, plus `pick_folder`,
-  which moved onto the pool here — its exemption claimed it was async for a reason other than
-  blocking work, but `blocking_pick_folder` holds its thread for as long as the panel is open).
-  Three gaps remain, none of them a regression — each was equally true before this item:
+  `JoinError`, so only the thirteen commands in `MUST_BLOCK` can produce `kind: "panic"` — the
+  nine original join arms, plus `pick_folder` (whose exemption claimed it was async for a reason
+  other than blocking work, though `blocking_pick_folder` holds its thread for as long as the
+  panel is open) and the three `files.rs` commands below.
+  Four gaps remain, none of them a regression — each was equally true before this item:
   - **A panic elsewhere in a command never reaches the mapping.** Tauri has no `catch_unwind` on
     the desktop command path (verified against `tauri` 2.11.5 and `tauri-macros` 2.6.3; the only
     one is in `mobile.rs`). A *sync* command's panic unwinds past the IPC handler; an *async*
@@ -189,6 +190,12 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     where the two limits meet: once `ctx.db` is poisoned, `list_handbrake_presets` fails as a
     deliberate error and the settings page again reads "Could not load presets. Is HandBrakeCLI
     installed?" — the exact misleading copy this item removed for the panic itself.
+  - **Other commands still block the main thread**, and `MUST_BLOCK` is not an inventory of them.
+    The `watch.rs` commands are sync and `dunce::canonicalize` a user-chosen path before
+    registering an OS watch (`watch_ops::canonical_watch_path`), and `cancel_conversion` removes a
+    partial output — both hang on a dead mount exactly as `check_paths_exist` did. Not fixed with
+    the `files.rs` three because registering watches and deleting partials have failure modes of
+    their own; the `files.rs` commands only had to stop waiting on a stat.
   - **Some failures are never shown at all.** `job-error` events carry a bare string and a panic
     in a background updater task produces no `Err`; separately, six frontend `catch` sites log to
     the console and render nothing (`QueueItem`, `useQueue`, `useHistory` ×2, `useBadSources`, and

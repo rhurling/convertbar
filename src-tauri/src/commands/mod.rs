@@ -163,6 +163,12 @@ mod tests {
         // The three `files.rs` entries are here for the blocking round trip alone: `exists()`,
         // `metadata()` and `canonicalize()` each wait on the mount, which is the whole hazard
         // even though none of them touches HandBrake.
+        //
+        // This holds the line for the commands already off the main thread; it is NOT an
+        // inventory of every main-thread hazard. The `watch.rs` commands are still sync and
+        // canonicalize a user-chosen path before registering an OS watch, and `cancel_conversion`
+        // removes a partial output — both block the main thread on a dead mount, and both are
+        // recorded under item 16 in docs/RECOMMENDATIONS.md rather than fixed here.
         const MUST_BLOCK: [&str; 13] = [
             "add_files",
             "scan_folder",
