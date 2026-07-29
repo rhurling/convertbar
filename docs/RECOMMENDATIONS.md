@@ -113,7 +113,9 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   Two helpers now own the mapping — `blocking_json` for work returning a `Result`, and
   `blocking_response` for `fs::fs_list`, which picks its own 200/403/404/500 — so all ten
   handlers stopped spelling their failure arms, and the tripwire checks the class instead of
-  the phrase: no route module may call `spawn_blocking(`, with no exemption. Exempting
+  the phrase: no route module may name `spawn_blocking` in code at all — matched over
+  comment-stripped source, so an aliased spelling or a turbofish cannot slip past a literal
+  `spawn_blocking(` the way it once could — with no exemption. Exempting
   `fs.rs` (the tenth site, and the one that diverged) would have left the tripwire blind to a
   second endpoint in that same module. It covers a route module added later — including one
   added as a subdirectory, since the walk recurses and exempts `mod.rs` by full path rather
