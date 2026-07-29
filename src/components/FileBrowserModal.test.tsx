@@ -179,6 +179,22 @@ describe("FileBrowserModal", () => {
     await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/Movies"));
   });
 
+  it("ignores a keydown that bubbles up from the Open button rather than the row", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [entry({ name: "Movies", path: "/Movies", is_dir: true })],
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const openButton = await screen.findByRole("button", { name: "Open Movies" });
+    fireEvent.keyDown(openButton, { key: "Enter" });
+
+    // jsdom doesn't synthesize the browser's native button-activation click from this keydown,
+    // so we can only assert the half we can observe: the row's handler must not have run, i.e.
+    // the folder was not also toggled into the selection.
+    expect(screen.getByRole("button", { name: /^Add 0 items/ })).toBeDisabled();
+  });
+
   it("multi-selects files and calls onSelect with their paths", async () => {
     fsListMock.mockResolvedValue({
       entries: [entry({ name: "a.mp4", path: "/a.mp4" }), entry({ name: "b.mp4", path: "/b.mp4" })],

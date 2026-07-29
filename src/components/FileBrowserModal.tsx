@@ -195,6 +195,12 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                   onKeyDown={
                     rowInteractive
                       ? (e) => {
+                          // Ignore keydowns bubbled up from the nested checkbox/Open button —
+                          // otherwise Enter on the Open button both toggles selection (this
+                          // handler) and navigates (the button's own native activation), and our
+                          // preventDefault on Space for the row breaks the button's own Space
+                          // activation.
+                          if (e.target !== e.currentTarget) return;
                           // Route Enter/Space to the same handler the click uses — one state
                           // transition, two entry points. preventDefault on Space so the modal
                           // doesn't scroll.
@@ -215,6 +221,9 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                       checked={isSelected}
                       readOnly
                       aria-label={entry.name}
+                      // The row is the selection control now — this box isn't a separate tab
+                      // stop (three tab stops for one logical control was the wrong shape).
+                      tabIndex={-1}
                       onClick={(e) => {
                         e.stopPropagation();
                         handleRowClick(entry);
