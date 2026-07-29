@@ -160,12 +160,10 @@ mod tests {
         // being counted, and reinstates the freeze silently. Every entry here reaches a
         // subprocess, an unbounded walk, or a per-file probe.
         //
-        // This holds the line for the commands already off the main thread; it is NOT an
-        // inventory of every main-thread hazard. `check_paths_exist` and `open_path` still stat
-        // paths synchronously, which hangs the UI on a dead network mount — pre-existing, and
-        // recorded under item 16 in docs/RECOMMENDATIONS.md rather than fixed here, because
-        // moving them is a UI-responsiveness change with its own frontend contract.
-        const MUST_BLOCK: [&str; 10] = [
+        // The three `files.rs` entries are here for the blocking round trip alone: `exists()`,
+        // `metadata()` and `canonicalize()` each wait on the mount, which is the whole hazard
+        // even though none of them touches HandBrake.
+        const MUST_BLOCK: [&str; 13] = [
             "add_files",
             "scan_folder",
             "confirm_folder_add",
@@ -176,6 +174,9 @@ mod tests {
             "generate_preset_suffix",
             "validate_handbrake",
             "pick_folder",
+            "check_paths_exist",
+            "open_path",
+            "reveal_in_dir",
         ];
         // Async for a reason other than blocking work: both await genuinely async updater work.
         const NOT_BLOCKING_WORK: [&str; 2] = ["check_for_update", "install_update"];

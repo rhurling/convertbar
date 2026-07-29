@@ -152,6 +152,16 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     misconfigured. The HTTP transport now hangs `kind` off the `Error` it throws; without that it
     would have dropped the very distinction the route helpers exist to make, and the same UI code
     would have labelled a bug on desktop but not on the server.
+  - **The last three main-thread stats went with it.** `check_paths_exist`, `open_path` and
+    `reveal_in_dir` were sync, so Tauri ran them on the main thread, where `exists()`,
+    `metadata()` and `canonicalize()` each wait on the mount — opening the history context menu on
+    a job whose source lived on a disconnected share froze the whole UI until the mount timed out.
+    That is the probe hazard at a fifth, sixth and seventh entry point, and `MUST_BLOCK` now holds
+    all three. Moving them off the main thread is what upstream does too: every
+    `#[tauri::command]` in `tauri-plugin-opener` is `async`, so `NSWorkspace` and the Windows
+    shell calls were never assuming the main thread either. `check_paths_exist` gained a `Result`
+    in the process; its one caller already had a rejection handler, and a rejection leaves the
+    menu's file actions disabled, which is what it already showed while the stat was in flight.
   - **The sweep needed enforcing too, and needed to be behavioural rather than textual.** Three
     sites did not spell `String(e)` at all — they discarded the error and showed fixed copy. The
     worst reproduced this item's own bug verbatim: a panic inside `list_handbrake_presets`
@@ -164,7 +174,7 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   `JoinError`, so only those ten commands can produce `kind: "panic"` (nine, plus `pick_folder`,
   which moved onto the pool here — its exemption claimed it was async for a reason other than
   blocking work, but `blocking_pick_folder` holds its thread for as long as the panel is open).
-  Four gaps remain, and none is a regression — each was equally true before this item:
+  Three gaps remain, none of them a regression — each was equally true before this item:
   - **A panic elsewhere in a command never reaches the mapping.** Tauri has no `catch_unwind` on
     the desktop command path (verified against `tauri` 2.11.5 and `tauri-macros` 2.6.3; the only
     one is in `mobile.rs`). A *sync* command's panic unwinds past the IPC handler; an *async*
@@ -179,14 +189,6 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     where the two limits meet: once `ctx.db` is poisoned, `list_handbrake_presets` fails as a
     deliberate error and the settings page again reads "Could not load presets. Is HandBrakeCLI
     installed?" — the exact misleading copy this item removed for the panic itself.
-  - **Two commands still stat paths on the main thread.** `check_paths_exist` (fired when the
-    history context menu opens) and `open_path` are sync, so Tauri runs them on the main thread,
-    and a `Path::exists()` against a dead network mount hangs for tens of seconds — the same
-    freeze the probe hazard caused, at a fifth and sixth entry point. Left alone deliberately:
-    moving them is a UI-responsiveness fix, and `check_paths_exist` currently cannot fail, so
-    giving it a `Result` changes a frontend contract that has nothing to do with this item. The
-    `MUST_BLOCK` list in `commands/mod.rs` says so where someone would otherwise read it as a
-    complete inventory of main-thread hazards.
   - **Some failures are never shown at all.** `job-error` events carry a bare string and a panic
     in a background updater task produces no `Err`; separately, six frontend `catch` sites log to
     the console and render nothing (`QueueItem`, `useQueue`, `useHistory` ×2, `useBadSources`, and
