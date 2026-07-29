@@ -107,7 +107,12 @@ fn get_handbrake_path(
 /// Filtered in Rust rather than SQL because in-place-ness is a *normalized* path
 /// comparison (`converter::is_in_place` collapses `//` and `/./`), which a `WHERE
 /// source_path = output_path` would miss.
-pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
+///
+/// `pub(crate)`, like `converter::is_in_place`: `settings_ops` is the only caller. The
+/// DELETE is guarded with `AND status = 'queued'` (matching `remove_job`'s idiom) so the
+/// function's correctness does not silently depend on the caller holding `ctx.db` across
+/// the SELECT and this DELETE.
+pub(crate) fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
     let rows: Vec<(String, String, String)> = match conn
         .prepare("SELECT id, source_path, output_path FROM jobs WHERE status = 'queued'")
     {
@@ -122,7 +127,10 @@ pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
     for (id, source, output) in rows {
         if crate::converter::is_in_place(&source, &output) {
             if conn
-                .execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![id])
+                .execute(
+                    "DELETE FROM jobs WHERE id = ?1 AND status = 'queued'",
+                    rusqlite::params![id],
+                )
                 .is_ok()
             {
                 dropped += 1;

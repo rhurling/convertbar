@@ -311,6 +311,15 @@ mod tests {
                     [],
                 )
                 .unwrap();
+                // Not byte-identical, but the same file once normalized (`//` and `/.` collapse
+                // under Path comparison) — pins that the filter is is_in_place, not a raw
+                // source_path = output_path string/SQL comparison.
+                conn.execute(
+                    "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                     VALUES ('norm', '/m//c.mp4', '/m/./c.mp4', 'p', 'queued', 2, '2020-01-01T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
             }
 
             let result = update_setting(&ctx, "cleanup_mode", "keep");
@@ -349,7 +358,7 @@ mod tests {
 
     #[test]
     fn switching_to_delete_leaves_queued_in_place_jobs_alone() {
-        let (ctx, _sink, _d) = test_ctx(test_conn());
+        let (ctx, sink, _d) = test_ctx(test_conn());
         {
             let conn = ctx.db.lock().unwrap();
             conn.execute(
@@ -367,6 +376,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "in-place jobs are only impossible under keep");
+        // Nothing was dropped, so the hook must not emit either.
+        assert_eq!(sink.payloads("queue-updated").len(), 0);
     }
 
     #[test]
