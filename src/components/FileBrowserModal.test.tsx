@@ -127,6 +127,58 @@ describe("FileBrowserModal", () => {
     await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/Movies"));
   });
 
+  it("toggles selection when clicking directly on the row's checkbox", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [entry({ name: "a.mp4", path: "/a.mp4" })],
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    // Query by the checkbox's own accessible name (the entry name), not the row text — this is
+    // the checkbox input itself, the exact click target that was previously a dead no-op.
+    const checkbox = (await screen.findByLabelText("a.mp4")) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+
+    fireEvent.click(checkbox);
+
+    expect(checkbox.checked).toBe(true);
+  });
+
+  it("selects a row from the keyboard in files mode", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [entry({ name: "a.mp4", path: "/a.mp4" })],
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const nameEl = await screen.findByText("a.mp4");
+    const row = nameEl.closest(".file-browser-entry") as HTMLElement;
+    row.focus();
+    fireEvent.keyDown(row, { key: "Enter" });
+
+    expect(screen.getByRole("button", { name: /^Add 1 item/ })).not.toBeDisabled();
+  });
+
+  it("enters a folder from the keyboard in directory mode", async () => {
+    fsListMock.mockImplementation((path: string) => {
+      if (path === "/") {
+        return Promise.resolve({
+          entries: [entry({ name: "Movies", path: "/Movies", is_dir: true })],
+        });
+      }
+      return Promise.resolve({ entries: [] });
+    });
+
+    render(<FileBrowserModal mode="directory" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const nameEl = await screen.findByText("Movies");
+    const row = nameEl.closest(".file-browser-entry") as HTMLElement;
+    row.focus();
+    fireEvent.keyDown(row, { key: " " });
+
+    await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/Movies"));
+  });
+
   it("multi-selects files and calls onSelect with their paths", async () => {
     fsListMock.mockResolvedValue({
       entries: [entry({ name: "a.mp4", path: "/a.mp4" }), entry({ name: "b.mp4", path: "/b.mp4" })],

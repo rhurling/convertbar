@@ -179,13 +179,31 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
           ) : (
             entries.map((entry) => {
               const isSelected = selected.has(entry.path);
+              // Directory-mode file rows stay inert (not selectable, no navigate target), same
+              // as their old disabled-button state; every other row is keyboard-operable.
+              const rowInteractive = selectable || entry.is_dir;
               return (
                 <div
                   key={entry.path}
                   className={`file-browser-entry${isSelected ? " file-browser-entry-selected" : ""}${
                     !selectable && !entry.is_dir ? " file-browser-entry-disabled" : ""
                   }`}
+                  role={selectable ? "checkbox" : entry.is_dir ? "button" : undefined}
+                  aria-checked={selectable ? isSelected : undefined}
+                  tabIndex={rowInteractive ? 0 : undefined}
                   onClick={() => handleRowClick(entry)}
+                  onKeyDown={
+                    rowInteractive
+                      ? (e) => {
+                          // Route Enter/Space to the same handler the click uses — one state
+                          // transition, two entry points. preventDefault on Space so the modal
+                          // doesn't scroll.
+                          if (e.key !== "Enter" && e.key !== " ") return;
+                          if (e.key === " ") e.preventDefault();
+                          handleRowClick(entry);
+                        }
+                      : undefined
+                  }
                 >
                   {selectable && (
                     /* readOnly, not onChange: the row's click handler owns the state transition
@@ -197,7 +215,10 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                       checked={isSelected}
                       readOnly
                       aria-label={entry.name}
-                      onClick={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleRowClick(entry);
+                      }}
                     />
                   )}
                   <span className="file-browser-entry-icon">{entry.is_dir ? "📁" : "📄"}</span>

@@ -1264,6 +1264,11 @@ select.setting-input {
   background: var(--bg-hover);
 }
 
+.file-browser-entry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .file-browser-entry:disabled {
   color: var(--text-dim);
   cursor: default;
