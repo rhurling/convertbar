@@ -17,7 +17,7 @@
 - The certificate must be **Developer ID Application**. Not "Apple Development", not "Apple Distribution", not "Mac Developer". Those are for Xcode-managed and App Store flows and will not pass Gatekeeper for direct distribution. (The Tauri docs' CI example greps for `Apple Development` — that example is for a different distribution channel; do not copy it.)
 - **`src-tauri/tauri.conf.json` gets no `signingIdentity` and no `macOS` block.** Adding one makes every local `npm run tauri build` — including the rebuild inside `scripts/release.sh` — fail on a machine without the private key.
 - **The bundle identifier stays `com.convertbar.app`.** It is the anchor for both the TCC grants this work is meant to stabilize and the updater's app identity.
-- **No entitlements file.** Under the hardened runtime ConvertBar needs none: it spawns HandBrakeCLI as a *separate process* (not a loaded library), it is not sandboxed so file access is unrestricted, and its webview content process is Apple's own. Add an entitlement only in response to an observed failure, never speculatively.
+- **No entitlements file.** Under the hardened runtime ConvertBar needs none: it spawns HandBrakeCLI as a *separate process* (not a loaded library), it is not sandboxed so file access is unrestricted, and its webview's JIT lives in Apple's own XPC processes. Checked against the actual sources — no `dlopen`, `libloading`, `DYLD_*` manipulation, `fork` without `exec`, or unsigned dylibs anywhere. Add an entitlement only in response to an observed failure, never speculatively. The hardened runtime itself needs no configuration: `hardenedRuntime` defaults to `true` in the installed Tauri CLI's config schema.
 - **Never commit `.p12`, `.p8`, `.cer`, or `.certSigningRequest` files.** Task 6 adds the `.gitignore` guard; until then, keep them on the Desktop and delete them after upload.
 - The `.p8` private key is **downloadable exactly once**. Put it in 1Password before closing the browser tab.
 - `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in `.github/workflows/build.yml:92-93` are the **updater** minisign keys. They are unrelated to code signing. Do not touch, rename, or reuse them.
@@ -42,7 +42,9 @@
 
 **Human task.** Produces two secret values and one identity string. No Xcode involved — Keychain Access is part of macOS.
 
-**Prerequisite:** Developer ID certificates can only be created by the Account Holder. On a personal (individual) membership you are the Account Holder, so this is satisfied.
+**Prerequisites:**
+- An **active paid** Apple Developer Program membership. Confirmed by the user; verify in 10 seconds at <https://developer.apple.com/account> — the Membership panel must show an active enrollment. A free Apple ID developer account cannot issue Developer ID certificates, and the portal simply will not offer the option in Step 3.
+- Developer ID certificates can only be created by the Account Holder. On an individual membership you are the Account Holder, so this is satisfied.
 
 - [ ] **Step 1: Confirm the starting state**
 
@@ -69,8 +71,9 @@ This writes the CSR to disk *and* creates the matching private key in your login
 
 Go to <https://developer.apple.com/account/resources/certificates/list> → **+** → under **Software**, select **Developer ID Application** → Continue.
 
-- If asked to choose a profile type, pick **Direct** (distribution outside the Mac App Store).
-- If asked to choose a Sub-CA, pick **G2 Sub-CA** (the default; the "Previous Sub-CA" option exists only for macOS 10.11 and earlier).
+The portal's exact follow-up prompts are not pinned down here (Apple changes them); these two are *guesses at what may appear*, not documented steps — if neither shows up, nothing is wrong:
+- If asked to choose a profile type, pick the direct-distribution option (outside the Mac App Store).
+- If asked to choose a Sub-CA, pick **G2 Sub-CA** — the default. The "Previous Sub-CA" option exists only for compatibility with very old macOS releases.
 - Upload `~/Desktop/ConvertBar.certSigningRequest` → Continue → **Download**.
 
 Note: Apple caps how many Developer ID Application certificates an account may hold (historically 5). Do not create spares.
@@ -126,7 +129,34 @@ At <https://github.com/rhurling/convertbar/settings/secrets/actions>, create:
 
 `APPLE_SIGNING_IDENTITY` is not cryptographically secret, but it carries a legal name and team ID; keeping it a secret rather than an inline literal keeps both out of public build logs.
 
-- [ ] **Step 9: Clean up the disk**
+- [ ] **Step 9: Prove the CI import path works, before CI depends on it**
+
+The base64 `.p12` + password pair is the one mechanism that no other step exercises — Task 3 signs from the login keychain instead. A truncated paste or a mistyped password would otherwise surface for the first time during a real release. Replay locally exactly what Tauri does in CI (`create-keychain` → `import` → `set-key-partition-list`):
+
+```bash
+P12_B64_FILE=~/Desktop/cert.b64            # paste the Step 7 clipboard here first
+KC="$HOME/Library/Keychains/signtest.keychain-db"
+
+base64 --decode < "$P12_B64_FILE" > /tmp/roundtrip.p12
+security create-keychain -p testpw signtest.keychain
+security unlock-keychain -p testpw signtest.keychain
+security import /tmp/roundtrip.p12 -k signtest.keychain -P '<APPLE_CERTIFICATE_PASSWORD>' -T /usr/bin/codesign
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k testpw signtest.keychain
+security find-identity -v -p codesigning signtest.keychain
+```
+
+Expected: the same `Developer ID Application: …` identity as Step 4, found in the throwaway keychain.
+
+`security import` failing with `MAC verification failed` means the password is wrong; an `unable to read` error means the base64 is truncated. Either way, fix it now rather than during a release.
+
+Then remove every trace:
+
+```bash
+security delete-keychain signtest.keychain
+rm -f /tmp/roundtrip.p12 "$P12_B64_FILE"
+```
+
+- [ ] **Step 10: Clean up the disk**
 
 Put `ConvertBar-DeveloperID.p12` in 1Password, then:
 
@@ -272,7 +302,17 @@ npm ci
 npm run tauri build -- --target aarch64-apple-darwin
 ```
 
-Expected in the output: a `signing` line naming the Developer ID identity, then a notarization submission that waits and succeeds. This is slow (full release build plus a notarization round trip) — that is why Steps 2–3 came first.
+**This command is expected to exit non-zero. That is not a failure.** `tauri.conf.json` sets `createUpdaterArtifacts: true`, and `TAURI_SIGNING_PRIVATE_KEY` is a CI-only secret, so every local build ends with an updater-signing error *after* bundling and notarization have already completed. `scripts/release.sh:112-115` handles the same thing the same way, and defines success identically.
+
+Success criteria, in the output — not the exit code:
+- a `signing` line naming the Developer ID identity
+- a notarization submission that waits and is accepted
+- a `Finished N bundles` line
+- then the expected trailing `TAURI_SIGNING_PRIVATE_KEY` error — ignore it
+
+If notarization is *silently absent* from the output, that is the real failure: the Tauri bundler skips notarization with only a warning when the API-key variables are missing, rather than erroring. Re-check Step 1's exports. (This skip-with-a-warning behaviour is exactly why Task 4's CI preflight is load-bearing.)
+
+This step is slow — a full release build plus a notarization round trip — which is why Steps 2–3 came first.
 
 - [ ] **Step 5: Verify the built bundle**
 
@@ -303,16 +343,21 @@ xcrun stapler validate /tmp/updchk/ConvertBar.app;  echo "updater app -> $?"
 rm -rf /tmp/updchk
 ```
 
-Tauri's bundling order determines whether the `.app`, the `.dmg`, or both carry a stapled ticket, and whether the updater tarball was created before or after stapling. Task 4 asserts exactly what is observed here and nothing more — a CI check that asserts an unstapled artifact is stapled would block every future release.
+**Expected result — confirm it, do not assume it:** the Tauri bundler notarizes and staples the **`.app`** only; the DMG bundler signs the disk image but never submits it for notarization. So `app -> 0` and `dmg -> 1` is the healthy outcome, not a defect. The updater tarball's status is genuinely unknown and depends on whether Tauri tarred before or after stapling.
 
-An unstapled artifact is not a disaster: Gatekeeper falls back to an online notarization check on first launch. It only matters for a user who is offline on first launch. Note the finding in the PR description either way.
+Whatever the four exit codes actually are, **Task 4 and Task 7 assert exactly that and nothing more.** A CI check asserting an unstapled artifact is stapled would block every future release; an acceptance test asserting the DMG is notarized would fail on a perfectly healthy build.
+
+An unstapled artifact is not a disaster: Gatekeeper falls back to an online notarization check on first launch, so it only affects a user who is offline the very first time they open the app. Record all four results in the PR description.
 
 - [ ] **Step 7: Clean up**
 
 ```bash
 rm -f /tmp/signtest /tmp/signtest.c /tmp/signtest.zip
-rm -rf ~/private_keys
+rm -f ~/private_keys/AuthKey_<KEYID>.p8
+rmdir ~/private_keys 2>/dev/null || true
 ```
+
+Delete the one file, not the directory — `~/private_keys` is one of the locations Apple tooling searches for App Store Connect keys by convention, so an `rm -rf` there could take out an unrelated key.
 
 The `.p8` is in 1Password and in the `APPLE_API_KEY_P8` secret; nothing needs it on disk.
 
@@ -416,7 +461,9 @@ a live CDN lookup from the runner.
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          app=$(find target -maxdepth 6 -name 'ConvertBar.app' -type d | head -1)
+          # -print -quit, not `| head -1`: no pipe means no SIGPIPE interaction
+          # with pipefail, and it cannot silently pick an arbitrary bundle.
+          app=$(find target -maxdepth 6 -name 'ConvertBar.app' -type d -print -quit)
           [ -n "$app" ] || { echo "::error::no ConvertBar.app found"; exit 1; }
 
           codesign --verify --strict --verbose=2 "$app"
@@ -428,8 +475,12 @@ a live CDN lookup from the runner.
             || { echo "::error::not signed with a Developer ID Application cert"; exit 1; }
 
           # Advisory: needs network, and notarization is already gated above.
-          spctl -a -vvv --type execute "$app" 2>&1 | tee /dev/stderr \
-            | grep -q 'source=Notarized Developer ID' \
+          # Captured rather than piped — `spctl | tee | grep -q` goes non-zero
+          # under pipefail when grep exits early and tee takes SIGPIPE, which
+          # would print this warning on a perfectly healthy build.
+          verdict=$(spctl -a -vvv --type execute "$app" 2>&1) || true
+          echo "$verdict"
+          grep -q 'source=Notarized Developer ID' <<<"$verdict" \
             || echo "::warning::spctl did not report a notarized Developer ID"
 ```
 
@@ -543,8 +594,16 @@ private key. Only CI signs.
 
 **Renewal:** the certificate expires <DATE FROM TASK 1 STEP 5>. Re-run Task 1 of
 `docs/superpowers/plans/2026-07-29-macos-code-signing.md` and replace the first
-three secrets. Builds fail loud at the preflight step rather than silently
-shipping unsigned.
+three secrets. A renewed certificate under the same Team ID does **not** cost
+users their permissions again — the designated requirement anchors to the team
+and bundle identifier, not to this particular certificate. Builds already shipped
+keep working after expiry; notarization tickets do not expire with the cert.
+
+**Rotating the API key:** revoke in App Store Connect, generate a replacement, and
+update `APPLE_API_ISSUER`/`APPLE_API_KEY`/`APPLE_API_KEY_P8`. Note the preflight
+only checks that secrets are *present* — a revoked-but-still-populated key passes
+it and fails later at the notarization submission instead. Still loud, just further
+along.
 ```
 
 Replace `<DATE FROM TASK 1 STEP 5>` with the real `notAfter` date.
@@ -570,14 +629,18 @@ If a macOS leg fails, `publish-tauri` fails, so `publish-release` never runs and
 
 - [ ] **Step 2: Verify the published artifact as a user would**
 
-Download the `.dmg` from the release page on a machine that has never built the app, then:
+Download the `.dmg` from the release page on a machine that has never built the app. **Assess the `.app` inside it, not the `.dmg` itself** — Tauri notarizes and staples the app bundle, and does not submit the disk image, so a Gatekeeper assessment of the DMG reports un-notarized on a completely healthy release. (Confirm against Task 3 Step 6's recorded `dmg ->` exit code; if that came back `0`, the DMG *is* stapled and can be assessed directly.)
 
 ```bash
 xattr -p com.apple.quarantine ~/Downloads/ConvertBar_*.dmg   # confirms it is quarantined, like a user's copy
-spctl -a -vvv --type install ~/Downloads/ConvertBar_*.dmg
+hdiutil attach ~/Downloads/ConvertBar_*.dmg
+spctl -a -vvv --type execute /Volumes/ConvertBar/ConvertBar.app
+hdiutil detach /Volumes/ConvertBar
 ```
 
-Expected: `accepted`, `source=Notarized Developer ID`. Then open it — there must be **no** "cannot be opened because the developer cannot be verified" dialog and no right-click-to-open workaround.
+Expected: `accepted`, `source=Notarized Developer ID`.
+
+Then drag it to `/Applications` and open it. That launch is the assertion that matters: there must be **no** "cannot be opened because the developer cannot be verified" dialog and no workaround needed.
 
 - [ ] **Step 3: Verify the reason this work exists**
 
@@ -593,11 +656,16 @@ Note that the transition itself costs the grants once: the currently installed a
 
 Only if Task 2 Step 1 finds App Store Connect API keys unavailable. Do not use this to avoid a legitimate blocker — raise the blocker first.
 
-Set `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD` and `APPLE_SIGNING_IDENTITY` and omit the three API-key secrets, the key-materialization step, and the `source=Notarized Developer ID` assertion (keep the `codesign --verify` and hardened-runtime assertions).
+Set `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD` and `APPLE_SIGNING_IDENTITY`, then:
+
+- **Trim Task 4 Step 1's preflight loop to those three variables.** Leaving all six listed makes the preflight fail on every release forever, since the three API-key secrets no longer exist.
+- Omit the three API-key secrets, Task 4 Step 2 (key materialization), and Task 4 Step 3's `APPLE_API_ISSUER`/`APPLE_API_KEY` lines.
+- Drop the `source=Notarized Developer ID` advisory from Task 4 Step 4. Keep `codesign --verify`, the hardened-runtime check and the Developer ID authority check — all three still hold.
+- Skip Task 3 Step 3 and adjust Task 7 Step 2 to expect a Gatekeeper warning rather than a clean launch.
 
 What that buys and costs:
 - **Buys:** stable TCC grants — the entire original motivation.
-- **Costs:** Gatekeeper still blocks downloaded builds with "cannot be opened because the developer cannot be verified"; users keep needing right-click → Open.
+- **Costs:** Gatekeeper still blocks downloaded builds with "cannot be opened because the developer cannot be verified". On macOS 15 and later this is worse than the familiar right-click → Open: that override was removed, and each user must go to System Settings → Privacy & Security → "Open Anyway" per app.
 
 Notarization can be added later without redoing Task 1.
 
