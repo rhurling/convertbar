@@ -90,6 +90,8 @@ let pathsExist: PathsExist = { source_exists: true, output_exists: true };
 let badSources: JobInfo[] = [];
 let settings: AppSettings = makeSettings("trash");
 let purgeResults: PurgeResult[] = [];
+// When set, purge rejects with it — shaped as the desktop backend rejects.
+let purgeFailure: unknown = null;
 
 const listeners = new Map<string, Set<(e: { payload: unknown }) => void>>();
 function emit(event: string, payload?: unknown) {
@@ -104,6 +106,7 @@ beforeEach(() => {
   badSources = [];
   settings = makeSettings("trash");
   purgeResults = [];
+  purgeFailure = null;
   listeners.clear();
   listenMock.mockImplementation(((event: string, cb: (e: { payload: unknown }) => void) => {
     if (!listeners.has(event)) listeners.set(event, new Set());
@@ -121,7 +124,8 @@ beforeEach(() => {
     if (cmd === "reveal_in_dir") return Promise.resolve(undefined);
     if (cmd === "remove_history_entry") return Promise.resolve(undefined);
     if (cmd === "get_bad_sources") return Promise.resolve(badSources);
-    if (cmd === "purge_bad_sources") return Promise.resolve(purgeResults);
+    if (cmd === "purge_bad_sources")
+      return purgeFailure ? Promise.reject(purgeFailure) : Promise.resolve(purgeResults);
     if (cmd === "get_settings") return Promise.resolve(settings);
     return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
   }) as typeof invoke);
@@ -392,6 +396,24 @@ describe("HistoryPage", () => {
       const call = invokeMock.mock.calls.find(([cmd]) => cmd === "purge_bad_sources");
       expect(call?.[1]).toEqual({ ids: ["a"] });
       expect(call?.[1]).not.toEqual({ ids: ["hist-1", "a"] });
+    });
+
+    it("does not tell the user to retry a purge that panicked", async () => {
+      // "Please try again" is advice for a transient failure. A panic is a bug and retrying
+      // will reproduce it, so this catch — which showed fixed copy and therefore survived the
+      // String(e) sweep untouched — has to branch on the discriminator.
+      badSources = [badSourceJob("a")];
+      purgeFailure = { error: "task panicked: boom", kind: "panic" };
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(1\)/i);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 1 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      expect(
+        await screen.findByText("Internal error (this is a bug): task panicked: boom"),
+      ).toBeInTheDocument();
     });
 
     it("reports outcomes honestly when some files are left alone, not silently implying everything was destroyed", async () => {

@@ -147,7 +147,7 @@ mod tests {
         for (module, source) in &modules {
             for chunk in source.split("pub async fn ").skip(1) {
                 let name = chunk
-                    .split(|c: char| c == '(' || c == '<')
+                    .split(['(', '<'])
                     .next()
                     .expect("a command name")
                     .trim();

@@ -41,6 +41,9 @@ function makeMeta(preset: string): PresetMetadata {
 let currentPreset: string;
 let presetList: string[];
 let presetsShouldThrow: boolean;
+// What list_handbrake_presets rejects with, shaped as the desktop backend rejects: the
+// serialized `CommandError`. A test may swap in the panic variant.
+let presetsFailure: unknown;
 let suffixes: Record<string, string | null>;
 let detectResult: string | null;
 
@@ -51,6 +54,7 @@ beforeEach(() => {
   currentPreset = "Fast 1080p30";
   presetList = ["Fast 1080p30", "HQ 1080p30"];
   presetsShouldThrow = false;
+  presetsFailure = { error: "no cli" };
   suffixes = { "Fast 1080p30": ".fast", "HQ 1080p30": ".hq" };
   detectResult = null;
 
@@ -60,7 +64,7 @@ beforeEach(() => {
         return Promise.resolve(makeSettings(currentPreset));
       case "list_handbrake_presets":
         return presetsShouldThrow
-          ? Promise.reject({ error: "no cli" })
+          ? Promise.reject(presetsFailure)
           : Promise.resolve(presetList);
       case "get_preset_suffix":
         // Backend supplies the default template when a preset has no stored row,
@@ -176,6 +180,24 @@ describe("useSettings", () => {
     await waitFor(() =>
       expect(result.current.presetsError).toBe(
         "Could not load presets. Is HandBrakeCLI installed?",
+      ),
+    );
+    expect(result.current.presets).toEqual([]);
+  });
+
+  it("does not blame the HandBrakeCLI install for a panic", async () => {
+    // This site swallowed the error and showed fixed copy, so it survived the String(e) sweep
+    // and kept reproducing item 16's own bug: a crash inside list_handbrake_presets sent the
+    // user off to check an install that was fine. The discriminator only helps if the copy
+    // branches on it.
+    presetsShouldThrow = true;
+    presetsFailure = { error: "task panicked: boom", kind: "panic" };
+
+    const { result } = renderHook(() => useSettings());
+
+    await waitFor(() =>
+      expect(result.current.presetsError).toBe(
+        "Internal error (this is a bug): task panicked: boom",
       ),
     );
     expect(result.current.presets).toEqual([]);

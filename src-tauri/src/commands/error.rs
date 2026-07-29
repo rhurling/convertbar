@@ -132,8 +132,14 @@ mod tests {
     fn a_formatted_panic_keeps_its_message() {
         // `panic!("{}", x)` boxes a String where `panic!("literal")` boxes a &str; reading only
         // one of the two would silently degrade half of all real panics to the fallback text.
-        let detail = tauri::async_runtime::block_on(blocking(|| -> Result<(), String> {
-            panic!("{} went wrong", "something")
+        //
+        // `black_box` is load-bearing: with a literal argument rustc flattens `format_args!` to a
+        // single static piece, so `panic!("{} went wrong", "something")` boxes a &str and this
+        // test passes without ever reaching the String branch. It did exactly that until a
+        // mutation removed the branch and nothing went red.
+        let reason = std::hint::black_box(String::from("something"));
+        let detail = tauri::async_runtime::block_on(blocking(move || -> Result<(), String> {
+            panic!("{reason} went wrong")
         }))
         .expect_err("a panicking task must fail");
 
