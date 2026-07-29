@@ -128,6 +128,15 @@ a different shape from intake, where the suffix is a value computed for paths th
 exist. Recording the asymmetry so a later reader does not "finish the job" and assume it was
 an oversight. If it is worth fixing, it is its own change with its own argument.
 
+> **Superseded 2026-07-29** — it was worth fixing, and this is that argument. "Per-batch state
+> threaded into `purge_one_locked` for each id" is what makes an *empty* batch pointless rather
+> than different: with no ids, the resolution is threaded to nobody. The tell was in the test
+> the paragraph above points at — it had to name a HandBrake world while admitting "either
+> world would do", so the fixture could not fail loud and the resolution could not be observed
+> by anyone. `purge_bad_sources` now returns `Ok(vec![])` before reading a setting or reaching
+> the locator, and both the core and route tests assert that with the `PanickingLocator`
+> default. The asymmetry with intake this paragraph recorded is closed, not preserved.
+
 ### Testing
 
 **New core test** — the seam pays for itself; no new fixture is needed, because

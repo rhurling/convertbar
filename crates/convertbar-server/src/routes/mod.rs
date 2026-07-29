@@ -606,13 +606,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn purge_bad_sources_with_no_ids_returns_an_empty_array() {
-        // purge_bad_sources resolves HandBrake once up front even for an empty batch, so the
-        // world has to be declared; ids=[] then never consumes the answer, which is why either
-        // world would do and AbsentLocator (the CI world) is the honest one to name.
-        let (state, _tx) =
-            test_state_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator));
+        // `test_state()`'s PanickingLocator is the assertion, as it is for the empty add above:
+        // an empty batch must return before it resolves HandBrake. This test used to declare
+        // AbsentLocator because the route resolved unconditionally — a world it named but never
+        // consumed, which is precisely the tell that the resolution was pointless.
         let (status, json) = request_json(
-            api_router(state),
+            api_router(test_state()),
             "POST",
             "/api/bad-sources/purge",
             Some(json!({"ids": []})),
