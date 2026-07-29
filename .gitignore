@@ -32,3 +32,10 @@ dist-ssr
 
 # Cargo workspace build dir
 /target/
+
+# Code-signing material — must never be committed
+# (see docs/superpowers/plans/2026-07-29-macos-code-signing.md)
+*.p12
+*.p8
+*.cer
+*.certSigningRequest
