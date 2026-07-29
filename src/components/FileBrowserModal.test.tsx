@@ -45,7 +45,7 @@ describe("FileBrowserModal", () => {
     expect(screen.getByText("clip.mp4")).toBeInTheDocument();
   });
 
-  it("navigates into a directory on click", async () => {
+  it("navigates into a directory via its open button, not by clicking the row", async () => {
     fsListMock.mockImplementation((path: string) => {
       if (path === "/") {
         return Promise.resolve({
@@ -62,10 +62,69 @@ describe("FileBrowserModal", () => {
 
     render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
 
+    // Clicking the row selects the folder rather than entering it — that uniformity is
+    // what lets a shift-range span folders and files.
     fireEvent.click(await screen.findByText("Movies"));
+    expect(fsListMock).toHaveBeenCalledTimes(1);
 
+    fireEvent.click(screen.getByRole("button", { name: "Open Movies" }));
     await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/Movies"));
     expect(await screen.findByText("clip.mp4")).toBeInTheDocument();
+  });
+
+  it("selects every row in the listing from the select-all control", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [
+        entry({ name: "2024", path: "/2024", is_dir: true }),
+        entry({ name: "a.mp4", path: "/a.mp4" }),
+      ],
+    });
+    const onSelect = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={onSelect} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByLabelText("Select all"));
+    fireEvent.click(screen.getByRole("button", { name: /^Add 2 items/ }));
+
+    expect(onSelect).toHaveBeenCalledWith(["/2024", "/a.mp4"]);
+  });
+
+  it("shows the select-all box as indeterminate when only some rows are selected", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [
+        entry({ name: "a.mp4", path: "/a.mp4" }),
+        entry({ name: "b.mp4", path: "/b.mp4" }),
+      ],
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const selectAll = (await screen.findByLabelText("Select all")) as HTMLInputElement;
+    expect(selectAll.checked).toBe(false);
+    expect(selectAll.indeterminate).toBe(false);
+
+    fireEvent.click(screen.getByText("a.mp4"));
+    // Partial selection reads as indeterminate, not unchecked — otherwise the header
+    // claims nothing is selected while a row is ticked right below it.
+    expect(selectAll.indeterminate).toBe(true);
+
+    fireEvent.click(screen.getByText("b.mp4"));
+    expect(selectAll.checked).toBe(true);
+    expect(selectAll.indeterminate).toBe(false);
+  });
+
+  it("keeps directory mode free of checkboxes", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [entry({ name: "Movies", path: "/Movies", is_dir: true })],
+    });
+
+    render(<FileBrowserModal mode="directory" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    expect(await screen.findByText("Movies")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Select all")).not.toBeInTheDocument();
+    // Directory mode still navigates on a row click, as it always has.
+    fireEvent.click(screen.getByText("Movies"));
+    await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/Movies"));
   });
 
   it("multi-selects files and calls onSelect with their paths", async () => {
@@ -78,7 +137,7 @@ describe("FileBrowserModal", () => {
 
     fireEvent.click(await screen.findByText("a.mp4"));
     fireEvent.click(await screen.findByText("b.mp4"));
-    fireEvent.click(screen.getByRole("button", { name: /add 2 files/i }));
+    fireEvent.click(screen.getByRole("button", { name: /add 2 items/i }));
 
     expect(onSelect).toHaveBeenCalledWith(["/a.mp4", "/b.mp4"]);
   });
@@ -121,7 +180,8 @@ describe("FileBrowserModal", () => {
 
     render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
 
-    fireEvent.click(await screen.findByText("Movies"));
+    await screen.findByText("Movies");
+    fireEvent.click(screen.getByRole("button", { name: "Open Movies" }));
     await screen.findByText("clip.mp4");
 
     fireEvent.click(screen.getByRole("button", { name: "/" }));
@@ -147,7 +207,7 @@ describe("FileBrowserModal", () => {
 
     render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
 
-    expect(await screen.findByRole("button", { name: /add 0 files/i })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: /add 0 items/i })).toBeDisabled();
   });
 
   it('starts at the configured browse root instead of always guessing "/"', async () => {
@@ -185,7 +245,8 @@ describe("FileBrowserModal", () => {
 
     render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
 
-    fireEvent.click(await screen.findByText("Movies"));
+    await screen.findByText("Movies");
+    fireEvent.click(screen.getByRole("button", { name: "Open Movies" }));
     await screen.findByText("clip.mp4");
 
     // Breadcrumb reads [/media] > Movies — no crumb above /media is offered.

@@ -89,12 +89,29 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
     });
   };
 
-  const handleEntryClick = (entry: FsEntry) => {
-    if (entry.is_dir) {
-      load(entry.path);
-    } else if (mode === "files") {
-      toggleSelect(entry.path);
+  const selectable = mode === "files";
+
+  const handleRowClick = (entry: FsEntry) => {
+    // Directory mode keeps its original behavior: a folder click navigates, a file is inert.
+    if (!selectable) {
+      if (entry.is_dir) load(entry.path);
+      return;
     }
+    toggleSelect(entry.path);
+  };
+
+  const allSelected = entries.length > 0 && entries.every((e) => selected.has(e.path));
+  const someSelected = entries.some((e) => selected.has(e.path));
+
+  const toggleSelectAll = () => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const e of entries) {
+        if (allSelected) next.delete(e.path);
+        else next.add(e.path);
+      }
+      return next;
+    });
   };
 
   const handleConfirm = () => {
@@ -111,7 +128,7 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   const confirmLabel =
     mode === "directory"
       ? "Choose this folder"
-      : `Add ${selected.size} file${selected.size === 1 ? "" : "s"}`;
+      : `Add ${selected.size} item${selected.size === 1 ? "" : "s"}`;
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -139,6 +156,21 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
 
         {error && <div className="setting-error">{error}</div>}
 
+        {selectable && !loading && entries.length > 0 && (
+          <label className="file-browser-select-all">
+            <input
+              type="checkbox"
+              aria-label="Select all"
+              checked={allSelected}
+              ref={(el) => {
+                if (el) el.indeterminate = !allSelected && someSelected;
+              }}
+              onChange={toggleSelectAll}
+            />
+            <span>Select all ({entries.length})</span>
+          </label>
+        )}
+
         <div className="file-browser-list">
           {loading ? (
             <div className="empty-state">Loading…</div>
@@ -147,20 +179,43 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
           ) : (
             entries.map((entry) => {
               const isSelected = selected.has(entry.path);
-              const selectable = mode === "files" && !entry.is_dir;
               return (
-                <button
+                <div
                   key={entry.path}
-                  type="button"
-                  className={`file-browser-entry${isSelected ? " file-browser-entry-selected" : ""}`}
-                  onClick={() => handleEntryClick(entry)}
-                  disabled={!entry.is_dir && mode === "directory"}
+                  className={`file-browser-entry${isSelected ? " file-browser-entry-selected" : ""}${
+                    !selectable && !entry.is_dir ? " file-browser-entry-disabled" : ""
+                  }`}
+                  onClick={() => handleRowClick(entry)}
                 >
-                  <span className="file-browser-entry-icon">
-                    {entry.is_dir ? "📁" : selectable ? (isSelected ? "☑" : "☐") : "📄"}
-                  </span>
+                  {selectable && (
+                    /* readOnly, not onChange: the row's click handler owns the state transition
+                       (it needs the shiftKey modifier, which a change event does not carry). Without
+                       readOnly React warns on every row about a checked input with no onChange. */
+                    <input
+                      type="checkbox"
+                      className="file-browser-entry-check"
+                      checked={isSelected}
+                      readOnly
+                      aria-label={entry.name}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  )}
+                  <span className="file-browser-entry-icon">{entry.is_dir ? "📁" : "📄"}</span>
                   <span className="file-browser-entry-name">{entry.name}</span>
-                </button>
+                  {selectable && entry.is_dir && (
+                    <button
+                      type="button"
+                      className="file-browser-entry-open"
+                      aria-label={`Open ${entry.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        load(entry.path);
+                      }}
+                    >
+                      →
+                    </button>
+                  )}
+                </div>
               );
             })
           )}

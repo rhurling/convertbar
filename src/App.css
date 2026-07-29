@@ -1280,6 +1280,43 @@ select.setting-input {
   color: var(--green);
 }
 
+.file-browser-select-all {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.file-browser-entry-disabled {
+  color: var(--text-dim);
+  cursor: default;
+}
+
+.file-browser-entry-check {
+  flex-shrink: 0;
+}
+
+/* Full-height hit area: the row itself now selects, so this is the only way into a
+   folder and must not be a small target. */
+.file-browser-entry-open {
+  margin-left: auto;
+  padding: 4px 10px;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 14px;
+  cursor: pointer;
+  align-self: stretch;
+}
+
+.file-browser-entry-open:hover {
+  background: var(--bg-tertiary);
+}
+
 .file-browser-footer {
   display: flex;
   justify-content: flex-end;
