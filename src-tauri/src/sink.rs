@@ -21,6 +21,27 @@ impl<R: tauri::Runtime> EventSink for TauriSink<R> {
 
 pub struct TrashDisposer;
 impl convertbar_core::dispose::FileDisposer for TrashDisposer {
+    /// macOS: NSFileManager's `trashItemAtURL`, NOT the `trash` crate's default.
+    ///
+    /// That default (`DeleteMethod::Finder`) shells out to `osascript` to tell Finder to
+    /// delete, which is an Apple Event and therefore needs the Automation TCC grant. TCC pins
+    /// that grant to the bundle's cdhash, and ConvertBar ships adhoc-signed — so every release
+    /// build changes the cdhash and silently invalidates the grant. v2.0.0 shipped into exactly
+    /// that: Trash was refused for a whole queue and no original was ever removed.
+    /// `trashItemAtURL` needs no permission, so it survives an unsigned rebuild.
+    ///
+    /// Trade-off: no Finder trash sound, and on some systems the Trash entry has no "Put Back"
+    /// (files are still recoverable by dragging them out).
+    #[cfg(target_os = "macos")]
+    fn dispose(&self, path: &str) -> bool {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut cx = trash::TrashContext::new();
+        cx.set_delete_method(DeleteMethod::NsFileManager);
+        cx.delete(path).is_ok()
+    }
+
+    /// Windows and Linux have no equivalent permission gate — the crate default is correct.
+    #[cfg(not(target_os = "macos"))]
     fn dispose(&self, path: &str) -> bool {
         trash::delete(path).is_ok()
     }
