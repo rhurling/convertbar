@@ -79,6 +79,13 @@ function App() {
         return <WatchedFoldersPage />;
       case "settings":
         return <SettingsPage onHbPathChanged={refreshHbStatus} />;
+      default: {
+        // noImplicitReturns is off, so without this the return type would silently widen to
+        // `JSX.Element | undefined` (a legal ReactNode) if a fifth Tab member were ever added,
+        // and the new tab would render a blank column with no compiler error.
+        const exhaustive: never = tab;
+        throw new Error(`Unhandled tab: ${exhaustive}`);
+      }
     }
   };
 
