@@ -1170,6 +1170,10 @@ fn process_queue(ctx: &Ctx) {
 
                 let (kept, space_saved, status_str) = decide_cleanup(original_size, conv_size);
 
+                // Set when the distinct-file cleanup left the loser on disk; carries which file
+                // that was so the error can name it.
+                let mut cleanup_failed: Option<KeptFile> = None;
+
                 // Act on the decision. In-place replaces/keeps the source via the temp; the
                 // distinct-file path keeps both names and trashes/deletes the loser as before.
                 let in_place_apply_failed = if in_place {
@@ -1182,24 +1186,26 @@ fn process_queue(ctx: &Ctx) {
                     )
                     .is_err()
                 } else {
-                    match kept {
-                        KeptFile::Converted => match cleanup_mode.as_str() {
-                            "delete" => {
-                                let _ = std::fs::remove_file(&job.source_path);
-                            }
-                            _ => {
-                                let _ = ctx.disposer.dispose(&job.source_path);
-                            }
-                        },
-                        KeptFile::Original => match cleanup_mode.as_str() {
-                            "delete" => {
-                                let _ = std::fs::remove_file(&job.output_path);
-                            }
-                            _ => {
-                                let _ = ctx.disposer.dispose(&job.output_path);
-                            }
-                        },
-                        KeptFile::Neither => {}
+                    // The loser of the size comparison — the file this job promises to remove.
+                    // Neither means there is nothing to remove (no usable output).
+                    let loser = match kept {
+                        KeptFile::Converted => Some(job.source_path.as_str()),
+                        KeptFile::Original => Some(job.output_path.as_str()),
+                        KeptFile::Neither => None,
+                    };
+                    if let Some(loser) = loser {
+                        if cleanup_mode == "delete" {
+                            let _ = std::fs::remove_file(loser);
+                        } else {
+                            let _ = ctx.disposer.dispose(loser);
+                        }
+                        // Read the verdict off the filesystem, not off the primitive's bool: a
+                        // loser that is gone satisfies the contract however the call reported
+                        // (a source that vanished mid-encode makes `dispose` report failure),
+                        // and a loser still sitting there is a failure however it reported.
+                        if std::path::Path::new(loser).exists() {
+                            cleanup_failed = Some(kept);
+                        }
                     }
                     false
                 };
@@ -1228,6 +1234,34 @@ fn process_queue(ctx: &Ctx) {
                     // re-encoded content, and in trash mode it is the only in-place copy (the
                     // original is in Trash), so removing it would force trash recovery. The marker
                     // keeps it out of scans, and the next in-place encode pre-clears it.
+                    continue;
+                }
+
+                // The distinct-file counterpart: the encode itself succeeded, but the file this
+                // job promised to remove is still on disk, so both copies remain. Recording
+                // 'done'/'skipped' here would claim a cleanup that did not happen and book
+                // space_saved that was never freed — the shape of the v2.0.0 field regression,
+                // where macOS refused the Trash Apple Event and a whole queue silently kept
+                // every original while reporting gigabytes saved.
+                if let Some(stuck) = cleanup_failed {
+                    had_errors = true;
+                    let which = match stuck {
+                        KeptFile::Converted => "original",
+                        // Only reachable for Original: Neither never sets cleanup_failed.
+                        _ => "larger re-encode",
+                    };
+                    let verb = if cleanup_mode == "delete" {
+                        "deleted"
+                    } else {
+                        "moved to Trash"
+                    };
+                    record_job_error(
+                        ctx,
+                        &job.id,
+                        &file_name,
+                        &format!("Encode finished, but the {which} could not be {verb}; both files remain"),
+                        crate::failure_class::FailureClass::Environment,
+                    );
                     continue;
                 }
 
@@ -1521,6 +1555,33 @@ mod tests {
         let disposer = Arc::new(RecordingDisposer::default());
         let ctx = Ctx::new(conn, sink.clone(), disposer.clone(), locator);
         (ctx, sink, disposer)
+    }
+
+    /// `test_ctx` with a caller-supplied disposer, for tests about what process_queue does
+    /// when the Trash primitive itself fails rather than succeeding silently.
+    fn test_ctx_with_disposer(
+        conn: Connection,
+        disposer: Arc<dyn crate::dispose::FileDisposer>,
+    ) -> (Arc<Ctx>, Arc<TestSink>) {
+        let sink = Arc::new(TestSink::default());
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer,
+            Arc::new(crate::handbrake::PanickingLocator),
+        );
+        (ctx, sink)
+    }
+
+    fn saved_of(db: &Arc<Mutex<Connection>>, id: &str) -> Option<i64> {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT space_saved FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 
     fn set_setting(db: &Arc<Mutex<Connection>>, key: &str, value: &str) {
@@ -3649,6 +3710,132 @@ HandBrake has exited.";
                 .iter()
                 .any(|(_, body)| body.contains("in.mp4")),
             "a successful encode must notify with the file name, got: {notifications:?}"
+        );
+    }
+
+    // The v2.0.0 field regression. macOS refused the Trash Apple Event (the app's Automation
+    // grant is pinned to a cdhash that every unsigned rebuild changes), `trash::delete`
+    // returned Err — and the swallowed `let _ =` still wrote status='done',
+    // kept_file='converted' and a positive space_saved while BOTH files sat on disk. Seven
+    // jobs recorded ~1.1 GB "saved" that was never freed; the only way to notice was to go
+    // look at the folder. A cleanup that did not happen is a failed job, not a silent one.
+    #[test]
+    fn a_failed_trash_of_the_original_errors_instead_of_claiming_a_false_success() {
+        let (ctx, _sink) =
+            test_ctx_with_disposer(test_conn(), Arc::new(crate::dispose::FailingDisposer));
+        set_setting(&ctx.db, "cleanup_mode", "trash");
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let src = dir.path().join("in.mp4");
+        std::fs::write(&src, b"0123456789").unwrap(); // 10 bytes; the fake encode writes 5
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            10,
+        );
+
+        process_queue(&ctx);
+
+        let (status, msg) = job_row(&ctx.db, "j1");
+        assert_eq!(
+            status, "error",
+            "a job whose original is still on disk has not done what 'done' promises"
+        );
+        let msg = msg.unwrap_or_default();
+        assert!(
+            msg.contains("original") && msg.contains("both files remain"),
+            "history must say WHAT is wrong on disk, not just that something failed — got: {msg}"
+        );
+        assert_eq!(
+            class_of(&ctx.db, "j1").as_deref(),
+            Some("environment"),
+            "a refused Trash operation is the environment's fault, never the file's"
+        );
+        assert!(
+            src.exists() && out.exists(),
+            "fixture check: both files remaining IS the condition under test"
+        );
+        assert_eq!(
+            saved_of(&ctx.db, "j1"),
+            None,
+            "nothing was freed, so the run must not book space_saved — the false 1.1 GB \
+             total is what hid this bug for a whole queue"
+        );
+    }
+
+    // The mirror: when the re-encode LOSES, the loser is the new file. A failed disposal
+    // there leaves a stray output beside the original, so it fails the same contract.
+    #[test]
+    fn a_failed_trash_of_the_larger_reencode_errors_too() {
+        let (ctx, _sink) =
+            test_ctx_with_disposer(test_conn(), Arc::new(crate::dispose::FailingDisposer));
+        set_setting(&ctx.db, "cleanup_mode", "trash");
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let src = dir.path().join("in.mp4");
+        std::fs::write(&src, b"0").unwrap(); // 1 byte, so the 5-byte encode loses
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1,
+        );
+
+        process_queue(&ctx);
+
+        let (status, msg) = job_row(&ctx.db, "j1");
+        assert_eq!(
+            status, "error",
+            "'skipped' claims the pointless output was cleaned up — it is still there"
+        );
+        assert!(
+            msg.unwrap_or_default().contains("re-encode"),
+            "the message must name the file that is stuck, not the one we kept"
+        );
+        assert!(src.exists() && out.exists(), "fixture check");
+    }
+
+    // The verdict comes from the filesystem, not from the primitive's bool. A source that is
+    // gone by the time we look satisfies the contract however the delete call reported — else
+    // an already-vanished source would be reported as a cleanup failure it isn't.
+    #[test]
+    fn a_disposer_that_reports_failure_but_removed_the_file_still_completes() {
+        let (ctx, _sink) =
+            test_ctx_with_disposer(test_conn(), Arc::new(crate::dispose::LyingDisposer));
+        set_setting(&ctx.db, "cleanup_mode", "trash");
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let src = dir.path().join("in.mp4");
+        std::fs::write(&src, b"0123456789").unwrap();
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            10,
+        );
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            job_row(&ctx.db, "j1").0,
+            "done",
+            "the original is gone, which is all 'done' promises"
+        );
+        assert!(!src.exists(), "fixture check: the disposer did delete it");
+        assert_eq!(
+            saved_of(&ctx.db, "j1"),
+            Some(5),
+            "10 - 5 bytes really freed"
         );
     }
 
