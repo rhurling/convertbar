@@ -105,9 +105,19 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
   (all 39 routes, the frontend transport, every route test) and this item asked for a
   distinction, not a re-taxonomy.
 - Nine sites went through `core_err`; the tenth (`fs.rs`) built the same body through that
-  module's local `json_err`, which is why grepping `core_err` found nine. A directory-walking
-  tripwire test now fails if any route module spells the shape out again — including a route
-  module added later, since it walks `src/routes` rather than listing the modules.
+  module's local `json_err`, which is why grepping `core_err` found nine.
+- **Applied is not enforced.** The first cut left each handler writing its own
+  `spawn_blocking` match and guarded them with a tripwire matching the literal text
+  `task panicked` — so a handler mapping its join arm through `core_err` with *fresh wording*
+  reintroduced the gap with the whole suite green. That was confirmed by mutation, not assumed.
+  Two helpers now own the mapping — `blocking_json` for work returning a `Result`, and
+  `blocking_response` for `fs::fs_list`, which picks its own 200/403/404/500 — so all ten
+  handlers stopped spelling their failure arms, and the tripwire checks the class instead of
+  the phrase: no route module may call `spawn_blocking(`, with no exemption. Exempting
+  `fs.rs` (the tenth site, and the one that diverged) would have left the tripwire blind to a
+  second endpoint in that same module. It covers a route module added later, since it walks
+  `src/routes` rather than listing modules; it reads source text, so it is a backstop rather
+  than a proof.
 - **Out of scope, recorded:** the desktop head has the same indistinguishability.
   `src-tauri/src/commands/*` map join failures with `.map_err(|e| e.to_string())?`, so the
   frontend receives a plain string with no channel to carry a discriminator. Fixing it there
