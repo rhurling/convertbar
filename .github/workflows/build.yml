@@ -61,6 +61,46 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
+      # The bundler skips notarization with only a *warning* when the API-key
+      # variables are absent, and falls back to an ad-hoc signature when the
+      # certificate is absent. Both failure modes produce a release that looks
+      # fine and silently breaks every user's TCC permission grants. Refuse to
+      # build instead.
+      - name: Require macOS signing credentials
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          missing=0
+          for var in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                     APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8; do
+            if [ -z "${!var}" ]; then
+              echo "::error::$var is not set — refusing to publish an unsigned macOS build"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      # Tauri reads a *path* to the App Store Connect key, so the base64 secret
+      # has to become a file. Named AuthKey_<KEYID>.p8 because some Apple
+      # tooling infers the key ID from the filename. $RUNNER_TEMP is outside the
+      # checkout, so no bundler glob or stray `git add` can pick it up.
+      - name: Materialize the App Store Connect API key
+        if: runner.os == 'macOS'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -91,6 +131,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS code signing; ignored on the Linux and Windows legs. The Tauri
+          # CLI imports APPLE_CERTIFICATE into a temporary keychain itself, so no
+          # manual `security create-keychain` step is needed here.
+          # APPLE_API_KEY_PATH is exported into GITHUB_ENV by an earlier step.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
           tagName: v__VERSION__
           releaseName: "v__VERSION__"
@@ -101,6 +150,53 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # tauri-action has already uploaded to the draft by now, but publish-release
+      # needs every matrix leg green, so failing here leaves the release a draft.
+      #
+      # Notarization itself is already gated: the bundler waits for Apple's verdict
+      # and fails the build on rejection. So this asserts only what is decidable
+      # offline and deterministically, and reports the network-dependent Gatekeeper
+      # verdict as a warning. Every threshold below was measured on a real signed
+      # build (2026-07-29): app stapled, dmg NOT stapled (signed but never
+      # submitted), updater tarball stapled.
+      - name: Verify the macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # -print -quit, not `| head -1`: no pipe means no SIGPIPE interaction
+          # with pipefail, and it cannot silently pick an arbitrary bundle.
+          app=$(find target -maxdepth 6 -name 'ConvertBar.app' -type d -print -quit)
+          [ -n "$app" ] || { echo "::error::no ConvertBar.app found"; exit 1; }
+
+          codesign --verify --strict --verbose=2 "$app"
+
+          desc=$(codesign -dvv "$app" 2>&1)
+          grep -q 'flags=.*runtime' <<<"$desc" \
+            || { echo "::error::hardened runtime missing"; exit 1; }
+          grep -q 'Authority=Developer ID Application' <<<"$desc" \
+            || { echo "::error::not signed with a Developer ID Application cert"; exit 1; }
+
+          xcrun stapler validate "$app" \
+            || { echo "::error::notarization ticket is not stapled to the app"; exit 1; }
+
+          # Advisory, not gating: an unstapled updater artifact still works, it just
+          # costs auto-updating users an online Gatekeeper check on first launch.
+          updater=$(find target -maxdepth 6 -name 'ConvertBar.app.tar.gz' -print -quit)
+          if [ -n "$updater" ]; then
+            work=$(mktemp -d)
+            tar -xzf "$updater" -C "$work"
+            xcrun stapler validate "$work/ConvertBar.app" \
+              || echo "::warning::updater tarball is not stapled (Tauri bundling order may have changed)"
+          fi
+
+          # Advisory: needs network. Captured rather than piped, because
+          # `spctl | tee | grep -q` goes non-zero under pipefail when grep exits
+          # early and tee takes SIGPIPE — printing this on a healthy build.
+          verdict=$(spctl -a -vvv --type execute "$app" 2>&1) || true
+          echo "$verdict"
+          grep -q 'source=Notarized Developer ID' <<<"$verdict" \
+            || echo "::warning::spctl did not report a notarized Developer ID"
 
   # Publishing is the event that seals an immutable release, so it runs once,
   # after every platform has uploaded to the draft.

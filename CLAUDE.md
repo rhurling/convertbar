@@ -26,6 +26,33 @@ The script bumps all three manifests (`tauri.conf.json`, `package.json`, `Cargo.
 
 Never hand-edit the version — the script keeps the manifests and lockfile in sync and rebuilds before committing.
 
+## Code Signing (macOS)
+
+Release builds are Developer ID–signed and notarized in CI. This is not cosmetic: an ad-hoc signature's designated requirement is the binary's cdhash, so macOS revoked every TCC permission grant on each new build. A Developer ID signature anchors the requirement to the team and bundle identifier instead, so grants survive version bumps.
+
+Six repository secrets drive it, all consumed in `.github/workflows/build.yml`:
+
+| Secret | What it is |
+|---|---|
+| `APPLE_CERTIFICATE` | base64 of the Developer ID Application `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | that `.p12`'s export password |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: … (TEAMID)` |
+| `APPLE_API_ISSUER` | App Store Connect API issuer UUID |
+| `APPLE_API_KEY` | App Store Connect API key ID |
+| `APPLE_API_KEY_P8` | base64 of `AuthKey_<KEYID>.p8` |
+
+Notarization authenticates with the App Store Connect API key — deliberately never `APPLE_ID`/`APPLE_PASSWORD`, so no personal Apple ID or app-specific password exists in CI. The key is team-scoped, holds only the Developer role, and is revocable on its own.
+
+The preflight step exists because both failure modes are silent: the bundler skips notarization with only a *warning* when the API-key variables are absent, and falls back to an ad-hoc signature when the certificate is absent. Either would ship a release that looks fine and breaks every user's permission grants. A missing secret fails the macOS legs instead, which leaves the release an unpublished draft (`publish-release` needs every matrix leg green).
+
+`tauri.conf.json` intentionally carries no `signingIdentity`: local builds, including the rebuild inside `scripts/release.sh`, stay ad-hoc and need no private key. Only CI signs.
+
+**Renewal:** the certificate expires **2031-07-30**. Re-run Task 1 of `docs/superpowers/plans/2026-07-29-macos-code-signing.md` and replace the first three secrets. A renewed certificate under the same Team ID does **not** cost users their permissions again — the designated requirement anchors to the team and bundle identifier, not to the particular certificate. Builds already shipped keep working after expiry; notarization tickets do not expire with the cert.
+
+**Rotating the API key:** revoke in App Store Connect, generate a replacement, and update `APPLE_API_ISSUER`/`APPLE_API_KEY`/`APPLE_API_KEY_P8`. The preflight only checks that secrets are *present*, so a revoked-but-still-populated key passes it and fails later at the notarization submission — still loud, just further along.
+
+**On a Command Line Tools–only machine**, the Developer ID issuing intermediate is absent from the trust store (it ships with Xcode), so a freshly installed certificate shows "not trusted" and `security find-identity -v -p codesigning` reports zero identities. Fix by fetching the intermediate named in the certificate's own Authority Information Access extension; see Task 1 Step 4 of the plan. CI is unaffected — GitHub's macOS runners have full Xcode.
+
 ## Merging a PR (non-release)
 
 `main` is protected: signed commits, no merge commits, PR required. Claude cannot `git push` — ask the user to push with `! git push -u origin <branch>`. Then:
