@@ -22,3 +22,25 @@ impl FileDisposer for RecordingDisposer {
         std::fs::remove_file(path).is_ok()
     }
 }
+
+/// Test disposer for the denied-Trash world: reports failure and leaves the file where it
+/// is — what `trash::delete` does on macOS when the Apple Event to Finder is refused.
+#[derive(Default)]
+pub struct FailingDisposer;
+impl FileDisposer for FailingDisposer {
+    fn dispose(&self, _path: &str) -> bool {
+        false
+    }
+}
+
+/// Test disposer that performs the delete but reports failure anyway. Pins that the cleanup
+/// verdict is read from the filesystem rather than from this bool: a source that is gone by
+/// the time we look satisfies the contract no matter what the primitive claimed.
+#[derive(Default)]
+pub struct LyingDisposer;
+impl FileDisposer for LyingDisposer {
+    fn dispose(&self, path: &str) -> bool {
+        let _ = std::fs::remove_file(path);
+        false
+    }
+}
