@@ -421,6 +421,25 @@ pub fn resolve_handbrake_path(ctx: &Ctx) -> Result<Option<String>, String> {
     Ok(resolve_with_locator(configured.as_deref(), &*ctx.handbrake))
 }
 
+/// The message for "HandBrakeCLI could not be located". Exported because it is asserted across a
+/// crate boundary (`convertbar-server`'s route tests read it as an HTTP response body) and is
+/// persisted verbatim as a job's `error_message` by `converter::process_queue`, so the wording is
+/// a contract rather than an incidental string. One definition means renaming it is a compile
+/// error instead of a silent test break in another crate.
+pub const HANDBRAKE_NOT_FOUND: &str = "HandBrakeCLI not found";
+
+/// [`resolve_handbrake_path`] with "not found" folded into the error — the single production site
+/// of the `None` -> `Err` mapping.
+///
+/// Locks `ctx.db` (via `resolve_handbrake_path`) and may spawn `which`/`where`, so it must never
+/// be called while a `ctx.db` guard is held: the mutex is not reentrant. Call sites that already
+/// hold the guard (`queue_ops::get_handbrake_path`) or that already hold a resolved path
+/// (`queue_ops::add_files_inner`, `converter::process_queue`) reference [`HANDBRAKE_NOT_FOUND`]
+/// directly instead — calling this there would deadlock or re-spawn `which`.
+pub fn require_handbrake_path(ctx: &Ctx) -> Result<String, String> {
+    resolve_handbrake_path(ctx)?.ok_or_else(|| HANDBRAKE_NOT_FOUND.to_string())
+}
+
 /// Preset metadata via the shared cache. The cache mutex is deliberately NOT held
 /// across the HandBrake shell-out: any command contending this lock would otherwise
 /// block for the whole subprocess run (lock convoy). Concurrent misses may fetch the
@@ -505,13 +524,20 @@ mod tests {
     use super::*;
 
     fn test_ctx() -> std::sync::Arc<Ctx> {
+        test_ctx_with_locator(std::sync::Arc::new(crate::handbrake::PanickingLocator))
+    }
+
+    /// `test_ctx` for tests that actually reach HandBrake resolution and must therefore say which
+    /// world they are in, rather than inheriting whatever the host has installed. Named to match
+    /// the identically-purposed helper in `queue_ops`'s test module.
+    fn test_ctx_with_locator(locator: std::sync::Arc<dyn HandbrakeLocator>) -> std::sync::Arc<Ctx> {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
         Ctx::new(
             conn,
             std::sync::Arc::new(crate::events::TestSink::default()),
             std::sync::Arc::new(crate::dispose::DeleteDisposer),
-            std::sync::Arc::new(crate::handbrake::PanickingLocator),
+            locator,
         )
     }
 
@@ -808,6 +834,38 @@ Matroska/
     fn absent_locator_reports_handbrake_missing() {
         // The CI world, expressible for the first time.
         assert_eq!(resolve_with_locator(Some(""), &AbsentLocator), None);
+    }
+
+    #[test]
+    fn handbrake_not_found_wording_is_pinned() {
+        // The ONE place the wording itself is asserted. Every other site — production and test —
+        // references the constant, which protects the identifier but not its value. Without this,
+        // editing the string would silently change the HTTP error body, the persisted job
+        // `error_message`, and the text the user reads, with nothing going red. Changing this
+        // line is the deliberate act of changing a user- and API-visible contract; that is the
+        // point of it being exactly one line in exactly one place.
+        assert_eq!(HANDBRAKE_NOT_FOUND, "HandBrakeCLI not found");
+    }
+
+    #[test]
+    fn require_handbrake_path_reports_missing_in_the_absent_world() {
+        // The single production site of the `None` -> `Err` mapping. Eight call sites across
+        // three crates each used to spell this out; if one drifts now it is a compile error
+        // rather than a silent cross-crate test break.
+        let ctx = test_ctx_with_locator(std::sync::Arc::new(AbsentLocator));
+        assert_eq!(
+            require_handbrake_path(&ctx).unwrap_err(),
+            HANDBRAKE_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn require_handbrake_path_returns_the_located_path_in_the_installed_world() {
+        // `StubLocator` alone is enough here, with no preset-cache seeding: this function
+        // resolves a path and stops — it never runs the binary.
+        let ctx =
+            test_ctx_with_locator(std::sync::Arc::new(StubLocator("/opt/HandBrakeCLI".into())));
+        assert_eq!(require_handbrake_path(&ctx).unwrap(), "/opt/HandBrakeCLI");
     }
 
     #[test]

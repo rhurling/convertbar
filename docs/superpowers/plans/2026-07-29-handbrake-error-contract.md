@@ -13,6 +13,23 @@
 ## Global Constraints
 
 - Every task ends green on: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets`.
+- **Verifying lints — read this before trusting any "clippy will fail" reasoning.** There is no
+  `[lints]` table or `deny` attribute in any workspace `Cargo.toml`, and `.github/workflows/test.yml`
+  runs no clippy step at all. `unused_imports` and `dead_code` are warn-level, so
+  `cargo clippy --workspace --all-targets` **exits 0 with them present**. Clippy is not a backstop
+  here. To prove a task introduced no new warning, diff against the pre-change baseline:
+  ```bash
+  git stash && git checkout <base-sha>
+  cargo clippy --workspace --all-targets 2>&1 | grep -E "^warning|^error" | sort | uniq -c > /tmp/base.txt
+  git checkout - && git stash pop
+  cargo clippy --workspace --all-targets 2>&1 | grep -E "^warning|^error" | sort | uniq -c > /tmp/now.txt
+  diff /tmp/base.txt /tmp/now.txt   # must be empty
+  ```
+  The explicit `grep` checks each task specifies are the real guard — run them.
+- **PR 2's line numbers are stale by design.** They are pre-PR-1 coordinates; Task 1 inserted 9
+  lines above most of them (`queue_ops.rs:831` → ~840, `:1236` → ~1246, `:1649` → ~1658;
+  `routes/mod.rs:288` → ~292). **The quoted "Before:" snippets are authoritative, not the numbers** —
+  each was verified character-exact and unique. Search for the snippet.
 - **Never hold `ctx.db`'s lock across an event emit.** `std::sync::Mutex` is not reentrant and the desktop tray listener re-locks synchronously on the same thread. Two shipped deadlocks came from violating this.
 - **`ctx.db` is not reentrant, full stop.** `require_handbrake_path` locks it. It must never be called while a `ctx.db` guard is held.
 - **Test fixtures default to `PanickingLocator`.** A test that reaches HandBrake resolution without declaring its world must fail loud. Use `AbsentLocator` for the CI world, `StubLocator` for the installed world, never `PathLocator` outside `#[ignore]`d tests.
@@ -912,17 +929,31 @@ the constant in `crates/convertbar-core/src/handbrake.rs`:
 pub const HANDBRAKE_NOT_FOUND: &str = "XXX PLACEHOLDER XXX";
 ```
 
-Run `cargo test --workspace`. Expected: **green**. Any failure names a test that still hardcodes
-the words — fix that test to use the constant, then re-run. Restore the real value afterwards and
-confirm green again. Record both runs in the report.
+Run `cargo test --workspace`. Expected: **exactly one failure —
+`handbrake::tests::handbrake_not_found_wording_is_pinned`**, which asserts the literal wording on
+purpose. Any OTHER failure names a test that still hardcodes the words — fix that test to use the
+constant, then re-run.
+
+The single deliberate failure is the point. Every other site references the constant, which
+protects the identifier but not its value; without that one pin, editing the string would
+silently change the HTTP error body, the persisted job `error_message`, and the user-visible
+text with nothing going red — the exact silent break the constant's doc comment claims to
+prevent, inverted. Restore the real value afterwards and confirm fully green. Record both runs.
 
 - [ ] **Step 2: Panic-detection check**
 
 The server test at `routes/mod.rs:288` exists to prove its 500 is deliberate rather than a panic
 unwinding inside `spawn_blocking`. Swapping its assertion to the constant must not weaken that.
 
-Temporarily add `panic!("forced");` as the first line of the `spawn_blocking` closure in
-`crates/convertbar-server/src/routes/queue.rs`'s `add_files` handler. Run:
+The handler's closure is a single expression (`move || queue_ops::add_files(&ctx, &b.paths)`),
+so it must be blockified. In `crates/convertbar-server/src/routes/queue.rs`, temporarily replace
+that closure with:
+
+```rust
+move || { panic!("forced"); #[allow(unreachable_code)] queue_ops::add_files(&ctx, &b.paths) }
+```
+
+Then run:
 
 `cargo test -p convertbar-server add_files_route_reports_the_error_when_handbrake_is_absent`
 

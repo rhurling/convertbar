@@ -21,9 +21,9 @@ pub async fn detect_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<Option<String>
 #[tauri::command]
 pub async fn list_handbrake_presets(ctx: State<'_, Arc<Ctx>>) -> Result<Vec<String>, String> {
     let ctx = ctx.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || match hb::resolve_handbrake_path(&ctx)? {
-        Some(p) => hb::list_presets(&p),
-        None => Err("HandBrakeCLI not found".to_string()),
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = hb::require_handbrake_path(&ctx)?;
+        hb::list_presets(&path)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -44,7 +44,7 @@ pub async fn generate_preset_suffix(
             }
         }
 
-        let handbrake_path = hb::resolve_handbrake_path(&ctx)?.ok_or("HandBrakeCLI not found")?;
+        let handbrake_path = hb::require_handbrake_path(&ctx)?;
         hb::cached_preset_metadata(&ctx, &handbrake_path, &preset)
     })
     .await

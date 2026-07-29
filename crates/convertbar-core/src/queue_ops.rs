@@ -97,7 +97,7 @@ fn get_handbrake_path(
     locator: &dyn handbrake::HandbrakeLocator,
 ) -> Result<String, String> {
     handbrake::resolve_with_locator(read_configured_handbrake_path(conn).as_deref(), locator)
-        .ok_or_else(|| "HandBrakeCLI not found".to_string())
+        .ok_or_else(|| handbrake::HANDBRAKE_NOT_FOUND.to_string())
 }
 
 /// Whether a row's verdict should be re-verified with a fresh scan before its file is
@@ -837,7 +837,7 @@ pub fn add_files_inner(
 
     // Resolve template if needed
     let suffix = if suffix_template.contains('{') {
-        let hb = hb_path.clone().ok_or("HandBrakeCLI not found")?;
+        let hb = hb_path.clone().ok_or(handbrake::HANDBRAKE_NOT_FOUND)?;
         let metadata = crate::handbrake::cached_preset_metadata(ctx, &hb, &preset)?;
         handbrake::resolve_suffix_template(&suffix_template, &metadata)
     } else {
@@ -1244,25 +1244,31 @@ pub fn get_bad_sources(ctx: &Ctx) -> Result<Vec<JobInfo>, String> {
 /// `purge_one_locked` additionally releases the DB mutex around each scan so a slow purge can't
 /// stall the converter thread too.
 pub fn purge_bad_sources(ctx: &Arc<Ctx>, ids: Vec<String>) -> Result<Vec<PurgeResult>, String> {
-    let (action, configured_handbrake_path) = {
+    let action: String = {
         let conn = ctx.db.lock().map_err(|e| e.to_string())?;
-        let action: String = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'bad_source_action'",
-                params![],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|_| "trash".to_string());
-        (action, read_configured_handbrake_path(&conn))
-    };
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'bad_source_action'",
+            params![],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "trash".to_string())
+    }; // guard dropped here: `require_handbrake_path` takes `ctx.db` itself, and it is not
+       // reentrant. The two settings are no longer read in one acquisition — they are
+       // independent, and nothing here depends on seeing a consistent snapshot of both.
     let action = PurgeAction::from_setting(&action);
     // R3: resolved ONCE for the whole batch, OUTSIDE the lock, and passed to every
     // `purge_one_locked` call below — the fallback can spawn a blocking `which`/`where`
     // subprocess (`PathLocator`), and this used to run per id, under the DB mutex, in both
     // purge phases, i.e. up to 2N blocking spawns under the lock for a batch of N ids.
-    let handbrake_path =
-        handbrake::resolve_with_locator(configured_handbrake_path.as_deref(), &*ctx.handbrake)
-            .ok_or_else(|| "HandBrakeCLI not found".to_string());
+    // `require_handbrake_path` locks only to read the setting, releases, then runs the locator
+    // unlocked, so R3 still holds — at the cost of one extra acquisition per batch, not per id.
+    // A lock failure inside it now lands in this `Err` and reaches `purge_one_locked` per id
+    // (which maps any `Err` to `Unverifiable`, destroying nothing) rather than failing the whole
+    // call. A mutex already poisoned when this call began would have failed the `action` read
+    // above; poisoning that lands BETWEEN the two acquisitions — the converter thread panicking
+    // under the lock mid-batch — surfaces here instead, as per-id `Unverifiable` rather than one
+    // `Err` for the call. Fail-safe either way: nothing is destroyed on an unverifiable verdict.
+    let handbrake_path = handbrake::require_handbrake_path(ctx);
     Ok(ids
         .iter()
         .map(|id| PurgeResult {
@@ -1655,7 +1661,10 @@ mod tests {
         let err = add_files_inner(&ctx, &["/tmp/whatever.mkv".to_string()], None).expect_err(
             "intake must fail when the suffix template needs HandBrake and it is absent",
         );
-        assert!(err.contains("HandBrakeCLI not found"), "got: {err}");
+        assert!(
+            err.contains(crate::handbrake::HANDBRAKE_NOT_FOUND),
+            "got: {err}"
+        );
     }
 
     #[test]

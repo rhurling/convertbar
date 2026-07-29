@@ -300,7 +300,10 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(json, json!({"error": "HandBrakeCLI not found"}));
+        assert_eq!(
+            json,
+            json!({"error": convertbar_core::handbrake::HANDBRAKE_NOT_FOUND})
+        );
     }
 
     #[tokio::test]

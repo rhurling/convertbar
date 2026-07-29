@@ -881,7 +881,7 @@ fn process_queue(ctx: &Ctx) {
                     ctx,
                     &job.id,
                     &file_name,
-                    "HandBrakeCLI not found",
+                    crate::handbrake::HANDBRAKE_NOT_FOUND,
                     crate::failure_class::FailureClass::Environment,
                 );
                 continue;
@@ -1695,7 +1695,7 @@ mod tests {
         assert!(
             msg.clone()
                 .unwrap_or_default()
-                .contains("HandBrakeCLI not found"),
+                .contains(crate::handbrake::HANDBRAKE_NOT_FOUND),
             "the failure must name the missing binary, not blame the source file — got {msg:?}"
         );
         assert_eq!(class_of(&ctx.db, "j1").as_deref(), Some("environment"));
