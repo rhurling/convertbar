@@ -115,6 +115,10 @@ enum InPlaceAction {
 
 fn in_place_action(kept: KeptFile, cleanup_mode: &str) -> InPlaceAction {
     match kept {
+        // "keep" is prevented at add time and at setting-change time (queue_ops), so this
+        // arm only covers the race where a job flips to 'encoding' in between. Discarding
+        // the temp is the non-destructive outcome: a wasted encode, never a lost original.
+        KeptFile::Converted if cleanup_mode == "keep" => InPlaceAction::RemoveTemp,
         KeptFile::Converted => {
             if cleanup_mode == "delete" {
                 InPlaceAction::RenameTempOverSource
@@ -1192,6 +1196,12 @@ fn process_queue(ctx: &Ctx) {
                         ctx.disposer.as_ref(),
                     )
                     .is_err()
+                } else if cleanup_mode == "keep" {
+                    // Keep both files. decide_cleanup still ran, so status and space_saved are
+                    // unchanged — only the disposal is skipped. cleanup_failed deliberately stays
+                    // None: under keep the loser is on disk BY DESIGN, so the exists() verdict
+                    // below must not run or every keep job would report a false cleanup failure.
+                    false
                 } else {
                     // The loser of the size comparison — the file this job promises to remove.
                     // Neither means there is nothing to remove (no usable output).
@@ -3334,6 +3344,31 @@ HandBrake has exited.";
     }
 
     #[test]
+    fn in_place_action_never_disposes_under_keep() {
+        // Release-mode backstop for the race where a job flips to 'encoding' between the
+        // setting write and Task 4's dequeue. The `else` branch this replaces is
+        // TrashSourceThenRename, which on the server routes through DeleteDisposer and
+        // permanently removes the user's source. debug_assert! would compile out.
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "keep"),
+            InPlaceAction::RemoveTemp
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Original, "keep"),
+            InPlaceAction::RemoveTemp
+        );
+        // Unchanged for the two shipping modes.
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "delete"),
+            InPlaceAction::RenameTempOverSource
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "trash"),
+            InPlaceAction::TrashSourceThenRename
+        );
+    }
+
+    #[test]
     fn apply_rename_replaces_source_with_temp() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("clip.mp4");
@@ -3924,6 +3959,85 @@ HandBrake has exited.";
             Some(10 - encoded),
             "space_saved must be the real delta between the 10-byte source and the encode"
         );
+    }
+
+    #[test]
+    fn keep_leaves_both_files_and_records_the_normal_space_saved() {
+        // Keep is an evaluation mode: the user verifies the encode, deletes originals by
+        // hand, then switches to Delete. So space_saved keeps its usual value — it records
+        // how much the encode OPTIMIZED, not how many bytes were freed. Zeroing it would
+        // blank the one number the user is evaluating.
+        let (ctx, _sink, disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "cleanup_mode", "keep");
+
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        // 1000 is far bigger than the fake encode's few-byte output, so the re-encode wins.
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        assert!(source.exists(), "keep must not remove the source");
+        assert!(out.exists(), "keep must not remove the output");
+        assert!(
+            disposer.0.lock().unwrap().is_empty(),
+            "nothing may be routed to the disposer under keep"
+        );
+
+        let (status, _) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "done");
+        // Derived from the encode's real size, never a literal: the fake script writes
+        // "done\n" on Unix but "done\r\n" on Windows.
+        let encoded = std::fs::metadata(&out).unwrap().len() as i64;
+        assert_eq!(
+            saved_of(&ctx.db, "j1"),
+            Some(1000 - encoded),
+            "keep must record the same delta delete would, even though nothing was disposed"
+        );
+    }
+
+    #[test]
+    fn keep_with_a_larger_output_keeps_both_and_still_records_skipped() {
+        let (ctx, _sink, disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "cleanup_mode", "keep");
+
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        // 3 bytes is smaller than the fake encode's output (5-6 bytes), so the re-encode loses.
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            3,
+        );
+
+        process_queue(&ctx);
+
+        assert!(source.exists());
+        assert!(out.exists(), "even a losing output survives under keep");
+        assert!(disposer.0.lock().unwrap().is_empty());
+
+        let (status, _) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "skipped");
+        // The negative delta, identical to what delete would record for the same sizes: keep
+        // changed the disposal and nothing else.
+        let encoded = std::fs::metadata(&out).unwrap().len() as i64;
+        assert_eq!(saved_of(&ctx.db, "j1"), Some(3 - encoded));
     }
 
     #[test]
