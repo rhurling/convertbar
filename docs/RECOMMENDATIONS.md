@@ -139,9 +139,11 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     — and a tripwire that greps for call sites would never see a struct literal. As a sibling, it
     cannot. The tripwire also bans `async_runtime::spawn` and `thread::spawn` (both reach a join
     arm without reaching `blocking`) and a command declared `-> Result<_, String>` (which would
-    otherwise silently opt one command back out of the shared shape), and a second test requires
-    every async command to actually reach `blocking` — dropping it for a direct call costs the
-    taxonomy *and* the off-main-thread guarantee the probe-hazard fix bought at four entry points.
+    otherwise silently opt one command back out of the shared shape). A second test names the ten
+    commands that must reach `blocking` — named rather than inferred from `async`, because a
+    command that drops the keyword stops matching, stops being counted, and reinstates the freeze
+    the probe-hazard fix removed at four entry points, silently. A third refuses a
+    `#[tauri::command]` defined outside `src/commands`, which would escape both of the others.
   - **The frontend was the other half.** Every display site spelled `String(e)` (or `${e}`), which
     is correct only while the backend fails with a bare string — the moment it gained a field, the
     whole UI would have rendered `[object Object]` for *ordinary* errors, not just panics.
@@ -159,8 +161,10 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     component test renders a panic end to end — before it, the entire frontend half was pinned
     only by unit tests of `errorText`, so any display site could revert with the suite green.
 - **Still open, and genuinely out of scope.** Only a panic *inside a `blocking` closure* becomes a
-  `JoinError`, so only those nine commands can produce `kind: "panic"`. Three gaps remain, and
-  none is a regression — each was equally true before this item:
+  `JoinError`, so only those ten commands can produce `kind: "panic"` (nine, plus `pick_folder`,
+  which moved onto the pool here — its exemption claimed it was async for a reason other than
+  blocking work, but `blocking_pick_folder` holds its thread for as long as the panel is open).
+  Four gaps remain, and none is a regression — each was equally true before this item:
   - **A panic elsewhere in a command never reaches the mapping.** Tauri has no `catch_unwind` on
     the desktop command path (verified against `tauri` 2.11.5 and `tauri-macros` 2.6.3; the only
     one is in `mobile.rs`). A *sync* command's panic unwinds past the IPC handler; an *async*
@@ -172,6 +176,14 @@ Core functionality: drag-and-drop queuing, HandBrakeCLI encoding with progress p
     `ctx.db.lock().map_err(|e| e.to_string())?`, and `From<String>` stamps that `PoisonError` with
     no discriminator. So the panic itself is labelled and its permanent consequence is not.
     Fixing it needs a typed error out of core, not a shape at the command boundary.
+  - **Two commands still stat paths on the main thread.** `check_paths_exist` (fired when the
+    history context menu opens) and `open_path` are sync, so Tauri runs them on the main thread,
+    and a `Path::exists()` against a dead network mount hangs for tens of seconds — the same
+    freeze the probe hazard caused, at a fifth and sixth entry point. Left alone deliberately:
+    moving them is a UI-responsiveness fix, and `check_paths_exist` currently cannot fail, so
+    giving it a `Result` changes a frontend contract that has nothing to do with this item. The
+    `MUST_BLOCK` list in `commands/mod.rs` says so where someone would otherwise read it as a
+    complete inventory of main-thread hazards.
   - **Some failures are never shown at all.** `job-error` events carry a bare string and a panic
     in a background updater task produces no `Err`; separately, six frontend `catch` sites log to
     the console and render nothing (`QueueItem`, `useQueue`, `useHistory` ×2, `useBadSources`, and

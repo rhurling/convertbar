@@ -4,8 +4,10 @@
 // (src-tauri/src/commands/error.rs) and the server's error body
 // (crates/convertbar-server/src/routes/mod.rs) each serialize to `{error, kind?}` — so one
 // helper reads both. `kind` is the whole discriminator: it is absent for a failure the backend
-// means (HandBrakeCLI missing, an id that matches no row) and `"panic"` when a blocking task
-// died, which is a bug in ConvertBar rather than anything the user can act on.
+// means (HandBrakeCLI missing, an id that matches no row) and `"panic"` when a blocking task did
+// not return — a bug in ConvertBar rather than anything the user can act on. (Strictly it also
+// covers a task cancelled at runtime shutdown, which is not a bug; both heads accept that, since
+// the conclusion "nothing the user can fix" is the same.)
 //
 // This replaced a bare `String(e)` at every display site, which was wrong twice over: it cannot
 // see `kind`, and on desktop `invoke` rejects with the raw object, so it renders

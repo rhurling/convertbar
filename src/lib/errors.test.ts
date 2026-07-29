@@ -82,22 +82,53 @@ describe("display sites", () => {
       return out;
     };
 
+    // Line comments go first, like the Rust twin: a comment quoting `String(e)` is prose, and
+    // failing on it would train people to work around the tripwire. Collapsing the whitespace
+    // inside `${ … }` closes the spaced spelling, which no formatter here would normalise —
+    // there is no Prettier or ESLint in this repo.
+    const codeOnly = (source: string): string =>
+      source
+        .split("\n")
+        .map((line) => (line.includes("//") ? line.slice(0, line.indexOf("//")) : line))
+        .join("\n")
+        .replace(/\$\{\s*([\w$]+)\s*\}/g, "${$1}");
+
+    // `.toString()` needles begin with the binding, so `e.toString()` would otherwise match
+    // any identifier ending in "e" — `fileSize.toString()` is not a caught error. The Rust twin
+    // guards the preceding character for the same reason.
+    const usesToken = (source: string, needle: string): boolean => {
+      for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
+        if (at === 0 || !/[\w$.]/.test(source[at - 1])) return true;
+      }
+      return false;
+    };
+
     const files = walk(root).filter((f) => !f.endsWith(join("lib", "errors.ts")));
     let bindingsChecked = 0;
 
     for (const file of files) {
-      const source = readFileSync(file, "utf8");
-      // Derived from the file's own catch bindings rather than a fixed list of names: a fixed
-      // list is dodged by renaming the binding, which is a rename away from `${error}` — a
-      // spelling a hardcoded ["e", "err"] would wave straight through.
-      const bindings = new Set(
-        [...source.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*)\s*\)/g)].map((m) => m[1]),
-      );
+      const source = codeOnly(readFileSync(file, "utf8"));
+      // Derived from the file's own bindings rather than a fixed list of names: a fixed list is
+      // dodged by renaming the binding, which is a rename away from `${error}` — a spelling a
+      // hardcoded ["e", "err"] waves straight through. Both a `catch` block and a promise
+      // `.catch(cb)` count: several files have only the latter, and "surface this error" lands
+      // there just as easily.
+      const bindings = new Set([
+        ...[...source.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*)\s*(?::[^)]*)?\)/g)].map(
+          (m) => m[1],
+        ),
+        ...[
+          ...source.matchAll(
+            /\.catch\s*\(\s*\(?\s*([A-Za-z_$][\w$]*)\s*(?::[^)=]*)?\)?\s*=>/g,
+          ),
+        ].map((m) => m[1]),
+      ]);
 
       for (const binding of bindings) {
         bindingsChecked++;
         // Every way to turn a value into display text. `errorText` and `isPanic` take the
-        // binding directly, so they are unaffected.
+        // binding directly, so they are unaffected. Known miss: string concatenation
+        // (`"failed: " + e`), which cannot be told from arithmetic without parsing.
         for (const needle of [
           `String(${binding})`,
           `\${${binding}}`,
@@ -105,7 +136,7 @@ describe("display sites", () => {
           `JSON.stringify(${binding})`,
         ]) {
           expect(
-            source.includes(needle),
+            usesToken(source, needle),
             `${file} renders a caught error with ${needle}; use errorText(${binding}) so a ` +
               `panic stays distinguishable and an object body does not render as [object Object]`,
           ).toBe(false);
@@ -114,8 +145,10 @@ describe("display sites", () => {
     }
 
     // Guards the walk and the binding scan: either matching nothing would pass every assertion
-    // above while checking no file, or no catch block, at all.
+    // above while checking no file, or no binding, at all.
     expect(files.length).toBeGreaterThan(20);
-    expect(bindingsChecked).toBeGreaterThan(10);
+    // 12 today. The bound is loose because it exists to catch the regexes collapsing to nothing,
+    // not to track the count — and a tripwire that fails on every refactor gets deleted.
+    expect(bindingsChecked).toBeGreaterThan(8);
   });
 });

@@ -130,13 +130,20 @@ mod tests {
 
     /// True when `body` calls the helper itself, rather than merely containing the word — a
     /// sibling `fn scan_blocking(…)` would satisfy a plain `contains` while running the work
-    /// synchronously on the caller's thread.
+    /// synchronously on the caller's thread. `.blocking(` (a method), `self.blocking(` and
+    /// `other::blocking(` are rejected for the same reason: only the imported free function is
+    /// the helper this module vouches for.
+    ///
+    /// Two known limits, both consistent with these tests being a backstop rather than a parser:
+    /// a string literal containing the call text vouches for a body that never calls it (only
+    /// `//` comments are stripped), and a turbofish `blocking::<T, _>(…)` reads as a miss and
+    /// would fail loudly. Neither occurs today.
     fn calls_the_helper(body: &str) -> bool {
         body.match_indices("blocking(").any(|(at, _)| {
             body[..at]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.' && c != ':')
         })
     }
 
@@ -152,6 +159,12 @@ mod tests {
         // coverage simply by dropping the keyword: rewritten sync, it stops matching, stops
         // being counted, and reinstates the freeze silently. Every entry here reaches a
         // subprocess, an unbounded walk, or a per-file probe.
+        //
+        // This holds the line for the commands already off the main thread; it is NOT an
+        // inventory of every main-thread hazard. `check_paths_exist` and `open_path` still stat
+        // paths synchronously, which hangs the UI on a dead network mount — pre-existing, and
+        // recorded under item 16 in docs/RECOMMENDATIONS.md rather than fixed here, because
+        // moving them is a UI-responsiveness change with its own frontend contract.
         const MUST_BLOCK: [&str; 10] = [
             "add_files",
             "scan_folder",
@@ -169,6 +182,7 @@ mod tests {
 
         let (modules, _) = command_modules();
         let mut seen = Vec::new();
+        let mut exempt_seen = Vec::new();
         for (module, source) in &modules {
             // Split on `async fn` rather than `pub async fn`: a `pub(crate) async fn` registers
             // in `generate_handler` exactly the same and would otherwise be silently exempt.
@@ -176,6 +190,7 @@ mod tests {
             for chunk in source.split(concat!("async ", "fn ")).skip(1) {
                 let name = chunk.split(['(', '<']).next().expect("a name").trim();
                 if NOT_BLOCKING_WORK.contains(&name) {
+                    exempt_seen.push(name);
                     continue;
                 }
                 // Stop at the next item so a later command's call cannot vouch for this one.
@@ -208,6 +223,18 @@ mod tests {
             missing.is_empty(),
             "MUST_BLOCK names commands that no longer exist: {missing:?} — renamed, or removed?"
         );
+
+        // The same check for the exemptions, or a rename leaves one dangling forever and a later
+        // command reusing the name inherits an exemption nobody granted it.
+        let mut stale: Vec<_> = NOT_BLOCKING_WORK
+            .iter()
+            .filter(|n| !exempt_seen.contains(n))
+            .collect();
+        stale.sort();
+        assert!(
+            stale.is_empty(),
+            "NOT_BLOCKING_WORK exempts commands that no longer exist: {stale:?}"
+        );
     }
 
     #[test]
@@ -231,7 +258,9 @@ mod tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).expect("readable");
-                if code_only(&source).contains(concat!("#[tauri::", "command]")) {
+                // Prefix only, no closing bracket: `#[tauri::command(rename_all = "…")]` is a
+                // spelling Tauri documents, and matching the bare form would wave it through.
+                if code_only(&source).contains(concat!("#[tauri::", "command")) {
                     stray.push(path.to_string_lossy().into_owned());
                 }
             }

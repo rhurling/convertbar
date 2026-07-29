@@ -592,10 +592,10 @@ pub(crate) mod tests {
         assert_eq!(
             helper_source.matches(spawn).count(),
             4,
-            "mod.rs should spawn in exactly four places (`blocking_json`, `blocking_response`, \
-             and the two tests that force a real JoinError — one panicking with a literal, one \
-             with a formatted String, because the payload arms differ) — a fifth means something \
-             here maps a blocking failure without going through the two helpers"
+            "mod.rs should reach the blocking pool in exactly four places (`blocking_json`, \
+             `blocking_response`, and the two tests that panic a real task — one with a literal, \
+             one with a formatted String, because the payload arms differ) — a fifth means \
+             something here maps a blocking failure without going through the two helpers"
         );
 
         // Guards the walk itself: a walk that matched nothing would pass every assertion above
