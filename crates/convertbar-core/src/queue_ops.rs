@@ -100,9 +100,15 @@ fn get_handbrake_path(
         .ok_or_else(|| handbrake::HANDBRAKE_NOT_FOUND.to_string())
 }
 
-/// Deletes every `queued` job whose output path is its own source (an in-place re-encode),
-/// returning how many rows went. Called when `cleanup_mode` becomes `keep`, where such a
-/// job is impossible: there is no second file to keep.
+/// Deletes every `queued` or `paused` job whose output path is its own source (an in-place
+/// re-encode), returning how many rows went. Called when `cleanup_mode` becomes `keep`, where
+/// such a job is impossible: there is no second file to keep.
+///
+/// `paused` matters here, not just `queued`: on macOS/Linux a mid-encode pause (SIGSTOP) leaves
+/// the job's row in `paused` while the process is merely frozen, not finished — a job the user
+/// can switch to keep for just as easily as a queued one. A job already `encoding` (running,
+/// unpaused) can't be reached here at all; that race is closed by `process_queue`'s own
+/// backstop re-reading `cleanup_mode` fresh at the cleanup decision.
 ///
 /// Filtered in Rust rather than SQL because in-place-ness is a *normalized* path
 /// comparison (`converter::is_in_place` collapses `//` and `/./`), which a `WHERE
@@ -111,16 +117,17 @@ fn get_handbrake_path(
 /// `pub`: called from `settings_ops::update_setting` (same crate) at the moment the user
 /// switches to keep, AND from each head's boot sequence (`src-tauri/src/lib.rs`,
 /// `crates/convertbar-server/src/startup.rs` — both other crates) right after
-/// `converter::recover_interrupted_jobs`. A job that was `encoding` under keep when the app
-/// quit or crashed is requeued by that recovery (it has no cleanup_mode filter), so it must
+/// `converter::recover_interrupted_jobs`. A job that was `encoding`/`paused` under keep when the
+/// app quit or crashed is requeued by that recovery (it has no cleanup_mode filter), so it must
 /// be dropped again on the way back up — hence the cross-crate visibility. The DELETE is
-/// guarded with `AND status = 'queued'` (matching `remove_job`'s idiom) so the function's
+/// guarded with `AND status IN (...)` (matching `remove_job`'s idiom) so the function's
 /// correctness does not silently depend on the caller holding `ctx.db` across the SELECT and
-/// this DELETE.
+/// this DELETE. The SELECT and DELETE status sets are kept identical on purpose — widen both
+/// together, never just one.
 pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
-    let rows: Vec<(String, String, String)> = match conn
-        .prepare("SELECT id, source_path, output_path FROM jobs WHERE status = 'queued'")
-    {
+    let rows: Vec<(String, String, String)> = match conn.prepare(
+        "SELECT id, source_path, output_path FROM jobs WHERE status IN ('queued', 'paused')",
+    ) {
         Ok(mut stmt) => match stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
             Ok(rows) => rows.flatten().collect(),
             Err(_) => return 0,
@@ -133,7 +140,7 @@ pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
         if crate::converter::is_in_place(&source, &output) {
             if conn
                 .execute(
-                    "DELETE FROM jobs WHERE id = ?1 AND status = 'queued'",
+                    "DELETE FROM jobs WHERE id = ?1 AND status IN ('queued', 'paused')",
                     rusqlite::params![id],
                 )
                 .is_ok()

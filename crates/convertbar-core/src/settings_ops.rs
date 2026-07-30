@@ -203,9 +203,10 @@ pub fn update_setting(ctx: &Ctx, key: &str, value: &str) -> Result<(), String> {
         crate::watcher::refresh_skip_marker(ctx);
     }
 
-    // Switching to keep makes any queued in-place job impossible (its output IS its
-    // source). Drop them here, at the moment the user makes the choice, so no such job
-    // can reach the converter and no error row is ever written.
+    // Switching to keep makes any queued or paused in-place job impossible (its output IS
+    // its source). Drop them here, at the moment the user makes the choice, so no such job
+    // can reach the converter and no error row is ever written. (An `encoding` in-place job
+    // can't be reached here — that race is closed by process_queue's own backstop.)
     if key == "cleanup_mode" && normalize_cleanup_mode(value) == "keep" {
         let dropped = {
             let conn = ctx.db.lock().map_err(|e| e.to_string())?;
@@ -354,6 +355,52 @@ mod tests {
             lock_free,
             "a hook running after the write must not strand the connection"
         );
+    }
+
+    // Finding 1's `drop_queued_in_place_jobs` widening: a mid-encode pause (SIGSTOP on
+    // macOS/Linux) leaves an in-place job's row in 'paused', not 'queued' — the original
+    // `WHERE status = 'queued'` filter missed it entirely, so switching to keep while such a
+    // job sat paused left it to be caught only by process_queue's completion backstop once
+    // resumed. Dropping it here too, at the moment of the switch, is strictly earlier and
+    // matches what already happens for a merely-queued job.
+    #[test]
+    fn switching_to_keep_drops_a_paused_in_place_job() {
+        let (ctx, sink, _d) = test_ctx(test_conn());
+        {
+            let conn = ctx.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('inplace-paused', '/m/a.mp4', '/m/a.mp4', 'p', 'paused', 0, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            // A non-in-place paused job must survive the switch untouched.
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('normal-paused', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'paused', 1, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        update_setting(&ctx, "cleanup_mode", "keep").unwrap();
+
+        let ids: Vec<String> = ctx
+            .db
+            .lock()
+            .unwrap()
+            .prepare("SELECT id FROM jobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["normal-paused".to_string()],
+            "THE POINT OF THIS TEST: the paused in-place job must be dropped, not just a queued one"
+        );
+        assert_eq!(sink.payloads("queue-updated").len(), 1);
     }
 
     #[test]
