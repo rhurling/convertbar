@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { httpCommands } from "../lib/transport/http";
 import type { FsEntry } from "../lib/transport/types";
 import { errorText } from "../lib/errors";
@@ -46,11 +46,23 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   const [error, setError] = useState<string | null>(null);
   const [gotoDraft, setGotoDraft] = useState("");
 
+  // Every navigation stays live while a listing is in flight (the breadcrumb and the
+  // jump-to-path form are never disabled), and `fsList` has no abort, so responses can arrive
+  // out of order — a cold-NAS folder takes seconds while the root the user retreated to
+  // answers instantly. Only the newest request may touch state: without this, arrival order
+  // wins over user intent, the abandoned folder's listing snaps back under the cursor, and a
+  // late failure paints an error banner over a listing that loaded fine (nothing clears it —
+  // `setError(null)` only runs when a load starts).
+  const latestRequest = useRef(0);
+
   const load = useCallback(async (target: string) => {
+    const request = ++latestRequest.current;
+    const isCurrent = () => request === latestRequest.current;
     setLoading(true);
     setError(null);
     try {
       const result = await httpCommands.fsList(target);
+      if (!isCurrent()) return;
       setEntries(result.entries);
       setPath(target);
       // The selection deliberately survives navigation — gathering from several folders
@@ -58,9 +70,12 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       // something within one listing.
       setAnchor(null);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(errorText(e));
     } finally {
-      setLoading(false);
+      // Guarded too: clearing `loading` from a superseded request drops the spinner and
+      // exposes the previous listing as though the pending navigation had finished.
+      if (isCurrent()) setLoading(false);
     }
   }, []);
 
@@ -215,7 +230,10 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
         <div className="file-browser-list">
           {loading ? (
             <div className="empty-state">Loading…</div>
-          ) : entries.length === 0 ? (
+          ) : /* `path` is only set by a listing that landed, so a null one means we have
+                 nothing to describe — "Empty folder" under the error banner of a folder that
+                 was never listed is a claim we cannot make. */
+          path === null ? null : entries.length === 0 ? (
             <div className="empty-state">Empty folder</div>
           ) : (
             entries.map((entry) => {
