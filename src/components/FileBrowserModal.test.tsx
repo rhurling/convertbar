@@ -636,4 +636,121 @@ describe("FileBrowserModal", () => {
     // "Empty folder" is a claim about a folder we listed. We listed nothing.
     expect(screen.queryByText("Empty folder")).toBeNull();
   });
+
+  it("exposes the picker as a modal dialog named by its own header", async () => {
+    fsListMock.mockResolvedValue({ entries: [] });
+
+    render(<FileBrowserModal mode="directory" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    // Without aria-modal a screen reader keeps offering the page behind the overlay, which
+    // the backdrop's inertness means the user cannot even reach with a click.
+    const dialog = screen.getByRole("dialog", { name: "Choose a folder" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    await waitFor(() => expect(fsListMock).toHaveBeenCalled());
+  });
+
+  it("opens with focus inside the dialog", async () => {
+    fsListMock.mockResolvedValue({ entries: [] });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    // Focus has to start in the dialog, or a keyboard user Tabs the whole page behind the
+    // overlay before reaching the picker they just opened.
+    expect(document.activeElement).toBe(screen.getByRole("dialog", { name: "Add files" }));
+    await waitFor(() => expect(fsListMock).toHaveBeenCalled());
+  });
+
+  it("closes on Escape", async () => {
+    fsListMock.mockResolvedValue({ entries: [] });
+    const onClose = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={onClose} />);
+    await waitFor(() => expect(fsListMock).toHaveBeenCalled());
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    // The backdrop is deliberately inert, so Escape is the only dismissal that isn't
+    // Tab-hunting for Cancel.
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("cycles Tab inside the dialog instead of leaking into the page behind it", async () => {
+    fsListMock.mockResolvedValue({ entries: [entry({ name: "a.mp4", path: "/a.mp4" })] });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    // Select one file so the confirm button is enabled and is therefore the last stop.
+    fireEvent.click(await screen.findByText("a.mp4"));
+    const close = screen.getByTitle("Close");
+    const confirm = screen.getByRole("button", { name: /^Add 1 item/ });
+
+    confirm.focus();
+    fireEvent.keyDown(confirm, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+
+    fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(confirm);
+  });
+
+  it("pulls focus back into the dialog when Tab is pressed with focus adrift", async () => {
+    fsListMock.mockResolvedValue({ entries: [entry({ name: "a.mp4", path: "/a.mp4" })] });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+    await screen.findByText("a.mp4");
+
+    // A click on the inert backdrop leaves activeElement on <body>.
+    (document.activeElement as HTMLElement).blur();
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.keyDown(document.body, { key: "Tab" });
+
+    expect(document.activeElement).toBe(screen.getByTitle("Close"));
+  });
+
+  it("leaves focus on the jump-to-path input when its own navigation lands", async () => {
+    fsListMock.mockImplementation((path: string) =>
+      path === "/media/movies"
+        ? Promise.resolve({ entries: [entry({ name: "deep.mp4", path: "/media/movies/deep.mp4" })] })
+        : Promise.resolve({ entries: [] }),
+    );
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const input = (await screen.findByLabelText("Go to path")) as HTMLInputElement;
+    input.focus();
+    fireEvent.change(input, { target: { value: "/media/movies" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(await screen.findByText("deep.mp4")).toBeInTheDocument();
+
+    // The restore is for focus that was actually lost with an unmounted row, not a grab on
+    // every listing: this input is still mounted, and typing position belongs to the user.
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("moves focus to the listing when a navigation unmounts the focused row", async () => {
+    fsListMock.mockImplementation((path: string) => {
+      if (path === "/") {
+        return Promise.resolve({
+          entries: [entry({ name: "Movies", path: "/Movies", is_dir: true })],
+        });
+      }
+      return Promise.resolve({ entries: [entry({ name: "clip.mp4", path: "/Movies/clip.mp4" })] });
+    });
+
+    const { container } = render(
+      <FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    const row = (await screen.findByText("Movies")).closest(".file-browser-entry") as HTMLElement;
+    row.focus();
+    expect(document.activeElement).toBe(row);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Movies" }));
+    await screen.findByText("clip.mp4");
+
+    // The focused row is gone with the old listing. Focus must land on the new listing
+    // rather than <body>, or the keyboard user restarts from the top of the document
+    // after every single folder they enter.
+    expect(document.activeElement).toBe(container.querySelector(".file-browser-list"));
+  });
 });

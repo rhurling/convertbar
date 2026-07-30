@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { httpCommands } from "../lib/transport/http";
 import type { FsEntry } from "../lib/transport/types";
 import { errorText } from "../lib/errors";
@@ -55,6 +55,12 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   // `setError(null)` only runs when a load starts).
   const latestRequest = useRef(0);
 
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  // Both pickers (Queue's and Watch's) are mounted at once in the wider layouts, so the
+  // heading's id cannot be a fixed string.
+  const titleId = useId();
+
   const load = useCallback(async (target: string) => {
     const request = ++latestRequest.current;
     const isCurrent = () => request === latestRequest.current;
@@ -100,6 +106,59 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       active = false;
     };
   }, [load]);
+
+  // Focus starts in the dialog rather than wherever the opening click left it, so Escape and
+  // Tab-cycling both have somewhere to begin and a screen reader announces the dialog by name.
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+
+  // Navigating unmounts the row that had focus, which drops focus to <body> — from there a
+  // keyboard user Tabs the whole document again after every folder they enter. Put it on the
+  // new listing instead, so Tab continues into the rows. Only when focus actually escaped:
+  // a jump-to-path submit leaves it on the still-mounted input, which must not be stolen.
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog || dialog.contains(document.activeElement)) return;
+    listRef.current?.focus();
+  }, [entries]);
+
+  // Tab-cycling and Escape, on the document rather than the dialog: focus can sit on <body>
+  // (a click on the inert backdrop, or a row unmounted before the effect above runs), and a
+  // handler on the dialog would never see the keydown to bring it back.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      // tabIndex >= 0 excludes both the dialog itself and each row's nested checkbox, which
+      // is deliberately not its own tab stop; `disabled` excludes the confirm button while
+      // nothing is selected.
+      const stops = [...dialog.querySelectorAll<HTMLElement>("button, input, [tabindex]")].filter(
+        (el) => el.tabIndex >= 0 && !el.matches(":disabled"),
+      );
+      if (stops.length === 0) return;
+      const first = stops[0];
+      const last = stops[stops.length - 1];
+      const active = document.activeElement;
+      if (!dialog.contains(active)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
 
   const toggleSelect = (entryPath: string) => {
     setSelected((prev) => {
@@ -167,9 +226,17 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
 
   return (
     <div className="modal-overlay">
-      <div className="file-browser-modal">
+      <div
+        className="file-browser-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        // Not a tab stop — just a landing target, so opening the picker can put focus inside it.
+        tabIndex={-1}
+        ref={dialogRef}
+      >
         <div className="file-browser-header">
-          <span>{mode === "directory" ? "Choose a folder" : "Add files"}</span>
+          <span id={titleId}>{mode === "directory" ? "Choose a folder" : "Add files"}</span>
           <button type="button" className="btn btn-small" onClick={onClose} title="Close">
             &times;
           </button>
@@ -227,7 +294,7 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
           </label>
         )}
 
-        <div className="file-browser-list">
+        <div className="file-browser-list" tabIndex={-1} ref={listRef}>
           {loading ? (
             <div className="empty-state">Loading…</div>
           ) : /* `path` is only set by a listing that landed, so a null one means we have
