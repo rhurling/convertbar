@@ -120,6 +120,28 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     if (suffixDraft !== presetSuffix) updatePresetSuffix(suffixDraft);
   };
 
+  // Commit-on-blur alone loses data: crossing the 1300px layout breakpoint swaps App's two JSX
+  // trees and remounts this page (browser zoom crosses it without touching the window), and an
+  // unmount fires no `blur` — so a typed-but-unblurred draft was silently discarded. Flushing the
+  // same commits the blur handlers run keeps the edit. Held in a ref because the unmount effect
+  // must run *only* on unmount, and a bare `[]` effect would capture the first render's drafts.
+  const commitDrafts = () => {
+    // Before get_settings lands, every draft still holds a placeholder ("" / "0"). Committing
+    // those would persist them over the user's stored values, so a pre-load unmount writes
+    // nothing; each commit's own equality guard covers the loaded case. This is also what keeps
+    // StrictMode's dev-only mount/unmount/mount cycle from writing anything.
+    if (!settings) return;
+    commitHbPath();
+    commitMarker();
+    commitDisk();
+    commitSuffix();
+  };
+  const commitDraftsRef = useRef(commitDrafts);
+  useEffect(() => {
+    commitDraftsRef.current = commitDrafts;
+  });
+  useEffect(() => () => commitDraftsRef.current(), []);
+
   const handleChipClick = useCallback(
     (variable: string) => {
       const newSuffix = suffixDraft + variable;

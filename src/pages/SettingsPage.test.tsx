@@ -210,6 +210,61 @@ describe("SettingsPage", () => {
     );
   });
 
+  it("commits every unblurred draft when the page unmounts", async () => {
+    // Commit-on-blur alone loses data: crossing the 1300px layout breakpoint remounts this page
+    // (browser zoom crosses it without touching the window), and an unmount fires no `blur`, so
+    // a typed-but-unblurred value was silently discarded with no warning.
+    const { unmount } = render(<SettingsPage onHbPathChanged={() => {}} />);
+    const hbInput = await screen.findByPlaceholderText("/usr/local/bin/HandBrakeCLI");
+
+    fireEvent.change(hbInput, { target: { value: "/new/hb" } });
+    fireEvent.change(screen.getByPlaceholderText(".downloading"), {
+      target: { value: ".part" },
+    });
+    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2.5" } });
+    fireEvent.change(screen.getByPlaceholderText(".{resolution}-{codec}"), {
+      target: { value: ".hevc" },
+    });
+
+    unmount();
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+        key: "handbrake_path",
+        value: "/new/hb",
+      });
+      expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+        key: "watch_skip_marker",
+        value: ".part",
+      });
+      expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+        key: "low_disk_min_gb",
+        value: "2.5",
+      });
+      expect(invokeMock).toHaveBeenCalledWith("set_preset_suffix", {
+        preset: "Fast 1080p30",
+        suffix: ".hevc",
+      });
+    });
+  });
+
+  it("writes nothing when it unmounts before settings have loaded", async () => {
+    // Until get_settings lands, every draft holds a placeholder ("" for the paths, "0" for the
+    // threshold). A commit-on-unmount that fired anyway would persist those over the user's
+    // stored values — an unmount during the initial load must write nothing at all.
+    invokeMock.mockImplementation(((cmd: string) => {
+      if (cmd === "get_settings") return new Promise(() => {}); // never resolves
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    }) as typeof invoke);
+
+    const { unmount } = render(<SettingsPage onHbPathChanged={() => {}} />);
+    expect(await screen.findByText("Loading settings...")).toBeInTheDocument();
+
+    unmount();
+
+    expect(invokeMock.mock.calls.map((c) => c[0])).toEqual(["get_settings"]);
+  });
+
   it("switches the bad-source action to permanent deletion", async () => {
     render(<SettingsPage />);
     const radio = await screen.findByLabelText(/delete bad source files permanently/i);
