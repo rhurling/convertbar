@@ -1255,6 +1255,12 @@ select.setting-input {
   overflow: hidden;
 }
 
+/* It only takes focus so opening the picker can put it inside the dialog; a ring around the
+   whole modal would point at something the overlay already makes obvious. */
+.file-browser-modal:focus {
+  outline: none;
+}
+
 .file-browser-header {
   display: flex;
   align-items: center;
@@ -1305,6 +1311,13 @@ select.setting-input {
   flex: 1;
   overflow-y: auto;
   padding: 4px 0;
+}
+
+/* Focus lands here after a navigation unmounts the row that had it, so the ring is the only
+   thing telling a keyboard user where Tab will resume. */
+.file-browser-list:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .file-browser-entry {
