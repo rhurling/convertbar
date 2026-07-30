@@ -346,6 +346,14 @@ pub fn run() {
                 // source — critical for in-place jobs where output_path == source_path).
                 crate::converter::recover_interrupted_jobs(&db);
 
+                // An in-place job that was 'encoding' (not merely 'queued') when the user
+                // switched cleanup_mode to keep survives update_setting's queued-only drop, and
+                // the requeue above just resurrected it. Such a job is impossible under keep —
+                // drop it again here, before has_queued/should_resume can pick it up.
+                if convertbar_core::settings_ops::read_cleanup_mode(&db) == "keep" {
+                    convertbar_core::queue_ops::drop_queued_in_place_jobs(&db);
+                }
+
                 has_queued = db.query_row(
                     "SELECT COUNT(*) > 0 FROM jobs WHERE status = 'queued'",
                     [],

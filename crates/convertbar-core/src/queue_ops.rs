@@ -108,11 +108,16 @@ fn get_handbrake_path(
 /// comparison (`converter::is_in_place` collapses `//` and `/./`), which a `WHERE
 /// source_path = output_path` would miss.
 ///
-/// `pub(crate)`, like `converter::is_in_place`: `settings_ops` is the only caller. The
-/// DELETE is guarded with `AND status = 'queued'` (matching `remove_job`'s idiom) so the
-/// function's correctness does not silently depend on the caller holding `ctx.db` across
-/// the SELECT and this DELETE.
-pub(crate) fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
+/// `pub`: called from `settings_ops::update_setting` (same crate) at the moment the user
+/// switches to keep, AND from each head's boot sequence (`src-tauri/src/lib.rs`,
+/// `crates/convertbar-server/src/startup.rs` — both other crates) right after
+/// `converter::recover_interrupted_jobs`. A job that was `encoding` under keep when the app
+/// quit or crashed is requeued by that recovery (it has no cleanup_mode filter), so it must
+/// be dropped again on the way back up — hence the cross-crate visibility. The DELETE is
+/// guarded with `AND status = 'queued'` (matching `remove_job`'s idiom) so the function's
+/// correctness does not silently depend on the caller holding `ctx.db` across the SELECT and
+/// this DELETE.
+pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
     let rows: Vec<(String, String, String)> = match conn
         .prepare("SELECT id, source_path, output_path FROM jobs WHERE status = 'queued'")
     {
