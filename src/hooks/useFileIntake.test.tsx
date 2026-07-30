@@ -313,4 +313,39 @@ describe("useFileIntake", () => {
 
     await waitFor(() => expect(result.current.status).toMatch(/Error:.*scan failed/));
   });
+
+  it("addPaths on a folder with no videos shows a status message instead of silence", async () => {
+    // Folders became selectable for the first time in this branch: ticking one with no
+    // video files anywhere and pressing "Add 1 item" used to close the modal, flash
+    // "Adding…", and then do nothing at all — no message, ever. classify_paths still
+    // returns the folder (file_count: 0); the old code silently `continue`d past it.
+    classified = {
+      files: [],
+      folders: [{ file_count: 0, folder_name: "Empty", folder_path: "/empty" }],
+    };
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    await act(async () => {
+      await result.current.addPaths(["/empty"]);
+    });
+
+    expect(result.current.status).toBe("Nothing added · no videos in 1 folder");
+    expect(invokeMock).not.toHaveBeenCalledWith("confirm_folder_add", expect.anything());
+  });
+
+  it("addPaths on a path that no longer exists shows a status message instead of silence", async () => {
+    // classify_paths silently drops any path that is neither a file nor a directory by the
+    // time it runs (deleted/renamed since being picked) — it just never appears in files or
+    // folders, with no error and no other signal to the caller.
+    classified = { files: [], folders: [] };
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    await act(async () => {
+      await result.current.addPaths(["/gone.mp4"]);
+    });
+
+    expect(result.current.status).toBe("Nothing added · 1 path no longer exists");
+  });
 });

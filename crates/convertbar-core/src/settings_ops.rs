@@ -1,6 +1,7 @@
 use rusqlite::params;
 
 use crate::ctx::Ctx;
+use crate::events::EventSinkExt;
 use crate::types::Settings;
 
 /// The output-filename suffix template applied to a preset the user has never
@@ -67,6 +68,31 @@ pub fn normalize_bad_source_action(value: &str) -> &'static str {
     }
 }
 
+/// Coerce a stored `cleanup_mode` to a known value. Exactly `"keep"` or `"delete"` pass
+/// through; anything else — corrupted, empty, or written by a newer version — reads as
+/// `"trash"`, which is what every pre-existing row already means. Sibling of
+/// [`normalize_bad_source_action`].
+pub fn normalize_cleanup_mode(value: &str) -> &'static str {
+    match value {
+        "keep" => "keep",
+        "delete" => "delete",
+        _ => "trash",
+    }
+}
+
+/// The stored `cleanup_mode`, normalized. The single read path — `converter` and
+/// `queue_ops` both go through this so no call site ever string-compares a raw column.
+pub fn read_cleanup_mode(conn: &rusqlite::Connection) -> String {
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'cleanup_mode'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    normalize_cleanup_mode(&raw).to_string()
+}
+
 /// Reads every stored setting into a [`Settings`] snapshot, falling back to defaults for keys
 /// that have no row yet. `launch_at_login` is the *stored* value here — on desktop the autostart
 /// plugin is the actual source of truth, and the desktop wrapper overlays that on top.
@@ -110,7 +136,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
         let (key, value) = row.map_err(|e| e.to_string())?;
         match key.as_str() {
             "preset" => preset = value,
-            "cleanup_mode" => cleanup_mode = value,
+            "cleanup_mode" => cleanup_mode = normalize_cleanup_mode(&value).to_string(),
             "launch_at_login" => launch_at_login = value == "true",
             "handbrake_path" => handbrake_path = value,
             "menubar_show_percent" => menubar_show_percent = value == "true",
@@ -175,6 +201,20 @@ pub fn update_setting(ctx: &Ctx, key: &str, value: &str) -> Result<(), String> {
     // Let the running watcher pick up a changed skip-marker name without a restart.
     if key == "watch_skip_marker" {
         crate::watcher::refresh_skip_marker(ctx);
+    }
+
+    // Switching to keep makes any queued or paused in-place job impossible (its output IS
+    // its source). Drop them here, at the moment the user makes the choice, so no such job
+    // can reach the converter and no error row is ever written. (An `encoding` in-place job
+    // can't be reached here — that race is closed by process_queue's own backstop.)
+    if key == "cleanup_mode" && normalize_cleanup_mode(value) == "keep" {
+        let dropped = {
+            let conn = ctx.db.lock().map_err(|e| e.to_string())?;
+            crate::queue_ops::drop_queued_in_place_jobs(&conn)
+        }; // guard released before the emit below — see the comment above.
+        if dropped > 0 {
+            ctx.events.emit_t("queue-updated", ());
+        }
     }
 
     Ok(())
@@ -244,6 +284,182 @@ mod tests {
         assert!(
             ctx.db.try_lock().is_ok(),
             "a rejected write must still release the connection"
+        );
+    }
+
+    #[test]
+    fn switching_to_keep_drops_queued_in_place_jobs() {
+        // Run on a worker thread with a bounded join, exactly like the sibling deadlock test
+        // above (`update_setting_hands_the_connection_back_before_the_hooks_run`). This hook
+        // re-locks ctx.db, so if the write scope's guard ever stops being dropped first, the
+        // failure mode is a SELF-DEADLOCK — an unbounded hang that would freeze the whole
+        // suite rather than fail. The timeout turns that into a legible failure.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (ctx, sink, _d) = test_ctx(test_conn());
+            {
+                let conn = ctx.db.lock().unwrap();
+                // One in-place job (source == output) and one normal job.
+                conn.execute(
+                    "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                     VALUES ('inplace', '/m/a.mp4', '/m/a.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                     VALUES ('normal', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'queued', 1, '2020-01-01T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
+                // Not byte-identical, but the same file once normalized (`//` and `/.` collapse
+                // under Path comparison) — pins that the filter is is_in_place, not a raw
+                // source_path = output_path string/SQL comparison.
+                conn.execute(
+                    "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                     VALUES ('norm', '/m//c.mp4', '/m/./c.mp4', 'p', 'queued', 2, '2020-01-01T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
+            }
+
+            let result = update_setting(&ctx, "cleanup_mode", "keep");
+
+            let ids: Vec<String> = ctx
+                .db
+                .lock()
+                .unwrap()
+                .prepare("SELECT id FROM jobs ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let emits = sink.payloads("queue-updated").len();
+            let lock_free = ctx.db.try_lock().is_ok();
+            let _ = tx.send((result, ids, emits, lock_free));
+        });
+
+        let (result, ids, emits, lock_free) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("update_setting deadlocked against its own post-write hook");
+        result.unwrap();
+        assert_eq!(
+            ids,
+            vec!["normal".to_string()],
+            "only the in-place job is dropped"
+        );
+        // The Queue panel must learn about the removal.
+        assert_eq!(emits, 1);
+        assert!(
+            lock_free,
+            "a hook running after the write must not strand the connection"
+        );
+    }
+
+    // Finding 1's `drop_queued_in_place_jobs` widening: a mid-encode pause (SIGSTOP on
+    // macOS/Linux) leaves an in-place job's row in 'paused', not 'queued' — the original
+    // `WHERE status = 'queued'` filter missed it entirely, so switching to keep while such a
+    // job sat paused left it to be caught only by process_queue's completion backstop once
+    // resumed. Dropping it here too, at the moment of the switch, is strictly earlier and
+    // matches what already happens for a merely-queued job.
+    #[test]
+    fn switching_to_keep_drops_a_paused_in_place_job() {
+        let (ctx, sink, _d) = test_ctx(test_conn());
+        {
+            let conn = ctx.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('inplace-paused', '/m/a.mp4', '/m/a.mp4', 'p', 'paused', 0, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            // A non-in-place paused job must survive the switch untouched.
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('normal-paused', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'paused', 1, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        update_setting(&ctx, "cleanup_mode", "keep").unwrap();
+
+        let ids: Vec<String> = ctx
+            .db
+            .lock()
+            .unwrap()
+            .prepare("SELECT id FROM jobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["normal-paused".to_string()],
+            "THE POINT OF THIS TEST: the paused in-place job must be dropped, not just a queued one"
+        );
+        assert_eq!(sink.payloads("queue-updated").len(), 1);
+    }
+
+    #[test]
+    fn switching_to_delete_leaves_queued_in_place_jobs_alone() {
+        let (ctx, sink, _d) = test_ctx(test_conn());
+        {
+            let conn = ctx.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('inplace', '/m/a.mp4', '/m/a.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        update_setting(&ctx, "cleanup_mode", "delete").unwrap();
+
+        let conn = ctx.db.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "in-place jobs are only impossible under keep");
+        // NOTE: this does NOT reach (and so cannot pin) the `if dropped > 0` guard at :214 —
+        // value is "delete" here, so the outer `key == "cleanup_mode" && ... == "keep"` gate
+        // above it is false and the whole drop block, guard included, is never entered. This
+        // assertion passes whether the guard exists or not. See
+        // `switching_to_keep_with_nothing_to_drop_does_not_emit` below for a scenario that
+        // actually enters the keep branch with dropped == 0.
+        assert_eq!(sink.payloads("queue-updated").len(), 0);
+    }
+
+    #[test]
+    fn switching_to_keep_with_nothing_to_drop_does_not_emit() {
+        // Pins the `if dropped > 0` guard at :214 for real, unlike the sibling test above:
+        // this writes "keep", so the gate at :209 IS true, the drop block runs, and
+        // drop_queued_in_place_jobs genuinely returns 0 (the only queued job is NOT in-place).
+        // A regression that deletes the guard (always emit) must turn this red.
+        let (ctx, sink, _d) = test_ctx(test_conn());
+        {
+            let conn = ctx.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('normal', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        update_setting(&ctx, "cleanup_mode", "keep").unwrap();
+
+        let conn = ctx.db.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "the non-in-place job is untouched");
+        assert_eq!(
+            sink.payloads("queue-updated").len(),
+            0,
+            "dropped == 0 must not emit — the case switching_to_delete_... could not reach"
         );
     }
 
@@ -333,5 +549,77 @@ mod tests {
         assert_eq!(normalize_bad_source_action(""), "trash");
         assert_eq!(normalize_bad_source_action("DELETE"), "trash");
         assert_eq!(normalize_bad_source_action("nonsense"), "trash");
+    }
+
+    #[test]
+    fn cleanup_mode_normalizes_to_three_known_values() {
+        // Exact matches pass through; everything else reads as "trash". The fallback is
+        // deliberately NOT "keep": it preserves the behavior every existing row already has,
+        // and mirrors normalize_bad_source_action's convention.
+        assert_eq!(normalize_cleanup_mode("keep"), "keep");
+        assert_eq!(normalize_cleanup_mode("delete"), "delete");
+        assert_eq!(normalize_cleanup_mode("trash"), "trash");
+        assert_eq!(normalize_cleanup_mode(""), "trash");
+        assert_eq!(normalize_cleanup_mode("KEEP"), "trash");
+        assert_eq!(normalize_cleanup_mode("nonsense"), "trash");
+    }
+
+    #[test]
+    fn read_cleanup_mode_normalizes_what_it_reads() {
+        let conn = test_conn();
+        // init_db seeds 'trash'.
+        assert_eq!(read_cleanup_mode(&conn), "trash");
+
+        conn.execute(
+            "UPDATE settings SET value = 'keep' WHERE key = 'cleanup_mode'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read_cleanup_mode(&conn), "keep");
+
+        // A corrupted row must never reach a call site as a raw string.
+        conn.execute(
+            "UPDATE settings SET value = 'garbage' WHERE key = 'cleanup_mode'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read_cleanup_mode(&conn), "trash");
+    }
+
+    #[test]
+    fn get_settings_normalizes_cleanup_mode() {
+        let (ctx, _sink, _d) = test_ctx(test_conn());
+
+        // Default init_db value.
+        let settings = get_settings(&ctx).unwrap();
+        assert_eq!(settings.cleanup_mode, "trash");
+
+        // Valid value passes through.
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value = 'keep' WHERE key = 'cleanup_mode'",
+                [],
+            )
+            .unwrap();
+        let settings = get_settings(&ctx).unwrap();
+        assert_eq!(settings.cleanup_mode, "keep");
+
+        // Corrupted row: the Settings struct must never surface a raw garbage value.
+        // It must normalize to trash, just like read_cleanup_mode does.
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value = 'garbage' WHERE key = 'cleanup_mode'",
+                [],
+            )
+            .unwrap();
+        let settings = get_settings(&ctx).unwrap();
+        assert_eq!(
+            settings.cleanup_mode, "trash",
+            "get_settings must normalize corrupted cleanup_mode to trash"
+        );
     }
 }

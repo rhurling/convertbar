@@ -6,6 +6,9 @@ interface DropZoneProps {
   onSkip: () => void;
   status: string | null;
   isDragOver: boolean;
+  /** Server head: there is no OS drag-drop in a browser tab, so the surface opens the
+   *  file browser instead of advertising a drop that cannot happen. */
+  onPick?: () => void;
 }
 
 /**
@@ -14,7 +17,7 @@ interface DropZoneProps {
  * and calls the passed handlers. The window-level drag-drop listener lives in the hook, so this
  * component is never the reason a drop is or isn't captured.
  */
-export default function DropZone({ pendingConfirm, onAdd, onSkip, status, isDragOver }: DropZoneProps) {
+export default function DropZone({ pendingConfirm, onAdd, onSkip, status, isDragOver, onPick }: DropZoneProps) {
   return (
     <div className={`drop-zone ${isDragOver ? "drag-over" : ""}`}>
       {pendingConfirm ? (
@@ -36,6 +39,10 @@ export default function DropZone({ pendingConfirm, onAdd, onSkip, status, isDrag
         </div>
       ) : status ? (
         <span className="drop-zone-status">{status}</span>
+      ) : onPick ? (
+        <button type="button" className="drop-zone-pick" onClick={onPick}>
+          Add files or folders…
+        </button>
       ) : (
         <span className="drop-zone-label">Drop video files or folders here</span>
       )}

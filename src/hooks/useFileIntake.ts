@@ -103,12 +103,22 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
         setStatusMsg(`Error: ${errorText(e)}`, true);
         return;
       }
-      setStatusMsg(null); // clear the placeholder; tasks report via the scanner + summaries
+
+      // Whether anything was either enqueued now or pushed to confirmQueueRef for the user to
+      // confirm later — both cases already give the user feedback (a task summary or the
+      // confirm prompt itself), so only a fully empty outcome needs a message of its own.
+      let enqueuedOrPending = false;
+      let emptyFolders = 0;
       if (classified.files.length > 0) {
+        enqueuedOrPending = true;
         enqueue({ kind: "files", paths: classified.files });
       }
       for (const folder of classified.folders) {
-        if (folder.file_count === 0) continue;
+        if (folder.file_count === 0) {
+          emptyFolders++;
+          continue;
+        }
+        enqueuedOrPending = true;
         if (folder.file_count <= AUTO_ADD_MAX) {
           enqueue({ kind: "folder", folder });
         } else {
@@ -116,6 +126,28 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
           bump();
         }
       }
+
+      if (enqueuedOrPending) {
+        setStatusMsg(null); // clear the placeholder; tasks report via the scanner + summaries
+        return;
+      }
+
+      // Nothing was enqueued and nothing is pending confirmation. classify_paths silently drops
+      // any path that is neither a file nor a directory by the time it runs (deleted/renamed
+      // since being picked), so a selection can shrink to zero without ever raising an error.
+      // Without this, "Adding…" was the last thing the user ever saw — a folder with no videos
+      // (or a vanished path) closed the modal, flashed "Adding…", and then did nothing at all.
+      const missing = paths.length - classified.files.length - classified.folders.length;
+      const parts: string[] = [];
+      if (emptyFolders > 0) {
+        parts.push(`no videos in ${emptyFolders} folder${emptyFolders === 1 ? "" : "s"}`);
+      }
+      if (missing > 0) {
+        parts.push(
+          `${missing} path${missing === 1 ? "" : "s"} no longer exist${missing === 1 ? "s" : ""}`,
+        );
+      }
+      setStatusMsg(parts.length > 0 ? `Nothing added · ${parts.join(" · ")}` : "Nothing to add", true);
     },
     [enqueue, setStatusMsg, bump],
   );

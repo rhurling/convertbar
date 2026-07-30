@@ -89,17 +89,8 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
         onSkip={intake.onSkip}
         status={intake.status}
         isDragOver={intake.isDragOver}
+        onPick={isServerHead ? () => setShowBrowser(true) : undefined}
       />
-
-      {/* Desktop takes files via native OS drag-drop; the server head has no such event in a
-          browser tab, so it gets an explicit picker into the file-browser modal instead. */}
-      {isServerHead && (
-        <div className="intake-actions">
-          <button className="btn btn-small" onClick={() => setShowBrowser(true)}>
-            Add files…
-          </button>
-        </div>
-      )}
 
       {showBrowser && (
         <FileBrowserModal
@@ -172,7 +163,11 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
       {!isAdding && !activeJob && pendingJobs.length === 0 && (
         <div className="empty-state">
           <span className="empty-state-icon">&#128194;</span>
-          <span>Drag video files or folders here to get started</span>
+          <span>
+            {isServerHead
+              ? "Add files or folders to get started"
+              : "Drag video files or folders here to get started"}
+          </span>
         </div>
       )}
     </div>

@@ -60,4 +60,39 @@ describe("DropZone (presentational)", () => {
     );
     expect(container.querySelector(".drop-zone.drag-over")).not.toBeNull();
   });
+
+  it("renders a pick button instead of the drop label when onPick is given", async () => {
+    const onPick = vi.fn();
+    render(
+      <DropZone pendingConfirm={null} onAdd={vi.fn()} onSkip={vi.fn()} status={null} isDragOver={false} onPick={onPick} />,
+    );
+
+    // There is no OS drag-drop event in a browser tab, so advertising one is a lie.
+    expect(screen.queryByText(/Drop video files/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Add files or folders/ }));
+    expect(onPick).toHaveBeenCalled();
+  });
+
+  it("keeps the drop label when onPick is absent", () => {
+    render(
+      <DropZone pendingConfirm={null} onAdd={vi.fn()} onSkip={vi.fn()} status={null} isDragOver={false} />,
+    );
+    expect(screen.getByText(/Drop video files/)).toBeInTheDocument();
+  });
+
+  it("shows the folder confirm prompt even when onPick is given", () => {
+    render(
+      <DropZone
+        pendingConfirm={{ folder_path: "/m", folder_name: "m", file_count: 9 }}
+        onAdd={vi.fn()}
+        onSkip={vi.fn()}
+        status={null}
+        isDragOver={false}
+        onPick={vi.fn()}
+      />,
+    );
+    // onPick must not shadow the confirm branch — that would strand the intake pipeline.
+    expect(screen.getByText(/Add 9 files/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Add files or folders/ })).not.toBeInTheDocument();
+  });
 });

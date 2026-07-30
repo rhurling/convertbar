@@ -10,6 +10,19 @@ function coerceSettingValue(current: unknown, value: string): string | boolean |
   return value;
 }
 
+// `useSettings` fetches once on mount and the backend emits no settings-changed event, so two
+// mounted instances (e.g. History and Settings, both mounted at once in the three-col layout)
+// would otherwise drift apart forever once one of them writes. A module-level registry lets
+// every mounted instance converge on a successful write without a backend event or schema
+// change: the writing instance already knows the new value, so it shares it directly instead of
+// making every other instance pay for its own get_settings round-trip.
+type SettingsWriteListener = (key: string, value: string) => void;
+const settingsWriteListeners = new Set<SettingsWriteListener>();
+
+function broadcastSettingWrite(key: string, value: string) {
+  for (const listener of settingsWriteListeners) listener(key, value);
+}
+
 export function useSettings() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [presets, setPresets] = useState<string[]>([]);
@@ -71,6 +84,20 @@ export function useSettings() {
     refresh();
   }, [refresh]);
 
+  // Converge with every other mounted instance: apply a value another instance just wrote to
+  // the backend, the same coercion the optimistic update below applies to our own writes.
+  useEffect(() => {
+    const listener: SettingsWriteListener = (key, value) => {
+      setSettings((prev) =>
+        prev ? { ...prev, [key]: coerceSettingValue(prev[key as keyof AppSettings], value) } : prev,
+      );
+    };
+    settingsWriteListeners.add(listener);
+    return () => {
+      settingsWriteListeners.delete(listener);
+    };
+  }, []);
+
   const updateSetting = useCallback(
     async (key: string, value: string) => {
       setError(null);
@@ -94,6 +121,10 @@ export function useSettings() {
         );
         return;
       }
+
+      // Share the confirmed value with every other mounted useSettings instance instead of
+      // letting each one pay for its own get_settings round-trip.
+      broadcastSettingWrite(key, value);
 
       if (key === "preset") {
         await loadPresetData(value);

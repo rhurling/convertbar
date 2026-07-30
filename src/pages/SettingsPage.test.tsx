@@ -13,7 +13,7 @@ import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const invokeMock = vi.mocked(invoke);
 
-function makeSettings(): AppSettings {
+function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings {
   return {
     preset: "Fast 1080p30",
     cleanup_mode: "trash",
@@ -33,6 +33,7 @@ function makeSettings(): AppSettings {
     low_disk_min_gb: 0,
     bad_source_action: "trash",
     update_mode: "automatic",
+    ...overrides,
   };
 }
 
@@ -284,5 +285,115 @@ describe("SettingsPage", () => {
 
     expect(screen.getByText("vacation.RESOLVED_B.mp4")).toBeInTheDocument();
     expect(screen.queryByText("vacation.RESOLVED_A.mp4")).not.toBeInTheDocument();
+  });
+
+  it("offers three cleanup modes on desktop", async () => {
+    render(<SettingsPage />);
+
+    expect(await screen.findByLabelText("Move original to Trash")).toBeInTheDocument();
+    expect(screen.getByLabelText("Delete original permanently")).toBeInTheDocument();
+    expect(screen.getByLabelText("Keep both files")).toBeInTheDocument();
+  });
+
+  it("writes cleanup_mode=keep when Keep is chosen", async () => {
+    render(<SettingsPage />);
+
+    fireEvent.click(await screen.findByLabelText("Keep both files"));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+        key: "cleanup_mode",
+        value: "keep",
+      }),
+    );
+  });
+
+  it("hides the Trash option on the server head", async () => {
+    // A headless deployment has no Trash, and the `trash` crate litters .Trash-<uid>
+    // directories on the NAS mounts these servers run against.
+    vi.stubEnv("VITE_HEAD", "server");
+    const fetchMock = vi.fn((path: string) => {
+      if (path === "/api/settings") {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(makeSettings()) });
+      }
+      if (path === "/api/handbrake/presets") {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(["Fast 1080p30"]) });
+      }
+      if (path === "/api/info") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              version: "1.2.3",
+              head: "server",
+              can_pause_process: true,
+              auth_required: false,
+              browse_roots: [],
+            }),
+        });
+      }
+      if (path.includes("/suffix/generate")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(META) });
+      }
+      if (path.includes("/suffix")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve("-conv") });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({ error: "not mocked" }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.resetModules();
+
+    const { default: FreshSettingsPage } = await import("./SettingsPage");
+    render(<FreshSettingsPage />);
+
+    expect(await screen.findByLabelText("Delete original permanently")).toBeInTheDocument();
+    expect(screen.getByLabelText("Keep both files")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Move original to Trash")).not.toBeInTheDocument();
+  });
+
+  it("warns only when keep is selected AND the resolved suffix is empty", async () => {
+    const warning = /cannot keep the original/i;
+
+    // An empty resolved suffix comes from resolve_suffix_template returning "".
+    const withMode = (cleanup_mode: string, suffix: string) => {
+      invokeMock.mockImplementation(((cmd: string) => {
+        switch (cmd) {
+          case "get_settings":
+            return Promise.resolve(makeSettings({ cleanup_mode }));
+          case "list_handbrake_presets":
+            return Promise.resolve(["Fast 1080p30"]);
+          case "get_preset_suffix":
+            return Promise.resolve(suffix);
+          case "generate_preset_suffix":
+            return Promise.resolve(META);
+          case "resolve_suffix_template":
+            return Promise.resolve(suffix);
+          default:
+            return Promise.resolve(null);
+        }
+      }) as typeof invoke);
+    };
+
+    withMode("keep", "-conv");
+    const a = render(<SettingsPage />);
+    expect(await screen.findByLabelText("Keep both files")).toBeInTheDocument();
+    // Anchor on the resolved preview so the 250ms debounce has definitely settled before
+    // asserting the warning's absence — otherwise this checks the still-empty initial state.
+    await waitFor(() => expect(screen.getByText("vacation-conv.mp4")).toBeInTheDocument());
+    expect(screen.queryByText(warning)).not.toBeInTheDocument();
+    a.unmount();
+
+    withMode("delete", "");
+    const b = render(<SettingsPage />);
+    expect(await screen.findByLabelText("Keep both files")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("vacation.mp4")).toBeInTheDocument());
+    expect(screen.queryByText(warning)).not.toBeInTheDocument();
+    b.unmount();
+
+    // Only the combination warns — the setting alone or the empty suffix alone must not.
+    withMode("keep", "");
+    render(<SettingsPage />);
+    expect(await screen.findByText(warning)).toBeInTheDocument();
   });
 });

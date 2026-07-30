@@ -1,33 +1,35 @@
 import { commands } from "../lib/tauri";
 import { isServerHead } from "../lib/head";
 
-type Tab = "queue" | "history" | "watch" | "settings";
+export type Tab = "queue" | "history" | "watch" | "settings";
 
 interface TabBarProps {
-  activeTab: Tab;
+  tabs: Tab[];
+  /** Undefined in three-col, where every panel is pinned and nothing is tabbed. */
+  activeTab: Tab | undefined;
   onTabChange: (tab: Tab) => void;
   isAdding: boolean;
   updateAvailable: boolean;
 }
 
-const tabs: { id: Tab; label: string }[] = [
-  { id: "queue", label: "Queue" },
-  { id: "history", label: "History" },
-  { id: "watch", label: "Watch" },
-  { id: "settings", label: "Settings" },
-];
+export const TAB_LABELS: Record<Tab, string> = {
+  queue: "Queue",
+  history: "History",
+  watch: "Watch",
+  settings: "Settings",
+};
 
-export default function TabBar({ activeTab, onTabChange, isAdding, updateAvailable }: TabBarProps) {
+export default function TabBar({ tabs, activeTab, onTabChange, isAdding, updateAvailable }: TabBarProps) {
   return (
     <div className="tab-bar" data-tauri-drag-region>
       {tabs.map((tab) => (
         <button
-          key={tab.id}
-          className={`tab-btn ${activeTab === tab.id ? "active" : ""}`}
-          onClick={() => onTabChange(tab.id)}
+          key={tab}
+          className={`tab-btn ${activeTab === tab ? "active" : ""}`}
+          onClick={() => onTabChange(tab)}
         >
-          {tab.label}
-          {tab.id === "settings" && updateAvailable && (
+          {TAB_LABELS[tab]}
+          {tab === "settings" && updateAvailable && (
             <span className="tab-badge" aria-label="Update available" />
           )}
         </button>

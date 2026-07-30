@@ -319,6 +319,32 @@ describe("useSettings", () => {
     expect(result.current.presetSuffix).toBe(".fast");
   });
 
+  it("converges a second mounted instance after one instance writes", async () => {
+    // Three-col layout mounts History and Settings simultaneously and permanently, each with
+    // its own useSettings() instance. Without convergence, flipping cleanup_mode in Settings
+    // would leave History's copy stale indefinitely — two visible panels disagreeing about
+    // destructive behavior. Fix: a module-level registry shares the confirmed write instead of
+    // each instance needing its own backend event or refetch.
+    const a = renderHook(() => useSettings());
+    const b = renderHook(() => useSettings());
+    await waitFor(() => expect(a.result.current.loading).toBe(false));
+    await waitFor(() => expect(b.result.current.loading).toBe(false));
+    expect(b.result.current.settings?.cleanup_mode).toBe("trash");
+
+    const readsBefore = invokeMock.mock.calls.filter((c) => c[0] === "get_settings").length;
+
+    await act(async () => {
+      await a.result.current.updateSetting("cleanup_mode", "keep");
+    });
+
+    expect(a.result.current.settings?.cleanup_mode).toBe("keep");
+    expect(b.result.current.settings?.cleanup_mode).toBe("keep");
+    // Convergence must come from sharing the value the write already confirmed, not from a
+    // second instance polling get_settings again (a refetch storm as more panels mount).
+    const readsAfter = invokeMock.mock.calls.filter((c) => c[0] === "get_settings").length;
+    expect(readsAfter).toBe(readsBefore);
+  });
+
   it("ignores stale suffix/metadata when rapid preset switches resolve out of order", async () => {
     // N4: two quick preset changes (A then B) can interleave so A's suffix/metadata resolve
     // last, leaving state for A while settings.preset is B — the same race useQueue guards.

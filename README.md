@@ -92,7 +92,35 @@ the destination volume.
    Available variables: `{codec}`, `{resolution}`, `{quality}`, `{preset}`,
    `{device}` — all read from the preset's own metadata.
 3. When the encode finishes, the two files are compared and the larger one is
-   removed — moved to the Trash by default, or deleted permanently if you prefer.
+   removed, according to your **After conversion** setting.
+
+**After conversion** — what happens to the file that loses on size:
+
+- **Move original to Trash** (desktop only) — recoverable from the OS Trash.
+- **Delete original permanently** — the default on the server head; a headless
+  deployment has no Trash, and the `trash` crate litters `.Trash-<uid>` folders on
+  NAS mounts.
+- **Keep both files** — nothing is deleted. This is an evaluation mode: run a batch,
+  check the encodes are good on your hardware, delete the originals yourself, then
+  switch to Delete. History still shows how much each encode saved, so you can judge
+  the result before committing to it.
+
+Four things to know about Keep:
+
+- An empty output suffix re-encodes in place, so there is no second file to keep.
+  Those files are skipped with a note until you choose Delete or set a suffix.
+- While originals are kept, ConvertBar avoids re-converting them by remembering each
+  file's size and modification time in History. Clearing History forgets that, and a
+  watched folder will convert those files again into renumbered outputs
+  (`movie (1).1080p-h265.mp4`).
+- History's savings figure is labeled "Potential savings" rather than "Total saved"
+  while Keep is active: it is still the same original-minus-encoded delta per file,
+  but under Keep neither file has actually been removed, so nothing has been freed yet.
+- **Before rolling back to an older ConvertBar version, switch back to Trash or
+  Delete first.** A pre-Keep binary compares `cleanup_mode` against the literal
+  string `"delete"`; `"keep"` fails that check and falls through to the delete/trash
+  branch instead, so a routine version rollback would permanently delete every
+  original on its next batch.
 
 Encoding is deliberately sequential: hardware encoders would just contend for the
 same silicon if run in parallel, so two at once is usually slower overall.
@@ -108,6 +136,13 @@ docker pull ghcr.io/rhurling/convertbar:latest
 
 See [`docker-compose.example.yml`](docker-compose.example.yml) for a ready-to-copy
 compose file.
+
+The web UI takes files through the picker, not by dragging them onto the page — a
+browser tab receives no OS drag-drop event. Click the intake panel on the Queue tab
+to browse. Inside the picker, every row has a checkbox (folders included, added
+recursively), the header selects everything in the current folder, shift-click selects
+a range, and the selection survives moving between folders. Reordering the queue by
+dragging still works.
 
 ### Unraid
 

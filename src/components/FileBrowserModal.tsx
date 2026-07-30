@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { httpCommands } from "../lib/transport/http";
 import type { FsEntry } from "../lib/transport/types";
 import { errorText } from "../lib/errors";
+import { rangeBetween } from "../lib/pathSelection";
 
 const FALLBACK_ROOT = "/";
 
@@ -40,8 +41,10 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   const [path, setPath] = useState<string | null>(null);
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [anchor, setAnchor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [gotoDraft, setGotoDraft] = useState("");
 
   const load = useCallback(async (target: string) => {
     setLoading(true);
@@ -50,7 +53,10 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       const result = await httpCommands.fsList(target);
       setEntries(result.entries);
       setPath(target);
-      setSelected(new Set());
+      // The selection deliberately survives navigation — gathering from several folders
+      // in one pass is the point. The shift anchor does NOT: a range only means
+      // something within one listing.
+      setAnchor(null);
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -89,12 +95,43 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
     });
   };
 
-  const handleEntryClick = (entry: FsEntry) => {
-    if (entry.is_dir) {
-      load(entry.path);
-    } else if (mode === "files") {
-      toggleSelect(entry.path);
+  const selectable = mode === "files";
+
+  const handleRowClick = (entry: FsEntry, shiftKey: boolean) => {
+    // Directory mode keeps its original behavior: a folder click navigates, a file is inert.
+    if (!selectable) {
+      if (entry.is_dir) load(entry.path);
+      return;
     }
+    if (shiftKey && anchor) {
+      const range = rangeBetween(entries, anchor, entry.path);
+      if (range.length > 0) {
+        // Additive by design: a range never deselects, so a mis-aimed shift-click
+        // cannot silently drop work the user did earlier.
+        setSelected((prev) => {
+          const next = new Set(prev);
+          for (const p of range) next.add(p);
+          return next;
+        });
+        return;
+      }
+    }
+    setAnchor(entry.path);
+    toggleSelect(entry.path);
+  };
+
+  const allSelected = entries.length > 0 && entries.every((e) => selected.has(e.path));
+  const someSelected = entries.some((e) => selected.has(e.path));
+
+  const toggleSelectAll = () => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const e of entries) {
+        if (allSelected) next.delete(e.path);
+        else next.add(e.path);
+      }
+      return next;
+    });
   };
 
   const handleConfirm = () => {
@@ -111,11 +148,11 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   const confirmLabel =
     mode === "directory"
       ? "Choose this folder"
-      : `Add ${selected.size} file${selected.size === 1 ? "" : "s"}`;
+      : `Add ${selected.size} item${selected.size === 1 ? "" : "s"}`;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="file-browser-modal" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-overlay">
+      <div className="file-browser-modal">
         <div className="file-browser-header">
           <span>{mode === "directory" ? "Choose a folder" : "Add files"}</span>
           <button type="button" className="btn btn-small" onClick={onClose} title="Close">
@@ -137,7 +174,43 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
           ))}
         </div>
 
+        <form
+          className="file-browser-goto"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const target = gotoDraft.trim();
+            if (target) load(target);
+          }}
+        >
+          <input
+            className="setting-input"
+            type="text"
+            aria-label="Go to path"
+            placeholder="/media/movies"
+            value={gotoDraft}
+            onChange={(e) => setGotoDraft(e.target.value)}
+          />
+          <button type="submit" className="btn btn-small">
+            Go
+          </button>
+        </form>
+
         {error && <div className="setting-error">{error}</div>}
+
+        {selectable && !loading && entries.length > 0 && (
+          <label className="file-browser-select-all">
+            <input
+              type="checkbox"
+              aria-label="Select all"
+              checked={allSelected}
+              ref={(el) => {
+                if (el) el.indeterminate = !allSelected && someSelected;
+              }}
+              onChange={toggleSelectAll}
+            />
+            <span>Select all ({entries.length})</span>
+          </label>
+        )}
 
         <div className="file-browser-list">
           {loading ? (
@@ -147,26 +220,94 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
           ) : (
             entries.map((entry) => {
               const isSelected = selected.has(entry.path);
-              const selectable = mode === "files" && !entry.is_dir;
+              // Directory-mode file rows stay inert (not selectable, no navigate target), same
+              // as their old disabled-button state; every other row is keyboard-operable.
+              const rowInteractive = selectable || entry.is_dir;
               return (
-                <button
+                <div
                   key={entry.path}
-                  type="button"
-                  className={`file-browser-entry${isSelected ? " file-browser-entry-selected" : ""}`}
-                  onClick={() => handleEntryClick(entry)}
-                  disabled={!entry.is_dir && mode === "directory"}
+                  className={`file-browser-entry${isSelected ? " file-browser-entry-selected" : ""}${
+                    !selectable && !entry.is_dir ? " file-browser-entry-disabled" : ""
+                  }`}
+                  role={selectable ? "checkbox" : entry.is_dir ? "button" : undefined}
+                  aria-checked={selectable ? isSelected : undefined}
+                  tabIndex={rowInteractive ? 0 : undefined}
+                  onClick={(e) => handleRowClick(entry, e.shiftKey)}
+                  onKeyDown={
+                    rowInteractive
+                      ? (e) => {
+                          // Ignore keydowns bubbled up from the nested checkbox/Open button —
+                          // otherwise Enter on the Open button both toggles selection (this
+                          // handler) and navigates (the button's own native activation), and our
+                          // preventDefault on Space for the row breaks the button's own Space
+                          // activation.
+                          if (e.target !== e.currentTarget) return;
+                          // Route Enter/Space to the same handler the click uses — one state
+                          // transition, two entry points. preventDefault on Space so the modal
+                          // doesn't scroll.
+                          if (e.key !== "Enter" && e.key !== " ") return;
+                          if (e.key === " ") e.preventDefault();
+                          handleRowClick(entry, e.shiftKey);
+                        }
+                      : undefined
+                  }
                 >
-                  <span className="file-browser-entry-icon">
-                    {entry.is_dir ? "📁" : selectable ? (isSelected ? "☑" : "☐") : "📄"}
-                  </span>
+                  {selectable && (
+                    /* readOnly, not onChange: the row's click handler owns the state transition
+                       (it needs the shiftKey modifier, which a change event does not carry). Without
+                       readOnly React warns on every row about a checked input with no onChange. */
+                    <input
+                      type="checkbox"
+                      className="file-browser-entry-check"
+                      checked={isSelected}
+                      readOnly
+                      aria-label={entry.name}
+                      // The row is the selection control now — this box isn't a separate tab
+                      // stop (three tab stops for one logical control was the wrong shape).
+                      tabIndex={-1}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleRowClick(entry, e.shiftKey);
+                      }}
+                    />
+                  )}
+                  <span className="file-browser-entry-icon">{entry.is_dir ? "📁" : "📄"}</span>
                   <span className="file-browser-entry-name">{entry.name}</span>
-                </button>
+                  {selectable && entry.is_dir && (
+                    <button
+                      type="button"
+                      className="file-browser-entry-open"
+                      aria-label={`Open ${entry.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        load(entry.path);
+                      }}
+                    >
+                      →
+                    </button>
+                  )}
+                </div>
               );
             })
           )}
         </div>
 
         <div className="file-browser-footer">
+          {mode === "files" && selected.size > 0 && (
+            <span className="file-browser-count">
+              {selected.size} selected
+              <button
+                type="button"
+                className="btn btn-small btn-dim"
+                onClick={() => {
+                  setSelected(new Set());
+                  setAnchor(null);
+                }}
+              >
+                Clear
+              </button>
+            </span>
+          )}
           <button type="button" className="btn btn-small" onClick={onClose}>
             Cancel
           </button>

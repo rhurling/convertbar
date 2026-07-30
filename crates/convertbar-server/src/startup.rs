@@ -56,6 +56,14 @@ pub fn boot(ctx: &Arc<Ctx>) {
         // source — critical for in-place jobs where output_path == source_path).
         convertbar_core::converter::recover_interrupted_jobs(&db);
 
+        // An in-place job that was 'encoding' (not merely 'queued') when the user switched
+        // cleanup_mode to keep survives update_setting's queued-only drop, and the requeue
+        // above just resurrected it. Such a job is impossible under keep — drop it again here,
+        // before has_queued/should_auto_resume can pick it up.
+        if convertbar_core::settings_ops::read_cleanup_mode(&db) == "keep" {
+            convertbar_core::queue_ops::drop_queued_in_place_jobs(&db);
+        }
+
         has_queued = db
             .query_row(
                 "SELECT COUNT(*) > 0 FROM jobs WHERE status = 'queued'",
@@ -218,6 +226,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_leaves_keep_untouched() {
+        // The server forces trash -> delete because the `trash` crate litters .Trash-<uid>
+        // on NAS mounts. It must NOT touch 'keep', which is a deliberate user choice the
+        // web UI now offers. No production code enforces this — only the fact that the
+        // rewrite is scoped to the exact string 'trash'. This test is what keeps it scoped.
+        let conn = test_conn();
+        conn.execute(
+            "UPDATE settings SET value = 'keep' WHERE key = 'cleanup_mode'",
+            [],
+        )
+        .unwrap();
+        let ctx = test_ctx(conn);
+
+        normalize_server_settings(&ctx);
+
+        let conn = ctx.db.lock().unwrap();
+        assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("keep"));
+    }
+
     // --- boot ---
     //
     // The positive auto-resume path (a queued job + queue_paused='false') is deliberately
@@ -253,6 +281,109 @@ mod tests {
         assert!(
             !ctx.converter.is_running(),
             "queue_paused=true must not trigger auto-resume"
+        );
+    }
+
+    // Finding 2 of the final-review pass: recover_interrupted_jobs requeues EVERY interrupted
+    // row with no cleanup_mode filter, including an in-place job that was 'encoding' when the
+    // user switched to keep (update_setting only drops in-place siblings that are still
+    // 'queued' — it cannot reach a row already 'encoding'). Left alone, that resurrected job
+    // would reach process_queue under keep: not destructive (the RemoveTemp backstop holds and
+    // the source survives byte-identical), but the design says such a job cannot exist, and it
+    // wastes an encode and books a done History row for it. `boot` must drop it again, right
+    // after the requeue and before has_queued/should_auto_resume can act on it.
+    #[test]
+    fn boot_drops_a_resurrected_in_place_job_under_keep() {
+        let conn = test_conn();
+        // source_path == output_path: an in-place job, interrupted mid-encode.
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('inplace', '/tmp/a.mp4', '/tmp/a.mp4', 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE settings SET value = 'keep' WHERE key = 'cleanup_mode'",
+            [],
+        )
+        .unwrap();
+        // Isolates this test to the drop itself — a separate test below covers that the drop
+        // also prevents an auto-resume that would otherwise have picked the job up.
+        set_queue_paused(&conn, true);
+        let ctx = test_ctx(conn);
+
+        boot(&ctx);
+
+        let count: i64 = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM jobs WHERE id = 'inplace'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "recover_interrupted_jobs requeues the row, then the keep-mode drop must remove \
+             it again before boot returns — an in-place job cannot exist under keep"
+        );
+    }
+
+    #[test]
+    fn boot_leaves_a_resurrected_in_place_job_alone_outside_keep() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('inplace', '/tmp/a.mp4', '/tmp/a.mp4', 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // cleanup_mode left at init_db's default ('trash') — the drop must be scoped to keep.
+        set_queue_paused(&conn, true);
+        let ctx = test_ctx(conn);
+
+        boot(&ctx);
+
+        let status: String = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM jobs WHERE id = 'inplace'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            status, "queued",
+            "outside keep, a requeued in-place job is legitimate and must survive boot"
+        );
+    }
+
+    #[test]
+    fn boot_does_not_auto_resume_onto_a_dropped_in_place_job_under_keep() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('inplace', '/tmp/a.mp4', '/tmp/a.mp4', 'p', 'encoding', 0, '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE settings SET value = 'keep' WHERE key = 'cleanup_mode'",
+            [],
+        )
+        .unwrap();
+        // queue_paused left unset (defaults to false): if the resurrected in-place job survived
+        // the drop, has_queued would be true and boot would auto-resume onto it. Deterministic,
+        // not a timing race, because a passing test means run_queue was never invoked at all —
+        // see the module doc above on why the positive resume path can't be asserted directly.
+        let ctx = test_ctx(conn);
+
+        boot(&ctx);
+
+        assert!(
+            !ctx.converter.is_running(),
+            "the only queued/encoding row was the in-place job the keep-mode drop must remove; \
+             nothing should have been left for auto-resume to pick up"
         );
     }
 

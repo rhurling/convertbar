@@ -53,4 +53,17 @@ describe("summarizeAdds", () => {
       "Added 1 · 1 skipped (already converted) · 2 skipped (already at target)",
     );
   });
+
+  it("labels an in-place-blocked skip and sorts it first", () => {
+    const summary = summarizeAdds([
+      {
+        added: [],
+        skipped: [
+          { reason: "not_video", count: 2 },
+          { reason: "in_place_keep_blocked", count: 3 },
+        ],
+      },
+    ]);
+    expect(summary).toBe("3 skipped (in-place encode needs Delete) · 2 skipped (not a video)");
+  });
 });

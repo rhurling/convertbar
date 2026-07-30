@@ -115,6 +115,10 @@ enum InPlaceAction {
 
 fn in_place_action(kept: KeptFile, cleanup_mode: &str) -> InPlaceAction {
     match kept {
+        // "keep" is prevented at add time and at setting-change time (queue_ops), so this
+        // arm only covers the race where a job flips to 'encoding' in between. Discarding
+        // the temp is the non-destructive outcome: a wasted encode, never a lost original.
+        KeptFile::Converted if cleanup_mode == "keep" => InPlaceAction::RemoveTemp,
         KeptFile::Converted => {
             if cleanup_mode == "delete" {
                 InPlaceAction::RenameTempOverSource
@@ -162,12 +166,24 @@ fn apply_in_place_action(
 }
 
 /// Whether a failed in-place cleanup must demote a "successful" encode to an error. Only a failed
-/// *rename* matters: for `KeptFile::Converted` the re-encode was meant to replace the source, so a
-/// rename failure means it did not (and in trash mode the original may already be in Trash). A failed
-/// temp removal (`Original`/`Neither`) is benign — the source is correctly kept, only an orphan temp
-/// lingers (it is marker-excluded from scans and pre-cleared on the next in-place encode).
-fn in_place_apply_is_fatal(kept: KeptFile, apply_failed: bool) -> bool {
-    apply_failed && matches!(kept, KeptFile::Converted)
+/// *rename* (`RenameTempOverSource`/`TrashSourceThenRename`) matters: those are the two actions
+/// that were meant to replace the source, so a failure there means it did not (and in trash mode
+/// the original may already be in Trash). A failed `RemoveTemp` is benign — the source is
+/// correctly kept, only an orphan temp lingers (it is marker-excluded from scans and pre-cleared
+/// on the next in-place encode).
+///
+/// Keyed on the ACTION, not on `kept`: `RemoveTemp` with a `kept == KeptFile::Converted` decision
+/// is reachable whenever cleanup_mode is `"keep"` (`in_place_action` discards a winning re-encode
+/// there instead of keeping "both" — there is no second file for an in-place job). Keying fatality
+/// on `kept` alone mistook that benign, by-design temp-removal failure for a botched replacement
+/// and recorded a false "In-place replacement failed" error for a job that behaved exactly as
+/// keep mode intends.
+fn in_place_apply_is_fatal(action: Option<InPlaceAction>, apply_failed: bool) -> bool {
+    apply_failed
+        && matches!(
+            action,
+            Some(InPlaceAction::RenameTempOverSource) | Some(InPlaceAction::TrashSourceThenRename)
+        )
 }
 
 pub struct ConverterState {
@@ -465,12 +481,7 @@ fn get_handbrake_path(
 }
 
 fn get_cleanup_mode(db: &Connection) -> String {
-    db.query_row(
-        "SELECT value FROM settings WHERE key = 'cleanup_mode'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .unwrap_or_else(|_| "trash".to_string())
+    crate::settings_ops::read_cleanup_mode(db)
 }
 
 fn get_low_disk_min_gb(db: &Connection) -> f64 {
@@ -808,7 +819,6 @@ fn process_queue(ctx: &Ctx) {
         }
         let job;
         let handbrake_path_opt;
-        let cleanup_mode;
         let low_disk_min_gb;
         {
             let db = ctx.db.lock().unwrap();
@@ -817,10 +827,13 @@ fn process_queue(ctx: &Ctx) {
                 None => break,
             };
             handbrake_path_opt = get_handbrake_path(&db, &*ctx.handbrake);
-            cleanup_mode = get_cleanup_mode(&db);
             low_disk_min_gb = get_low_disk_min_gb(&db);
             // The job is flipped to 'encoding' below, AFTER the low-disk gate — a gated job
             // must stay 'queued' so the Resume button can retry it.
+            //
+            // cleanup_mode is deliberately NOT captured here: an encode can run for minutes to
+            // hours, and the user may switch to "keep" while this job is mid-flight (see the
+            // fresh read right before the cleanup decision, below).
         }
 
         let file_name = std::path::Path::new(&job.source_path)
@@ -1182,14 +1195,34 @@ fn process_queue(ctx: &Ctx) {
 
                 let (kept, space_saved, status_str) = decide_cleanup(original_size, conv_size);
 
+                // Re-read fresh, right here, rather than trusting the value captured at job
+                // pickup: this encode can have run for minutes or hours, and update_setting only
+                // drops in-place jobs that are still 'queued' — it cannot reach a row that was
+                // already 'encoding'. Without this re-read, a job already in flight when the user
+                // clicks "Keep both files" would still apply the STALE pre-encode mode below,
+                // permanently destroying the original the user just asked to keep. Narrowly
+                // scoped and dropped before any emit below (never hold ctx.db across
+                // ctx.events.emit_t — the tray listener re-locks it synchronously and
+                // std::sync::Mutex is not reentrant).
+                let cleanup_mode = {
+                    let db = ctx.db.lock().unwrap();
+                    get_cleanup_mode(&db)
+                };
+
                 // Set when the distinct-file cleanup left the loser on disk; carries which file
                 // that was so the error can name it.
                 let mut cleanup_failed: Option<KeptFile> = None;
+
+                // Which action was actually taken for an in-place job, so the fatality check
+                // below can key off the action rather than off `kept` — see
+                // `in_place_apply_is_fatal`'s doc.
+                let mut in_place_action_taken: Option<InPlaceAction> = None;
 
                 // Act on the decision. In-place replaces/keeps the source via the temp; the
                 // distinct-file path keeps both names and trashes/deletes the loser as before.
                 let in_place_apply_failed = if in_place {
                     let action = in_place_action(kept, &cleanup_mode);
+                    in_place_action_taken = Some(action);
                     apply_in_place_action(
                         action,
                         &encode_target,
@@ -1197,6 +1230,12 @@ fn process_queue(ctx: &Ctx) {
                         ctx.disposer.as_ref(),
                     )
                     .is_err()
+                } else if cleanup_mode == "keep" {
+                    // Keep both files. decide_cleanup still ran, so status and space_saved are
+                    // unchanged — only the disposal is skipped. cleanup_failed deliberately stays
+                    // None: under keep the loser is on disk BY DESIGN, so the exists() verdict
+                    // below must not run or every keep job would report a false cleanup failure.
+                    false
                 } else {
                     // The loser of the size comparison — the file this job promises to remove.
                     // Neither means there is nothing to remove (no usable output).
@@ -1226,7 +1265,7 @@ fn process_queue(ctx: &Ctx) {
                 // trash mode the original may now be in Trash, with the temp left behind). Record an
                 // error instead of a false "done" so history never claims a success that left the
                 // file out of place. A failed temp *removal* is benign and handled as success.
-                if in_place_apply_is_fatal(kept, in_place_apply_failed) {
+                if in_place_apply_is_fatal(in_place_action_taken, in_place_apply_failed) {
                     had_errors = true;
                     // Which of the two shapes this is, read off the filesystem rather than
                     // inferred from the mode: the original is still in place both when the
@@ -1277,6 +1316,32 @@ fn process_queue(ctx: &Ctx) {
                         &format!("Encode finished, but the {which} could not be {verb}; both files remain"),
                         crate::failure_class::FailureClass::Environment,
                     );
+                    continue;
+                }
+
+                // In-place + keep is the backstop for the race where a job reaches
+                // 'encoding'/'paused' between the user choosing keep and this job's turn:
+                // drop_queued_in_place_jobs (queue_ops.rs) only reaches rows still waiting
+                // ('queued'/'paused') and can't touch one already running unpaused. RemoveTemp,
+                // above, already discarded the wasted re-encode and left the untouched source in
+                // place. Recording a 'done' row here — as this code used to — would be a lie on
+                // three counts: kept_file/converted_size/space_saved would describe a conversion
+                // that never happened; the notification below would claim bytes were saved that
+                // weren't; and record_source_identity would fingerprint the UNTOUCHED source,
+                // which cheap_skip_reason's identity check (queue_ops.rs) is unconditional on —
+                // permanently skipping the file as AlreadyConverted on every future scan/add,
+                // even after switching back to Delete, with no escape short of clearing History
+                // or touching the file. Delete the row instead, mirroring what
+                // drop_queued_in_place_jobs does for a job that hadn't started yet: no row, no
+                // fingerprint, no false notification, no phantom savings — and the file is fully
+                // eligible to be queued and converted again.
+                if in_place && cleanup_mode == "keep" {
+                    {
+                        let db = ctx.db.lock().unwrap();
+                        let _ = db.execute("DELETE FROM jobs WHERE id = ?1", params![job.id]);
+                    } // guard dropped before the emit below — the tray listener re-locks ctx.db
+                      // synchronously on this same thread, and std::sync::Mutex is not reentrant.
+                    ctx.events.emit_t("queue-updated", ());
                     continue;
                 }
 
@@ -1641,6 +1706,18 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap()
+    }
+
+    fn job_exists(db: &Arc<Mutex<Connection>>, id: &str) -> bool {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
     }
 
     #[test]
@@ -3339,6 +3416,34 @@ HandBrake has exited.";
     }
 
     #[test]
+    fn in_place_action_never_disposes_under_keep() {
+        // Release-mode backstop for the race where a job flips to 'encoding' between the
+        // setting write and Task 4's dequeue. The `else` branch this replaces is
+        // TrashSourceThenRename, which on the server routes through DeleteDisposer and
+        // permanently removes the user's source. debug_assert! would compile out.
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "keep"),
+            InPlaceAction::RemoveTemp
+        );
+        // Original already falls into the catch-all `KeptFile::Original | KeptFile::Neither
+        // => RemoveTemp` arm for every mode string, "keep" included — this call pins that
+        // catch-all, not keep-specific behavior, and cannot fail for any cleanup_mode.
+        assert_eq!(
+            in_place_action(KeptFile::Original, "keep"),
+            InPlaceAction::RemoveTemp
+        );
+        // Unchanged for the two shipping modes.
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "delete"),
+            InPlaceAction::RenameTempOverSource
+        );
+        assert_eq!(
+            in_place_action(KeptFile::Converted, "trash"),
+            InPlaceAction::TrashSourceThenRename
+        );
+    }
+
+    #[test]
     fn apply_rename_replaces_source_with_temp() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("clip.mp4");
@@ -3418,13 +3523,32 @@ HandBrake has exited.";
 
     #[test]
     fn in_place_apply_is_fatal_only_for_failed_rename() {
-        // A failed rename (Converted) is fatal: the source was meant to be replaced and wasn't.
-        assert!(in_place_apply_is_fatal(KeptFile::Converted, true));
-        // A successful apply is never fatal.
-        assert!(!in_place_apply_is_fatal(KeptFile::Converted, false));
-        // A failed temp removal (Original/Neither) is benign: the source is correctly kept.
-        assert!(!in_place_apply_is_fatal(KeptFile::Original, true));
-        assert!(!in_place_apply_is_fatal(KeptFile::Neither, true));
+        // A failed rename (either action that was meant to replace the source) is fatal.
+        assert!(in_place_apply_is_fatal(
+            Some(InPlaceAction::RenameTempOverSource),
+            true
+        ));
+        assert!(in_place_apply_is_fatal(
+            Some(InPlaceAction::TrashSourceThenRename),
+            true
+        ));
+        // A successful apply is never fatal, whatever the action.
+        assert!(!in_place_apply_is_fatal(
+            Some(InPlaceAction::RenameTempOverSource),
+            false
+        ));
+        // THE POINT OF THIS ASSERTION (Finding 5 of the final-review pass): a failed RemoveTemp
+        // is benign — the source is correctly kept. RemoveTemp paired with a decision that would
+        // have been KeptFile::Converted is exactly what cleanup_mode == "keep" produces for a
+        // winning re-encode (in_place_action discards it rather than keeping "both"). Keying
+        // fatality on `kept` alone used to misreport this expected, by-design temp-removal
+        // failure as "In-place replacement failed"; keying it on the action fixes that.
+        assert!(!in_place_apply_is_fatal(
+            Some(InPlaceAction::RemoveTemp),
+            true
+        ));
+        // No action taken (only the in_place branch ever sets Some) must never be fatal.
+        assert!(!in_place_apply_is_fatal(None, true));
     }
 
     #[test]
@@ -3928,6 +4052,318 @@ HandBrake has exited.";
             saved_of(&ctx.db, "j1"),
             Some(10 - encoded),
             "space_saved must be the real delta between the 10-byte source and the encode"
+        );
+    }
+
+    #[test]
+    fn keep_leaves_both_files_and_records_the_normal_space_saved() {
+        // Keep is an evaluation mode: the user verifies the encode, deletes originals by
+        // hand, then switches to Delete. So space_saved keeps its usual value — it records
+        // how much the encode OPTIMIZED, not how many bytes were freed. Zeroing it would
+        // blank the one number the user is evaluating.
+        let (ctx, _sink, disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "cleanup_mode", "keep");
+
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        // 1000 is far bigger than the fake encode's few-byte output, so the re-encode wins.
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        assert!(source.exists(), "keep must not remove the source");
+        assert!(out.exists(), "keep must not remove the output");
+        assert!(
+            disposer.0.lock().unwrap().is_empty(),
+            "nothing may be routed to the disposer under keep"
+        );
+
+        let (status, error) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "done");
+        assert_eq!(
+            error, None,
+            "a keep job that left both files as designed is not an error"
+        );
+        // Derived from the encode's real size, never a literal: the fake script writes
+        // "done\n" on Unix but "done\r\n" on Windows.
+        let encoded = std::fs::metadata(&out).unwrap().len() as i64;
+        assert_eq!(
+            saved_of(&ctx.db, "j1"),
+            Some(1000 - encoded),
+            "keep must record the same delta delete would, even though nothing was disposed"
+        );
+    }
+
+    #[test]
+    fn keep_with_a_larger_output_keeps_both_and_still_records_skipped() {
+        let (ctx, _sink, disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "cleanup_mode", "keep");
+
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        // 3 bytes is smaller than the fake encode's output (5-6 bytes), so the re-encode loses.
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            3,
+        );
+
+        process_queue(&ctx);
+
+        assert!(source.exists());
+        assert!(out.exists(), "even a losing output survives under keep");
+        assert!(disposer.0.lock().unwrap().is_empty());
+
+        let (status, error) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "skipped");
+        assert_eq!(
+            error, None,
+            "a keep job that left both files as designed is not an error"
+        );
+        // The negative delta, identical to what delete would record for the same sizes: keep
+        // changed the disposal and nothing else.
+        let encoded = std::fs::metadata(&out).unwrap().len() as i64;
+        assert_eq!(saved_of(&ctx.db, "j1"), Some(3 - encoded));
+    }
+
+    // The end-to-end counterpart to `in_place_action_never_disposes_under_keep`: that test only
+    // checks the pure mapping, which is why the row mis-record this pins (Finding 1 of a later
+    // Fable adversarial-review pass) was invisible to it — the wrong record is produced
+    // downstream, in process_queue itself. Output IS source for an in-place job, so "keep both"
+    // is impossible; in_place_action maps every KeptFile variant to RemoveTemp under keep,
+    // discarding the temp unconditionally. Recording ANY row here — even one that correctly said
+    // kept_file = "original" — would still fingerprint the untouched source via
+    // record_source_identity and permanently hide it from future scans as AlreadyConverted (see
+    // cheap_skip_reason in queue_ops.rs). The fix deletes the row entirely instead.
+    #[test]
+    fn in_place_keep_discards_the_temp_and_leaves_no_row_behind() {
+        let (ctx, _sink, disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "cleanup_mode", "keep");
+
+        let source = real_source(dir.path(), "movie.mkv"); // 10 real bytes on disk
+        let original_bytes = std::fs::read(&source).unwrap();
+        let p = source.to_str().unwrap();
+        // in-place: output_path == source_path. The fake encode's few-byte output is smaller
+        // than the 10-byte source, so decide_cleanup says KeptFile::Converted — the exact case
+        // Finding 1 was about.
+        queue_job(&ctx.db, "j1", p, p, 10);
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            original_bytes,
+            "the source must survive byte-identical; in-place + keep never touches it"
+        );
+        let temp = in_place_temp_path(p);
+        assert!(
+            !temp.exists(),
+            "the temp must be discarded, not left as a .convertbar-tmp. leftover"
+        );
+        assert!(
+            disposer.0.lock().unwrap().is_empty(),
+            "nothing may be routed to the disposer under keep"
+        );
+
+        assert!(
+            !job_exists(&ctx.db, "j1"),
+            "THE POINT OF THIS TEST: no row may survive an in-place + keep completion, done or \
+             otherwise — any recorded row would fingerprint the untouched source and hide it \
+             from every future scan as AlreadyConverted"
+        );
+    }
+
+    // A stand-in for HandBrakeCLI that succeeds like successful_fake_handbrake_script, but takes
+    // a beat before finishing — long enough for a test to observe the job sitting 'encoding' and
+    // change a setting while it is genuinely mid-flight, short enough not to slow the suite down.
+    // Unlike slow_fake_handbrake_script, nothing here ever kills this process early, so the
+    // grandchild-pipe concern that rules out `ping`/`timeout` for THAT script (see its comment)
+    // does not apply — the process is always allowed to exit on its own.
+    fn delayed_success_fake_handbrake_script(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("hb-delayed-ok.cmd");
+            std::fs::write(
+                &p,
+                "@echo off\r\n:loop\r\nif not \"%~2\"==\"\" (\r\nshift\r\ngoto loop\r\n)\r\nping -n 2 127.0.0.1 >nul\r\necho done> \"%~1\"\r\nexit /b 0\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("hb-delayed-ok.sh");
+            std::fs::write(
+                &p,
+                "#!/bin/sh\nfor a; do out=\"$a\"; done\nsleep 1\necho done > \"$out\"\nexit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    // Finding 1 of the final-review pass, part one: converter.rs used to capture cleanup_mode
+    // ONCE at job pickup and never look at it again. A job already encoding when the user
+    // clicked "Keep both files" would still apply the STALE, pre-encode mode at completion —
+    // for an in-place job that meant `in_place_action(Converted, "delete")` ->
+    // RenameTempOverSource, permanently overwriting (destroying) the original the user had just
+    // asked to keep. `bcc0bae` fixed that by re-reading cleanup_mode fresh right before the
+    // cleanup decision, which closes the ENTIRE duration of the encode.
+    //
+    // That fix correctly discards the temp (RemoveTemp) and leaves the source untouched, but it
+    // still recorded a 'done' row with kept_file/converted_size/space_saved describing a
+    // conversion that never happened, and fingerprinted the untouched source via
+    // record_source_identity — which cheap_skip_reason's identity check (queue_ops.rs) treats
+    // as unconditional proof the file is already converted, forever (even after switching back
+    // to Delete). THIS test pins the completion side of that fix from a second-round Fable
+    // review: the row must be deleted, not recorded, leaving nothing to lie about and nothing to
+    // falsely fingerprint. See the sibling test below for the re-add-after-Delete half.
+    #[test]
+    fn cleanup_mode_switched_to_keep_mid_encode_leaves_no_row_behind() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        // Stale mode AT PICKUP: if the earlier fix regressed, this is what the job would
+        // destructively apply at completion despite the switch to "keep" below.
+        set_setting(&ctx.db, "cleanup_mode", "delete");
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = delayed_success_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let src = real_source(dir.path(), "clip.mp4"); // 10 real bytes on disk
+        let original_bytes = std::fs::read(&src).unwrap();
+        let p = src.to_str().unwrap();
+        // in-place: output_path == source_path. The fake encode's few-byte output is smaller
+        // than the 10-byte source, so decide_cleanup would say KeptFile::Converted — the exact
+        // decision that "delete" mode would apply destructively, and that "keep" must discard
+        // via RemoveTemp instead of recording.
+        queue_job(&ctx.db, "j1", p, p, 10);
+
+        run_queue(ctx.clone());
+        wait_until("the fake encode to be running", || {
+            job_row(&ctx.db, "j1").0 == "encoding"
+        });
+
+        // The switch happens WHILE the job above is mid-encode — after pickup captured the old
+        // mode, before the job reaches its cleanup decision.
+        crate::settings_ops::update_setting(&ctx, "cleanup_mode", "keep").unwrap();
+
+        wait_until("the queue thread to finish", || {
+            !*ctx.converter.is_running.lock().unwrap()
+        });
+
+        assert!(
+            !job_exists(&ctx.db, "j1"),
+            "THE POINT OF THIS TEST: the completion backstop must delete the row entirely, not \
+             record a 'done' row that lies about a conversion that never happened and \
+             fingerprints the untouched source, permanently hiding it from future scans"
+        );
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            original_bytes,
+            "the original must survive byte-identical: a job that was 'encoding' under 'delete' \
+             when the user switched to 'keep' must honor the switch, not the stale mode captured \
+             at pickup"
+        );
+        let temp = in_place_temp_path(p);
+        assert!(
+            !temp.exists(),
+            "keep discards a winning in-place re-encode (RemoveTemp) rather than leaving a temp \
+             sibling around — this is a wasted encode, not a kept second file"
+        );
+    }
+
+    // Finding 1, part two: with the row gone and no fingerprint recorded (previous test), the
+    // file must be fully eligible for conversion again once the user switches back to Delete —
+    // not silently skipped forever. Before this fix, record_source_identity stamped the
+    // untouched source's (size, mtime) onto the wrongly-recorded 'done' row, and
+    // cheap_skip_reason's identity check is unconditional, so the file was skipped as
+    // AlreadyConverted on every future add/scan, including after switching back to Delete. With
+    // the row deleted, add_files must queue it like any other unconverted file, and a second run
+    // must actually convert it in place.
+    #[test]
+    fn file_dropped_by_keep_backstop_converts_after_switching_back_to_delete() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        set_setting(&ctx.db, "cleanup_mode", "delete");
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = delayed_success_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let src = real_source(dir.path(), "clip.mp4");
+        let p = src.to_str().unwrap();
+
+        // A literal (non-templated) empty suffix keeps this preset in-place AND keeps
+        // `add_files_inner` from ever resolving HandBrake for suffix/metadata — it only needs
+        // the configured `handbrake_path` for the actual encode below.
+        let preset: String = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        crate::settings_ops::set_preset_suffix(&ctx, &preset, "").unwrap();
+
+        queue_job(&ctx.db, "j1", p, p, 10);
+
+        run_queue(ctx.clone());
+        wait_until("the fake encode to be running", || {
+            job_row(&ctx.db, "j1").0 == "encoding"
+        });
+        crate::settings_ops::update_setting(&ctx, "cleanup_mode", "keep").unwrap();
+        wait_until("the first run to finish", || {
+            !*ctx.converter.is_running.lock().unwrap()
+        });
+        assert!(
+            !job_exists(&ctx.db, "j1"),
+            "setup: the keep backstop must have dropped the first job's row"
+        );
+
+        // The escape hatch the fix promises: switch back to Delete...
+        crate::settings_ops::update_setting(&ctx, "cleanup_mode", "delete").unwrap();
+
+        // ...and re-add the SAME file.
+        let add_result = crate::queue_ops::add_files(&ctx, &[p.to_string()]).unwrap();
+        assert_eq!(
+            add_result.added.len(),
+            1,
+            "THE POINT OF THIS TEST: no fingerprint survived the backstop, so re-adding the \
+             same file must queue it again, not silently skip it as AlreadyConverted \
+             (skipped: {:?})",
+            add_result.skipped
+        );
+
+        run_queue(ctx.clone());
+        wait_until("the second run to finish", || {
+            !*ctx.converter.is_running.lock().unwrap()
+        });
+
+        let new_id = add_result.added[0].id.clone();
+        let (status, error) = job_row(&ctx.db, &new_id);
+        assert_eq!(
+            status, "done",
+            "the file must actually convert this time under Delete (error: {error:?})"
         );
     }
 
