@@ -167,6 +167,20 @@ describe("HistoryPage", () => {
     expect(screen.getByRole("button", { name: /Clear/ })).toBeInTheDocument();
   });
 
+  it("labels the summary as potential savings under Keep mode, since nothing is freed yet", async () => {
+    // Finding 3 of the final-review pass: under cleanup_mode=keep, both files stay on disk,
+    // so "Total saved" overstates what actually happened — the figure is only what deleting
+    // the originals by hand would save.
+    settings = { ...makeSettings("trash"), cleanup_mode: "keep" };
+    page = { jobs: [erroredJob("a")], total: 1 };
+    summary = { total_saved_bytes: 1024, total_files: 3 };
+
+    render(<HistoryPage />);
+
+    await waitFor(() => expect(screen.getByText(/Potential savings/)).toBeInTheDocument());
+    expect(screen.queryByText(/^Total saved/)).not.toBeInTheDocument();
+  });
+
   describe("context menu", () => {
     async function openMenuOn(fileName: string) {
       await waitFor(() =>

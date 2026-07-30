@@ -105,7 +105,7 @@ the destination volume.
   switch to Delete. History still shows how much each encode saved, so you can judge
   the result before committing to it.
 
-Two things to know about Keep:
+Three things to know about Keep:
 
 - An empty output suffix re-encodes in place, so there is no second file to keep.
   Those files are skipped with a note until you choose Delete or set a suffix.
@@ -113,6 +113,9 @@ Two things to know about Keep:
   file's size and modification time in History. Clearing History forgets that, and a
   watched folder will convert those files again into renumbered outputs
   (`movie (1).1080p-h265.mp4`).
+- History's savings figure is labeled "Potential savings" rather than "Total saved"
+  while Keep is active: it is still the same original-minus-encoded delta per file,
+  but under Keep neither file has actually been removed, so nothing has been freed yet.
 
 Encoding is deliberately sequential: hardware encoders would just contend for the
 same silicon if run in parallel, so two at once is usually slower overall.

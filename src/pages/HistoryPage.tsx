@@ -197,7 +197,9 @@ export default function HistoryPage() {
           {summary.total_files > 0 && (
             <div className="summary-left">
               <span className="summary-saved">
-                Total saved: {formatBytes(summary.total_saved_bytes)}
+                {settings?.cleanup_mode === "keep"
+                  ? `Potential savings: ${formatBytes(summary.total_saved_bytes)}`
+                  : `Total saved: ${formatBytes(summary.total_saved_bytes)}`}
               </span>
               <span className="summary-files">
                 {summary.total_files} file{summary.total_files !== 1 ? "s" : ""}
