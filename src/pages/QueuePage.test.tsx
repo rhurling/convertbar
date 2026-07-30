@@ -158,6 +158,18 @@ it("seeds the low-disk banner from backend state on mount, without the event fir
   expect(await screen.findByText(/free on the destination/i)).toBeInTheDocument();
 });
 
+it("passes no onPick to DropZone on desktop — there is no picker without a server-side filesystem", () => {
+  // Finding 6 of the final-review pass: nothing pinned onPick===undefined on desktop.
+  // DropZone's mock here renders the pick button only when onPick is truthy (mirroring
+  // DropZone's own behavior, which DropZone.test.tsx pins) and a bare dropzone div otherwise
+  // — so the button's absence is exactly what proves QueuePage passed `undefined`.
+  render(<QueuePage hbStatus={null} adding={null} isAdding={false} intake={intakeStub} />);
+  expect(
+    screen.queryByRole("button", { name: /Add files or folders/ }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByTestId("dropzone")).toBeInTheDocument();
+});
+
 it("has no separate intake button on the server head — the drop surface is the picker", async () => {
   vi.stubEnv("VITE_HEAD", "server");
   vi.stubGlobal("EventSource", StubEventSource);
