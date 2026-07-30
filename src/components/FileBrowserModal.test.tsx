@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 
 const fsListMock = vi.fn();
 let browseRoots: string[] = ["/"];
@@ -517,5 +517,123 @@ describe("FileBrowserModal", () => {
     expect(onClose).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("discards a listing that lands after the user has navigated somewhere newer", async () => {
+    let landSlow!: (result: { entries: FsEntry[] }) => void;
+    fsListMock.mockImplementation((path: string) => {
+      if (path === "/") {
+        return Promise.resolve({
+          entries: [
+            entry({ name: "Slow", path: "/Slow", is_dir: true }),
+            entry({ name: "root.mp4", path: "/root.mp4" }),
+          ],
+        });
+      }
+      if (path === "/Slow") {
+        return new Promise<{ entries: FsEntry[] }>((resolve) => {
+          landSlow = resolve;
+        });
+      }
+      return Promise.reject(new Error(`unexpected path: ${path}`));
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open Slow" }));
+    // Impatient: a cold-NAS folder is still listing, so go back to the root.
+    fireEvent.click(screen.getByRole("button", { name: "/" }));
+    await screen.findByText("root.mp4");
+
+    await act(async () => {
+      landSlow({ entries: [entry({ name: "slow.mp4", path: "/Slow/slow.mp4" })] });
+    });
+
+    // Arrival order must not beat user intent: the abandoned folder cannot yank the
+    // listing back, which would also mean a click lands on whatever row moved into place.
+    expect(screen.getByText("root.mp4")).toBeInTheDocument();
+    expect(screen.queryByText("slow.mp4")).toBeNull();
+  });
+
+  it("discards an error from a request the user already navigated away from", async () => {
+    let failSlow!: (reason: Error) => void;
+    fsListMock.mockImplementation((path: string) => {
+      if (path === "/") {
+        return Promise.resolve({
+          entries: [
+            entry({ name: "Slow", path: "/Slow", is_dir: true }),
+            entry({ name: "root.mp4", path: "/root.mp4" }),
+          ],
+        });
+      }
+      if (path === "/Slow") {
+        return new Promise<{ entries: FsEntry[] }>((_resolve, reject) => {
+          failSlow = reject;
+        });
+      }
+      return Promise.reject(new Error(`unexpected path: ${path}`));
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open Slow" }));
+    fireEvent.click(screen.getByRole("button", { name: "/" }));
+    await screen.findByText("root.mp4");
+
+    await act(async () => {
+      failSlow(new Error("mount timed out"));
+    });
+
+    // A late failure must not put an error banner over a listing that loaded fine —
+    // nothing clears it, since setError(null) only runs when a load starts.
+    expect(screen.queryByText("mount timed out")).toBeNull();
+    expect(screen.getByText("root.mp4")).toBeInTheDocument();
+  });
+
+  it("keeps showing the spinner when an abandoned request lands mid-navigation", async () => {
+    let landSlow!: (result: { entries: FsEntry[] }) => void;
+    fsListMock.mockImplementation((path: string) => {
+      if (path === "/") {
+        return Promise.resolve({
+          entries: [
+            entry({ name: "Slow", path: "/Slow", is_dir: true }),
+            entry({ name: "root.mp4", path: "/root.mp4" }),
+          ],
+        });
+      }
+      if (path === "/Slow") {
+        return new Promise<{ entries: FsEntry[] }>((resolve) => {
+          landSlow = resolve;
+        });
+      }
+      // "/Slower" never settles.
+      return new Promise<{ entries: FsEntry[] }>(() => {});
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open Slow" }));
+    const input = screen.getByLabelText("Go to path");
+    fireEvent.change(input, { target: { value: "/Slower" } });
+    fireEvent.submit(input.closest("form")!);
+
+    await act(async () => {
+      landSlow({ entries: [entry({ name: "slow.mp4", path: "/Slow/slow.mp4" })] });
+    });
+
+    // The stale arrival must not clear `loading`, which would drop the spinner and expose
+    // the old listing as though the pending navigation had finished.
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+    expect(screen.queryByText("root.mp4")).toBeNull();
+  });
+
+  it("does not claim an empty folder when the first listing never landed", async () => {
+    fsListMock.mockRejectedValue(new Error("connection refused"));
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    expect(await screen.findByText("connection refused")).toBeInTheDocument();
+    // "Empty folder" is a claim about a folder we listed. We listed nothing.
+    expect(screen.queryByText("Empty folder")).toBeNull();
   });
 });
