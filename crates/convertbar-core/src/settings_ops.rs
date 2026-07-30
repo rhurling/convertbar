@@ -376,8 +376,44 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "in-place jobs are only impossible under keep");
-        // Nothing was dropped, so the hook must not emit either.
+        // NOTE: this does NOT reach (and so cannot pin) the `if dropped > 0` guard at :214 —
+        // value is "delete" here, so the outer `key == "cleanup_mode" && ... == "keep"` gate
+        // above it is false and the whole drop block, guard included, is never entered. This
+        // assertion passes whether the guard exists or not. See
+        // `switching_to_keep_with_nothing_to_drop_does_not_emit` below for a scenario that
+        // actually enters the keep branch with dropped == 0.
         assert_eq!(sink.payloads("queue-updated").len(), 0);
+    }
+
+    #[test]
+    fn switching_to_keep_with_nothing_to_drop_does_not_emit() {
+        // Pins the `if dropped > 0` guard at :214 for real, unlike the sibling test above:
+        // this writes "keep", so the gate at :209 IS true, the drop block runs, and
+        // drop_queued_in_place_jobs genuinely returns 0 (the only queued job is NOT in-place).
+        // A regression that deletes the guard (always emit) must turn this red.
+        let (ctx, sink, _d) = test_ctx(test_conn());
+        {
+            let conn = ctx.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('normal', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        update_setting(&ctx, "cleanup_mode", "keep").unwrap();
+
+        let conn = ctx.db.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "the non-in-place job is untouched");
+        assert_eq!(
+            sink.payloads("queue-updated").len(),
+            0,
+            "dropped == 0 must not emit — the case switching_to_delete_... could not reach"
+        );
     }
 
     #[test]
