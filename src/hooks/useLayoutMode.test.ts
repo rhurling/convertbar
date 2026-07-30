@@ -66,4 +66,41 @@ describe("useLayoutMode", () => {
     const { result } = renderHook(() => useLayoutMode());
     expect(result.current).toBe("tabs");
   });
+
+  it("subscribes and updates via the legacy addListener/removeListener API", () => {
+    // MediaQueryList only became an EventTarget in Safari 14; before that only the
+    // deprecated addListener/removeListener pair exists. The desktop head runs the system
+    // WebView with no minimumSystemVersion pin, so a host without addEventListener is
+    // reachable in practice. Calling addEventListener unconditionally throws a TypeError
+    // from this passive effect during mount, and with no error boundary React unmounts the
+    // whole root — a permanently blank popover. This double exposes ONLY the legacy API to
+    // prove the hook falls back instead of throwing.
+    const legacyListeners = new Map<string, Set<Listener>>();
+    let legacyMatching: string[] = [];
+    window.matchMedia = ((query: string) => ({
+      matches: legacyMatching.includes(query),
+      media: query,
+      addListener: (fn: Listener) => {
+        if (!legacyListeners.has(query)) legacyListeners.set(query, new Set());
+        legacyListeners.get(query)!.add(fn);
+      },
+      removeListener: (fn: Listener) => legacyListeners.get(query)?.delete(fn),
+      // Deliberately no addEventListener/removeEventListener.
+    })) as unknown as typeof window.matchMedia;
+
+    const { result, unmount } = renderHook(() => useLayoutMode());
+    expect(result.current).toBe("tabs");
+
+    act(() => {
+      legacyMatching = ["(min-width: 900px)"];
+      for (const set of legacyListeners.values()) for (const fn of set) fn();
+    });
+    expect(result.current).toBe("two-col");
+
+    const subscribedCount = [...legacyListeners.values()].reduce((n, s) => n + s.size, 0);
+    expect(subscribedCount).toBeGreaterThan(0);
+    unmount();
+    const remainingCount = [...legacyListeners.values()].reduce((n, s) => n + s.size, 0);
+    expect(remainingCount).toBe(0);
+  });
 });

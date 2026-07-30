@@ -16,6 +16,23 @@ function currentMode(): LayoutMode {
 }
 
 /**
+ * Subscribes `update` to `query`'s change event, preferring the standard EventTarget API and
+ * falling back to the deprecated `addListener`/`removeListener` pair on hosts where
+ * `MediaQueryList` isn't an `EventTarget` yet (Safari < 14 — pre-Chromium WebKit, which the
+ * desktop head's system WebView can still be since `tauri.conf.json` sets no
+ * `minimumSystemVersion`). Returns the matching unsubscribe function so callers never mix the
+ * two APIs.
+ */
+function subscribe(query: MediaQueryList, update: () => void): () => void {
+  if (typeof query.addEventListener === "function") {
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }
+  query.addListener(update);
+  return () => query.removeListener(update);
+}
+
+/**
  * The layout decision, as state rather than CSS: which pages *mount* changes with width,
  * and CSS cannot mount an unmounted component.
  */
@@ -26,10 +43,10 @@ export function useLayoutMode(): LayoutMode {
     if (typeof window.matchMedia !== "function") return;
     const update = () => setMode(currentMode());
     const queries = [window.matchMedia(WIDE), window.matchMedia(WIDER)];
-    for (const q of queries) q.addEventListener("change", update);
+    const unsubscribers = queries.map((q) => subscribe(q, update));
     update();
     return () => {
-      for (const q of queries) q.removeEventListener("change", update);
+      for (const unsubscribe of unsubscribers) unsubscribe();
     };
   }, []);
 
