@@ -105,7 +105,7 @@ the destination volume.
   switch to Delete. History still shows how much each encode saved, so you can judge
   the result before committing to it.
 
-Three things to know about Keep:
+Four things to know about Keep:
 
 - An empty output suffix re-encodes in place, so there is no second file to keep.
   Those files are skipped with a note until you choose Delete or set a suffix.
@@ -116,6 +116,11 @@ Three things to know about Keep:
 - History's savings figure is labeled "Potential savings" rather than "Total saved"
   while Keep is active: it is still the same original-minus-encoded delta per file,
   but under Keep neither file has actually been removed, so nothing has been freed yet.
+- **Before rolling back to an older ConvertBar version, switch back to Trash or
+  Delete first.** A pre-Keep binary compares `cleanup_mode` against the literal
+  string `"delete"`; `"keep"` fails that check and falls through to the delete/trash
+  branch instead, so a routine version rollback would permanently delete every
+  original on its next batch.
 
 Encoding is deliberately sequential: hardware encoders would just contend for the
 same silicon if run in parallel, so two at once is usually slower overall.

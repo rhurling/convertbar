@@ -32,6 +32,11 @@
     trash folder; the Settings page can switch that to keeping both files while you
     evaluate the results. Its Settings page hides the desktop-only options (menu bar,
     notifications, auto-update, launch at login).
+
+    3. Before rolling back to an older image tag, switch the cleanup setting back to
+    Trash or Delete first. An older build does not recognize "keep" and falls back to
+    deleting replaced files, so a routine tag rollback while Keep is active would
+    permanently delete every original on its next batch.
   </Overview>
   <Category>MediaApp:Video Tools:</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
