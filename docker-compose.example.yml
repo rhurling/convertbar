@@ -1,6 +1,7 @@
 services:
   convertbar:
     image: ghcr.io/rhurling/convertbar:latest
+    init: true
     ports:
       - "8080:8080"
     environment:
@@ -8,6 +9,8 @@ services:
       # This placeholder is deliberately too weak: >=16 chars using >=8 distinct
       # characters is required, so the server refuses to start until you replace it.
       CONVERTBAR_AUTH_TOKEN: "CHANGE_ME"
+      # PUID: "1000"                         # drop privileges after start: server and
+      # PGID: "1000"                         # its output files run/land as this uid:gid
       # CONVERTBAR_BROWSE_ROOTS: "/media"    # optional: restrict the file browser
       # CONVERTBAR_ALLOWED_HOSTS: "nas.local"   # needed if you browse by hostname instead of IP
     volumes:

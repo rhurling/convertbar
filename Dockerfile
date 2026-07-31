@@ -25,8 +25,10 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends handbrake-cli ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/convertbar-server /usr/local/bin/convertbar-server
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 ENV CONVERTBAR_DATA_DIR=/config
+# 0777 keeps `docker run --user` working, where the entrypoint can't chown.
 RUN mkdir -m 0777 /config
-VOLUME /config
 EXPOSE 8080
-ENTRYPOINT ["convertbar-server"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
