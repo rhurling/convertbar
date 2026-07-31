@@ -169,6 +169,8 @@ caveats it also documents inline:
 | `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; needed if you browse by hostname instead of IP (e.g. `nas.local`) or use a reverse proxy. |
 | `CONVERTBAR_BROWSE_ROOTS` | `/` | Colon-separated paths the web file browser may navigate. Restrict it to your media mount(s), e.g. `/media`. |
 | `CONVERTBAR_TRUSTED_PROXIES` | *(none)* | Comma-separated IPs or CIDR ranges whose `X-Forwarded-For` header is believed, so login throttling counts real client addresses instead of the proxy's. **Set this as narrowly as possible** — see [Auth](#auth). |
+| `PUID` | `0` | UID to drop to after start. `0` keeps the container's starting user (root, unless you pass `--user`). See [Volumes and permissions](#volumes-and-permissions). |
+| `PGID` | `0` | GID to drop to after start. |
 
 ### Auth
 
@@ -244,9 +246,24 @@ Traefik, …) in front of it for TLS termination if you expose it beyond your LA
 ### Volumes and permissions
 
 `/config` holds the SQLite database and probe cache — mount it to persist state
-across container restarts (see `docker-compose.example.yml`). The image can run
-as any `--user <uid>:<gid>`; make sure `/config` and any mounted media
-directories are writable by that uid/gid.
+across container restarts (see `docker-compose.example.yml`).
+
+The preferred way to run unprivileged is `PUID`/`PGID`: the container starts as
+root, chowns `/config`, then drops to that uid:gid before starting the server —
+so everything ConvertBar (and the `HandBrakeCLI` processes it forks) writes into
+your media mounts lands with that ownership instead of `root:root`. Make sure
+mounted media directories are writable by that uid/gid; the entrypoint
+deliberately never chowns them. Starting as root is what keeps this compatible
+with entrypoint-hook integrations that need it, such as Unraid's Tailscale
+integration — which is exactly what breaks under `--user`.
+
+`docker run --user <uid>:<gid>` still works: the entrypoint detects it isn't
+root, ignores `PUID`/`PGID`, and execs the server directly. In that mode you
+must make `/config` and the media mounts writable by that uid/gid yourself.
+
+Either way, run with `--init` (or compose's `init: true`). If an entrypoint hook
+backgrounds a helper daemon, the server ends up as PID 1 and won't reap
+zombies; `tini` handles that.
 
 ### Watched folders on network shares
 

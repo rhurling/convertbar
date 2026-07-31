@@ -37,12 +37,17 @@
     Trash or Delete first. An older build does not recognize "keep" and falls back to
     deleting replaced files, so a routine tag rollback while Keep is active would
     permanently delete every original on its next batch.
+
+    The server runs as PUID:PGID (default 99:100, nobody:users), so re-encoded files
+    land with that ownership instead of root:root. Do not add --user to Extra
+    Parameters &#8212; it conflicts with entrypoint hooks such as the Tailscale
+    integration; the container drops privileges itself after start.
   </Overview>
   <Category>MediaApp:Video Tools:</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/rhurling/convertbar/main/unraid-template.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/rhurling/convertbar/main/src-tauri/icons/128x128.png</Icon>
-  <ExtraParams/>
+  <ExtraParams>--init</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DateInstalled/>
@@ -122,4 +127,24 @@
     Display="advanced"
     Required="false"
     Mask="false"/>
+
+  <Config
+    Name="PUID"
+    Target="PUID"
+    Default="99"
+    Description="UID the server runs as. 99 = nobody on Unraid. Leave empty or 0 to run as root."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">99</Config>
+
+  <Config
+    Name="PGID"
+    Target="PGID"
+    Default="100"
+    Description="GID the server runs as. 100 = users on Unraid."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">100</Config>
 </Container>

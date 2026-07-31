@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
   workflow_dispatch:
   pull_request:
-    paths: [Dockerfile, ".dockerignore", "crates/convertbar-server/**", ".github/workflows/docker.yml"]
+    paths: [Dockerfile, ".dockerignore", "docker-entrypoint.sh", "crates/convertbar-server/**", ".github/workflows/docker.yml"]
 
 # Cancel superseded PR runs; let a tag push (or a manual dispatch) run to completion.
 concurrency:
