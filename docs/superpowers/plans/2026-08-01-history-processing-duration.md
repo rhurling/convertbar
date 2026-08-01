@@ -221,10 +221,23 @@ Add to `mod tests` in `queue_ops.rs`. Match the existing fixture style in that m
             "the fields after started_at must not have shifted"
         );
         assert_eq!(job.original_size, Some(1000), "nor the fields before it");
+
+        // The search branch is a SEPARATE SELECT list with the same column order. Appending
+        // to only one of the two is a real mistake this catches; without it the search
+        // branch's index shift is invisible.
+        let searched = get_history(&ctx, 10, 0, Some("a.mkv".into()), None).unwrap();
+        assert_eq!(
+            searched.jobs[0].started_at.as_deref(),
+            Some("2026-08-01T10:00:05+00:00")
+        );
+        assert_eq!(
+            searched.jobs[0].completed_at.as_deref(),
+            Some("2026-08-01T10:12:39+00:00")
+        );
     }
 ```
 
-If `get_history`'s signature in this codebase differs, adapt the call — do not change the function.
+**Coverage honesty:** this pins two of the five SELECT lists. `get_queue`, `get_bad_sources_inner` and `get_next_job` are compiler-checked (the literal must name the field) but *not* index-checked, because `started_at` and `completed_at` are both `Option<String>` — swapping them raises no type error, and the rows those three queries return have NULLs in both positions anyway. Appending last, per the Global Constraints, is what actually protects them.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -362,12 +375,36 @@ Add to `mod tests` in `converter.rs`, near the other `claim_job` tests:
         assert_eq!(outcome, ClaimOutcome::Gone);
         assert_eq!(started_at_of(&ctx.db, "j1"), None);
     }
+
+    #[test]
+    fn the_claim_stamp_is_the_moment_of_the_claim_in_parseable_rfc3339() {
+        // `is_some()` alone would pass against a hardcoded constant, and against a garbage
+        // string: every Rust test would stay green while the frontend's Date.parse returns
+        // NaN and the feature silently renders nothing. Pin both the value and the format.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+
+        let before = chrono::Utc::now();
+        claim_job(&ctx.db.lock().unwrap(), "j1");
+        let after = chrono::Utc::now();
+
+        let stamped = started_at_of(&ctx.db, "j1").expect("the claim stamps");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+            .expect("the frontend parses this string with Date.parse");
+        assert!(
+            parsed >= before && parsed <= after,
+            "the duration anchor must be the claim moment, not a constant: {stamped}"
+        );
+    }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p convertbar-core claim`
-Expected: `claiming_a_job_stamps_the_encode_start_time` FAILS (`started_at` is None). `a_claim_that_loses_the_race_stamps_nothing` passes already — that is correct; it is a guard against the fix over-reaching.
+
+(One filter only — `cargo test` takes at most one `[TESTNAME]` before `--`; a second is rejected with `error: unexpected argument`. `claim` substring-matches all three tests here.)
+
+Expected: `claiming_a_job_stamps_the_encode_start_time` and `the_claim_stamp_is_the_moment_of_the_claim_in_parseable_rfc3339` FAIL (`started_at` is None). `a_claim_that_loses_the_race_stamps_nothing` passes already — that is correct; it is a guard against the fix over-reaching.
 
 - [ ] **Step 3: Stamp in `claim_job`**
 
@@ -516,7 +553,10 @@ Add to `mod tests` in `converter.rs`:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p convertbar-core recovery_clears_the_stamp a_recovered_job_restamps`
+Run: `cargo test -p convertbar-core recover`
+
+(A single filter — `cargo test` rejects a second `[TESTNAME]` with `error: unexpected argument`. `recover` substring-matches both `recovery_clears_the_stamp_...` and `a_recovered_job_restamps_...`.)
+
 Expected: `recovery_clears_the_stamp_...` FAILS on the first assertion (the stale `2026-08-01T22:00:00+00:00` survives). `a_recovered_job_restamps...` passes already.
 
 - [ ] **Step 3: Clear the stamp in `recover_interrupted_jobs`**
@@ -536,7 +576,7 @@ In `converter.rs`, in the `for` loop:
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `cargo test -p convertbar-core recovery_clears_the_stamp a_recovered_job_restamps`
+Run: `cargo test -p convertbar-core recover`
 Expected: PASS.
 
 - [ ] **Step 5: Write the failing pause test**
@@ -643,12 +683,63 @@ Add to `mod tests` in `control.rs`, modelled on the existing pause test that spa
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_keeps_the_stamp_so_the_row_shows_time_until_cancel() {
+        // Cancel is a TERMINAL transition, and the invariant says terminal transitions leave
+        // started_at alone — a cancelled job legitimately shows how long it ran before the
+        // user gave up. This is the only row of the spec's status table with no other pin:
+        // without it, a future cancel that routed through pause would silently blank the
+        // duration and no test would notice.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let ctx = test_ctx(conn);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".to_string());
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, started_at)
+                 VALUES ('j1', '/a.mkv', '/a.mp4', 'p', 'encoding', 0,
+                         '2026-08-01T10:00:00+00:00', '2026-08-01T10:00:05+00:00')",
+                [],
+            )
+            .unwrap();
+
+        cancel_conversion(&ctx).unwrap();
+
+        let started: Option<String> = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT started_at FROM jobs WHERE id = 'j1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            started.as_deref(),
+            Some("2026-08-01T10:00:05+00:00"),
+            "a cancelled encode really did run for that long"
+        );
+
+        let _ = child.wait();
+    }
 ```
+
+Check `cancel_conversion`'s actual signature and reaping behavior against `control.rs:218-310` before finalizing this test — it kills and reaps the child itself, so the `child.wait()` here may be redundant or may need to be dropped.
 
 - [ ] **Step 6: Run it to verify it fails**
 
-Run: `cargo test -p convertbar-core a_mid_encode_pause_discards`
-Expected: FAIL — `started_at` is still `2026-08-01T10:00:05+00:00`.
+Run: `cargo test -p convertbar-core pause_discards` then `cargo test -p convertbar-core resuming_does_not_restore`
+Expected: BOTH fail — `started_at` is still `2026-08-01T10:00:05+00:00`. Run them as two commands: `cargo test` accepts only one `[TESTNAME]` filter. Observing the resume test red here matters — written but never executed until the end, it could be silently broken and nobody would know.
 
 - [ ] **Step 7: Clear the stamp in `pause_conversion`**
 
@@ -666,7 +757,7 @@ In `control.rs`, amend the existing UPDATE inside the `if let Some(ref job_id)` 
 
 - [ ] **Step 8: Run to verify it passes**
 
-Run: `cargo test -p convertbar-core a_mid_encode_pause_discards`
+Run: `cargo test -p convertbar-core pause_discards` then `cargo test -p convertbar-core resuming_does_not_restore`
 Expected: PASS.
 
 - [ ] **Step 9: Run the full workspace suite**
@@ -699,7 +790,7 @@ crash plus a deleted source reported the whole downtime as encode time."
 - Test: `crates/convertbar-core/src/db.rs`, `crates/convertbar-core/src/settings_ops.rs`, `src/pages/SettingsPage.test.tsx`
 
 **Interfaces:**
-- Consumes: nothing from earlier tasks — independent, may be done in parallel with Tasks 1-4.
+- Consumes: nothing from earlier tasks — code-disjoint from the jobs column, so this task is orderable anywhere in the sequence. Do **not** run it concurrently with Task 2 in the same checkout: both edit `crates/convertbar-core/src/types.rs`, `src/lib/transport/types.ts` and `src/pages/HistoryPage.test.tsx`, and two agents sharing one working tree will collide.
 - Produces: `Settings.history_show_duration: bool` (Rust) / `history_show_duration: boolean` (TS), default `true`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -741,6 +832,16 @@ In `settings_ops.rs` `mod tests`, add. That module already has `test_conn()` (in
     }
 
     #[test]
+    fn a_fresh_db_reports_history_show_duration_true() {
+        // The seeded row and the parser must AGREE. The db.rs test pins the stored literal
+        // and the test above pins the fallback; this one pins what the frontend actually
+        // receives on a first run, which is the claim the whole "defaults on" design rests on.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+        assert!(get_settings(&ctx).unwrap().history_show_duration);
+    }
+
+    #[test]
     fn history_show_duration_is_writable() {
         let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
@@ -752,20 +853,13 @@ In `settings_ops.rs` `mod tests`, add. That module already has `test_conn()` (in
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p convertbar-core history_show_duration history_duration_defaults_on`
-Expected: FAIL to compile (no such field) and/or the default assertion fails.
+Run: `cargo test -p convertbar-core history_show_duration`
 
-- [ ] **Step 3: Add the seeded default and bump the count guard**
+(One filter only — a second `[TESTNAME]` is rejected by cargo.)
 
-In `db.rs`, add to the `defaults` array after `("update_mode", "automatic"),`:
+Expected: FAIL to compile — `no field 'history_show_duration' on type 'Settings'`. Note this is a *compile* failure, so no assertion is observed yet. Steps 3 and 4 are deliberately ordered to fix that: the struct and parser land first, which makes the crate compile and lets the seed test fail as a real assertion before the seed exists.
 
-```rust
-        ("history_show_duration", "true"),
-```
-
-Change **both** `assert_eq!(count, 18);` (at `:273` and `:334`) to `assert_eq!(count, 19);`.
-
-- [ ] **Step 4: Add the key to the allowlist, the struct, and the parser**
+- [ ] **Step 3: Add the key to the allowlist, the struct, and the parser**
 
 `settings_ops.rs`, end of `ALLOWED_KEYS`:
 
@@ -801,6 +895,22 @@ And in the returned `Settings { .. }` literal:
         history_show_duration,
     })
 ```
+
+- [ ] **Step 4: Observe the seed test fail, then add the seeded default**
+
+The crate now compiles. Run: `cargo test -p convertbar-core history_show_duration`
+
+Expected: `history_show_duration_falls_back_to_true_when_the_row_is_absent` and `history_show_duration_is_writable` PASS; `a_fresh_db_reports_history_show_duration_true` PASSES too (the parser fallback covers it). Then run `cargo test -p convertbar-core history_duration_defaults_on` — expected FAIL, because no row is seeded yet and `setting()` returns `None` rather than `Some("true")`. That is the assertion-level RED the compile error hid.
+
+Now add it. In `db.rs`, in the `defaults` array after `("update_mode", "automatic"),`:
+
+```rust
+        ("history_show_duration", "true"),
+```
+
+Change **both** `assert_eq!(count, 18);` (at `:273` and `:334`) to `assert_eq!(count, 19);`.
+
+Re-run `cargo test -p convertbar-core history_duration_defaults_on` — expected PASS.
 
 - [ ] **Step 5: Add the TypeScript field**
 
@@ -860,6 +970,28 @@ In `src/pages/SettingsPage.test.tsx`, inside the existing `describe("SettingsPag
     expect(await screen.findByLabelText("Show processing time")).toBeInTheDocument();
   });
 ```
+
+That test is presence-only: a checkbox wired to the wrong key, or one sending an inverted value, would still pass it. Add a second test on the desktop render that pins the write, using the file's existing `updateCallsFor` helper:
+
+```tsx
+  it("writes history_show_duration=false when the toggle is unchecked", async () => {
+    // Presence is not wiring. Without this, a checkbox bound to the wrong key — or one
+    // sending String(!e.target.checked) — ships silently: the Rust side's writable test
+    // proves the backend accepts the key, not that the UI sends it.
+    render(<SettingsPage />);
+
+    fireEvent.click(await screen.findByLabelText("Show processing time"));
+
+    await waitFor(() =>
+      expect(updateCallsFor("history_show_duration")).toHaveLength(1),
+    );
+    expect(
+      (updateCallsFor("history_show_duration")[0][1] as { value: string }).value,
+    ).toBe("false");
+  });
+```
+
+The fixture default is `true`, so the first click unchecks it and the written value must be `"false"` — an inverted `onChange` sends `"true"` and fails. Confirm `fireEvent`/`waitFor` are already imported in this file; add them to the existing `@testing-library/react` import if not.
 
 - [ ] **Step 7: Add the settings group**
 
@@ -948,8 +1080,10 @@ describe("durationSeconds", () => {
 describe("formatDuration", () => {
   it.each([
     [0.3, "<1s"],
+    [0.6, "1s"], // rounds up — Math.floor would say "<1s"
     [1, "1s"],
     [59, "59s"],
+    [59.6, "1m 00s"], // rounds across the minute boundary — Math.floor would say "59s"
     [60, "1m 00s"],
     [754, "12m 34s"],
     [3599, "59m 59s"],
@@ -1069,7 +1203,11 @@ Add to `src/components/HistoryItem.test.tsx`. First add `started_at: null,` to t
         showDuration
       />,
     );
+    // Probe by BOTH title and rendered text: a title-only probe passes vacuously forever if
+    // the implementation ever drops or rewords the attribute, including while it happily
+    // renders a bogus negative duration.
     expect(screen.queryByTitle("Encode time")).toBeNull();
+    expect(screen.queryByText(/^(<1s|\d+[smh])/)).toBeNull();
   });
 
   it("shows the duration of a skipped encode, which is the point of the feature", () => {
@@ -1079,17 +1217,19 @@ Add to `src/components/HistoryItem.test.tsx`. First add `started_at: null,` to t
     expect(screen.getByText("12m 34s")).toBeInTheDocument();
   });
 
-  it("shows the duration on an error row without breaking the message ellipsis", () => {
-    // The message and the duration share a flex row. If the message keeps the ellipsis
-    // rules on the flex container itself they stop applying, and the duration is pushed
-    // out of the clipped box — invisible at every width.
+  it("puts the duration BESIDE the error message, not inside the ellipsised element", () => {
+    // The load-bearing requirement is topological. If the duration ends up INSIDE the
+    // element that owns overflow:hidden + text-overflow:ellipsis, it gets clipped out of
+    // sight at every width — and an assertion that merely finds both on screen passes
+    // happily in exactly that broken state.
     const full = "Conversion failed: moov atom not found\n[mov] moov atom not found";
     render(<HistoryItem job={job({ ...timed, status: "error", error_message: full })} showDuration />);
 
-    expect(screen.getByText("12m 34s")).toBeInTheDocument();
+    const duration = screen.getByText("12m 34s");
     const msg = screen.getByText(/moov atom not found/);
     expect(msg.title).toBe(full);
-    expect(msg.className).toContain("history-item-error-msg");
+    expect(msg).not.toContainElement(duration); // the ellipsis owner must be a leaf
+    expect(msg.parentElement).toContainElement(duration); // and they share the row
   });
 
   it("renders a bottom row for the duration when there are no sizes to show", () => {
@@ -1220,6 +1360,7 @@ In `src/App.css`, replace the `.history-item-error-msg` rule and add the two new
   align-items: center;
   gap: 8px;
   margin-top: 2px;
+  font-size: 11px;
 }
 
 /* A flex CHILD, not the flex container: text-overflow only ellipsizes a block
@@ -1236,7 +1377,7 @@ In `src/App.css`, replace the `.history-item-error-msg` rule and add the two new
 }
 ```
 
-The duration inside `.history-item-error-row` needs the row's font size; add `font-size: 11px;` to `.history-item-error-row` so the duration matches the message.
+**The CSS half of this fix is not covered by any automated test.** jsdom performs no layout, so deleting `min-width: 0` or `flex: 1` from `.history-item-error-msg` leaves every test green while the duration is clipped out of sight at every width. The Task 7 test above pins the *markup topology* only. The CSS itself is verified solely by Task 9 Step 5 — do not skip it.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -1290,7 +1431,10 @@ Then the two tests:
 
     render(<HistoryPage />);
 
-    expect(await screen.findByText("Saved")).toBeInTheDocument();
+    // Anchor on the file name, NOT the "Saved" badge: HistoryPage renders a permanent
+    // "Saved" sort button (HistoryPage.tsx:305), so getByText("Saved") matches two
+    // elements and throws. doneJob("1") has source_path "/in/1.mp4".
+    expect(await screen.findByText("1.mp4")).toBeInTheDocument();
     expect(screen.queryByText("12m 34s")).toBeNull();
   });
 
@@ -1304,7 +1448,7 @@ Then the two tests:
   });
 ```
 
-`findByText("Saved")` is the badge on a `doneJob`, and proves the row rendered at all — without it, the negative assertion would also pass on an empty list.
+The file-name anchor proves the row rendered at all — without it, the negative assertion would also pass on an empty list, which is precisely the vacuity this test exists to avoid.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1326,7 +1470,7 @@ In `HistoryPage.tsx`:
         ))}
 ```
 
-`=== true` rather than a truthy check: `settings` is null while loading, and a nullish value must render nothing rather than flash a duration in.
+`=== true` is stylistic here, not load-bearing: `history_show_duration` is typed `boolean`, so `!!settings?.history_show_duration` behaves identically when `settings` is null. It is written this way to match the explicit-comparison style used elsewhere in this file, not because it changes the loading behavior.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1355,12 +1499,16 @@ Automated tests cannot prove the upgrade path or the visual result. Both failure
 
 - [ ] **Step 1: Verify the migration against a pre-upgrade database**
 
-Copy the real database aside first, then run the app against the copy:
+`get_db_path_from` joins the **fixed filename** `convertbar.db` onto `CONVERTBAR_DATA_DIR` (`db.rs:54-66`), so the copy must be named `convertbar.db` inside its own directory. Pointing at `/tmp` with a differently-named copy silently opens a *fresh* `/tmp/convertbar.db` and verifies nothing — or worse, opens a stale one from an earlier run and appears to pass.
 
 ```bash
-cp ~/Library/Application\ Support/com.convertbar.app/convertbar.db /tmp/convertbar-upgrade-test.db
-CONVERTBAR_DATA_DIR=/tmp npm run tauri dev
+mkdir -p /tmp/convertbar-upgrade-test
+cp ~/Library/Application\ Support/com.convertbar.app/convertbar.db \
+   /tmp/convertbar-upgrade-test/convertbar.db
+CONVERTBAR_DATA_DIR=/tmp/convertbar-upgrade-test npm run tauri dev
 ```
+
+Sanity-check that you are actually on the copy: the History list must show your real prior conversions. An empty History means the env var did not take effect and the test is measuring nothing.
 
 Confirm: the app starts, History lists prior conversions, and those rows show **no** duration (they have no `started_at`).
 
