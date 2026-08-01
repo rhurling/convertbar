@@ -198,6 +198,10 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   const someSelected = entries.some((e) => selected.has(e.path));
 
   const toggleSelectAll = () => {
+    // A bulk toggle is not a positional pick, so it leaves no range origin behind — same
+    // reset Clear does. Otherwise select-all-off shows an empty selection while a row
+    // picked before it still anchors a range, and the next shift-click resurrects it.
+    setAnchor(null);
     setSelected((prev) => {
       const next = new Set(prev);
       for (const e of entries) {
@@ -327,6 +331,11 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                           // preventDefault on Space for the row breaks the button's own Space
                           // activation.
                           if (e.target !== e.currentTarget) return;
+                          // Both Enter and Space auto-repeat while held, and this handler acts
+                          // on every event — a native checkbox toggles once per press. Without
+                          // the guard, holding a beat too long toggles twice and leaves the row
+                          // unselected while the user believes they selected it.
+                          if (e.repeat) return;
                           // Route Enter/Space to the same handler the click uses — one state
                           // transition, two entry points. preventDefault on Space so the modal
                           // doesn't scroll.

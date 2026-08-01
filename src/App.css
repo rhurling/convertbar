@@ -1334,18 +1334,16 @@ select.setting-input {
   cursor: pointer;
 }
 
-.file-browser-entry:hover:not(:disabled) {
+/* Rows are <div>s, so :disabled never matches — the inert directory-mode file rows are
+   marked with .file-browser-entry-disabled instead, and hover must exclude them or they
+   light up as though they were clickable. */
+.file-browser-entry:hover:not(.file-browser-entry-disabled) {
   background: var(--bg-hover);
 }
 
 .file-browser-entry:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
-}
-
-.file-browser-entry:disabled {
-  color: var(--text-dim);
-  cursor: default;
 }
 
 .file-browser-entry-name {

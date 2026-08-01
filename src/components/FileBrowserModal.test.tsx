@@ -466,6 +466,60 @@ describe("FileBrowserModal", () => {
     expect(onSelect).toHaveBeenCalledWith(["/c.mp4"]);
   });
 
+  it("unchecking select-all also resets the shift anchor", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [
+        entry({ name: "a.mp4", path: "/a.mp4" }),
+        entry({ name: "b.mp4", path: "/b.mp4" }),
+        entry({ name: "c.mp4", path: "/c.mp4" }),
+      ],
+    });
+    const onSelect = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={onSelect} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("a.mp4")); // sets the anchor to /a.mp4
+    const selectAll = screen.getByLabelText("Select all");
+    fireEvent.click(selectAll); // everything on
+    fireEvent.click(selectAll); // everything off — the screen now shows nothing selected
+
+    fireEvent.click(screen.getByText("c.mp4"), { shiftKey: true });
+
+    // Same invariant as Clear: a selection the user emptied must not be resurrectable by a
+    // range. Without the reset, the surviving a.mp4 anchor sweeps a.mp4 and b.mp4 back in.
+    fireEvent.click(screen.getByRole("button", { name: /^Add 1 item/ }));
+    expect(onSelect).toHaveBeenCalledWith(["/c.mp4"]);
+  });
+
+  it("ignores an auto-repeated keydown so holding Enter does not toggle a row twice", async () => {
+    fsListMock.mockResolvedValue({ entries: [entry({ name: "a.mp4", path: "/a.mp4" })] });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const row = (await screen.findByText("a.mp4")).closest(".file-browser-entry") as HTMLElement;
+    fireEvent.keyDown(row, { key: "Enter" });
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    // Holding the key a beat too long fires again. A native checkbox toggles once per
+    // press; without the guard the row ends up UNSELECTED while the user believes they
+    // selected it — the failure is silent and in the losing direction.
+    fireEvent.keyDown(row, { key: "Enter", repeat: true });
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+
+  it("ignores an auto-repeated Space so a held key does not toggle a row twice", async () => {
+    fsListMock.mockResolvedValue({ entries: [entry({ name: "a.mp4", path: "/a.mp4" })] });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const row = (await screen.findByText("a.mp4")).closest(".file-browser-entry") as HTMLElement;
+    fireEvent.keyDown(row, { key: " " });
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    fireEvent.keyDown(row, { key: " ", repeat: true });
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+
   it("navigates to a typed path", async () => {
     fsListMock.mockImplementation((path: string) =>
       path === "/media/movies"
