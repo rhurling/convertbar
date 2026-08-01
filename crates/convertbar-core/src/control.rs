@@ -82,7 +82,10 @@ pub fn pause_conversion(ctx: &Ctx) -> Result<(), String> {
                 {
                     let db = ctx.db.lock().map_err(|e| e.to_string())?;
                     let _ = db.execute(
-                        "UPDATE jobs SET status = 'paused' WHERE id = ?1",
+                        // started_at is cleared with the status: wall clock cannot exclude the
+                        // paused interval, so the measurement is discarded rather than inflated.
+                        // resume_conversion deliberately does not re-stamp.
+                        "UPDATE jobs SET status = 'paused', started_at = NULL WHERE id = ?1",
                         params![job_id],
                     );
                     // Not `set_queue_paused`: this pause is the user's, so the updater's claim on
@@ -715,6 +718,166 @@ mod tests {
             !converter::read_drain_pause(&db),
             "pause_conversion must release the updater's drain claim (set_user_queue_pause), or \
              a failed install / the next launch would lift the pause the user just set"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mid_encode_pause_discards_the_duration_measurement() {
+        // Wall clock cannot tell a 5-minute encode from a 5-minute encode paused for eight
+        // hours. Rather than accumulate paused time, the pause throws the measurement away:
+        // a blank duration is honest, an eight-hour one is a lie.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let ctx = test_ctx(conn);
+        // Reuse the existing pause test's throwaway-child fixture to get a real, live PID.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".to_string());
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, started_at)
+                 VALUES ('j1', '/a.mkv', '/a.mp4', 'p', 'encoding', 0,
+                         '2026-08-01T10:00:00+00:00', '2026-08-01T10:00:05+00:00')",
+                [],
+            )
+            .unwrap();
+
+        pause_conversion(&ctx).unwrap();
+
+        // Clean up before asserting (mirrors the existing pause fixtures' ordering): the child
+        // is SIGSTOPed by pause_conversion above, so CONT before kill so it can be reaped. Doing
+        // this before the assertion means a failing assertion can't leak a stopped process.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGCONT);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let started: Option<String> = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT started_at FROM jobs WHERE id = 'j1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            started, None,
+            "a paused encode reports no duration rather than one inflated by the pause"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resuming_does_not_restore_the_discarded_start_time() {
+        // Resume returns the job to 'encoding' without re-stamping: the encode it is
+        // resuming began before the pause, so any stamp written now would measure a
+        // fraction of the real work. Once discarded, the attempt stays unmeasured.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let ctx = test_ctx(conn);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".to_string());
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, started_at)
+                 VALUES ('j1', '/a.mkv', '/a.mp4', 'p', 'encoding', 0,
+                         '2026-08-01T10:00:00+00:00', '2026-08-01T10:00:05+00:00')",
+                [],
+            )
+            .unwrap();
+
+        pause_conversion(&ctx).unwrap();
+        resume_conversion(&ctx).unwrap();
+
+        // Clean up before asserting: resume_conversion already SIGCONTs the child, so it just
+        // needs killing/reaping here. Doing this before the assertion means a failing assertion
+        // can't leak a live child.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let (status, started): (String, Option<String>) = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, started_at FROM jobs WHERE id = 'j1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "encoding", "resume returns the job to encoding");
+        assert_eq!(started, None, "but does not invent a new start time");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_keeps_the_stamp_so_the_row_shows_time_until_cancel() {
+        // Cancel is a TERMINAL transition, and the invariant says terminal transitions leave
+        // started_at alone — a cancelled job legitimately shows how long it ran before the
+        // user gave up. This is the only row of the spec's status table with no other pin:
+        // without it, a future cancel that routed through pause would silently blank the
+        // duration and no test would notice.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let ctx = test_ctx(conn);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".to_string());
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, started_at)
+                 VALUES ('j1', '/a.mkv', '/a.mp4', 'p', 'encoding', 0,
+                         '2026-08-01T10:00:00+00:00', '2026-08-01T10:00:05+00:00')",
+                [],
+            )
+            .unwrap();
+
+        cancel_conversion(&ctx).unwrap();
+
+        // Clean up before asserting: cancel_conversion only kills/reaps a child it knows about
+        // via current_child, which this test never populates (only current_pid/current_job_id,
+        // mirroring the other fixtures above) — so the spawned `sleep` is still alive here and
+        // must be reaped directly, or it would leak. Doing this before the assertion means a
+        // failing assertion can't leak a live child either.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let started: Option<String> = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT started_at FROM jobs WHERE id = 'j1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            started.as_deref(),
+            Some("2026-08-01T10:00:05+00:00"),
+            "a cancelled encode really did run for that long"
         );
     }
 }

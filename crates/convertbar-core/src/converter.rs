@@ -55,7 +55,11 @@ pub fn recover_interrupted_jobs(db: &Connection) {
         };
         let _ = std::fs::remove_file(&target);
         let _ = db.execute(
-            "UPDATE jobs SET status = 'queued' WHERE id = ?1",
+            // started_at is cleared with the status: the abandoned attempt's start time must
+            // not survive into the next one. Three error paths in process_queue (vanished
+            // source, HandBrake-not-found, ClaimOutcome::Failed) write completed_at WITHOUT
+            // re-claiming, so a surviving stamp would report the whole downtime as encode time.
+            "UPDATE jobs SET status = 'queued', started_at = NULL WHERE id = ?1",
             params![id],
         );
     }
@@ -3778,6 +3782,86 @@ HandBrake has exited.";
             .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "queued");
+    }
+
+    #[test]
+    fn recovery_clears_the_stamp_so_a_pre_claim_error_reports_no_duration() {
+        // The regression this exists for: an encode stamped Monday 22:00, a crash, a source
+        // the user then deletes, a relaunch Tuesday. Recovery re-queues the job, and the
+        // vanished-source gate errors it BEFORE the claim — so nothing re-stamps. A stale
+        // stamp plus a fresh completed_at reads as a 12-hour encode that never happened.
+        //
+        // AbsentLocator, not the default PanickingLocator: process_queue resolves the
+        // HandBrake path before reaching the vanished-source gate, so this test must
+        // declare that it lives in the no-HandBrake world.
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::AbsentLocator));
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately never created on disk — this is the vanished source.
+        let src = dir.path().join("gone.mp4");
+        let out = dir.path().join("gone-conv.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+        // The interrupted first attempt: stamped, left 'encoding' by the crash.
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status = 'encoding', started_at = '2026-08-01T22:00:00+00:00'
+                 WHERE id = 'j1'",
+                [],
+            )
+            .unwrap();
+
+        recover_interrupted_jobs(&ctx.db.lock().unwrap());
+
+        assert_eq!(
+            started_at_of(&ctx.db, "j1"),
+            None,
+            "recovery returns the job to 'queued', so the abandoned attempt's start time \
+             must not survive into the next one"
+        );
+
+        *ctx.converter.is_running.lock().unwrap() = true;
+        process_queue(&ctx);
+
+        let (status, _msg) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "error", "the vanished source fails the job");
+        assert_eq!(
+            started_at_of(&ctx.db, "j1"),
+            None,
+            "a job that errored before ever being claimed has no encode duration to report"
+        );
+    }
+
+    #[test]
+    fn a_recovered_job_restamps_when_it_is_claimed_again() {
+        // The other half: clearing on recovery must not leave the retry unmeasured.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status = 'encoding', started_at = '2026-08-01T22:00:00+00:00'
+                 WHERE id = 'j1'",
+                [],
+            )
+            .unwrap();
+
+        recover_interrupted_jobs(&ctx.db.lock().unwrap());
+        claim_job(&ctx.db.lock().unwrap(), "j1");
+
+        let stamped = started_at_of(&ctx.db, "j1").expect("the re-claim stamps a fresh start");
+        assert_ne!(
+            stamped, "2026-08-01T22:00:00+00:00",
+            "the retry is measured from its own start, not the abandoned attempt's"
+        );
     }
 
     #[test]
