@@ -55,6 +55,38 @@ describe("UpdatePanel", () => {
     expect(document.querySelector("img")).toBeNull();
   });
 
+  it("links an available update at that release's own page, not the unfiltered releases index", async () => {
+    // GitHub can't filter its releases list to "newer than what I'm running", so the link is only
+    // worth showing when the update check already knows the answer — and then it must name that
+    // exact release. A link to /releases would hand the user the scanning job back.
+    mockUpdate.state = {
+      ...base,
+      status: "available",
+      available: { version: "1.1.0", date: null, notes: null },
+    };
+    render(<UpdatePanel />);
+
+    const link = await screen.findByRole("link", { name: /release page/i });
+    expect(link).toHaveAttribute("href", "https://github.com/rhurling/convertbar/releases/tag/v1.1.0");
+    // tauri-plugin-opener only hands a click to the system browser when the anchor targets
+    // _blank; without it the desktop webview would navigate away from the app itself.
+    expect(link).toHaveAttribute("target", "_blank");
+  });
+
+  it("offers no release link while the running version is current", async () => {
+    // The whole point of gating on the update check: an up-to-date user gets no link, rather than
+    // one that leads to a list where nothing is newer than what they already have.
+    mockUpdate.state = {
+      ...base,
+      status: "idle",
+      just_installed: { version: "1.0.0", notes: "### Fixes\n- a fix" },
+    };
+    render(<UpdatePanel />);
+
+    expect(await screen.findByText("What's new in 1.0.0")).toBeInTheDocument();
+    expect(screen.queryByRole("link")).toBeNull();
+  });
+
   it("shows a deferred install instead of appearing to do nothing", async () => {
     // Without this the user presses Install during an encode and sees no change at all.
     mockUpdate.state = {
