@@ -69,7 +69,9 @@ const BAD_SOURCE_REASONS: Record<string, string> = {
 export default function HistoryPage() {
   const { history, summary, hasMore, loading, loadMore, refresh, setSearchDebounced, sortBy, setSortBy } = useHistory();
   const { badSources, purge } = useBadSources();
-  const { settings } = useSettings();
+  // Values only — History renders no preset control, and in three-col it is mounted alongside
+  // Settings, whose instance already loads the preset list off HandBrakeCLI.
+  const { settings } = useSettings({ withPresets: false });
   const [showClearMenu, setShowClearMenu] = useState(false);
   const [searchInput, setSearchInput] = useState("");
   const [menu, setMenu] = useState<MenuState | null>(null);
