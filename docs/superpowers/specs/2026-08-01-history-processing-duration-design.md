@@ -303,9 +303,15 @@ Tests that reach HandBrake resolution must declare their locator world explicitl
   status-flip half of this race is pre-existing; the new consequence is a blank duration
   on a job that completed normally. Not worth a guard.
 - **The clearing UPDATE stays unguarded.** It has no `AND status = 'encoding'`, matching
-  the statement it amends. Adding one would also narrow a pre-existing race where a pause
-  can rewrite an already-`done` row, but that changes pause semantics and belongs in its
-  own change with its own tests. Inherited knowingly.
+  the statement it amends. This would NOT close the pause-races-child-exit gap above:
+  `current_job_id` is cleared (`converter.rs:1119`) right after `wait_for_active_child`
+  returns, but the completion UPDATE that writes `done`/`skipped` runs later
+  (`converter.rs:1370`), so throughout that window the row is still `encoding` and the
+  guard would let the clearing UPDATE through regardless. What it would narrow instead is
+  a separate, simultaneous cancel-and-pause race: `cancel_conversion` writes `error` while
+  `current_job_id` is still set, so a pause landing in that window could otherwise rewrite
+  an already-`error` row. That changes pause semantics and belongs in its own change with
+  its own tests. Inherited knowingly.
 - **`started_at` clearing depends on `current_job_id` being `Some`.** SIGSTOP is sent
   whenever `current_pid` is `Some`, while the DB write sits inside a nested
   `if let Some(ref job_id)`. They are set together at spawn, so a desync is believed
