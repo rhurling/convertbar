@@ -23,7 +23,16 @@ function broadcastSettingWrite(key: string, value: string) {
   for (const listener of settingsWriteListeners) listener(key, value);
 }
 
-export function useSettings() {
+/**
+ * `withPresets: false` skips the preset pipeline — the preset list plus the selected preset's
+ * suffix and metadata — for consumers that only read settings *values*. Every instance that asks
+ * for it pays for `list_handbrake_presets`, which shells out to HandBrakeCLI on every call (the
+ * server route has no cache, unlike `generate_preset_suffix`), so with History and Settings both
+ * mounted in three-col, opening the app spawned two concurrent CLI processes for one list.
+ * Under `withPresets: false` the preset pipeline never runs on load, so
+ * `presets`/`presetSuffix`/`presetMetadata` must not be read.
+ */
+export function useSettings({ withPresets = true }: { withPresets?: boolean } = {}) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [presets, setPresets] = useState<string[]>([]);
   const [presetSuffix, setPresetSuffix] = useState<string>("");
@@ -57,28 +66,30 @@ export function useSettings() {
       const s = await commands.getSettings();
       setSettings(s);
 
-      try {
-        const p = await commands.listHandbrakePresets();
-        setPresets(p);
-        setPresetsError(null);
-      } catch (e) {
-        // A panic here is a bug in ConvertBar, not a missing binary. Blaming the install would
-        // send the user after the wrong thing — which is precisely the confusion the
-        // discriminator exists to end, and this site swallowed the error entirely, so the fix
-        // reached it only once the swallow was opened up.
-        setPresetsError(
-          isPanic(e) ? errorText(e) : "Could not load presets. Is HandBrakeCLI installed?",
-        );
-        setPresets([]);
-      }
+      if (withPresets) {
+        try {
+          const p = await commands.listHandbrakePresets();
+          setPresets(p);
+          setPresetsError(null);
+        } catch (e) {
+          // A panic here is a bug in ConvertBar, not a missing binary. Blaming the install would
+          // send the user after the wrong thing — which is precisely the confusion the
+          // discriminator exists to end, and this site swallowed the error entirely, so the fix
+          // reached it only once the swallow was opened up.
+          setPresetsError(
+            isPanic(e) ? errorText(e) : "Could not load presets. Is HandBrakeCLI installed?",
+          );
+          setPresets([]);
+        }
 
-      await loadPresetData(s.preset);
+        await loadPresetData(s.preset);
+      }
     } catch (e) {
       console.error("Failed to load settings:", e);
     } finally {
       setLoading(false);
     }
-  }, [loadPresetData]);
+  }, [loadPresetData, withPresets]);
 
   useEffect(() => {
     refresh();
