@@ -168,9 +168,20 @@ Then `ExitWorktree` (remove), and:
 
 ```
 git checkout main && git pull --ff-only
+git branch -D <branch>      # yes, -D — see below
 ```
 
-Verify: `git worktree list`, `git status`, `git log --oneline -2`.
+**`ExitWorktree` does not delete the branch you renamed.** It removes the branch *it* created (`worktree-<name>`), and step 2 renamed that to `fix/<slug>-<n>` — so the rename orphans it and the branch survives the worktree removal. Delete it explicitly.
+
+It must be `-D`, not `-d`: `main` takes squash merges, so your commits never become ancestors of `main` and `-d` refuses with "not fully merged" no matter how thoroughly the PR landed. **Confirm the merge before force-deleting** — the safety `-d` would have given you is exactly what `-D` discards:
+
+```
+gh pr list --state all --head <branch> --json number,state,mergedAt
+```
+
+`git branch -D` may be blocked by the auto-mode classifier. If it is, hand the user the command to run with `!` rather than reaching for `git update-ref -d` — that bypasses the intent of the block.
+
+Verify: `git worktree list`, `git branch -vv` (no leftover `[origin/…: gone]` rows for this work), `git status`, `git log --oneline -2`.
 
 ## 12. Report
 
