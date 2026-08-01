@@ -27,6 +27,7 @@ function job(overrides: Partial<JobInfo> = {}): JobInfo {
     failure_class: null,
     queue_order: 0,
     created_at: "",
+    started_at: null,
     completed_at: null,
     ...overrides,
   };

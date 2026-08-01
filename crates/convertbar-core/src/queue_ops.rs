@@ -75,6 +75,7 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobInfo> {
         queue_order: row.get(11)?,
         created_at: row.get(12)?,
         completed_at: row.get(13)?,
+        started_at: row.get(14)?,
     })
 }
 
@@ -1095,6 +1096,7 @@ fn add_files_to_db(
             failure_class: None,
             queue_order,
             created_at: now,
+            started_at: None,
             completed_at: None,
         });
 
@@ -1187,7 +1189,7 @@ pub fn get_queue(ctx: &Ctx) -> Result<Vec<JobInfo>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at
              FROM jobs
              WHERE status IN ('queued', 'encoding', 'paused', 'error')
              ORDER BY queue_order ASC",
@@ -1291,7 +1293,7 @@ fn get_bad_sources_inner(conn: &rusqlite::Connection) -> Result<Vec<JobInfo>, St
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                     kept_file, space_saved, error_message, failure_class, queue_order, created_at,
-                    completed_at
+                    completed_at, started_at
              FROM jobs
              WHERE status = 'error' AND failure_class IN (?1, ?2)
              ORDER BY completed_at DESC",
@@ -1410,7 +1412,7 @@ fn get_history_inner(
     let jobs = if has_search {
         let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped') AND (source_path LIKE ?1 OR output_path LIKE ?1)
              ORDER BY {}
@@ -1427,7 +1429,7 @@ fn get_history_inner(
     } else {
         let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped')
              ORDER BY {}
@@ -2405,6 +2407,50 @@ mod tests {
     }
 
     // ---- get_history search / sort / pagination ----
+
+    #[test]
+    fn get_history_carries_started_at_through_to_the_frontend() {
+        // The whole feature is unreachable if the column is not in the SELECT list that
+        // feeds row_to_job — and because row_to_job reads by positional index, a column
+        // appended anywhere but last would silently shift every field after it.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, original_size,
+                                   queue_order, created_at, started_at, completed_at)
+                 VALUES ('j1', '/a.mkv', '/a.mp4', 'p', 'done', 1000, 0,
+                         '2026-08-01T10:00:00+00:00',
+                         '2026-08-01T10:00:05+00:00',
+                         '2026-08-01T10:12:39+00:00')",
+                [],
+            )
+            .unwrap();
+
+        let page = get_history(&ctx, 10, 0, None, None).unwrap();
+        let job = &page.jobs[0];
+        assert_eq!(job.started_at.as_deref(), Some("2026-08-01T10:00:05+00:00"));
+        assert_eq!(
+            job.completed_at.as_deref(),
+            Some("2026-08-01T10:12:39+00:00"),
+            "the fields after started_at must not have shifted"
+        );
+        assert_eq!(job.original_size, Some(1000), "nor the fields before it");
+
+        // The search branch is a SEPARATE SELECT list with the same column order. Appending
+        // to only one of the two is a real mistake this catches; without it the search
+        // branch's index shift is invisible.
+        let searched = get_history(&ctx, 10, 0, Some("a.mkv".into()), None).unwrap();
+        assert_eq!(
+            searched.jobs[0].started_at.as_deref(),
+            Some("2026-08-01T10:00:05+00:00")
+        );
+        assert_eq!(
+            searched.jobs[0].completed_at.as_deref(),
+            Some("2026-08-01T10:12:39+00:00")
+        );
+    }
 
     #[test]
     fn history_search_filters_by_path() {

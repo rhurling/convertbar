@@ -30,6 +30,7 @@ function makeSettings(preset: string): AppSettings {
     low_disk_min_gb: 0,
     bad_source_action: "trash",
     update_mode: "automatic",
+    history_show_duration: true,
   };
 }
 

@@ -55,7 +55,11 @@ pub fn recover_interrupted_jobs(db: &Connection) {
         };
         let _ = std::fs::remove_file(&target);
         let _ = db.execute(
-            "UPDATE jobs SET status = 'queued' WHERE id = ?1",
+            // started_at is cleared with the status: the abandoned attempt's start time must
+            // not survive into the next one. Three error paths in process_queue (vanished
+            // source, HandBrake-not-found, ClaimOutcome::Failed) write completed_at WITHOUT
+            // re-claiming, so a surviving stamp would report the whole downtime as encode time.
+            "UPDATE jobs SET status = 'queued', started_at = NULL WHERE id = ?1",
             params![id],
         );
     }
@@ -435,7 +439,7 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                 kept_file, space_saved, error_message, failure_class, queue_order, created_at,
-                completed_at
+                completed_at, started_at
          FROM jobs WHERE status = 'queued'
          ORDER BY queue_order ASC LIMIT 1",
         )
@@ -457,6 +461,7 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
             queue_order: row.get(11)?,
             created_at: row.get(12)?,
             completed_at: row.get(13)?,
+            started_at: row.get(14)?,
         })
     })
     .ok()
@@ -656,10 +661,17 @@ enum ClaimOutcome {
 
 /// Atomically claim `job_id` for encoding iff it is still queued. Distinguishes a genuine DB
 /// error from "row no longer queued" so a failing UPDATE can't spin the queue on the same job.
+///
+/// Also stamps `started_at`, the anchor for the encode duration shown in History. The
+/// invariant: `started_at` is set here and cleared by any NON-terminal transition back out
+/// of `encoding` — `recover_interrupted_jobs` and `pause_conversion`. Terminal transitions
+/// (done/skipped/error) leave it alone. A new transition out of `encoding` must answer this
+/// question or it will report a stale duration.
 fn claim_job(db: &Connection, job_id: &str) -> ClaimOutcome {
+    let now = chrono::Utc::now().to_rfc3339();
     match db.execute(
-        "UPDATE jobs SET status = 'encoding' WHERE id = ?1 AND status = 'queued'",
-        params![job_id],
+        "UPDATE jobs SET status = 'encoding', started_at = ?2 WHERE id = ?1 AND status = 'queued'",
+        params![job_id, now],
     ) {
         Ok(0) => ClaimOutcome::Gone,
         Ok(_) => ClaimOutcome::Claimed,
@@ -2976,6 +2988,72 @@ mod tests {
         assert_eq!(claim_job(&conn, "nope"), ClaimOutcome::Gone);
     }
 
+    fn started_at_of(db: &Arc<Mutex<Connection>>, id: &str) -> Option<String> {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT started_at FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn claiming_a_job_stamps_the_encode_start_time() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+
+        let outcome = claim_job(&ctx.db.lock().unwrap(), "j1");
+
+        assert_eq!(outcome, ClaimOutcome::Claimed);
+        assert!(
+            started_at_of(&ctx.db, "j1").is_some(),
+            "the duration is measured from the claim; without a stamp the encode time is \
+             unknowable after the fact"
+        );
+    }
+
+    #[test]
+    fn a_claim_that_loses_the_race_stamps_nothing() {
+        // clear_queue/remove_job can delete or re-status a job during the pre-spawn window.
+        // The conditional claim must not stamp a job it did not win, or a later attempt
+        // would measure from a start it never had.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET status = 'done' WHERE id = 'j1'", [])
+            .unwrap();
+
+        let outcome = claim_job(&ctx.db.lock().unwrap(), "j1");
+
+        assert_eq!(outcome, ClaimOutcome::Gone);
+        assert_eq!(started_at_of(&ctx.db, "j1"), None);
+    }
+
+    #[test]
+    fn the_claim_stamp_is_the_moment_of_the_claim_in_parseable_rfc3339() {
+        // `is_some()` alone would pass against a hardcoded constant, and against a garbage
+        // string: every Rust test would stay green while the frontend's Date.parse returns
+        // NaN and the feature silently renders nothing. Pin both the value and the format.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+
+        let before = chrono::Utc::now();
+        claim_job(&ctx.db.lock().unwrap(), "j1");
+        let after = chrono::Utc::now();
+
+        let stamped = started_at_of(&ctx.db, "j1").expect("the claim stamps");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+            .expect("the frontend parses this string with Date.parse");
+        assert!(
+            parsed >= before && parsed <= after,
+            "the duration anchor must be the claim moment, not a constant: {stamped}"
+        );
+    }
+
     #[test]
     fn gb_to_bytes_converts_a_fractional_threshold() {
         // A non-integer configured floor (e.g. 2.5 GB) must scale exactly, not truncate the GiB
@@ -3704,6 +3782,86 @@ HandBrake has exited.";
             .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "queued");
+    }
+
+    #[test]
+    fn recovery_clears_the_stamp_so_a_pre_claim_error_reports_no_duration() {
+        // The regression this exists for: an encode stamped Monday 22:00, a crash, a source
+        // the user then deletes, a relaunch Tuesday. Recovery re-queues the job, and the
+        // vanished-source gate errors it BEFORE the claim — so nothing re-stamps. A stale
+        // stamp plus a fresh completed_at reads as a 12-hour encode that never happened.
+        //
+        // AbsentLocator, not the default PanickingLocator: process_queue resolves the
+        // HandBrake path before reaching the vanished-source gate, so this test must
+        // declare that it lives in the no-HandBrake world.
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::AbsentLocator));
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately never created on disk — this is the vanished source.
+        let src = dir.path().join("gone.mp4");
+        let out = dir.path().join("gone-conv.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+        // The interrupted first attempt: stamped, left 'encoding' by the crash.
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status = 'encoding', started_at = '2026-08-01T22:00:00+00:00'
+                 WHERE id = 'j1'",
+                [],
+            )
+            .unwrap();
+
+        recover_interrupted_jobs(&ctx.db.lock().unwrap());
+
+        assert_eq!(
+            started_at_of(&ctx.db, "j1"),
+            None,
+            "recovery returns the job to 'queued', so the abandoned attempt's start time \
+             must not survive into the next one"
+        );
+
+        *ctx.converter.is_running.lock().unwrap() = true;
+        process_queue(&ctx);
+
+        let (status, _msg) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "error", "the vanished source fails the job");
+        assert_eq!(
+            started_at_of(&ctx.db, "j1"),
+            None,
+            "a job that errored before ever being claimed has no encode duration to report"
+        );
+    }
+
+    #[test]
+    fn a_recovered_job_restamps_when_it_is_claimed_again() {
+        // The other half: clearing on recovery must not leave the retry unmeasured.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status = 'encoding', started_at = '2026-08-01T22:00:00+00:00'
+                 WHERE id = 'j1'",
+                [],
+            )
+            .unwrap();
+
+        recover_interrupted_jobs(&ctx.db.lock().unwrap());
+        claim_job(&ctx.db.lock().unwrap(), "j1");
+
+        let stamped = started_at_of(&ctx.db, "j1").expect("the re-claim stamps a fresh start");
+        assert_ne!(
+            stamped, "2026-08-01T22:00:00+00:00",
+            "the retry is measured from its own start, not the abandoned attempt's"
+        );
     }
 
     #[test]

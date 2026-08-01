@@ -14,6 +14,7 @@ export interface JobInfo {
   failure_class: string | null;
   queue_order: number;
   created_at: string;
+  started_at: string | null;
   completed_at: string | null;
 }
 
@@ -96,6 +97,7 @@ export interface AppSettings {
   // Narrowed like bad_source_action: get_settings runs the raw stored string through
   // `normalize_update_mode` before returning it, so only these three ever reach the frontend.
   update_mode: UpdateMode;
+  history_show_duration: boolean;
 }
 
 export interface PathsExist {

@@ -55,6 +55,7 @@ pub const ALLOWED_KEYS: &[&str] = &[
     "low_disk_min_gb",
     "bad_source_action",
     "update_mode",
+    "history_show_duration",
 ];
 
 /// Coerce a stored `bad_source_action` to a known value. Anything other than an exact
@@ -123,6 +124,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
     // Stored raw: the coercion of an unknown value to Automatic is desktop-updater policy and
     // lives in the shell (`commands::settings::get_settings`), like `launch_at_login`.
     let mut update_mode = String::from("automatic");
+    let mut history_show_duration = true;
 
     let rows = stmt
         .query_map([], |row| {
@@ -155,6 +157,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
                 bad_source_action = normalize_bad_source_action(&value).to_string()
             }
             "update_mode" => update_mode = value,
+            "history_show_duration" => history_show_duration = value == "true",
             _ => {}
         }
     }
@@ -178,6 +181,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
         low_disk_min_gb,
         bad_source_action,
         update_mode,
+        history_show_duration,
     })
 }
 
@@ -471,6 +475,42 @@ mod tests {
         assert!(!ALLOWED_KEYS.contains(&"update_skipped_version"));
         assert!(!ALLOWED_KEYS.contains(&"update_notified_version"));
         assert!(!ALLOWED_KEYS.contains(&"update_installed"));
+    }
+
+    #[test]
+    fn history_show_duration_falls_back_to_true_when_the_row_is_absent() {
+        // A DB whose settings row is missing must not silently invert the default. init_db
+        // seeds the row, so only deleting it exposes the parser's fallback — and the
+        // surrounding initializers are a mix of true and false, so the right value has to
+        // be chosen deliberately rather than copied from a neighbour.
+        let conn = test_conn();
+        conn.execute(
+            "DELETE FROM settings WHERE key = 'history_show_duration'",
+            [],
+        )
+        .unwrap();
+        let (ctx, _sink, _disposer) = test_ctx(conn);
+
+        assert!(get_settings(&ctx).unwrap().history_show_duration);
+    }
+
+    #[test]
+    fn a_fresh_db_reports_history_show_duration_true() {
+        // The seeded row and the parser must AGREE. The db.rs test pins the stored literal
+        // and the test above pins the fallback; this one pins what the frontend actually
+        // receives on a first run, which is the claim the whole "defaults on" design rests on.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+        assert!(get_settings(&ctx).unwrap().history_show_duration);
+    }
+
+    #[test]
+    fn history_show_duration_is_writable() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+        update_setting(&ctx, "history_show_duration", "false").unwrap();
+
+        assert!(!get_settings(&ctx).unwrap().history_show_duration);
     }
 
     #[test]

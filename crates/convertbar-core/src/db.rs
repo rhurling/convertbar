@@ -96,6 +96,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             failure_class   TEXT,
             queue_order     INTEGER NOT NULL,
             created_at      TEXT NOT NULL,
+            started_at      TEXT,
             completed_at    TEXT
         );
         CREATE TABLE IF NOT EXISTS settings (
@@ -174,6 +175,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         }
     }
 
+    // Older DBs predate the encode-start timestamp. Same idempotent pattern as
+    // failure_class above. No backfill: a row written before this column existed has no
+    // knowable start time, and NULL renders no duration.
+    if let Err(e) = conn.execute("ALTER TABLE jobs ADD COLUMN started_at TEXT", []) {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+
     // Backfill: Linux DBs seeded before 0.13.1 stored "H.265 MKV 1080p", which is not a
     // valid preset name in current HandBrake (the built-in is "H.265 MKV 1080p30"), so
     // every default conversion failed. INSERT OR IGNORE below won't touch existing rows,
@@ -208,6 +218,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("low_disk_min_gb", "0"),
         ("bad_source_action", "trash"),
         ("update_mode", "automatic"),
+        ("history_show_duration", "true"),
     ];
 
     for (key, value) in defaults {
@@ -270,7 +281,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 18);
+        assert_eq!(count, 19);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -313,6 +324,18 @@ mod tests {
     }
 
     #[test]
+    fn history_duration_defaults_on() {
+        // The setting's whole rationale is that Docker users get the duration without
+        // hunting through settings. A default flip would be invisible in every other test.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(
+            setting(&conn, "history_show_duration").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn init_db_is_idempotent_and_preserves_user_changes() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -331,7 +354,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 18);
+        assert_eq!(count, 19);
     }
 
     #[test]
@@ -756,6 +779,71 @@ mod tests {
             })
             .unwrap();
         assert_eq!(got.as_deref(), Some("bad_source"));
+    }
+
+    #[test]
+    fn init_db_adds_started_at_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Writing through the column is the real proof it exists and is TEXT-typed.
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at, started_at)
+             VALUES ('j1', '/a.mkv', '/a.mp4', 'p', 'encoding', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:05Z')",
+            [],
+        )
+        .unwrap();
+        let got: Option<String> = conn
+            .query_row("SELECT started_at FROM jobs WHERE id = 'j1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("2026-01-01T00:00:05Z"));
+    }
+
+    #[test]
+    fn init_db_adds_started_at_to_an_existing_database() {
+        // An old DB predating the column. init_db must ALTER it in, leave existing rows
+        // NULL, and stay idempotent on a second run — users upgrade in place.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE jobs (
+                id              TEXT PRIMARY KEY,
+                source_path     TEXT NOT NULL,
+                output_path     TEXT NOT NULL,
+                preset          TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'queued',
+                original_size   INTEGER,
+                converted_size  INTEGER,
+                kept_file       TEXT,
+                space_saved     INTEGER,
+                error_message   TEXT,
+                queue_order     INTEGER NOT NULL,
+                created_at      TEXT NOT NULL,
+                completed_at    TEXT
+            );",
+        )
+        .unwrap();
+        insert_job(
+            &conn,
+            "old",
+            "done",
+            "2020-01-01T00:00:00Z",
+            Some("2020-01-01T00:10:00Z"),
+        );
+
+        init_db(&conn).unwrap();
+        // Second run must not error on the duplicate column.
+        init_db(&conn).unwrap();
+
+        let started: Option<String> = conn
+            .query_row("SELECT started_at FROM jobs WHERE id = 'old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            started, None,
+            "a pre-upgrade row has no start time and must render no duration, not a wrong one"
+        );
     }
 
     #[test]

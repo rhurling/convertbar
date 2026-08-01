@@ -15,6 +15,11 @@ pub struct JobInfo {
     pub failure_class: Option<String>,
     pub queue_order: i32,
     pub created_at: String,
+    /// When the encode was claimed and HandBrake launched. NULL for a job that never
+    /// reached the claim, and cleared by any non-terminal transition back out of
+    /// `encoding` (crash recovery, mid-encode pause) — see the invariant in
+    /// converter::claim_job.
+    pub started_at: Option<String>,
     pub completed_at: Option<String>,
 }
 
@@ -38,6 +43,7 @@ pub struct Settings {
     pub low_disk_min_gb: f64,
     pub bad_source_action: String,
     pub update_mode: String,
+    pub history_show_duration: bool,
 }
 
 /// Existence of a history entry's two paths, checked when its context menu opens.

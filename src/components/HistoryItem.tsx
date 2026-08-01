@@ -1,12 +1,23 @@
 import type { JobInfo } from "../lib/tauri";
-import { fileName, formatBytes, formatPercent } from "../lib/format";
+import {
+  durationSeconds,
+  fileName,
+  formatBytes,
+  formatDuration,
+  formatPercent,
+} from "../lib/format";
 
 interface HistoryItemProps {
   job: JobInfo;
+  showDuration?: boolean;
   onContextMenu?: (e: React.MouseEvent, job: JobInfo) => void;
 }
 
-export default function HistoryItem({ job, onContextMenu }: HistoryItemProps) {
+export default function HistoryItem({
+  job,
+  showDuration = false,
+  onContextMenu,
+}: HistoryItemProps) {
   const isError = job.status === "error";
   const keptOriginal = job.kept_file === "original";
 
@@ -23,6 +34,16 @@ export default function HistoryItem({ job, onContextMenu }: HistoryItemProps) {
     badgeLabel = "Skipped";
   }
 
+  const secs = showDuration
+    ? durationSeconds(job.started_at, job.completed_at)
+    : null;
+  const duration =
+    secs !== null ? (
+      <span className="history-item-duration" title="Encode time">
+        {formatDuration(secs)}
+      </span>
+    ) : null;
+
   return (
     <div
       className={`history-item ${isError ? "history-item-error" : ""}`}
@@ -37,25 +58,35 @@ export default function HistoryItem({ job, onContextMenu }: HistoryItemProps) {
         </span>
         <span className={`badge ${badgeClass}`}>{badgeLabel}</span>
       </div>
-      {!isError && job.original_size !== null && (
+      {!isError && (job.original_size !== null || duration) && (
         <div className="history-item-sizes">
-          <span>{formatBytes(job.original_size)}</span>
-          <span className="arrow">&rarr;</span>
-          <span>
-            {job.converted_size !== null
-              ? formatBytes(job.converted_size)
-              : "—"}
-          </span>
-          {job.space_saved !== null && job.space_saved > 0 && (
-            <span className="saved-pct">
-              -{formatPercent(job.space_saved, job.original_size)}
-            </span>
+          {job.original_size !== null && (
+            <>
+              <span>{formatBytes(job.original_size)}</span>
+              <span className="arrow">&rarr;</span>
+              <span>
+                {job.converted_size !== null
+                  ? formatBytes(job.converted_size)
+                  : "—"}
+              </span>
+              {job.space_saved !== null && job.space_saved > 0 && (
+                <span className="saved-pct">
+                  -{formatPercent(job.space_saved, job.original_size)}
+                </span>
+              )}
+            </>
           )}
+          {duration}
         </div>
       )}
-      {isError && job.error_message && (
-        <div className="history-item-error-msg" title={job.error_message}>
-          {job.error_message}
+      {isError && (job.error_message || duration) && (
+        <div className="history-item-error-row">
+          {job.error_message && (
+            <span className="history-item-error-msg" title={job.error_message}>
+              {job.error_message}
+            </span>
+          )}
+          {duration}
         </div>
       )}
     </div>
