@@ -319,7 +319,12 @@ export default function HistoryPage() {
 
       <div className="item-list">
         {history.map((job) => (
-          <HistoryItem key={job.id} job={job} onContextMenu={handleItemContextMenu} />
+          <HistoryItem
+            key={job.id}
+            job={job}
+            showDuration={settings?.history_show_duration === true}
+            onContextMenu={handleItemContextMenu}
+          />
         ))}
       </div>
 

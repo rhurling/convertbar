@@ -52,6 +52,14 @@ function doneJob(id: string): JobInfo {
   };
 }
 
+function timedJob(id: string): JobInfo {
+  return {
+    ...doneJob(id),
+    started_at: "2026-08-01T10:00:00+00:00",
+    completed_at: "2026-08-01T10:12:34+00:00",
+  };
+}
+
 // A row from the bad-source review list — same shape as a history error row, but with a
 // failure_class the review list is scoped by.
 function badSourceJob(id: string): JobInfo {
@@ -791,5 +799,30 @@ describe("HistoryPage", () => {
       expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: /move 1 to trash/i })).toBeEnabled();
     });
+  });
+
+  it("hides the duration when history_show_duration is off", async () => {
+    // The gap this closes: every HistoryItem and formatDuration test passes the flag in
+    // directly, so a HistoryPage that never reads the setting — or hardcodes it on —
+    // leaves the whole suite green while the shipped feature ignores the toggle.
+    settings = { ...makeSettings("trash"), history_show_duration: false };
+    page = { jobs: [timedJob("1")], total: 1 };
+
+    render(<HistoryPage />);
+
+    // Anchor on the file name, NOT the "Saved" badge: HistoryPage renders a permanent
+    // "Saved" sort button (HistoryPage.tsx:305), so getByText("Saved") matches two
+    // elements and throws. doneJob("1") has source_path "/in/1.mp4".
+    expect(await screen.findByText("1.mp4")).toBeInTheDocument();
+    expect(screen.queryByText("12m 34s")).toBeNull();
+  });
+
+  it("shows the duration when history_show_duration is on", async () => {
+    settings = { ...makeSettings("trash"), history_show_duration: true };
+    page = { jobs: [timedJob("1")], total: 1 };
+
+    render(<HistoryPage />);
+
+    expect(await screen.findByText("12m 34s")).toBeInTheDocument();
   });
 });
