@@ -80,6 +80,28 @@ describe("DropZone (presentational)", () => {
     expect(screen.getByText(/Drop video files/)).toBeInTheDocument();
   });
 
+  it("keeps the pick button visible while a status is showing", async () => {
+    // On the server head this button is the ONLY way to add anything — there is no OS
+    // drag-drop in a browser tab. Gating it behind `status` meant every add replaced the
+    // affordance with its own 4s summary toast, and a classify request that never settled
+    // left "Adding…" up forever, so intake was unreachable until the user reloaded the page.
+    const onPick = vi.fn();
+    render(
+      <DropZone
+        pendingConfirm={null}
+        onAdd={vi.fn()}
+        onSkip={vi.fn()}
+        status={"Adding…"}
+        isDragOver={false}
+        onPick={onPick}
+      />,
+    );
+
+    expect(screen.getByText("Adding…")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Add files or folders/ }));
+    expect(onPick).toHaveBeenCalled();
+  });
+
   it("shows the folder confirm prompt even when onPick is given", () => {
     render(
       <DropZone
