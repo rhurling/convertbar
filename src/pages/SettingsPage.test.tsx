@@ -98,6 +98,26 @@ function updateCallsFor(key: string) {
   );
 }
 
+/** Desktop head with a given cleanup mode and a literal (already-resolved) suffix. */
+function withMode(cleanup_mode: string, suffix: string) {
+  invokeMock.mockImplementation(((cmd: string) => {
+    switch (cmd) {
+      case "get_settings":
+        return Promise.resolve(makeSettings({ cleanup_mode }));
+      case "list_handbrake_presets":
+        return Promise.resolve(["Fast 1080p30"]);
+      case "get_preset_suffix":
+        return Promise.resolve(suffix);
+      case "generate_preset_suffix":
+        return Promise.resolve(META);
+      case "resolve_suffix_template":
+        return Promise.resolve(suffix);
+      default:
+        return Promise.resolve(null);
+    }
+  }) as typeof invoke);
+}
+
 describe("SettingsPage", () => {
   // Desktop's own "Updates" version label was replaced by `<UpdatePanel />` (mocked to null
   // above), which sources the version from useUpdate()/getUpdateState() instead — that path is
@@ -503,25 +523,6 @@ describe("SettingsPage", () => {
     const warning = /cannot keep the original/i;
 
     // An empty resolved suffix comes from resolve_suffix_template returning "".
-    const withMode = (cleanup_mode: string, suffix: string) => {
-      invokeMock.mockImplementation(((cmd: string) => {
-        switch (cmd) {
-          case "get_settings":
-            return Promise.resolve(makeSettings({ cleanup_mode }));
-          case "list_handbrake_presets":
-            return Promise.resolve(["Fast 1080p30"]);
-          case "get_preset_suffix":
-            return Promise.resolve(suffix);
-          case "generate_preset_suffix":
-            return Promise.resolve(META);
-          case "resolve_suffix_template":
-            return Promise.resolve(suffix);
-          default:
-            return Promise.resolve(null);
-        }
-      }) as typeof invoke);
-    };
-
     withMode("keep", "-conv");
     const a = render(<SettingsPage />);
     expect(await screen.findByLabelText("Keep both files")).toBeInTheDocument();
@@ -542,5 +543,81 @@ describe("SettingsPage", () => {
     withMode("keep", "");
     render(<SettingsPage />);
     expect(await screen.findByText(warning)).toBeInTheDocument();
+  });
+
+  it("does not call a whitespace-only suffix in-place — the engine only treats the exactly-empty one that way", async () => {
+    // A " " suffix produces `vacation .mp4`, a path distinct from the source, so nothing is
+    // re-encoded in place and nothing is blocked under keep: those jobs queue and run fine.
+    // Warning on `.trim() === ""` told the user their files would be skipped when they would
+    // not be, and claimed the skip-by-suffix shortcut was off when a non-empty suffix keeps it
+    // on (`stem.ends_with(suffix)` in queue_ops).
+    withMode("keep", " ");
+    render(<SettingsPage />);
+
+    expect(await screen.findByLabelText("Keep both files")).toBeInTheDocument();
+    // Anchor on the resolved preview so the 250ms debounce has settled before asserting absence.
+    await waitFor(() => expect(screen.getByText("vacation .mp4")).toBeInTheDocument());
+    expect(screen.queryByText(/re-encoded in place/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cannot keep the original/i)).not.toBeInTheDocument();
+  });
+
+  it("offers Trash as a remedy for a keep-blocked in-place job on desktop", async () => {
+    // Only `keep` blocks an in-place job (queue_ops.rs) — Trash permits it, routing the source
+    // to the OS Trash where it stays recoverable. Naming Delete as the sole way out pushed
+    // desktop users into permanent deletion for a job the recoverable mode would have run.
+    withMode("keep", "");
+    render(<SettingsPage />);
+
+    const warning = await screen.findByText(/cannot keep the original/i);
+    expect(warning.textContent).toMatch(/Trash/);
+  });
+
+  it("does not offer Trash as that remedy on the server head, which has no Trash mode", async () => {
+    // The mirror of the desktop case: the server head deliberately hides the Trash radio
+    // (DeleteDisposer, .Trash-<uid> on NAS mounts), so naming it here would send the user
+    // looking for a setting that is not on their screen.
+    vi.stubEnv("VITE_HEAD", "server");
+    const fetchMock = vi.fn((path: string) => {
+      if (path === "/api/settings") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(makeSettings({ cleanup_mode: "keep" })),
+        });
+      }
+      if (path === "/api/handbrake/presets") {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(["Fast 1080p30"]) });
+      }
+      if (path === "/api/info") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              version: "1.2.3",
+              head: "server",
+              can_pause_process: true,
+              auth_required: false,
+              browse_roots: [],
+            }),
+        });
+      }
+      if (path.includes("/suffix/generate")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(META) });
+      }
+      if (path.includes("/suffix")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve("") });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({ error: "not mocked" }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.resetModules();
+
+    const { default: FreshSettingsPage } = await import("./SettingsPage");
+    render(<FreshSettingsPage />);
+
+    const warning = await screen.findByText(/cannot keep the original/i);
+    expect(warning.textContent).not.toMatch(/Trash/);
+    expect(warning.textContent).toMatch(/Delete/);
   });
 });

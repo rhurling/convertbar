@@ -108,7 +108,9 @@ the destination volume.
 Four things to know about Keep:
 
 - An empty output suffix re-encodes in place, so there is no second file to keep.
-  Those files are skipped with a note until you choose Delete or set a suffix.
+  Those files are skipped with a note until you set a suffix or leave Keep. Only Keep
+  blocks them: Trash runs an in-place job too, and puts the original in the Trash
+  rather than deleting it.
 - While originals are kept, ConvertBar avoids re-converting them by remembering each
   file's size and modification time in History. Clearing History forgets that, and a
   watched folder will convert those files again into renumbered outputs
@@ -118,9 +120,10 @@ Four things to know about Keep:
   but under Keep neither file has actually been removed, so nothing has been freed yet.
 - **Before rolling back to an older ConvertBar version, switch back to Trash or
   Delete first.** A pre-Keep binary compares `cleanup_mode` against the literal
-  string `"delete"`; `"keep"` fails that check and falls through to the delete/trash
-  branch instead, so a routine version rollback would permanently delete every
-  original on its next batch.
+  string `"delete"`; `"keep"` fails that check and falls through to the trash branch
+  instead, so a routine version rollback silently stops keeping anything on its next
+  batch. On the desktop app that branch moves each original to the Trash, where it
+  is recoverable; on the server head, which has no Trash, it deletes them for good.
 
 Encoding is deliberately sequential: hardware encoders would just contend for the
 same silicon if run in parallel, so two at once is usually slower overall.
@@ -138,11 +141,11 @@ See [`docker-compose.example.yml`](docker-compose.example.yml) for a ready-to-co
 compose file.
 
 The web UI takes files through the picker, not by dragging them onto the page — a
-browser tab receives no OS drag-drop event. Click the intake panel on the Queue tab
-to browse. Inside the picker, every row has a checkbox (folders included, added
-recursively), the header selects everything in the current folder, shift-click selects
-a range, and the selection survives moving between folders. Reordering the queue by
-dragging still works.
+browser tab receives no OS drag-drop event. Click **Add files or folders…** in the
+intake panel on the Queue tab to browse. Inside the picker, every row has a checkbox
+(folders included, added recursively), the header selects everything in the current
+folder, shift-click selects a range, and the selection survives moving between
+folders. Reordering the queue by dragging still works.
 
 ### Unraid
 

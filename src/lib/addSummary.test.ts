@@ -64,6 +64,11 @@ describe("summarizeAdds", () => {
         ],
       },
     ]);
-    expect(summary).toBe("3 skipped (in-place encode needs Delete) · 2 skipped (not a video)");
+    // The label names the CAUSE, not a remedy: "needs Delete" was wrong on the desktop head,
+    // where Trash permits in-place jobs too (only `keep` blocks them, queue_ops.rs), and it
+    // steered users toward permanent deletion when the recoverable option would have done.
+    expect(summary).toBe(
+      "3 skipped (in-place encode can't keep the original) · 2 skipped (not a video)",
+    );
   });
 });

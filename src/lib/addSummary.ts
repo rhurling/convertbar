@@ -6,7 +6,9 @@ const SKIP_LABELS: Record<SkipReason, string> = {
   already_queued: "already queued",
   not_video: "not a video",
   already_at_target: "already at target",
-  in_place_keep_blocked: "in-place encode needs Delete",
+  // Names the cause, not a remedy: Trash permits in-place jobs too, so "needs Delete" was
+  // both wrong on desktop and a nudge toward the unrecoverable option.
+  in_place_keep_blocked: "in-place encode can't keep the original",
 };
 
 // Fixed order so the rendered summary is deterministic regardless of backend ordering.
