@@ -139,15 +139,16 @@ pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
     let mut dropped = 0;
     for (id, source, output) in rows {
         if crate::converter::is_in_place(&source, &output) {
-            if conn
+            // Count rows actually removed, not statements that ran: the `AND status IN (...)`
+            // re-check above can legitimately match nothing (process_queue flipped the row to
+            // 'encoding' after our SELECT), and an `is_ok()` count would book that as a drop
+            // and fire a `queue-updated` for a queue that never changed.
+            dropped += conn
                 .execute(
                     "DELETE FROM jobs WHERE id = ?1 AND status IN ('queued', 'paused')",
                     rusqlite::params![id],
                 )
-                .is_ok()
-            {
-                dropped += 1;
-            }
+                .unwrap_or(0);
         }
     }
     dropped
@@ -1646,6 +1647,46 @@ mod tests {
         // in-place encoding in general.
         let queued = add_files_to_db(&conn, &[source], "preset", "", false, "delete").unwrap();
         assert_eq!(queued.added.len(), 1);
+    }
+
+    #[test]
+    fn dropping_in_place_jobs_counts_rows_deleted_not_statements_run() {
+        // The returned count is the *only* thing `settings_ops::update_setting` has to decide
+        // whether to fire `queue-updated`, and the DELETE deliberately re-checks `status IN
+        // ('queued', 'paused')` so this function stays correct without the caller pinning the
+        // row across the SELECT and the DELETE. That re-check is what makes a 0-row DELETE
+        // reachable: `process_queue` can flip a row to 'encoding' in between, and then the
+        // statement succeeds having removed nothing. Counting `execute(...).is_ok()` books it
+        // as a drop anyway and the Queue panel refetches for a queue that never changed.
+        //
+        // A real interleave is not schedulable from a test, so the 0-row DELETE is injected
+        // with a BEFORE DELETE trigger raising IGNORE — SQLite skips the row operation and
+        // reports success with `changes() == 0`, exactly the shape the race produces.
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+             VALUES ('racer', '/m/a.mp4', '/m/a.mp4', 'p', 'queued', 0, '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER stolen_out_from_under_us BEFORE DELETE ON jobs
+             WHEN OLD.id = 'racer' BEGIN SELECT RAISE(IGNORE); END",
+            [],
+        )
+        .unwrap();
+
+        let dropped = drop_queued_in_place_jobs(&conn);
+
+        let survivors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(survivors, 1, "the trigger must actually block the DELETE");
+        assert_eq!(
+            dropped, 0,
+            "THE POINT OF THIS TEST: a DELETE that removed no row is not a drop — counting it \
+             fires a spurious queue-updated for a queue that did not change"
+        );
     }
 
     #[test]
