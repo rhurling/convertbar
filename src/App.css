@@ -877,6 +877,18 @@ select.setting-input {
   color: var(--text-dim);
 }
 
+.update-release-link {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.update-release-link:hover {
+  text-decoration: underline;
+}
+
 /* Bounded so a long release body can never push the Quit button off this 400x500 window. */
 .update-notes {
   max-height: 140px;

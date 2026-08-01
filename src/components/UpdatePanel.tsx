@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { MANUAL_CHECK_BLOCKED_STATUSES, useUpdate } from "../hooks/useUpdate";
 import { type AvailableUpdate, type UpdateMode } from "../lib/tauri";
+import { releaseTagUrl } from "../lib/releases";
 
 const MODES: { value: UpdateMode; label: string }[] = [
   { value: "automatic", label: "Automatic" },
@@ -36,6 +37,20 @@ function AvailableDetails({ update }: { update: AvailableUpdate }) {
       <div className="update-version">
         Version {update.version}
         {update.date && <span className="update-date"> · {update.date}</span>}
+        {/* Deliberately only rendered here, where an update is on offer: a permanent link to the
+            releases page would mostly send an up-to-date user to a list they have to scan, while
+            this one names the exact release that is newer than what they are running. Opened in
+            the system browser by tauri-plugin-opener's target="_blank" interception, which needs
+            the scoped `opener:allow-open-url` grant in capabilities/default.json — without it the
+            click is preventDefault'd and then silently refused. */}
+        <a
+          className="update-release-link"
+          href={releaseTagUrl(update.version)}
+          target="_blank"
+          rel="noreferrer"
+        >
+          Release page ↗
+        </a>
       </div>
       {update.notes && <pre className="update-notes">{update.notes}</pre>}
     </>

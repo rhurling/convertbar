@@ -3,6 +3,7 @@ import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
 import UpdatePanel from "../components/UpdatePanel";
 import { isServerHead } from "../lib/head";
+import { RELEASES_URL } from "../lib/releases";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
@@ -536,6 +537,12 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           <label className="setting-label">
             Version {appVersion && <span className="version-label">v{appVersion}</span>}
           </label>
+          {/* Unlike the desktop head, nothing here ever checks whether a newer release exists, so
+              this link can't be gated on one being available — it is the only path from a server
+              deployment to "is there something newer than what I redeployed?". */}
+          <a className="update-release-link" href={RELEASES_URL} target="_blank" rel="noreferrer">
+            Release notes ↗
+          </a>
         </div>
       ) : (
         <UpdatePanel />

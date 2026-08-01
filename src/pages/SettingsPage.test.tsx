@@ -105,7 +105,7 @@ describe("SettingsPage", () => {
   // version display, but only on the server head (no UpdatePanel there), so that's what this
   // pins now. Same resetModules/stubEnv approach as events.test.ts's server-head suite: isServerHead
   // is a module-level const, so the env must be stubbed and the module graph reloaded fresh.
-  it("renders the app version from getAppInfo() on the server head (its only version display, since there's no UpdatePanel there)", async () => {
+  it("renders the app version from getAppInfo() on the server head, next to a releases link (its only version display, since there's no UpdatePanel there)", async () => {
     vi.stubEnv("VITE_HEAD", "server");
     const fetchMock = vi.fn((path: string) => {
       if (path === "/api/info") {
@@ -147,6 +147,13 @@ describe("SettingsPage", () => {
     render(<FreshSettingsPage />);
 
     expect(await screen.findByText("v1.2.3")).toBeInTheDocument();
+
+    // The server head never checks for updates, so this link is the deployment's only route to
+    // "is there anything newer than what I redeployed?" — unlike the desktop head, it cannot be
+    // gated on an available update, and must not silently disappear.
+    const link = screen.getByRole("link", { name: /release notes/i });
+    expect(link).toHaveAttribute("href", "https://github.com/rhurling/convertbar/releases");
+    expect(link).toHaveAttribute("target", "_blank");
   });
 
   it("does not write the HandBrakeCLI path per edit; commits on blur", async () => {
