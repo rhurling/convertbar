@@ -805,6 +805,12 @@ describe("FileBrowserModal", () => {
     // The focused row is gone with the old listing. Focus must land on the new listing
     // rather than <body>, or the keyboard user restarts from the top of the document
     // after every single folder they enter.
-    expect(document.activeElement).toBe(container.querySelector(".file-browser-list"));
+    //
+    // waitFor, not a bare expect: the move is done by a passive effect, which React flushes in
+    // a scheduler callback *after* the commit that findByText already resolved on. A bare
+    // assertion races that window and sees <body> whenever the machine is loaded enough.
+    await waitFor(() =>
+      expect(document.activeElement).toBe(container.querySelector(".file-browser-list")),
+    );
   });
 });
