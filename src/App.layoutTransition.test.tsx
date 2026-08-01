@@ -100,6 +100,10 @@ describe("App layout transitions", () => {
   it("persists a typed-but-unblurred suffix when the 1300px crossing unmounts Settings", async () => {
     const { rerender } = render(<App />);
     const input = await screen.findByPlaceholderText(".{resolution}-{codec}");
+    // Same load-sync race as SettingsPage's unmount test: the input mounts when get_settings
+    // lands, but presetSuffix arrives later and its effect re-syncs suffixDraft, silently
+    // overwriting a value typed in between. Anchor on the loaded template before editing.
+    await waitFor(() => expect(input).toHaveValue(".{resolution}-{codec}"));
     fireEvent.change(input, { target: { value: ".hevc" } });
 
     // The crossing itself: a zoom step or window resize, with the edit still unblurred.

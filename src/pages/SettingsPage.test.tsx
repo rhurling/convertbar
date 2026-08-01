@@ -45,6 +45,22 @@ const META: PresetMetadata = {
   device: "apple",
 };
 
+/**
+ * The inputs mount as soon as `get_settings` lands, but `useSettings` keeps loading after that
+ * (`list_handbrake_presets`, then `loadPresetData`), and each arrival re-syncs a draft from the
+ * freshly loaded value (`SettingsPage.tsx:60-71`). A test that types before the last of those
+ * effects has flushed gets its edit silently overwritten, then fails somewhere unrelated —
+ * `presetSuffix` is the last value to land (`useSettings.ts:75`), so waiting for it anchors the
+ * whole load. Finding an input with `findBy*` is not enough: that resolves on DOM presence.
+ */
+async function waitForSettingsToSettle() {
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText(".{resolution}-{codec}")).toHaveValue(
+      ".{resolution}-{codec}",
+    ),
+  );
+}
+
 afterEach(() => {
   // Only ever armed by the server-head version test below (stubEnv/stubGlobal/resetModules) —
   // a no-op otherwise, so it is safe to run unconditionally after every test in this file.
@@ -137,6 +153,7 @@ describe("SettingsPage", () => {
     const input = await screen.findByPlaceholderText(
       "/usr/local/bin/HandBrakeCLI",
     );
+    await waitForSettingsToSettle();
 
     // Two edits reflect immediately (draft) with no write yet.
     fireEvent.change(input, { target: { value: "/new" } });
@@ -158,6 +175,7 @@ describe("SettingsPage", () => {
   it("does not write the skip marker per edit; commits on blur", async () => {
     render(<SettingsPage />);
     const input = await screen.findByPlaceholderText(".downloading");
+    await waitForSettingsToSettle();
 
     fireEvent.change(input, { target: { value: ".pa" } });
     fireEvent.change(input, { target: { value: ".part" } });
@@ -176,6 +194,7 @@ describe("SettingsPage", () => {
   it("does not write the low-disk threshold per keystroke; commits on blur", async () => {
     render(<SettingsPage />);
     const input = await screen.findByRole("spinbutton"); // the only number input on the page
+    await waitForSettingsToSettle();
     fireEvent.change(input, { target: { value: "2" } });
     fireEvent.change(input, { target: { value: "2.5" } });
     expect(updateCallsFor("low_disk_min_gb")).toHaveLength(0);
@@ -193,6 +212,7 @@ describe("SettingsPage", () => {
   it("does not persist the suffix per edit; commits on blur", async () => {
     render(<SettingsPage />);
     const input = await screen.findByPlaceholderText(".{resolution}-{codec}");
+    await waitForSettingsToSettle();
 
     fireEvent.change(input, { target: { value: ".h" } });
     fireEvent.change(input, { target: { value: ".hevc" } });
@@ -216,6 +236,11 @@ describe("SettingsPage", () => {
     // a typed-but-unblurred value was silently discarded with no warning.
     const { unmount } = render(<SettingsPage onHbPathChanged={() => {}} />);
     const hbInput = await screen.findByPlaceholderText("/usr/local/bin/HandBrakeCLI");
+
+    // Measured: without this, CPU contention reset hbDraft to "" right after the first change
+    // below, so commitHbPath's equality guard saw no diff and wrote nothing — while the three
+    // later edits survived, making the failure look like it was about handbrake_path alone.
+    await waitForSettingsToSettle();
 
     fireEvent.change(hbInput, { target: { value: "/new/hb" } });
     fireEvent.change(screen.getByPlaceholderText(".downloading"), {
