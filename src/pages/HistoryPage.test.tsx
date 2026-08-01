@@ -82,6 +82,7 @@ function makeSettings(badSourceAction: "trash" | "delete"): AppSettings {
     low_disk_min_gb: 0,
     bad_source_action: badSourceAction,
     update_mode: "automatic",
+    history_show_duration: true,
   };
 }
 

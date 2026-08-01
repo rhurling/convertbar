@@ -413,6 +413,22 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         </p>
       </div>
 
+      <div className="setting-group">
+        <label className="setting-label">History</label>
+        <div className="setting-toggles">
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={settings.history_show_duration}
+              onChange={(e) =>
+                updateSetting("history_show_duration", String(e.target.checked))
+              }
+            />
+            Show processing time
+          </label>
+        </div>
+      </div>
+
       {/* Menu bar display, notifications, and launch-at-login are all macOS menu-bar-app
           concepts with no equivalent on a headless server. */}
       {!isServerHead && (

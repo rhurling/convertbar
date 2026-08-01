@@ -97,6 +97,7 @@ export interface AppSettings {
   // Narrowed like bad_source_action: get_settings runs the raw stored string through
   // `normalize_update_mode` before returning it, so only these three ever reach the frontend.
   update_mode: UpdateMode;
+  history_show_duration: boolean;
 }
 
 export interface PathsExist {

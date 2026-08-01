@@ -218,6 +218,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ("low_disk_min_gb", "0"),
         ("bad_source_action", "trash"),
         ("update_mode", "automatic"),
+        ("history_show_duration", "true"),
     ];
 
     for (key, value) in defaults {
@@ -280,7 +281,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 18);
+        assert_eq!(count, 19);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -323,6 +324,18 @@ mod tests {
     }
 
     #[test]
+    fn history_duration_defaults_on() {
+        // The setting's whole rationale is that Docker users get the duration without
+        // hunting through settings. A default flip would be invisible in every other test.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(
+            setting(&conn, "history_show_duration").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn init_db_is_idempotent_and_preserves_user_changes() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -341,7 +354,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 18);
+        assert_eq!(count, 19);
     }
 
     #[test]

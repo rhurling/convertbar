@@ -33,6 +33,7 @@ function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings {
     low_disk_min_gb: 0,
     bad_source_action: "trash",
     update_mode: "automatic",
+    history_show_duration: true,
     ...overrides,
   };
 }
@@ -405,6 +406,65 @@ describe("SettingsPage", () => {
     expect(await screen.findByLabelText("Delete original permanently")).toBeInTheDocument();
     expect(screen.getByLabelText("Keep both files")).toBeInTheDocument();
     expect(screen.queryByLabelText("Move original to Trash")).not.toBeInTheDocument();
+  });
+
+  it("offers the history duration toggle on the server head, where it matters most", async () => {
+    // Unlike the menu bar and notification groups, this one is deliberately NOT wrapped in
+    // !isServerHead: the Docker web UI is the feature's primary audience. Asserting on the
+    // desktop render would pass even if it were gated to desktop only.
+    vi.stubEnv("VITE_HEAD", "server");
+    const fetchMock = vi.fn((path: string) => {
+      if (path === "/api/settings") {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(makeSettings()) });
+      }
+      if (path === "/api/handbrake/presets") {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(["Fast 1080p30"]) });
+      }
+      if (path === "/api/info") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              version: "1.2.3",
+              head: "server",
+              can_pause_process: true,
+              auth_required: false,
+              browse_roots: [],
+            }),
+        });
+      }
+      if (path.includes("/suffix/generate")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(META) });
+      }
+      if (path.includes("/suffix")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve("-conv") });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({ error: "not mocked" }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.resetModules();
+
+    const { default: FreshSettingsPage } = await import("./SettingsPage");
+    render(<FreshSettingsPage />);
+
+    expect(await screen.findByLabelText("Show processing time")).toBeInTheDocument();
+  });
+
+  it("writes history_show_duration=false when the toggle is unchecked", async () => {
+    // Presence is not wiring. Without this, a checkbox bound to the wrong key — or one
+    // sending String(!e.target.checked) — ships silently: the Rust side's writable test
+    // proves the backend accepts the key, not that the UI sends it.
+    render(<SettingsPage />);
+
+    fireEvent.click(await screen.findByLabelText("Show processing time"));
+
+    await waitFor(() =>
+      expect(updateCallsFor("history_show_duration")).toHaveLength(1),
+    );
+    expect(
+      (updateCallsFor("history_show_duration")[0][1] as { value: string }).value,
+    ).toBe("false");
   });
 
   it("warns only when keep is selected AND the resolved suffix is empty", async () => {
