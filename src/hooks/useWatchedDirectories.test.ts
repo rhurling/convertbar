@@ -2,12 +2,26 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, waitFor, act } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useWatchedDirectories } from "./useWatchedDirectories";
 import type { WatchedDirectory } from "../lib/tauri";
 
 const invokeMock = vi.mocked(invoke);
+const listenMock = vi.mocked(listen);
+
+// Mocked event bus: record each listener so a test can fire the event by name.
+const listeners = new Map<string, Set<(e: { payload: unknown }) => void>>();
+function emit(event: string, payload?: unknown) {
+  listeners.get(event)?.forEach((cb) => cb({ payload }));
+}
+
+function fetchCount() {
+  return invokeMock.mock.calls.filter((c) => c[0] === "get_watched_directories")
+    .length;
+}
 
 function dir(overrides: Partial<WatchedDirectory>): WatchedDirectory {
   return {
@@ -26,8 +40,19 @@ let pickedFolder: string | null = "/picked";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  listeners.clear();
   directories = [];
   pickedFolder = "/picked";
+  listenMock.mockImplementation(((
+    event: string,
+    cb: (e: { payload: unknown }) => void,
+  ) => {
+    if (!listeners.has(event)) listeners.set(event, new Set());
+    listeners.get(event)!.add(cb);
+    return Promise.resolve(() => {
+      listeners.get(event)!.delete(cb);
+    });
+  }) as typeof listen);
   invokeMock.mockImplementation(((cmd: string) => {
     switch (cmd) {
       case "get_watched_directories":
@@ -117,6 +142,79 @@ describe("useWatchedDirectories", () => {
     expect(invokeMock).toHaveBeenCalledWith("remove_watched_directory", {
       id: "x",
     });
+  });
+
+  // The Watch Folders panel is permanently mounted at two-col/three-col, so it never remounts
+  // to refetch. Without these two triggers it shows whatever the list was at page load — for
+  // days — while a second browser tab on the server head edits it out from under the user.
+  it("refetches when another client changes the watch list", async () => {
+    directories = [dir({ id: "a" })];
+    const { result } = renderHook(() => useWatchedDirectories());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    directories = [dir({ id: "a" }), dir({ id: "b", path: "/added-elsewhere" })];
+    await act(async () => {
+      emit("watched-directories-updated");
+    });
+
+    await waitFor(() =>
+      expect(result.current.directories.map((d) => d.id)).toEqual(["a", "b"]),
+    );
+  });
+
+  it("refetches after an SSE reconnect to heal a missed change", async () => {
+    directories = [dir({ id: "a" })];
+    const { result } = renderHook(() => useWatchedDirectories());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    // The event announcing this removal was dropped while the connection was down.
+    directories = [];
+    await act(async () => {
+      window.dispatchEvent(new Event("convertbar:events-reconnected"));
+    });
+
+    await waitFor(() => expect(result.current.directories).toHaveLength(0));
+  });
+
+  it("ignores a stale fetch that resolves after a newer one", async () => {
+    // A mutation refreshes explicitly *and* provokes the backend event, so two fetches are now
+    // in flight at once. If the older response is allowed to land last it overwrites the newer
+    // list with a pre-mutation snapshot, and nothing refetches afterwards to correct it.
+    const { result } = renderHook(() => useWatchedDirectories());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    const resolvers: Array<(v: WatchedDirectory[]) => void> = [];
+    invokeMock.mockImplementation(((cmd: string) => {
+      if (cmd === "get_watched_directories")
+        return new Promise<WatchedDirectory[]>((r) => resolvers.push(r));
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    }) as typeof invoke);
+
+    act(() => emit("watched-directories-updated"));
+    act(() => emit("watched-directories-updated"));
+    await waitFor(() => expect(resolvers).toHaveLength(2));
+
+    // Newest resolves first, then the stale one.
+    await act(async () => {
+      resolvers[1]([dir({ id: "fresh" })]);
+      resolvers[0]([dir({ id: "stale" })]);
+    });
+
+    expect(result.current.directories.map((d) => d.id)).toEqual(["fresh"]);
+  });
+
+  it("stops listening once unmounted", async () => {
+    const { result, unmount } = renderHook(() => useWatchedDirectories());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    unmount();
+    const before = fetchCount();
+    await act(async () => {
+      emit("watched-directories-updated");
+      window.dispatchEvent(new Event("convertbar:events-reconnected"));
+    });
+
+    expect(fetchCount()).toBe(before);
   });
 
   it("surfaces a backend error from add", async () => {

@@ -3,6 +3,12 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// useWatchedDirectories subscribes to `watched-directories-updated`; without this the real
+// Tauri listen() runs with no IPC behind it and rejects. Inert here — the refresh triggers
+// are exercised in useWatchedDirectories.test.ts.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(() => Promise.resolve(() => {})),
+}));
 
 import { invoke } from "@tauri-apps/api/core";
 import WatchedFoldersPage from "./WatchedFoldersPage";
