@@ -120,4 +120,26 @@ describe("App layout transitions", () => {
       }),
     );
   });
+
+  it("keeps Settings live when the 900px crossing only moves it to another column", async () => {
+    // Settings is the tabbed panel at tabs, and still reachable at two-col — it just shifts one
+    // column to the right, behind Queue's new pinned column. Columns are keyed by the panels
+    // they hold precisely so that shift is a reorder: index-keyed columns would match Settings
+    // against Queue and rebuild it, which is a remount the user never asked for.
+    layoutMode = "tabs";
+    const { rerender } = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+
+    const input = await screen.findByPlaceholderText(".{resolution}-{codec}");
+    await waitFor(() => expect(input).toHaveValue(".{resolution}-{codec}"));
+    fireEvent.change(input, { target: { value: ".hevc" } });
+
+    layoutMode = "two-col";
+    rerender(<App />);
+
+    // The draft is still a draft: same instance, so it is neither reset from the stored
+    // template nor force-committed by an unmount the user did not cause.
+    expect(screen.getByPlaceholderText(".{resolution}-{codec}")).toHaveValue(".hevc");
+    expect(invokeMock).not.toHaveBeenCalledWith("set_preset_suffix", expect.anything());
+  });
 });

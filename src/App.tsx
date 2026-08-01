@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { Fragment, useState, useEffect } from "react";
 import TabBar, { type Tab, TAB_LABELS } from "./components/TabBar";
 import QueuePage from "./pages/QueuePage";
 import HistoryPage from "./pages/HistoryPage";
@@ -20,6 +20,14 @@ const PINNED: Record<LayoutMode, Tab[]> = {
 };
 
 const ALL_TABS: Tab[] = ["queue", "history", "watch", "settings"];
+
+/** One rendered column. `tabbed` is the single column the TabBar switches between (no title of
+ *  its own — the TabBar already says which panel it holds). */
+interface Column {
+  key: string;
+  tabs: Tab[];
+  tabbed: boolean;
+}
 
 function App() {
   const layout = useLayoutMode();
@@ -89,6 +97,28 @@ function App() {
     }
   };
 
+  // One keyed list for every layout, rather than a `layout === "three-col" ? … : …` swap between
+  // two JSX trees. Two trees do not reconcile: their child slots line up by position, so crossing
+  // 900px or 1300px tore down and rebuilt every panel — and browser zoom (Cmd +/-) crosses those
+  // widths without the window moving. Queue paid for it every time, since it renders in all three
+  // layouts: an open file picker and the cross-folder selection it was gathering both vanished.
+  // Keying each column by the panels it holds makes a crossing a *reorder* of the same columns,
+  // so any panel present on both sides keeps its instance. Panels genuinely absent from the
+  // target layout still unmount — Settings commits its drafts on the way out for that.
+  const columns: Column[] =
+    layout === "three-col"
+      ? [
+          // Watch and Settings share the last column: Settings is by far the longest panel, and
+          // pairing it with the shortest balances the row.
+          { key: "queue", tabs: ["queue"], tabbed: false },
+          { key: "history", tabs: ["history"], tabbed: false },
+          { key: "watch+settings", tabs: ["watch", "settings"], tabbed: false },
+        ]
+      : [
+          ...pinned.map((tab) => ({ key: tab, tabs: [tab], tabbed: false })),
+          ...(activeTab ? [{ key: activeTab, tabs: [activeTab], tabbed: true }] : []),
+        ];
+
   if (unauthorized) return <LoginScreen />;
 
   return (
@@ -101,36 +131,18 @@ function App() {
         updateAvailable={updateState?.status === "available"}
       />
       <div className="app-columns">
-        {/* three-col groups Watch and Settings into one column: Settings is by far the
-            longest panel, and pairing it with the shortest balances the row. */}
-        {layout === "three-col" ? (
-          <>
-            <section className="app-column">
-              <h2 className="app-column-title">Queue</h2>
-              {panel("queue")}
-            </section>
-            <section className="app-column">
-              <h2 className="app-column-title">History</h2>
-              {panel("history")}
-            </section>
-            <section className="app-column">
-              <h2 className="app-column-title">Watch</h2>
-              {panel("watch")}
-              <h2 className="app-column-title">Settings</h2>
-              {panel("settings")}
-            </section>
-          </>
-        ) : (
-          <>
-            {pinned.map((tab) => (
-              <section className="app-column" key={tab}>
-                <h2 className="app-column-title">{TAB_LABELS[tab]}</h2>
+        {columns.map((column) => (
+          <section className={column.tabbed ? "app-column page" : "app-column"} key={column.key}>
+            {column.tabs.map((tab) => (
+              // The title occupies a slot even when it isn't rendered, so a panel that changes
+              // column kind (pinned <-> tabbed) still finds itself at the same position.
+              <Fragment key={tab}>
+                {!column.tabbed && <h2 className="app-column-title">{TAB_LABELS[tab]}</h2>}
                 {panel(tab)}
-              </section>
+              </Fragment>
             ))}
-            <section className="app-column page">{activeTab && panel(activeTab)}</section>
-          </>
-        )}
+          </section>
+        ))}
       </div>
     </div>
   );
