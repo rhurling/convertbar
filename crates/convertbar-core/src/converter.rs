@@ -657,10 +657,17 @@ enum ClaimOutcome {
 
 /// Atomically claim `job_id` for encoding iff it is still queued. Distinguishes a genuine DB
 /// error from "row no longer queued" so a failing UPDATE can't spin the queue on the same job.
+///
+/// Also stamps `started_at`, the anchor for the encode duration shown in History. The
+/// invariant: `started_at` is set here and cleared by any NON-terminal transition back out
+/// of `encoding` — `recover_interrupted_jobs` and `pause_conversion`. Terminal transitions
+/// (done/skipped/error) leave it alone. A new transition out of `encoding` must answer this
+/// question or it will report a stale duration.
 fn claim_job(db: &Connection, job_id: &str) -> ClaimOutcome {
+    let now = chrono::Utc::now().to_rfc3339();
     match db.execute(
-        "UPDATE jobs SET status = 'encoding' WHERE id = ?1 AND status = 'queued'",
-        params![job_id],
+        "UPDATE jobs SET status = 'encoding', started_at = ?2 WHERE id = ?1 AND status = 'queued'",
+        params![job_id, now],
     ) {
         Ok(0) => ClaimOutcome::Gone,
         Ok(_) => ClaimOutcome::Claimed,
@@ -2975,6 +2982,72 @@ mod tests {
         assert_eq!(sd, "done");
         // A missing id is Gone.
         assert_eq!(claim_job(&conn, "nope"), ClaimOutcome::Gone);
+    }
+
+    fn started_at_of(db: &Arc<Mutex<Connection>>, id: &str) -> Option<String> {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT started_at FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn claiming_a_job_stamps_the_encode_start_time() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+
+        let outcome = claim_job(&ctx.db.lock().unwrap(), "j1");
+
+        assert_eq!(outcome, ClaimOutcome::Claimed);
+        assert!(
+            started_at_of(&ctx.db, "j1").is_some(),
+            "the duration is measured from the claim; without a stamp the encode time is \
+             unknowable after the fact"
+        );
+    }
+
+    #[test]
+    fn a_claim_that_loses_the_race_stamps_nothing() {
+        // clear_queue/remove_job can delete or re-status a job during the pre-spawn window.
+        // The conditional claim must not stamp a job it did not win, or a later attempt
+        // would measure from a start it never had.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET status = 'done' WHERE id = 'j1'", [])
+            .unwrap();
+
+        let outcome = claim_job(&ctx.db.lock().unwrap(), "j1");
+
+        assert_eq!(outcome, ClaimOutcome::Gone);
+        assert_eq!(started_at_of(&ctx.db, "j1"), None);
+    }
+
+    #[test]
+    fn the_claim_stamp_is_the_moment_of_the_claim_in_parseable_rfc3339() {
+        // `is_some()` alone would pass against a hardcoded constant, and against a garbage
+        // string: every Rust test would stay green while the frontend's Date.parse returns
+        // NaN and the feature silently renders nothing. Pin both the value and the format.
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+        queue_job(&ctx.db, "j1", "/src/a.mkv", "/out/a.mp4", 1000);
+
+        let before = chrono::Utc::now();
+        claim_job(&ctx.db.lock().unwrap(), "j1");
+        let after = chrono::Utc::now();
+
+        let stamped = started_at_of(&ctx.db, "j1").expect("the claim stamps");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+            .expect("the frontend parses this string with Date.parse");
+        assert!(
+            parsed >= before && parsed <= after,
+            "the duration anchor must be the claim moment, not a constant: {stamped}"
+        );
     }
 
     #[test]
