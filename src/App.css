@@ -343,10 +343,28 @@ body {
   font-weight: 500;
 }
 
+.history-item-duration {
+  margin-left: auto;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+.history-item-error-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+/* A flex CHILD, not the flex container: text-overflow only ellipsizes a block
+   container's own text, so leaving these rules on the row would stop the message
+   truncating and push the duration outside the clipped box. */
 .history-item-error-msg {
+  flex: 1;
+  min-width: 0;
   font-size: 11px;
   color: var(--red);
-  margin-top: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
