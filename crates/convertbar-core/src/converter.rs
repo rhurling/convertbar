@@ -435,7 +435,7 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                 kept_file, space_saved, error_message, failure_class, queue_order, created_at,
-                completed_at
+                completed_at, started_at
          FROM jobs WHERE status = 'queued'
          ORDER BY queue_order ASC LIMIT 1",
         )
@@ -457,6 +457,7 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
             queue_order: row.get(11)?,
             created_at: row.get(12)?,
             completed_at: row.get(13)?,
+            started_at: row.get(14)?,
         })
     })
     .ok()

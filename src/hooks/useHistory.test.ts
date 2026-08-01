@@ -32,6 +32,7 @@ function job(id: string): JobInfo {
     failure_class: null,
     queue_order: 0,
     created_at: "",
+    started_at: null,
     completed_at: "2026-06-17",
   };
 }

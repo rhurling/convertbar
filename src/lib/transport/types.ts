@@ -14,6 +14,7 @@ export interface JobInfo {
   failure_class: string | null;
   queue_order: number;
   created_at: string;
+  started_at: string | null;
   completed_at: string | null;
 }
 
