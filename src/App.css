@@ -1401,7 +1401,11 @@ select.setting-input {
   background: var(--bg-hover);
 }
 
-.file-browser-entry:focus-visible {
+.file-browser-entry:focus-visible,
+/* In files mode the tab stop is the checkbox inside the row, not the row (a row-level
+   role="checkbox" made its own children presentational). The row is still what the eye
+   tracks down the listing, so it keeps the outline it had when it held focus itself. */
+.file-browser-entry:has(:focus-visible) {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }

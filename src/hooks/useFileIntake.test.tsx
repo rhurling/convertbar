@@ -334,6 +334,104 @@ describe("useFileIntake", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("confirm_folder_add", expect.anything());
   });
 
+  it("reports the folders it skipped even though other paths were added", async () => {
+    // A partial outcome used to report only its good half: anything enqueued set the
+    // "something happened" flag and returned, so the empty folder in the same selection was
+    // never mentioned at all. The user sees "Added 1" for a two-item pick and has no way to
+    // tell which item is missing, or that one was dropped.
+    classified = {
+      files: ["/a.mp4"],
+      folders: [{ file_count: 0, folder_name: "Empty", folder_path: "/empty" }],
+    };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "classify_paths":
+          return Promise.resolve(classified);
+        case "add_files":
+          return Promise.resolve({ added: [{ id: "1" }], skipped: [] });
+        case "start_queue":
+          return Promise.resolve(undefined);
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    await act(async () => {
+      await result.current.addPaths(["/a.mp4", "/empty"]);
+    });
+
+    await waitFor(() => expect(result.current.status).toBe("Added 1 · no videos in 1 folder"));
+  });
+
+  it("reports a vanished path alongside the add that did go through", async () => {
+    // Same shape, other cause: classify_paths silently drops a path that is neither a file nor
+    // a directory by the time it runs, so the shortfall is invisible unless the status says so.
+    classified = { files: ["/a.mp4"], folders: [] };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "classify_paths":
+          return Promise.resolve(classified);
+        case "add_files":
+          return Promise.resolve({ added: [{ id: "1" }], skipped: [] });
+        case "start_queue":
+          return Promise.resolve(undefined);
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    await act(async () => {
+      await result.current.addPaths(["/a.mp4", "/gone.mp4"]);
+    });
+
+    await waitFor(() =>
+      expect(result.current.status).toBe("Added 1 · 1 path no longer exists"),
+    );
+  });
+
+  it("holds the skip notice until the confirm prompt's own add reports", async () => {
+    // Nothing runs immediately when the only live folder needs confirmation, so the notice has
+    // to survive until that add produces a summary — otherwise the 4s toast fires and clears it
+    // while the user is still reading the prompt.
+    classified = {
+      files: [],
+      folders: [
+        { file_count: 0, folder_name: "Empty", folder_path: "/empty" },
+        { file_count: 12, folder_name: "Big", folder_path: "/big" },
+      ],
+    };
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "classify_paths":
+          return Promise.resolve(classified);
+        case "confirm_folder_add":
+          return Promise.resolve({ added: [{ id: "1" }], skipped: [] });
+        case "start_queue":
+          return Promise.resolve(undefined);
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+    await waitFor(() => expect(dragBus.handler).not.toBeNull());
+
+    await act(async () => {
+      await result.current.addPaths(["/empty", "/big"]);
+    });
+
+    expect(result.current.status).toBe("Skipped · no videos in 1 folder");
+
+    act(() => result.current.onAdd());
+    await waitFor(() => expect(result.current.status).toBe("Added 1 · no videos in 1 folder"));
+  });
+
   it("addPaths on a path that no longer exists shows a status message instead of silence", async () => {
     // classify_paths silently drops any path that is neither a file nor a directory by the
     // time it runs (deleted/renamed since being picked) — it just never appears in files or

@@ -151,10 +151,11 @@ describe("FileBrowserModal", () => {
 
     render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
 
-    const nameEl = await screen.findByText("a.mp4");
-    const row = nameEl.closest(".file-browser-entry") as HTMLElement;
-    row.focus();
-    fireEvent.keyDown(row, { key: "Enter" });
+    // Enter is not a checkbox key natively, but the row answered to it before the checkbox
+    // became the control, so the control keeps answering to it.
+    const box = await screen.findByRole("checkbox", { name: "a.mp4" });
+    box.focus();
+    fireEvent.keyDown(box, { key: "Enter" });
 
     expect(screen.getByRole("button", { name: /^Add 1 item/ })).not.toBeDisabled();
   });
@@ -177,22 +178,6 @@ describe("FileBrowserModal", () => {
     fireEvent.keyDown(row, { key: " " });
 
     await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/Movies"));
-  });
-
-  it("ignores a keydown that bubbles up from the Open button rather than the row", async () => {
-    fsListMock.mockResolvedValue({
-      entries: [entry({ name: "Movies", path: "/Movies", is_dir: true })],
-    });
-
-    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
-
-    const openButton = await screen.findByRole("button", { name: "Open Movies" });
-    fireEvent.keyDown(openButton, { key: "Enter" });
-
-    // jsdom doesn't synthesize the browser's native button-activation click from this keydown,
-    // so we can only assert the half we can observe: the row's handler must not have run, i.e.
-    // the folder was not also toggled into the selection.
-    expect(screen.getByRole("button", { name: /^Add 0 items/ })).toBeDisabled();
   });
 
   it("multi-selects files and calls onSelect with their paths", async () => {
@@ -378,6 +363,30 @@ describe("FileBrowserModal", () => {
     expect(onSelect).toHaveBeenCalledWith(["/c.mp4", "/2024", "/a.mp4", "/b.mp4"]);
   });
 
+  it("keeps a checkbox ticked when a shift-click lands on an already-selected row", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [
+        entry({ name: "a.mp4", path: "/a.mp4" }),
+        entry({ name: "b.mp4", path: "/b.mp4" }),
+      ],
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const a = (await screen.findByRole("checkbox", { name: "a.mp4" })) as HTMLInputElement;
+    const b = (await screen.findByRole("checkbox", { name: "b.mp4" })) as HTMLInputElement;
+    fireEvent.click(b); // anchor
+    fireEvent.click(a);
+    expect(a.checked).toBe(true);
+
+    // A real checkbox flips itself the moment it is clicked, but a shift-click is a range add
+    // and adds nothing here — so the box must be put back. Without React restoring controlled
+    // state, the row would read as unselected while it is still in the selection.
+    fireEvent.click(a, { shiftKey: true });
+    expect(a.checked).toBe(true);
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
+  });
+
   it("clears the selection from the footer", async () => {
     fsListMock.mockResolvedValue({ entries: [entry({ name: "a.mp4", path: "/a.mp4" })] });
 
@@ -496,28 +505,84 @@ describe("FileBrowserModal", () => {
 
     render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
 
-    const row = (await screen.findByText("a.mp4")).closest(".file-browser-entry") as HTMLElement;
-    fireEvent.keyDown(row, { key: "Enter" });
+    // Enter only: Space is the native activation now, and its once-per-press behaviour is the
+    // browser's (jsdom synthesizes no activation at all, so it cannot be asserted here).
+    const box = await screen.findByRole("checkbox", { name: "a.mp4" });
+    fireEvent.keyDown(box, { key: "Enter" });
     expect(screen.getByText("1 selected")).toBeInTheDocument();
 
-    // Holding the key a beat too long fires again. A native checkbox toggles once per
-    // press; without the guard the row ends up UNSELECTED while the user believes they
-    // selected it — the failure is silent and in the losing direction.
-    fireEvent.keyDown(row, { key: "Enter", repeat: true });
+    // Holding the key a beat too long fires again. Without the guard the row ends up
+    // UNSELECTED while the user believes they selected it — silent, and in the losing direction.
+    fireEvent.keyDown(box, { key: "Enter", repeat: true });
     expect(screen.getByText("1 selected")).toBeInTheDocument();
   });
 
-  it("ignores an auto-repeated Space so a held key does not toggle a row twice", async () => {
+  it("keeps the row's own click from firing when the Open button is clicked", async () => {
+    fsListMock.mockImplementation((path: string) =>
+      Promise.resolve({
+        entries:
+          path === "/"
+            ? [entry({ name: "Movies", path: "/Movies", is_dir: true })]
+            : [entry({ name: "clip.mp4", path: "/Movies/clip.mp4" })],
+      }),
+    );
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open Movies" }));
+
+    // The button sits inside the row, whose click handler selects. Entering a folder must not
+    // also tick it — the user asked to go in, not to queue the whole directory.
+    await screen.findByText("clip.mp4");
+    expect(screen.getByRole("button", { name: /^Add 0 items/ })).toBeDisabled();
+  });
+
+  it("keeps the row's checkbox and its Open button as siblings, not nested inside a checkbox", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [entry({ name: "Movies", path: "/Movies", is_dir: true })],
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const openButton = await screen.findByRole("button", { name: "Open Movies" });
+    // ARIA 1.2 makes every descendant of role="checkbox" presentational, so a row-level
+    // checkbox swallows both the real input and the Open button: an AT may drop the only way
+    // into the folder. Select-all plus the one row's own input is the whole census — the row
+    // itself must not also be a checkbox.
+    const checkboxes = await screen.findAllByRole("checkbox");
+    expect(checkboxes).toHaveLength(2);
+    for (const box of checkboxes) expect(box.contains(openButton)).toBe(false);
+  });
+
+  it("names a row's checkbox with the entry name alone, not its whole row's content", async () => {
+    fsListMock.mockResolvedValue({
+      entries: [entry({ name: "Movies", path: "/Movies", is_dir: true })],
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    expect(await screen.findByRole("checkbox", { name: "Movies" })).toBeInTheDocument();
+    // A row-level role="checkbox" took its name from its own content, concatenating the nested
+    // input, the icon and the Open button's arrow into "Movies 📁Movies →" (measured, jsdom).
+    // Every checkbox in the dialog must be named exactly, by nothing but itself.
+    expect(
+      screen.queryByRole("checkbox", {
+        name: (name) => name !== "Select all" && name !== "Movies",
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("makes the row's selection control a real focusable checkbox", async () => {
     fsListMock.mockResolvedValue({ entries: [entry({ name: "a.mp4", path: "/a.mp4" })] });
 
     render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
 
-    const row = (await screen.findByText("a.mp4")).closest(".file-browser-entry") as HTMLElement;
-    fireEvent.keyDown(row, { key: " " });
-    expect(screen.getByText("1 selected")).toBeInTheDocument();
-
-    fireEvent.keyDown(row, { key: " ", repeat: true });
-    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    const box = (await screen.findByRole("checkbox", { name: "a.mp4" })) as HTMLInputElement;
+    expect(box.tagName).toBe("INPUT");
+    // Reachable by Tab: it is the keyboard entry point for selection now that the row is not
+    // a custom checkbox, so Space activation (and its once-per-press repeat behaviour) is the
+    // browser's to provide rather than ours to emulate.
+    expect(box.tabIndex).toBe(0);
   });
 
   it("navigates to a typed path", async () => {
@@ -795,9 +860,9 @@ describe("FileBrowserModal", () => {
       <FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />,
     );
 
-    const row = (await screen.findByText("Movies")).closest(".file-browser-entry") as HTMLElement;
-    row.focus();
-    expect(document.activeElement).toBe(row);
+    const box = await screen.findByRole("checkbox", { name: "Movies" });
+    box.focus();
+    expect(document.activeElement).toBe(box);
 
     fireEvent.click(screen.getByRole("button", { name: "Open Movies" }));
     await screen.findByText("clip.mp4");

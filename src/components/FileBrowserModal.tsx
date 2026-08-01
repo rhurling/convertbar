@@ -135,9 +135,8 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       if (e.key !== "Tab") return;
       const dialog = dialogRef.current;
       if (!dialog) return;
-      // tabIndex >= 0 excludes both the dialog itself and each row's nested checkbox, which
-      // is deliberately not its own tab stop; `disabled` excludes the confirm button while
-      // nothing is selected.
+      // tabIndex >= 0 excludes the dialog itself and the listing container, neither of which is
+      // a tab stop; `disabled` excludes the confirm button while nothing is selected.
       const stops = [...dialog.querySelectorAll<HTMLElement>("button, input, [tabindex]")].filter(
         (el) => el.tabIndex >= 0 && !el.matches(":disabled"),
       );
@@ -309,32 +308,26 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
           ) : (
             entries.map((entry) => {
               const isSelected = selected.has(entry.path);
-              // Directory-mode file rows stay inert (not selectable, no navigate target), same
-              // as their old disabled-button state; every other row is keyboard-operable.
-              const rowInteractive = selectable || entry.is_dir;
+              // Directory mode alone keeps the row itself as the control: a folder row is a
+              // button that navigates, and a file row stays inert (not selectable, no navigate
+              // target), same as its old disabled-button state. In files mode the row is only a
+              // convenience click target for the mouse — the nested checkbox below is the real
+              // control, so the row carries no role, no tab stop and no keyboard handler.
+              const rowIsButton = !selectable && entry.is_dir;
               return (
                 <div
                   key={entry.path}
                   className={`file-browser-entry${isSelected ? " file-browser-entry-selected" : ""}${
                     !selectable && !entry.is_dir ? " file-browser-entry-disabled" : ""
                   }`}
-                  role={selectable ? "checkbox" : entry.is_dir ? "button" : undefined}
-                  aria-checked={selectable ? isSelected : undefined}
-                  tabIndex={rowInteractive ? 0 : undefined}
+                  role={rowIsButton ? "button" : undefined}
+                  tabIndex={rowIsButton ? 0 : undefined}
                   onClick={(e) => handleRowClick(entry, e.shiftKey)}
                   onKeyDown={
-                    rowInteractive
+                    rowIsButton
                       ? (e) => {
-                          // Ignore keydowns bubbled up from the nested checkbox/Open button —
-                          // otherwise Enter on the Open button both toggles selection (this
-                          // handler) and navigates (the button's own native activation), and our
-                          // preventDefault on Space for the row breaks the button's own Space
-                          // activation.
-                          if (e.target !== e.currentTarget) return;
-                          // Both Enter and Space auto-repeat while held, and this handler acts
-                          // on every event — a native checkbox toggles once per press. Without
-                          // the guard, holding a beat too long toggles twice and leaves the row
-                          // unselected while the user believes they selected it.
+                          // Enter and Space both auto-repeat while held, and this handler acts on
+                          // every event — without the guard a held key fires the navigation twice.
                           if (e.repeat) return;
                           // Route Enter/Space to the same handler the click uses — one state
                           // transition, two entry points. preventDefault on Space so the modal
@@ -347,8 +340,15 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                   }
                 >
                   {selectable && (
-                    /* readOnly, not onChange: the row's click handler owns the state transition
-                       (it needs the shiftKey modifier, which a change event does not carry). Without
+                    /* The real control, deliberately a native checkbox rather than the row: ARIA
+                       1.2 makes every descendant of a role="checkbox" presentational, so a
+                       row-level one swallowed both this input and the folder's Open button —
+                       an AT may drop the only way into a folder, and name-from-content announced
+                       the row as "Movies 📁Movies →". Native also means Space toggles once per
+                       press without us emulating key-repeat.
+
+                       readOnly, not onChange: the click handler owns the state transition (it
+                       needs the shiftKey modifier, which a change event does not carry). Without
                        readOnly React warns on every row about a checked input with no onChange. */
                     <input
                       type="checkbox"
@@ -356,11 +356,16 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
                       checked={isSelected}
                       readOnly
                       aria-label={entry.name}
-                      // The row is the selection control now — this box isn't a separate tab
-                      // stop (three tab stops for one logical control was the wrong shape).
-                      tabIndex={-1}
                       onClick={(e) => {
                         e.stopPropagation();
+                        handleRowClick(entry, e.shiftKey);
+                      }}
+                      onKeyDown={(e) => {
+                        // Space is the browser's (activation on keyup, once per press). Enter is
+                        // not a checkbox key at all, but the row answered to it before this
+                        // became a native control and a list of rows is an Enter-shaped thing —
+                        // so keep it, with the repeat guard the row used to carry.
+                        if (e.key !== "Enter" || e.repeat) return;
                         handleRowClick(entry, e.shiftKey);
                       }}
                     />
