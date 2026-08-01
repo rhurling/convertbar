@@ -241,7 +241,10 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
               Preview: <span>{previewFilename}</span>
             </div>
 
-            {resolvedSuffix.trim() === "" && (
+            {/* Exactly-empty, not `.trim()`: the engine calls a job in-place only when the
+                output path equals the source, and a whitespace suffix still yields a distinct
+                `vacation .mp4`. Trimming here warned about skips that never happen. */}
+            {resolvedSuffix === "" && (
               <div className="suffix-inplace-note">
                 Empty suffix: mp4 files are re-encoded in place, replacing the original. The fast
                 &quot;already converted&quot; skip-by-suffix is also disabled.
@@ -250,7 +253,8 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
                     {" "}
                     <strong>
                       An in-place re-encode cannot keep the original — there is only one file. These
-                      files will be skipped until you choose Delete or set a suffix.
+                      files will be skipped until you set a suffix or switch to{" "}
+                      {isServerHead ? "Delete" : "Trash or Delete"}.
                     </strong>
                   </>
                 )}
