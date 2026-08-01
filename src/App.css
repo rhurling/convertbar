@@ -1330,6 +1330,16 @@ select.setting-input {
   font-weight: 600;
 }
 
+/* Multi-root deployments only: one button per configured root, so a second root is
+   discoverable rather than reachable only by typing its path. */
+.file-browser-roots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
 .file-browser-breadcrumb {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);

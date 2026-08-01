@@ -77,6 +77,7 @@ beforeEach(() => {
     }
   }) as typeof invoke);
   fsListMock.mockResolvedValue({
+    path: "/",
     entries: [{ name: "clip.mp4", path: "/clip.mp4", is_dir: false, size: 1000 }],
   });
 });

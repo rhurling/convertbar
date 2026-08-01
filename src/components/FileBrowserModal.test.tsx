@@ -5,7 +5,10 @@ const fsListMock = vi.fn();
 let browseRoots: string[] = ["/"];
 vi.mock("../lib/transport/http", () => ({
   httpCommands: {
-    fsList: (path: string) => fsListMock(path),
+    // The real route always reports the directory it listed, so the seam supplies it too:
+    // by default the one that was asked for, which is right whenever no symlink is involved.
+    // A fixture that returns its own `path` (a listing that resolved elsewhere) wins.
+    fsList: async (path: string) => ({ path, ...(await fsListMock(path)) }),
     getAppInfo: () =>
       Promise.resolve({
         version: "1.0.0",
@@ -214,6 +217,83 @@ describe("FileBrowserModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /choose this folder/i }));
 
     expect(onSelect).toHaveBeenCalledWith(["/Movies"]);
+  });
+
+  it("shows the directory the server actually listed, not the one that was asked for", async () => {
+    // Navigating through a symlink puts the two sides in different namespaces: the client asks
+    // for ".../link", the server canonicalizes it and answers with entries under ".../real".
+    // Keeping the requested string leaves the picker holding a prefix none of its own entries
+    // share, and every crumb it slices out of that pair is fiction.
+    browseRoots = ["/media"];
+    fsListMock.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/media/link"
+          ? { path: "/media/real", entries: [entry({ name: "clip.mp4", path: "/media/real/clip.mp4" })] }
+          : { path: "/media", entries: [entry({ name: "link", path: "/media/link", is_dir: true })] },
+      ),
+    );
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    const input = await screen.findByLabelText("Go to path");
+    fireEvent.change(input, { target: { value: "/media/link" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(await screen.findByText("clip.mp4")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "real" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "link" })).not.toBeInTheDocument();
+  });
+
+  it("never invents breadcrumbs for a path that is under no advertised root", async () => {
+    // Belt and braces for the namespace mismatch above: if the current path is not under any
+    // root the picker knows about, slicing the root's length off it produced crumbs like
+    // "ool / media / Movies" whose clicks 404. Better one honest crumb than three fictional.
+    browseRoots = ["/media"];
+    fsListMock.mockResolvedValue({
+      path: "/mnt/pool/media/Movies",
+      entries: [entry({ name: "clip.mp4", path: "/mnt/pool/media/Movies/clip.mp4" })],
+    });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    expect(await screen.findByText("clip.mp4")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "/mnt/pool/media/Movies" })).toBeInTheDocument();
+    for (const fiction of ["ool", "media", "Movies"]) {
+      expect(screen.queryByRole("button", { name: fiction })).not.toBeInTheDocument();
+    }
+  });
+
+  it("offers every configured root when a deployment has more than one", async () => {
+    // CONVERTBAR_BROWSE_ROOTS=/media:/data — the second root was reachable only by typing its
+    // path into the jump-to-path form, with nothing on screen to say it existed.
+    browseRoots = ["/media", "/data"];
+    fsListMock.mockImplementation((path: string) =>
+      Promise.resolve({
+        path,
+        entries: [entry({ name: `in-${path.slice(1)}`, path: `${path}/x.mp4` })],
+      }),
+    );
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    expect(await screen.findByText("in-media")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "/data" }));
+
+    await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/data"));
+    expect(await screen.findByText("in-data")).toBeInTheDocument();
+  });
+
+  it("leaves the root switcher out when there is only one root", async () => {
+    browseRoots = ["/media"];
+    fsListMock.mockResolvedValue({ path: "/media", entries: [] });
+
+    render(<FileBrowserModal mode="files" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    await screen.findByText("Empty folder");
+    // The breadcrumb already starts at that one root; a switcher offering the same single
+    // destination is noise.
+    expect(screen.queryByRole("group", { name: "Browse roots" })).not.toBeInTheDocument();
   });
 
   it("navigates back up via the breadcrumb", async () => {

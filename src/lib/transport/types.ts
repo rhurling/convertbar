@@ -226,5 +226,10 @@ export interface FsEntry {
 }
 
 export interface FsListResult {
+  /** The canonical directory the server actually listed, which may differ from the one asked
+   * for — it resolves symlinks before it reads, and builds every entry path from the result.
+   * The client has no filesystem of its own to resolve with, so this is the only way for it to
+   * stay in the same namespace as the entries it is showing. */
+  path: string;
   entries: FsEntry[];
 }

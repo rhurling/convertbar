@@ -1080,6 +1080,70 @@ pub(crate) mod tests {
         assert_eq!(json["browse_roots"], json!(["/"]));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_api_info_advertises_roots_in_the_namespace_listings_use() {
+        // `/api/fs/list` answers in canonical paths (it has to — containment is checked after
+        // canonicalization). A root advertised as the raw config string is then a prefix of
+        // nothing the client will ever be shown: with CONVERTBAR_BROWSE_ROOTS=/media symlinked
+        // to /mnt/pool/media, the picker holds root "/media" and entries "/mnt/pool/media/...",
+        // and every path-relative calculation it makes from the pair is nonsense.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        let mut state = test_state();
+        let mut config = (*state.config).clone();
+        config.browse_roots = vec![link.clone()];
+        state.config = std::sync::Arc::new(config);
+
+        let response = api_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        assert_eq!(json["browse_roots"], json!([canonical.to_string_lossy()]));
+    }
+
+    #[tokio::test]
+    async fn get_api_info_still_advertises_a_root_that_does_not_resolve_yet() {
+        // A root can legitimately not exist at startup — a NAS mount that attaches later (see
+        // `routes::fs`). Canonicalizing must not drop it from the list, or the picker offers
+        // the user nothing at all until the mount appears and the server is restarted.
+        let mut state = test_state();
+        let mut config = (*state.config).clone();
+        config.browse_roots = vec![std::path::PathBuf::from("/nope-not-mounted-yet")];
+        state.config = std::sync::Arc::new(config);
+
+        let response = api_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["browse_roots"], json!(["/nope-not-mounted-yet"]));
+    }
+
     /// Regression: a nested router with no `.fallback()` of its own inherits the OUTER
     /// router's fallback (axum 0.8 documented behavior). Without an api-specific
     /// fallback, an unmatched `/api/*` path fell through to the SPA embed handler and
