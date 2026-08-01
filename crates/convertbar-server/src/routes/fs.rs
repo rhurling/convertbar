@@ -135,7 +135,11 @@ fn fs_list_blocking(requested: String, roots: Vec<PathBuf>) -> Response {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
-    Json(json!({ "entries": entries })).into_response()
+    // The canonical directory, not the requested one. Entry paths are built from it, so a
+    // client that kept its own request string would hold a prefix none of its entries share
+    // the moment a symlink is involved — and the client cannot canonicalize for itself, since
+    // only this side can see the filesystem.
+    Json(json!({ "path": canonical.to_string_lossy(), "entries": entries })).into_response()
 }
 
 #[cfg(test)]
@@ -289,6 +293,37 @@ mod tests {
 
             assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
             assert_eq!(json, json!({"error": "path outside allowed roots"}));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn listing_reports_the_canonical_path_it_actually_listed() {
+            // Entry paths are built from the canonicalized directory, so a client that keeps
+            // the path *it asked for* ends up holding a prefix that none of its entries share:
+            // ask for `<tmp>/link` and every entry comes back under `<tmp>/real`. The client
+            // cannot canonicalize on its own — only the server can see the filesystem — so the
+            // listing has to say which directory it really listed.
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let real = tmp.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::create_dir(real.join("Movies")).unwrap();
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+            let app = api_router(state_rooted_at(tmp.path()));
+            let uri = format!("/api/fs/list?path={}", link.display());
+            let (status, json) = get(app, &uri).await;
+
+            assert_eq!(status, axum::http::StatusCode::OK);
+            let canonical = std::fs::canonicalize(&real).unwrap();
+            assert_eq!(json["path"], json!(canonical.to_string_lossy()));
+            // ...and it is the prefix its own entries are under, which is the whole point.
+            let entry = json["entries"][0]["path"].as_str().unwrap();
+            assert!(
+                entry.starts_with(json["path"].as_str().unwrap()),
+                "entry {entry} is not under reported path {}",
+                json["path"]
+            );
         }
 
         #[cfg(unix)]
