@@ -18,7 +18,11 @@ normalizes to `trash`.
 
 `keep` and an in-place job (empty suffix, so `output_path == source_path`) are mutually
 exclusive, and that is enforced by PREVENTION, not refusal: `add_files_to_db` never
-queues such a job, and `update_setting` drops queued ones when the mode becomes `keep`.
+queues such a job, and `update_setting` drops `queued` ones when the mode becomes `keep`.
+Only `queued` ones: a `paused` row has a SIGSTOPped child behind it and a converter thread
+parked in `child.wait()`, so deleting it strands a live encode whose completion then writes
+to nothing — no history row and no fingerprint, which is exactly the re-ingestion loop below.
+`process_queue`'s backstop re-reads `cleanup_mode` at the cleanup decision and handles it.
 Do not "simplify" this into an error recorded in `process_queue` — an `error` row is
 invisible to both `queue_ops::fetch_skip_sets` and `watcher::filter_known_bad_sources`,
 so a watched folder would re-queue and re-fail every file on every boot. The
@@ -26,9 +30,12 @@ so a watched folder would re-queue and re-fail every file on every boot. The
 stay a real arm, not a `debug_assert!` — the branch it replaces permanently deletes the
 user's source on the server head.
 
-Under `keep` the source survives, so re-ingestion protection rests entirely on the
-`(size, mtime)` fingerprint in completed rows. Clearing history therefore re-converts
-kept sources.
+Under `keep` the source survives, so re-ingestion protection rests on the `(size, mtime)`
+fingerprint in completed rows — and, when a row has none (`file_identity` failed at add
+time), on `fetch_skip_sets` falling back to the source path for every unfingerprinted row
+while the mode is `keep`, not just for in-place ones. Without that fallback the file has
+nothing left to be recognized by and a watched folder re-queues it every pass. Clearing
+history removes both signals, so it re-converts kept sources.
 
 ## HandBrake Locator Test Fixtures
 

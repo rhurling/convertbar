@@ -101,15 +101,22 @@ fn get_handbrake_path(
         .ok_or_else(|| handbrake::HANDBRAKE_NOT_FOUND.to_string())
 }
 
-/// Deletes every `queued` or `paused` job whose output path is its own source (an in-place
-/// re-encode), returning how many rows went. Called when `cleanup_mode` becomes `keep`, where
-/// such a job is impossible: there is no second file to keep.
+/// Deletes every `queued` job whose output path is its own source (an in-place re-encode),
+/// returning how many rows went. Called when `cleanup_mode` becomes `keep`, where such a job is
+/// impossible: there is no second file to keep.
 ///
-/// `paused` matters here, not just `queued`: on macOS/Linux a mid-encode pause (SIGSTOP) leaves
-/// the job's row in `paused` while the process is merely frozen, not finished — a job the user
-/// can switch to keep for just as easily as a queued one. A job already `encoding` (running,
-/// unpaused) can't be reached here at all; that race is closed by `process_queue`'s own
-/// backstop re-reading `cleanup_mode` fresh at the cleanup decision.
+/// `queued` ONLY — deliberately, and do not widen it to `paused` or `encoding`. Both of those
+/// have a live child process behind them and a converter thread parked in `child.wait()`;
+/// deleting the row does not stop either. A `paused` row in particular is only ever written by
+/// `control::pause_conversion`, which SIGSTOPs a running encode (there is no "paused before it
+/// started" state). Drop it here and the user can switch back to delete, resume, and get an
+/// encode that really does replace the source in-place while the completion `UPDATE` and
+/// `record_source_identity` both hit 0 rows — no history row, no `(size, mtime)` fingerprint,
+/// so `fetch_skip_sets` never learns the file was converted and a watched folder re-encodes it
+/// on every later scan. It also empties the Queue panel while the frozen encode is still on the
+/// CPU. Leaving the row alone makes both endings correct instead: `process_queue`'s completion
+/// backstop re-reads `cleanup_mode` fresh, so resuming under keep discards the temp and deletes
+/// the row there, and resuming after a switch back to delete completes with full bookkeeping.
 ///
 /// Filtered in Rust rather than SQL because in-place-ness is a *normalized* path
 /// comparison (`converter::is_in_place` collapses `//` and `/./`), which a `WHERE
@@ -119,16 +126,17 @@ fn get_handbrake_path(
 /// switches to keep, AND from each head's boot sequence (`src-tauri/src/lib.rs`,
 /// `crates/convertbar-server/src/startup.rs` — both other crates) right after
 /// `converter::recover_interrupted_jobs`. A job that was `encoding`/`paused` under keep when the
-/// app quit or crashed is requeued by that recovery (it has no cleanup_mode filter), so it must
-/// be dropped again on the way back up — hence the cross-crate visibility. The DELETE is
-/// guarded with `AND status IN (...)` (matching `remove_job`'s idiom) so the function's
-/// correctness does not silently depend on the caller holding `ctx.db` across the SELECT and
-/// this DELETE. The SELECT and DELETE status sets are kept identical on purpose — widen both
-/// together, never just one.
+/// app quit or crashed is requeued to `queued` by that recovery (it has no cleanup_mode filter),
+/// so it must be dropped again on the way back up — hence the cross-crate visibility, and hence
+/// the `queued`-only filter costing nothing across a restart. The DELETE is guarded with `AND
+/// status = 'queued'` (matching `remove_job`'s idiom) so the function's correctness does not
+/// silently depend on the caller holding `ctx.db` across the SELECT and this DELETE. The SELECT
+/// and DELETE status filters are kept identical on purpose — change both together, never just
+/// one.
 pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
-    let rows: Vec<(String, String, String)> = match conn.prepare(
-        "SELECT id, source_path, output_path FROM jobs WHERE status IN ('queued', 'paused')",
-    ) {
+    let rows: Vec<(String, String, String)> = match conn
+        .prepare("SELECT id, source_path, output_path FROM jobs WHERE status = 'queued'")
+    {
         Ok(mut stmt) => match stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
             Ok(rows) => rows.flatten().collect(),
             Err(_) => return 0,
@@ -145,7 +153,7 @@ pub fn drop_queued_in_place_jobs(conn: &rusqlite::Connection) -> usize {
             // and fire a `queue-updated` for a queue that never changed.
             dropped += conn
                 .execute(
-                    "DELETE FROM jobs WHERE id = ?1 AND status IN ('queued', 'paused')",
+                    "DELETE FROM jobs WHERE id = ?1 AND status = 'queued'",
                     rusqlite::params![id],
                 )
                 .unwrap_or(0);
@@ -736,11 +744,13 @@ fn choose_output_path(source_path: &str, suffix: &str, is_taken: &dyn Fn(&str) -
 }
 
 /// Reads the three sets the cheap skip checks test against: active-queue source paths, the
-/// pre-migration legacy history paths (scoped by `skip_already_converted`, plus in-place rows),
-/// and the always-on `(size, mtime)` fingerprints of completed conversions.
+/// pre-migration legacy history paths (scoped by `skip_already_converted`, plus in-place rows
+/// and — under `keep` — every unfingerprinted row), and the always-on `(size, mtime)`
+/// fingerprints of completed conversions.
 fn fetch_skip_sets(
     conn: &rusqlite::Connection,
     skip_already_converted: bool,
+    cleanup_mode: &str,
 ) -> Result<(HashSet<String>, HashSet<String>, HashSet<(i64, i64)>), String> {
     let queued_paths: HashSet<String> = {
         let mut stmt = conn
@@ -758,8 +768,19 @@ fn fetch_skip_sets(
     // - `converted_identities`: (size, mtime) fingerprints for the always-on identity check.
     // - `legacy_history_paths`: source paths of PRE-MIGRATION rows that carry no fingerprint.
     //   In-place rows (source_path == output_path) are always included to prevent a re-encode
-    //   cascade; other legacy rows are included only when `skip_already_converted` is on, which
-    //   preserves the historical history-skip behavior for upgraded databases.
+    //   cascade; so is every unfingerprinted row while cleanup_mode is `keep`, for exactly the
+    //   same reason — keep leaves the source on disk, and with no fingerprint to recognize it
+    //   by (the re-scan's stat fails the same way the add-time one did) a watched folder
+    //   re-queues it on every pass, each run adding another `movie (N).suffix.mp4`. Other
+    //   legacy rows are included only when `skip_already_converted` is on, which preserves the
+    //   historical history-skip behavior for upgraded databases.
+    //
+    //   Keying the keep arm on the CURRENT mode rather than on row provenance is deliberate:
+    //   nothing records which mode a row was written under, and under trash/delete the source
+    //   is gone, so path-skipping those rows is a no-op. The one case it does change is a
+    //   delete-mode row whose path was later recycled by a different file — the same trade
+    //   `skip_already_converted` makes when on, and the alternative here is an unbounded
+    //   re-encode loop that fills the disk.
     let mut converted_identities: HashSet<(i64, i64)> = HashSet::new();
     let mut legacy_history_paths: HashSet<String> = HashSet::new();
     {
@@ -786,7 +807,7 @@ fn fetch_skip_sets(
                 }
                 _ => {
                     let in_place = Path::new(&source_path) == Path::new(&output_path);
-                    if in_place || skip_already_converted {
+                    if in_place || cleanup_mode == "keep" || skip_already_converted {
                         legacy_history_paths.insert(source_path);
                     }
                 }
@@ -805,9 +826,10 @@ fn probe_candidates(
     paths: &[String],
     suffix: &str,
     skip_already_converted: bool,
+    cleanup_mode: &str,
 ) -> Result<Vec<String>, String> {
     let (queued_paths, legacy_history_paths, converted_identities) =
-        fetch_skip_sets(conn, skip_already_converted)?;
+        fetch_skip_sets(conn, skip_already_converted, cleanup_mode)?;
     Ok(paths
         .iter()
         .filter(|p| {
@@ -904,7 +926,8 @@ pub fn add_files_inner(
     // uncertainty (no HandBrake, probe failure/timeout, unknown codec) the file is kept.
     let candidates_to_probe: Vec<String> = if skip_by_source_media {
         let conn = ctx.db.lock().map_err(|e| e.to_string())?;
-        probe_candidates(&conn, paths, &suffix, skip_already_converted)?
+        let cleanup_mode = crate::settings_ops::read_cleanup_mode(&conn);
+        probe_candidates(&conn, paths, &suffix, skip_already_converted, &cleanup_mode)?
     } else {
         Vec::new()
     };
@@ -992,7 +1015,7 @@ fn add_files_to_db(
     cleanup_mode: &str,
 ) -> Result<AddResult, String> {
     let (queued_paths, legacy_history_paths, converted_identities) =
-        fetch_skip_sets(conn, skip_already_converted)?;
+        fetch_skip_sets(conn, skip_already_converted, cleanup_mode)?;
 
     let mut queue_order = get_next_queue_order(conn)?;
     let mut added = Vec::new();
@@ -2171,7 +2194,7 @@ mod tests {
         insert_done_with_identity(&conn, "h1", "/m/a.mp4", "/m/a.h265.mp4", 500, 42);
 
         for flag in [false, true] {
-            let (_, legacy, identities) = fetch_skip_sets(&conn, flag).unwrap();
+            let (_, legacy, identities) = fetch_skip_sets(&conn, flag, "trash").unwrap();
             assert!(
                 identities.contains(&(500, 42)),
                 "a fingerprinted row is always in the identity set (flag={flag})"
@@ -2197,13 +2220,13 @@ mod tests {
             "2020-01-01T00:00:00Z",
         );
 
-        let (_, legacy_off, _) = fetch_skip_sets(&conn, false).unwrap();
+        let (_, legacy_off, _) = fetch_skip_sets(&conn, false, "trash").unwrap();
         assert!(
             !legacy_off.contains("/m/b.mkv"),
             "flag off: no legacy path skip"
         );
 
-        let (_, legacy_on, _) = fetch_skip_sets(&conn, true).unwrap();
+        let (_, legacy_on, _) = fetch_skip_sets(&conn, true, "trash").unwrap();
         assert!(
             legacy_on.contains("/m/b.mkv"),
             "flag on: legacy path skip preserved"
@@ -2223,12 +2246,90 @@ mod tests {
         .unwrap();
 
         for flag in [false, true] {
-            let (_, legacy, _) = fetch_skip_sets(&conn, flag).unwrap();
+            let (_, legacy, _) = fetch_skip_sets(&conn, flag, "trash").unwrap();
             assert!(
                 legacy.contains("/m//c.mp4"),
                 "a legacy in-place row is path-skipped regardless of flag (flag={flag})"
             );
         }
+    }
+
+    #[test]
+    fn fetch_skip_sets_null_fingerprint_row_is_legacy_under_keep() {
+        // Under keep the source is never removed, so a row with no `(size, mtime)` — the
+        // filesystem refused `metadata()`/`modified()` at add time — has NOTHING left to
+        // recognize it by: the identity check can't fire (the re-scan's stat fails the same
+        // way), and the path fallback was gated behind `skip_already_converted`, off by
+        // default. The file is re-queued on every scan, each run adding another
+        // `movie (N).h265.mp4`, until the disk fills. That makes it the same re-encode
+        // cascade the in-place case is already unconditionally protected from.
+        let conn = test_conn();
+        insert_history(
+            &conn,
+            "h1",
+            "/m/b.mkv",
+            "done",
+            0,
+            1000,
+            "2020-01-01T00:00:00Z",
+        );
+
+        let (_, legacy, _) = fetch_skip_sets(&conn, false, "keep").unwrap();
+        assert!(
+            legacy.contains("/m/b.mkv"),
+            "keep + no fingerprint + flag off: the path fallback is the ONLY protection left"
+        );
+
+        // Under trash/delete the source is gone, so the fallback stays flag-gated — that gate
+        // is what stops a genuinely different file recycling the path from being skipped.
+        for mode in ["trash", "delete"] {
+            let (_, legacy, _) = fetch_skip_sets(&conn, false, mode).unwrap();
+            assert!(
+                !legacy.contains("/m/b.mkv"),
+                "{mode}: the flag-off default must be unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn add_files_does_not_requeue_a_kept_source_that_has_no_fingerprint() {
+        // The consequence the test above only implies: the watched-folder re-ingestion itself.
+        // The path is deliberately one that does not exist, so `file_identity` returns None
+        // exactly as it does on the filesystem this bug needs — the code under test sees the
+        // same "no identity available" input either way.
+        let conn = test_conn();
+        insert_history(
+            &conn,
+            "h1",
+            "/m/movie.mkv",
+            "done",
+            0,
+            1000,
+            "2020-01-01T00:00:00Z",
+        );
+
+        let result = add_files_to_db(
+            &conn,
+            &["/m/movie.mkv".to_string()],
+            "preset",
+            ".h265",
+            false,
+            "keep",
+        )
+        .unwrap();
+
+        assert!(
+            result.added.is_empty(),
+            "a kept source already converted must not be queued a second time"
+        );
+        assert_eq!(
+            result.skipped,
+            vec![SkipCount {
+                reason: SkipReason::AlreadyConverted,
+                count: 1
+            }],
+            "and it must be reported as already converted, not silently dropped"
+        );
     }
 
     // ---- end-to-end recycling scenarios against real files ----
@@ -2337,11 +2438,11 @@ mod tests {
         ];
 
         // skip_already_converted ON: the history file is excluded alongside the queued one.
-        let with_flag = probe_candidates(&conn, &paths, "", true).unwrap();
+        let with_flag = probe_candidates(&conn, &paths, "", true, "trash").unwrap();
         assert_eq!(with_flag, vec!["/movies/fresh.mp4".to_string()]);
 
         // Flag OFF: the history file is no longer a cheap skip, so it becomes a probe candidate.
-        let without_flag = probe_candidates(&conn, &paths, "", false).unwrap();
+        let without_flag = probe_candidates(&conn, &paths, "", false, "trash").unwrap();
         assert_eq!(
             without_flag,
             vec![

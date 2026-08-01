@@ -361,14 +361,23 @@ mod tests {
         );
     }
 
-    // Finding 1's `drop_queued_in_place_jobs` widening: a mid-encode pause (SIGSTOP on
-    // macOS/Linux) leaves an in-place job's row in 'paused', not 'queued' — the original
-    // `WHERE status = 'queued'` filter missed it entirely, so switching to keep while such a
-    // job sat paused left it to be caught only by process_queue's completion backstop once
-    // resumed. Dropping it here too, at the moment of the switch, is strictly earlier and
-    // matches what already happens for a merely-queued job.
+    // A 'paused' row is never inert: it is only ever written by `control::pause_conversion`,
+    // which SIGSTOPs a LIVE child mid-encode (there is no "paused before it started" state, and
+    // a crash-surviving paused row is requeued to 'queued' by `recover_interrupted_jobs` before
+    // either head's boot-time drop runs). Deleting it here orphans that frozen encode: the
+    // converter thread is still inside `child.wait()`, so when the user resumes — after
+    // switching back to delete — the encode finishes and really does replace the source
+    // in-place, while the completion UPDATE and `record_source_identity` both hit 0 rows. No
+    // history row, no `(size, mtime)` fingerprint, so `fetch_skip_sets` never learns the file
+    // was converted and a watched folder re-encodes it on the next scan, forever.
+    //
+    // Leaving the row alone is what makes both endings correct: resume under keep and
+    // `process_queue`'s completion backstop discards the temp and deletes the row itself
+    // (it re-reads cleanup_mode fresh); resume after switching back to delete and the job
+    // completes with full bookkeeping. It also stops the Queue panel from emptying while the
+    // frozen encode is still on the CPU.
     #[test]
-    fn switching_to_keep_drops_a_paused_in_place_job() {
+    fn switching_to_keep_leaves_a_paused_in_place_job_alone() {
         let (ctx, sink, _d) = test_ctx(test_conn());
         {
             let conn = ctx.db.lock().unwrap();
@@ -382,6 +391,14 @@ mod tests {
             conn.execute(
                 "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
                  VALUES ('normal-paused', '/m/b.mp4', '/m/b-conv.mp4', 'p', 'paused', 1, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            // A merely-queued in-place job HAS no process behind it, so it is still dropped —
+            // this pins that the fix narrowed the status set rather than disabling the drop.
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, created_at)
+                 VALUES ('inplace-queued', '/m/c.mp4', '/m/c.mp4', 'p', 'queued', 2, '2020-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();
@@ -401,10 +418,16 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["normal-paused".to_string()],
-            "THE POINT OF THIS TEST: the paused in-place job must be dropped, not just a queued one"
+            vec!["inplace-paused".to_string(), "normal-paused".to_string()],
+            "THE POINT OF THIS TEST: the paused in-place job's encode is frozen, not finished — \
+             deleting its row strands the encode and loses the fingerprint that keeps a watched \
+             folder from re-converting the file forever"
         );
-        assert_eq!(sink.payloads("queue-updated").len(), 1);
+        assert_eq!(
+            sink.payloads("queue-updated").len(),
+            1,
+            "the queued in-place job really was dropped"
+        );
     }
 
     #[test]
