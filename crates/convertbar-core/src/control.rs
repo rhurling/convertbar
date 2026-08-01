@@ -761,14 +761,20 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
-        let started: Option<String> = ctx
+        let (status, started): (String, Option<String>) = ctx
             .db
             .lock()
             .unwrap()
-            .query_row("SELECT started_at FROM jobs WHERE id = 'j1'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT status, started_at FROM jobs WHERE id = 'j1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
+        assert_eq!(
+            status, "paused",
+            "the row must show paused, not still encoding, until restart"
+        );
         assert_eq!(
             started, None,
             "a paused encode reports no duration rather than one inflated by the pause"
@@ -826,23 +832,17 @@ mod tests {
         assert_eq!(started, None, "but does not invent a new start time");
     }
 
-    #[cfg(unix)]
     #[test]
     fn cancelling_keeps_the_stamp_so_the_row_shows_time_until_cancel() {
         // Cancel is a TERMINAL transition, and the invariant says terminal transitions leave
         // started_at alone — a cancelled job legitimately shows how long it ran before the
-        // user gave up. This is the only row of the spec's status table with no other pin:
-        // without it, a future cancel that routed through pause would silently blank the
-        // duration and no test would notice.
+        // user gave up. This pins cancel specifically; `done`, `skipped`, and post-claim
+        // `error` get no equivalent Rust-side pin — they are only exercised in the frontend
+        // with hand-passed props, relying on the fact that no terminal path writes
+        // started_at.
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
         let ctx = test_ctx(conn);
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        *ctx.converter.current_pid.lock().unwrap() = Some(pid);
         *ctx.converter.current_job_id.lock().unwrap() = Some("j1".to_string());
         ctx.db
             .lock()
@@ -857,14 +857,6 @@ mod tests {
             .unwrap();
 
         cancel_conversion(&ctx).unwrap();
-
-        // Clean up before asserting: cancel_conversion only kills/reaps a child it knows about
-        // via current_child, which this test never populates (only current_pid/current_job_id,
-        // mirroring the other fixtures above) — so the spawned `sleep` is still alive here and
-        // must be reaped directly, or it would leak. Doing this before the assertion means a
-        // failing assertion can't leak a live child either.
-        let _ = child.kill();
-        let _ = child.wait();
 
         let started: Option<String> = ctx
             .db
