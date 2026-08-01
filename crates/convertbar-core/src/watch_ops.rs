@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ctx::Ctx;
+use crate::events::EventSinkExt;
 use crate::types::WatchedDirectory;
 use crate::watcher;
 
@@ -32,6 +33,17 @@ pub fn get_watched_directories(ctx: &Ctx) -> Result<Vec<WatchedDirectory>, Strin
         .map_err(|e| e.to_string())?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())
+}
+
+/// Tells every connected client the watch list changed, so they refetch it. The payload is
+/// empty on purpose: like `queue-updated`, listeners re-read the list rather than trust a
+/// diff, which keeps a client that missed an event (SSE drop, lag) from drifting.
+///
+/// Call this only after the `ctx.db` guard has gone out of scope — the desktop tray listener
+/// re-locks `ctx.db` synchronously on the emitting thread, and `std::sync::Mutex` is not
+/// reentrant, so emitting under the guard self-deadlocks. See CLAUDE.md.
+fn announce_change(ctx: &Arc<Ctx>) {
+    ctx.events.emit_t("watched-directories-updated", ());
 }
 
 /// Canonical form of a watch path, so aliases of one folder (trailing slash, symlink,
@@ -86,6 +98,7 @@ pub fn add_watched_directory(
     }; // db lock released before reconcile re-acquires it
 
     watcher::reconcile(ctx);
+    announce_change(ctx);
     // Scan off-thread: it probes every existing file with a blocking HandBrakeCLI call, which would
     // freeze the UI on the main thread (this command is sync) for a folder full of files.
     watcher::scan_existing_background(ctx, dir.to_path_buf(), recursive);
@@ -112,6 +125,7 @@ pub fn update_watched_directory(
         }
     }
     watcher::reconcile(ctx);
+    announce_change(ctx);
     Ok(())
 }
 
@@ -140,6 +154,7 @@ pub fn set_watched_directory_enabled(
     };
 
     watcher::reconcile(ctx);
+    announce_change(ctx);
     // Re-enabling a folder ingests anything that landed while it was off (or the app was closed).
     // Scan off-thread — see `add_watched_directory`: the blocking HandBrake probe would otherwise
     // freeze the UI (this sync command runs on the main thread) for a folder with many files.
@@ -156,12 +171,16 @@ pub fn remove_watched_directory(ctx: &Arc<Ctx>, id: &str) -> Result<(), String> 
             .map_err(|e| e.to_string())?;
     }
     watcher::reconcile(ctx);
+    announce_change(ctx);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispose::RecordingDisposer;
+    use crate::events::TestSink;
+    use rusqlite::Connection;
 
     #[test]
     fn canonical_watch_path_unifies_aliases_of_the_same_folder() {
@@ -204,5 +223,73 @@ mod tests {
             canonical_watch_path("definitely-missing"),
             "definitely-missing"
         );
+    }
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn
+    }
+
+    /// Same harness as `settings_ops.rs`/`queue_ops.rs`: an in-memory DB plus a `TestSink` to
+    /// assert on. `PanickingLocator` declares the world — nothing here should reach HandBrake
+    /// resolution, and the empty tempdir gives `scan_existing_background` no file to probe.
+    fn test_ctx(conn: Connection) -> (Arc<Ctx>, Arc<TestSink>) {
+        let sink = Arc::new(TestSink::default());
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            Arc::new(RecordingDisposer::default()),
+            Arc::new(crate::handbrake::PanickingLocator),
+        );
+        (ctx, sink)
+    }
+
+    #[test]
+    fn every_mutation_announces_that_the_watch_list_changed() {
+        // A second client learns the watch list changed only from this event: the server head
+        // serves many browsers, and `useWatchedDirectories` fetches once on mount with no other
+        // refresh trigger. Without an emit here, a folder added in one tab stays invisible in
+        // every other tab until the user reloads the page — for days, since this panel is
+        // permanently mounted and never remounts to refetch (issue #144).
+        let (ctx, sink) = test_ctx(test_conn());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+
+        let added = add_watched_directory(&ctx, path, false, 5).unwrap();
+        assert_eq!(sink.payloads("watched-directories-updated").len(), 1, "add");
+
+        update_watched_directory(&ctx, &added.id, true, 9).unwrap();
+        assert_eq!(
+            sink.payloads("watched-directories-updated").len(),
+            2,
+            "update"
+        );
+
+        set_watched_directory_enabled(&ctx, &added.id, false).unwrap();
+        assert_eq!(
+            sink.payloads("watched-directories-updated").len(),
+            3,
+            "set_enabled"
+        );
+
+        remove_watched_directory(&ctx, &added.id).unwrap();
+        assert_eq!(
+            sink.payloads("watched-directories-updated").len(),
+            4,
+            "remove"
+        );
+    }
+
+    #[test]
+    fn a_rejected_mutation_announces_nothing() {
+        // Every listener refetches on this event, so emitting when nothing changed costs every
+        // connected client a round trip. Both of these bail before touching a row.
+        let (ctx, sink) = test_ctx(test_conn());
+
+        assert!(update_watched_directory(&ctx, "no-such-id", true, 9).is_err());
+        assert!(set_watched_directory_enabled(&ctx, "no-such-id", false).is_err());
+
+        assert!(sink.payloads("watched-directories-updated").is_empty());
     }
 }
