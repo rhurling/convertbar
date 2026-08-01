@@ -52,6 +52,28 @@ body {
   flex-shrink: 0;
 }
 
+/* Server head only (see TabBar): the bar's one piece of permanent content, so its height
+   stops depending on whether the adding spinner happens to be showing. */
+.app-title {
+  flex: none;
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  letter-spacing: 0.02em;
+  color: var(--text-primary);
+}
+
+/* flex-basis 0, like the tab buttons it replaced in the bar's flex line: with the default
+   `auto` the tabs' text width would count first and the drag spacer would end up narrower
+   than a tab, which is not how the bar divided itself before. */
+.tab-list {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
 .tab-btn {
   flex: 1 1 0;
   padding: 10px 0;

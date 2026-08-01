@@ -44,13 +44,19 @@ describe("App layout", () => {
 
     expect(await screen.findByTestId("queue-page")).toBeInTheDocument();
     // Queue is always visible, so its tab button is gone.
-    expect(screen.queryByRole("button", { name: "Queue" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "History" })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Queue" })).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
     // activeTab defaults to "queue", which is pinned — the derived fallback must land on
     // the first tab still in the bar rather than rendering an empty column.
     expect(screen.getByTestId("history-page")).toBeInTheDocument();
     // The pinned panel names itself; the tabbed one is already named by its tab button.
     expect(screen.getByRole("heading", { name: "Queue" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Queue" })).toContainElement(screen.getByTestId("queue-page"));
+    // The tabbed column had no heading and no label at all — "History" lived only on the
+    // button that switched to it, with nothing tying the two together.
+    expect(screen.getByRole("tabpanel", { name: "History" })).toContainElement(
+      screen.getByTestId("history-page"),
+    );
     // Only Queue is pinned at two-col — Watch and Settings stay unmounted until tabbed to.
     expect(screen.queryByTestId("watch-page")).not.toBeInTheDocument();
     expect(screen.queryByTestId("settings-page")).not.toBeInTheDocument();
@@ -65,11 +71,17 @@ describe("App layout", () => {
     expect(screen.getByTestId("watch-page")).toBeInTheDocument();
     expect(screen.getByTestId("settings-page")).toBeInTheDocument();
     for (const label of ["Queue", "History", "Watch", "Settings"]) {
-      expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
+      expect(screen.queryByRole("tab", { name: label })).not.toBeInTheDocument();
     }
     // Each pinned panel names itself, so a four-panel view is self-describing.
     expect(screen.getByRole("heading", { name: "Watch" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    // ...and each is its own named region, so four panels on one screen are four
+    // navigable landmarks rather than one anonymous slab. An inner h2 does not name a
+    // <section>; only an explicit label does.
+    for (const label of ["Queue", "History", "Watch", "Settings"]) {
+      expect(screen.getByRole("region", { name: label })).toBeInTheDocument();
+    }
     // Watch and Settings are grouped into a single column — Settings is by far the longest
     // panel, and pairing it with the shortest balances the row — so three columns total,
     // not four.
@@ -88,7 +100,7 @@ describe("App layout", () => {
     render(<App />);
 
     expect(await screen.findByTestId("queue-page")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Queue" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Queue" })).toBeInTheDocument();
     expect(screen.queryByTestId("history-page")).not.toBeInTheDocument();
   });
 
@@ -97,7 +109,7 @@ describe("App layout", () => {
     render(<App />);
 
     expect(await screen.findByTestId("queue-page")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("tab", { name: "History" }));
     expect(await screen.findByTestId("history-page")).toBeInTheDocument();
     expect(screen.queryByTestId("queue-page")).not.toBeInTheDocument();
   });
