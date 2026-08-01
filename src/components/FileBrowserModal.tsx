@@ -14,9 +14,18 @@ interface FileBrowserModalProps {
 }
 
 /** The configured root that contains `path`, so breadcrumb up-navigation never offers an
- * ancestor above it (the server 403s anything outside `browse_roots` — see `routes::fs`). */
-function containingRoot(path: string, roots: string[]): string {
-  return roots.find((root) => path === root || path.startsWith(root.endsWith("/") ? root : `${root}/`)) ?? roots[0];
+ * ancestor above it (the server 403s anything outside `browse_roots` — see `routes::fs`).
+ *
+ * Null when no root contains it, which the caller must not paper over: slicing a
+ * non-prefix root off a path yields crumbs that name directories nobody has — `/media` against
+ * `/mnt/pool/media/Movies` produced "ool / media / Movies", and every one of those 404s when
+ * clicked. `/api/info` canonicalizes its roots so this should not arise, but a root that fails
+ * to resolve there and resolves by the time a listing runs would land here. */
+function containingRoot(path: string, roots: string[]): string | null {
+  return (
+    roots.find((root) => path === root || path.startsWith(root.endsWith("/") ? root : `${root}/`)) ??
+    null
+  );
 }
 
 /** Joins a root with the relative segments under it, without producing a doubled slash when
@@ -70,7 +79,10 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       const result = await httpCommands.fsList(target);
       if (!isCurrent()) return;
       setEntries(result.entries);
-      setPath(target);
+      // The directory the server says it listed, not the one we asked for: it resolves symlinks
+      // before reading and builds entry paths from the result, so keeping `target` would leave
+      // us holding a prefix none of our own entries share.
+      setPath(result.path);
       // The selection deliberately survives navigation — gathering from several folders
       // in one pass is the point. The shift anchor does NOT: a range only means
       // something within one listing.
@@ -216,8 +228,12 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   };
 
   // Breadcrumb: a crumb for the containing configured root (its own label, not always "/"),
-  // then one crumb per path segment beneath it — never a crumb above the root itself.
-  const root = path === null ? roots[0] : containingRoot(path, roots);
+  // then one crumb per path segment beneath it — never a crumb above the root itself. When no
+  // configured root contains the current path, the whole path becomes the single base crumb:
+  // up-navigation has nowhere safe to go, and inventing intermediate crumbs from a root that
+  // is not a prefix is how you get crumbs that 404.
+  const containing = path === null ? roots[0] : containingRoot(path, roots);
+  const root = containing ?? path!;
   const relativeSegments =
     path === null || path === root ? [] : path.slice(root.length).split("/").filter(Boolean);
 
@@ -244,6 +260,27 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
             &times;
           </button>
         </div>
+
+        {/* Only for a genuinely multi-root deployment (CONVERTBAR_BROWSE_ROOTS=/media:/data).
+            The breadcrumb already starts at the single root otherwise, and a switcher whose one
+            destination is where you already are is noise. Before this, every root past the
+            first was reachable only by typing its path into the jump-to-path form — nothing on
+            screen said it existed. */}
+        {roots.length > 1 && (
+          <div className="file-browser-roots" role="group" aria-label="Browse roots">
+            {roots.map((r) => (
+              <button
+                key={r}
+                type="button"
+                className={`btn btn-small${r === containing ? " btn-active" : ""}`}
+                aria-current={r === containing ? "true" : undefined}
+                onClick={() => load(r)}
+              >
+                {r}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="file-browser-breadcrumb">
           <button type="button" onClick={() => load(root)}>
