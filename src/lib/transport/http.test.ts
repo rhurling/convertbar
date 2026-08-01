@@ -92,4 +92,57 @@ describe("http transport", () => {
   it("desktop-only members throw a tripwire error", () => {
     expect(() => httpCommands.hideWindow()).toThrow("not available on server");
   });
+
+  describe("deadlines", () => {
+    // A stalled connection: headers never arrive and the socket is never closed, so the
+    // fetch promise only ever settles if the transport itself aborts it.
+    const stall = () =>
+      fetchMock.mockImplementation(
+        (_path: string, init: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError")),
+            );
+          }),
+      );
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("aborts a request that never settles instead of awaiting it forever", async () => {
+      stall();
+      const pending = httpCommands.getSettings();
+      const rejects = expect(pending).rejects.toThrow(/timed out/i);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await rejects;
+    });
+
+    it("gives the filesystem-walking intake routes a longer deadline than ordinary calls", async () => {
+      stall();
+      const pending = httpCommands.classifyPaths(["/media"]);
+      let settled = false;
+      pending.catch(() => {
+        settled = true;
+      });
+
+      // A recursive video scan of a large tree on a network mount routinely outlives the
+      // ordinary deadline. Cutting intake off at 30s would trade a rare hang for a
+      // guaranteed failure on exactly the libraries this head exists to serve.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      await expect(pending).rejects.toThrow(/timed out/i);
+    });
+
+    it("clears the deadline timer once a request completes", async () => {
+      fetchMock.mockResolvedValue(mockResponse(200, { ok: true }));
+      await httpCommands.getSettings();
+
+      // Every call arms a timer holding an AbortController; leaving them pending would
+      // accumulate one per request across a long-lived tab (the queue refetches constantly).
+      expect(vi.getTimerCount()).toBe(0);
+    });
+  });
 });

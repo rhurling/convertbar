@@ -164,6 +164,14 @@ body {
   font-size: 12px;
 }
 
+/* Status and the pick button stack rather than compete: the button must stay reachable
+   while a status is showing (see DropZone's onPick branch). */
+.drop-zone-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .drop-zone-pick {
   width: 100%;
   padding: 0;
