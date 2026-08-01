@@ -8,9 +8,17 @@ import { errorText } from "../lib/errors";
 /** Folders with this many files or fewer are added without a confirm prompt. */
 const AUTO_ADD_MAX = 5;
 
-type AddTask =
-  | { kind: "files"; paths: string[] }
-  | { kind: "folder"; folder: FolderScanResult };
+type AddTask = ({ kind: "files"; paths: string[] } | { kind: "folder"; folder: FolderScanResult }) & {
+  /** What classify dropped from the same selection (empty folders, vanished paths), appended to
+   * this task's own summary. It cannot be shown when it is discovered: every task overwrites the
+   * status with its summary as it lands, so a message set at classify time is wiped within
+   * milliseconds — which is how a partial outcome came to report only its good half. */
+  notice?: string;
+};
+
+/** A folder awaiting the user's confirmation, plus any notice its selection has to report once
+ * the user answers — the notice outlives the prompt because the prompt has no deadline. */
+type PendingConfirm = { folder: FolderScanResult; notice?: string };
 
 export interface FileIntake {
   pendingConfirm: FolderScanResult | null;
@@ -36,7 +44,7 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
   const [, forceRender] = useState(0);
   const bump = useCallback(() => forceRender((n) => n + 1), []);
 
-  const confirmQueueRef = useRef<FolderScanResult[]>([]);
+  const confirmQueueRef = useRef<PendingConfirm[]>([]);
   const taskQueueRef = useRef<AddTask[]>([]);
   const runningRef = useRef(false);
   const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -75,7 +83,8 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
               : await commands.confirmFolderAdd(task.folder.folder_path);
           await commands.startQueue();
           // summarizeAdds returns string | null; a null status renders nothing.
-          setStatusMsg(summarizeAdds([res]), true);
+          const parts = [summarizeAdds([res]), task.notice].filter((p): p is string => !!p);
+          setStatusMsg(parts.length > 0 ? parts.join(" · ") : null, true);
         } catch (e) {
           setStatusMsg(`Error: ${errorText(e)}`, true);
         }
@@ -104,50 +113,69 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
         return;
       }
 
-      // Whether anything was either enqueued now or pushed to confirmQueueRef for the user to
-      // confirm later — both cases already give the user feedback (a task summary or the
-      // confirm prompt itself), so only a fully empty outcome needs a message of its own.
-      let enqueuedOrPending = false;
+      // Build the whole batch before running any of it: the shortfall below is only knowable
+      // once every path has been sorted, and it has to be attached to the task whose summary
+      // lands last, or the summaries would bury it.
+      const tasks: AddTask[] = [];
       let emptyFolders = 0;
       if (classified.files.length > 0) {
-        enqueuedOrPending = true;
-        enqueue({ kind: "files", paths: classified.files });
+        tasks.push({ kind: "files", paths: classified.files });
       }
+      const confirms: FolderScanResult[] = [];
       for (const folder of classified.folders) {
         if (folder.file_count === 0) {
           emptyFolders++;
-          continue;
-        }
-        enqueuedOrPending = true;
-        if (folder.file_count <= AUTO_ADD_MAX) {
-          enqueue({ kind: "folder", folder });
+        } else if (folder.file_count <= AUTO_ADD_MAX) {
+          tasks.push({ kind: "folder", folder });
         } else {
-          confirmQueueRef.current.push(folder); // push, never replace — the anti-clobber invariant
-          bump();
+          confirms.push(folder);
         }
       }
 
-      if (enqueuedOrPending) {
+      // classify_paths silently drops any path that is neither a file nor a directory by the
+      // time it runs (deleted/renamed since being picked), so a selection can shrink without
+      // ever raising an error. Both shortfalls are invisible in the result unless said aloud:
+      // a two-item pick reporting "Added 1" gives the user no way to tell which item is gone.
+      const missing = paths.length - classified.files.length - classified.folders.length;
+      const skipped: string[] = [];
+      if (emptyFolders > 0) {
+        skipped.push(`no videos in ${emptyFolders} folder${emptyFolders === 1 ? "" : "s"}`);
+      }
+      if (missing > 0) {
+        skipped.push(
+          `${missing} path${missing === 1 ? "" : "s"} no longer exist${missing === 1 ? "s" : ""}`,
+        );
+      }
+      const notice = skipped.join(" · ");
+
+      // push, never replace — the anti-clobber invariant.
+      const pending: PendingConfirm[] = confirms.map((folder) => ({ folder }));
+      confirmQueueRef.current.push(...pending);
+
+      if (tasks.length > 0) {
+        // Rides on the last task: it is the one whose summary stays on screen.
+        if (notice) tasks[tasks.length - 1].notice = notice;
+        for (const task of tasks) enqueue(task);
+        if (pending.length > 0) bump();
         setStatusMsg(null); // clear the placeholder; tasks report via the scanner + summaries
         return;
       }
 
-      // Nothing was enqueued and nothing is pending confirmation. classify_paths silently drops
-      // any path that is neither a file nor a directory by the time it runs (deleted/renamed
-      // since being picked), so a selection can shrink to zero without ever raising an error.
-      // Without this, "Adding…" was the last thing the user ever saw — a folder with no videos
-      // (or a vanished path) closed the modal, flashed "Adding…", and then did nothing at all.
-      const missing = paths.length - classified.files.length - classified.folders.length;
-      const parts: string[] = [];
-      if (emptyFolders > 0) {
-        parts.push(`no videos in ${emptyFolders} folder${emptyFolders === 1 ? "" : "s"}`);
+      if (pending.length > 0) {
+        // Nothing runs until the user answers the prompt, so the notice goes up now — the status
+        // line is free, and a prompt that is never answered would otherwise report nothing at
+        // all — and also rides the confirmed add, so its summary still carries it however long
+        // the user takes to decide.
+        if (notice) pending[pending.length - 1].notice = notice;
+        bump();
+        setStatusMsg(notice ? `Skipped · ${notice}` : null, Boolean(notice));
+        return;
       }
-      if (missing > 0) {
-        parts.push(
-          `${missing} path${missing === 1 ? "" : "s"} no longer exist${missing === 1 ? "s" : ""}`,
-        );
-      }
-      setStatusMsg(parts.length > 0 ? `Nothing added · ${parts.join(" · ")}` : "Nothing to add", true);
+
+      // Nothing was enqueued and nothing is pending confirmation. Without this, "Adding…" was
+      // the last thing the user ever saw — a folder with no videos (or a vanished path) closed
+      // the modal, flashed "Adding…", and then did nothing at all.
+      setStatusMsg(notice ? `Nothing added · ${notice}` : "Nothing to add", true);
     },
     [enqueue, setStatusMsg, bump],
   );
@@ -179,11 +207,11 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
   }, []);
 
   const onAdd = useCallback(() => {
-    const folder = confirmQueueRef.current[0];
-    if (!folder) return;
+    const next = confirmQueueRef.current[0];
+    if (!next) return;
     confirmQueueRef.current.shift();
     bump();
-    enqueue({ kind: "folder", folder });
+    enqueue({ kind: "folder", folder: next.folder, notice: next.notice });
   }, [enqueue, bump]);
 
   const onSkip = useCallback(() => {
@@ -192,7 +220,7 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
     bump();
   }, [bump]);
 
-  const pendingConfirm = confirmQueueRef.current[0] ?? null;
+  const pendingConfirm = confirmQueueRef.current[0]?.folder ?? null;
 
   return { pendingConfirm, onAdd, onSkip, status, isDragOver, addPaths: handlePaths };
 }
