@@ -129,7 +129,7 @@ describe("App layout transitions", () => {
     // against Queue and rebuild it, which is a remount the user never asked for.
     layoutMode = "tabs";
     const { rerender } = render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Settings" }));
 
     const input = await screen.findByPlaceholderText(".{resolution}-{codec}");
     await waitFor(() => expect(input).toHaveValue(".{resolution}-{codec}"));

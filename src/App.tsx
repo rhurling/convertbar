@@ -1,5 +1,5 @@
-import { Fragment, useState, useEffect } from "react";
-import TabBar, { type Tab, TAB_LABELS } from "./components/TabBar";
+import { useState, useEffect } from "react";
+import TabBar, { type Tab, TAB_LABELS, tabId, tabPanelId } from "./components/TabBar";
 import QueuePage from "./pages/QueuePage";
 import HistoryPage from "./pages/HistoryPage";
 import WatchedFoldersPage from "./pages/WatchedFoldersPage";
@@ -20,6 +20,8 @@ const PINNED: Record<LayoutMode, Tab[]> = {
 };
 
 const ALL_TABS: Tab[] = ["queue", "history", "watch", "settings"];
+
+const panelTitleId = (tab: Tab) => `panel-title-${tab}`;
 
 /** One rendered column. `tabbed` is the single column the TabBar switches between (no title of
  *  its own — the TabBar already says which panel it holds). */
@@ -132,16 +134,29 @@ function App() {
       />
       <div className="app-columns">
         {columns.map((column) => (
-          <section className={column.tabbed ? "app-column page" : "app-column"} key={column.key}>
+          <div className={column.tabbed ? "app-column page" : "app-column"} key={column.key}>
             {column.tabs.map((tab) => (
+              // A panel, not a column, is the unit worth naming: the last column holds two of
+              // them, and a <section> is only a landmark once it has a label — an h2 inside it
+              // names nothing. The tabbed column's panel is instead the tabpanel its tab button
+              // controls, which is where its name comes from since no title is rendered there.
               // The title occupies a slot even when it isn't rendered, so a panel that changes
               // column kind (pinned <-> tabbed) still finds itself at the same position.
-              <Fragment key={tab}>
-                {!column.tabbed && <h2 className="app-column-title">{TAB_LABELS[tab]}</h2>}
+              <section
+                key={tab}
+                id={column.tabbed ? tabPanelId(tab) : undefined}
+                role={column.tabbed ? "tabpanel" : undefined}
+                aria-labelledby={column.tabbed ? tabId(tab) : panelTitleId(tab)}
+              >
+                {!column.tabbed && (
+                  <h2 className="app-column-title" id={panelTitleId(tab)}>
+                    {TAB_LABELS[tab]}
+                  </h2>
+                )}
                 {panel(tab)}
-              </Fragment>
+              </section>
             ))}
-          </section>
+          </div>
         ))}
       </div>
     </div>
