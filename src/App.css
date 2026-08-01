@@ -346,6 +346,7 @@ body {
 .history-item-duration {
   margin-left: auto;
   white-space: nowrap;
+  flex-shrink: 0;
   color: var(--text-dim);
 }
 
@@ -363,7 +364,6 @@ body {
 .history-item-error-msg {
   flex: 1;
   min-width: 0;
-  font-size: 11px;
   color: var(--red);
   overflow: hidden;
   text-overflow: ellipsis;

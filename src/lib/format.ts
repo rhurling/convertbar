@@ -25,9 +25,11 @@ export function fileName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-/// Seconds between a job's encode start and its completion, or null when there is no
-/// duration to show: a missing stamp (never claimed, paused mid-encode, or a row predating
-/// the column), an unparseable stamp, or a non-positive delta from a clock adjustment.
+/**
+ * Seconds between a job's encode start and its completion, or null when there is no
+ * duration to show: a missing stamp (never claimed, paused mid-encode, or a row predating
+ * the column), an unparseable stamp, or a non-positive delta from a clock adjustment.
+ */
 export function durationSeconds(
   startedAt: string | null,
   completedAt: string | null,
