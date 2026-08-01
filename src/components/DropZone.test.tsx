@@ -86,7 +86,7 @@ describe("DropZone (presentational)", () => {
     // affordance with its own 4s summary toast, and a classify request that never settled
     // left "Adding…" up forever, so intake was unreachable until the user reloaded the page.
     const onPick = vi.fn();
-    render(
+    const { container } = render(
       <DropZone
         pendingConfirm={null}
         onAdd={vi.fn()}
@@ -100,6 +100,18 @@ describe("DropZone (presentational)", () => {
     expect(screen.getByText("Adding…")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Add files or folders/ }));
     expect(onPick).toHaveBeenCalled();
+
+    // The click-target fix moves the panel's 24px padding onto the button so the whole
+    // dashed surface is clickable, and keys both rules off this nesting
+    // (`.drop-zone:has(.drop-zone-picker)`, `.drop-zone-picker .drop-zone-status`).
+    // Hoisting the status out of the picker would silently restore the padding to the
+    // panel and re-deaden ~80% of the target. jsdom applies no CSS, so this pins the
+    // structure the stylesheet depends on — not the geometry, which only the server-head
+    // Playwright measurement can check.
+    const picker = container.querySelector(".drop-zone-picker");
+    expect(picker).not.toBeNull();
+    expect(picker).toContainElement(screen.getByText("Adding…"));
+    expect(picker).toContainElement(screen.getByRole("button", { name: /Add files or folders/ }));
   });
 
   it("shows the folder confirm prompt even when onPick is given", () => {
