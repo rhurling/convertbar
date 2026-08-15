@@ -4697,19 +4697,10 @@ HandBrake has exited.";
     /// the stub shells out to `powershell` to read `(Get-Process -Id $PID).PriorityClass` and
     /// redirects it to `record_to`.
     ///
-    /// `$PID` there is PowerShell's own automatic variable for *its own* process, not the
-    /// `.cmd`'s — cmd.exe has no `%PID%` equivalent, so there is no cheap way to ask a batch
-    /// script for its own process id. That would be the wrong process to read anyway if it
-    /// weren't: what `Command::creation_flags` actually sets the priority class of is the
-    /// `cmd.exe` that Windows implicitly spawns to run a `.cmd` passed to `CreateProcess`
-    /// (documented `CreateProcess` behavior for `.bat`/`.cmd` targets), and it is `powershell`
-    /// that inherits that. Per `CreateProcess`'s documented priority-class rule, a child spawned
-    /// with no priority-class flags of its own inherits `BELOW_NORMAL_PRIORITY_CLASS` or
-    /// `IDLE_PRIORITY_CLASS` from its parent — the two classes `creation_flags` sets, and the
-    /// two this suite tests below. `NORMAL_PRIORITY_CLASS` is not covered by that inheritance
-    /// rule, but `normal` is untested here for the same reason `nice_recording_...`'s sibling
-    /// tests use `low`/`idle`: it is not what the mutation-review's target reads, and Unix
-    /// already has `normal_leaves_the_child_untouched` as a direct-call test.
+    /// `$PID` there is PowerShell's *own* automatic variable — it names the `powershell.exe`
+    /// process this `.cmd` launches as a child, not the `.cmd` itself (cmd.exe has no `%PID%`
+    /// equivalent to read instead). See the comment on the test below for why measuring that
+    /// grandchild is still a valid proxy for the priority class `creation_flags` actually set.
     #[cfg(windows)]
     fn priority_recording_fake_handbrake_script(
         dir: &std::path::Path,
@@ -4734,7 +4725,34 @@ HandBrake has exited.";
     /// this the only thing that would go red — everything else in the suite (including the
     /// mapping test) is silent to it.
     ///
-    /// UNCOMPILED: written on macOS, no Windows target available here. See the mutation-fix
+    /// What is actually measured is not the stub itself but its PowerShell *grandchild*
+    /// (`priority_recording_fake_handbrake_script`'s `$PID` is PowerShell's own pid, not the
+    /// `.cmd`'s) — the process `creation_flags` sets the priority class of is the `cmd.exe`
+    /// Windows implicitly spawns to run a `.cmd` passed to `CreateProcess`, one level up from
+    /// what gets measured. That is only a valid proxy because of one specific, documented
+    /// `CreateProcess` rule (Scheduling Priorities, under `dwCreationFlags`): a child spawned
+    /// with no priority-class flag of its own defaults to `NORMAL_PRIORITY_CLASS` — *unless*
+    /// the creating process is itself `IDLE_PRIORITY_CLASS` or `BELOW_NORMAL_PRIORITY_CLASS`,
+    /// in which case the child inherits the parent's class instead of defaulting to normal.
+    /// PowerShell is launched with no priority flags, so it inherits `cmd.exe`'s class under
+    /// that exception.
+    ///
+    /// That exception covers exactly the two classes `creation_flags` sets (`BelowNormal` for
+    /// `low`, `Idle` for `idle`), which is why asserting `low` here is sound. It is also a hard
+    /// constraint: the rule does NOT cover `NORMAL_PRIORITY_CLASS`, so this technique cannot be
+    /// reused to assert `normal` — a grandchild of a `Normal`-class `cmd.exe` would report
+    /// `Normal` regardless of what `creation_flags` actually passed, because normal is the
+    /// unconditional default, not an inherited value. If a future change swapped `low`'s mapped
+    /// class for anything other than `BelowNormal`/`Idle`, this test would start failing for a
+    /// reason unrelated to the bug it hunts (grandchild no longer inherits) rather than
+    /// detecting the real regression — worth remembering before "simplifying" the tier mapping.
+    /// `normal` itself stays covered only by `priority::creation_flags`'s direct-call unit test
+    /// and Unix's `normal_leaves_the_child_untouched`, per the same reasoning
+    /// `nice_recording_...`'s sibling tests already apply by testing `low`/`idle` end-to-end.
+    ///
+    /// UNCOMPILED: written on macOS, no Windows target available here. The inheritance rule
+    /// above was confirmed against Microsoft's documented `CreateProcess` behavior (not left as
+    /// an open assumption), but the test itself has not run on Windows. See the mutation-fix
     /// report for what would verify it.
     #[test]
     #[cfg(windows)]
