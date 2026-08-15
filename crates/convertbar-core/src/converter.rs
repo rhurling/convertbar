@@ -4692,4 +4692,80 @@ HandBrake has exited.";
         let recorded = std::fs::read_to_string(&record).unwrap().trim().to_string();
         assert_eq!(recorded, "19");
     }
+
+    /// Windows counterpart to `nice_recording_fake_handbrake_script`. Instead of `ps -o nice=`,
+    /// the stub shells out to `powershell` to read `(Get-Process -Id $PID).PriorityClass` and
+    /// redirects it to `record_to`.
+    ///
+    /// `$PID` there is PowerShell's own automatic variable for *its own* process, not the
+    /// `.cmd`'s — cmd.exe has no `%PID%` equivalent, so there is no cheap way to ask a batch
+    /// script for its own process id. That would be the wrong process to read anyway if it
+    /// weren't: what `Command::creation_flags` actually sets the priority class of is the
+    /// `cmd.exe` that Windows implicitly spawns to run a `.cmd` passed to `CreateProcess`
+    /// (documented `CreateProcess` behavior for `.bat`/`.cmd` targets), and it is `powershell`
+    /// that inherits that. Per `CreateProcess`'s documented priority-class rule, a child spawned
+    /// with no priority-class flags of its own inherits `BELOW_NORMAL_PRIORITY_CLASS` or
+    /// `IDLE_PRIORITY_CLASS` from its parent — the two classes `creation_flags` sets, and the
+    /// two this suite tests below. `NORMAL_PRIORITY_CLASS` is not covered by that inheritance
+    /// rule, but `normal` is untested here for the same reason `nice_recording_...`'s sibling
+    /// tests use `low`/`idle`: it is not what the mutation-review's target reads, and Unix
+    /// already has `normal_leaves_the_child_untouched` as a direct-call test.
+    #[cfg(windows)]
+    fn priority_recording_fake_handbrake_script(
+        dir: &std::path::Path,
+        record_to: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let p = dir.join("hb-priority.cmd");
+        std::fs::write(
+            &p,
+            format!(
+                "@echo off\r\npowershell -NoProfile -Command \"(Get-Process -Id $PID).PriorityClass\" > \"{}\"\r\nexit /b 0\r\n",
+                record_to.display()
+            ),
+        )
+        .unwrap();
+        p
+    }
+
+    /// Proves `process_queue` actually threads `encode_priority` into the Windows spawn path
+    /// (the `#[cfg(windows)] cmd.creation_flags(...)` block in the body above) rather than just
+    /// proving, as `priority::creation_flags`'s own unit test does, that the tier-to-flag
+    /// mapping is correct in isolation. Deleting that block, or passing the wrong flags, leaves
+    /// this the only thing that would go red — everything else in the suite (including the
+    /// mapping test) is silent to it.
+    ///
+    /// UNCOMPILED: written on macOS, no Windows target available here. See the mutation-fix
+    /// report for what would verify it.
+    #[test]
+    #[cfg(windows)]
+    fn process_queue_applies_the_configured_priority_class_to_the_child_on_windows() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("priority.txt");
+        let script = priority_recording_fake_handbrake_script(dir.path(), &record);
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "encode_priority", "low");
+
+        let src = real_source(dir.path(), "a.mp4");
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        let recorded = std::fs::read_to_string(&record)
+            .expect("the stub ran and recorded its priority class")
+            .trim()
+            .to_string();
+        assert_eq!(
+            recorded, "BelowNormal",
+            "the encode must run at the configured priority class, not the parent's"
+        );
+    }
 }

@@ -652,6 +652,43 @@ describe("SettingsPage", () => {
     ).toBe("idle");
   });
 
+  it("checks only the radio matching the loaded encode priority", async () => {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings({ encode_priority: "low" }));
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "update_setting":
+        case "set_preset_suffix":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage onHbPathChanged={() => {}} />);
+
+    const normal = await screen.findByLabelText(/compete equally with other apps/i);
+    const low = await screen.findByLabelText(/yield to other apps when the cpu is busy/i);
+    const idle = await screen.findByLabelText(/run only with cpu nothing else wants/i);
+
+    expect(low).toBeChecked();
+    expect(normal).not.toBeChecked();
+    expect(idle).not.toBeChecked();
+  });
+
   it("shows the Linux caveat only when priority is group-scoped", async () => {
     // The setting is offered on Linux rather than hidden — autogrouping can be disabled, and a
     // process with no cpu controller on its path does get real host-wide nice — so the note is

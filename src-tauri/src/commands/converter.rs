@@ -64,3 +64,20 @@ pub fn get_platform_capabilities() -> PlatformCapabilities {
 pub fn quit_app(app: AppHandle) {
     app.exit(0);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `priority_is_group_scoped` must name Linux specifically (`cfg!(target_os = "linux")`),
+    /// not `cfg!(unix)` — the easy copy-paste from `can_pause_process` one line above, since
+    /// that field genuinely is `cfg!(unix)`. Swapping the two would show macOS users a caveat
+    /// that only describes Linux's cgroup-scoped scheduling. Pinned on macOS specifically: it's
+    /// the platform where `cfg!(unix)` (true) and `cfg!(target_os = "linux")` (false) actually
+    /// disagree, so this is where the mutation is observable.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn priority_is_not_group_scoped_on_macos() {
+        assert!(!get_platform_capabilities().priority_is_group_scoped);
+    }
+}
