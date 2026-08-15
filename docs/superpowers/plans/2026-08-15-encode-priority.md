@@ -176,14 +176,16 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cargo test -p convertbar-core priority:: 2>&1 | tail -20`
-Expected: FAIL — compile errors, `cannot find type EncodePriority in this scope`. (The module is not registered yet, so this may report that `priority.rs` is not part of the crate; that is the same failure.)
-
-- [ ] **Step 3: Register the module**
+- [ ] **Step 2: Register the module**
 
 In `crates/convertbar-core/src/lib.rs`, add `pub mod priority;` in the existing alphabetical run of `pub mod` declarations.
+
+This comes **before** the red-test run on purpose. A `.rs` file that no `mod` declaration references is not compiled and produces no diagnostic at all: `cargo test` would exit 0, the filter would match 0 tests, and Step 3 would report a false green instead of the failure it is there to observe.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `cargo test -p convertbar-core priority:: 2>&1 | tail -20`
+Expected: FAIL to compile — `cannot find function normalize_encode_priority in this scope`, `cannot find type EncodePriority in this scope`.
 
 - [ ] **Step 4: Write the implementation**
 
@@ -473,6 +475,11 @@ Add to `mod tests` in `crates/convertbar-core/src/converter.rs`:
 ```rust
 /// A stand-in for HandBrakeCLI that records the nice value it was given, then exits.
 /// `ps -o nice=` is used rather than /proc so the same script works on macOS and Linux.
+///
+/// The `sleep 0.2` closes a race: the parent sets the priority just *after* spawn, so a stub
+/// that measured itself immediately would be sampling concurrently with the call it is meant
+/// to observe. The parent path is a match plus one syscall against the child's execve, so the
+/// parent wins in practice — but "in practice" is how flaky CI tests are written.
 #[cfg(unix)]
 fn nice_recording_fake_handbrake_script(
     dir: &std::path::Path,
@@ -483,7 +490,7 @@ fn nice_recording_fake_handbrake_script(
     std::fs::write(
         &p,
         format!(
-            "#!/bin/sh\nps -o nice= -p $$ | tr -d ' ' > {}\nexit 0\n",
+            "#!/bin/sh\nsleep 0.2\nps -o nice= -p $$ | tr -d ' ' > {}\nexit 0\n",
             record_to.display()
         ),
     )
@@ -562,6 +569,36 @@ fn process_queue_leaves_the_child_at_the_parent_priority_by_default() {
         parent_nice.to_string(),
         "with no setting stored, the child must inherit the parent's priority untouched"
     );
+}
+
+/// The third tier, end to end. Linux-only: on macOS `Idle` is a background QoS class that
+/// leaves the nice value at 0, so this probe cannot see it — that platform's coverage is the
+/// `idle_sets_darwin_background_class_and_not_nice` unit test in Task 1.
+#[test]
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_queue_applies_the_idle_tier() {
+    let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("nice.txt");
+    let script = nice_recording_fake_handbrake_script(dir.path(), &record);
+    set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+    set_setting(&ctx.db, "encode_priority", "idle");
+
+    let src = real_source(dir.path(), "a.mp4");
+    let out = dir.path().join("out.mp4");
+    queue_job(
+        &ctx.db,
+        "j1",
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        1000,
+    );
+
+    process_queue(&ctx);
+
+    let recorded = std::fs::read_to_string(&record).unwrap().trim().to_string();
+    assert_eq!(recorded, "19");
 }
 ```
 
@@ -800,7 +837,7 @@ The desktop has no `AppInfo` struct in Rust — `src/lib/transport/tauri.ts:112-
 
 - [ ] **Step 1: Write the failing test**
 
-In `crates/convertbar-server/src/routes/mod.rs`, next to the existing `assert_eq!(json["can_pause_process"], cfg!(unix));` around line 1076:
+The test is `get_api_info_returns_the_five_fields` at `crates/convertbar-server/src/routes/mod.rs:1054`. Add next to its existing `assert_eq!(json["can_pause_process"], cfg!(unix));` (around :1076):
 
 ```rust
         // Linux confines scheduling priority to a cgroup/autogroup, so the encode-priority
@@ -809,9 +846,14 @@ In `crates/convertbar-server/src/routes/mod.rs`, next to the existing `assert_eq
         assert_eq!(json["priority_is_group_scoped"], cfg!(target_os = "linux"));
 ```
 
+Rename the test to `get_api_info_returns_the_six_fields` — it now asserts six.
+
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p convertbar-server app_info 2>&1 | tail -20`
+Run: `cargo test -p convertbar-server api_info 2>&1 | tail -20`
+
+The filter is `api_info`, **not** `app_info`. Cargo filters by substring against the test path; no test in this crate contains `app_info` (only the non-test handler `get_app_info`), so `app_info` would match zero tests and exit **green** — a false pass at exactly the step meant to prove the assertion can fail.
+
 Expected: FAIL — the JSON has no `priority_is_group_scoped` key, so the comparison is against `Null`.
 
 - [ ] **Step 3: Write the implementation**
@@ -831,9 +873,10 @@ and to its construction after `can_pause_process: cfg!(unix),`:
             priority_is_group_scoped: cfg!(target_os = "linux"),
 ```
 
-In `src-tauri/src/commands/converter.rs`, add the same field to `PlatformCapabilities` and its constructor:
+In `src-tauri/src/commands/converter.rs`, add the same field to `PlatformCapabilities` and its constructor. **Keep the `#[derive(serde::Serialize)]`** — it is on the struct today (`:48`) and `#[tauri::command]` requires it to serialize the return value:
 
 ```rust
+#[derive(serde::Serialize)]
 pub struct PlatformCapabilities {
     pub can_pause_process: bool,
     pub priority_is_group_scoped: bool,
@@ -865,7 +908,7 @@ and to `AppSettings`, after `history_show_duration`:
   encode_priority: "normal" | "low" | "idle";
 ```
 
-Also add `priority_is_group_scoped: boolean;` to the `PlatformCapabilities` interface in the same file if one is declared there.
+Also add `priority_is_group_scoped: boolean;` to the `PlatformCapabilities` interface at `src/lib/transport/types.ts:145`. This is required, not optional: `tauri.ts` reads `caps.priority_is_group_scoped` and will not compile without it.
 
 In `src/lib/transport/tauri.ts:112-124`, add to the synthesized object:
 
@@ -873,15 +916,34 @@ In `src/lib/transport/tauri.ts:112-124`, add to the synthesized object:
       priority_is_group_scoped: caps.priority_is_group_scoped,
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Fix the five typed `AppSettings` fixtures**
 
-Run: `cargo test -p convertbar-server app_info 2>&1 | tail -20` — expected PASS.
-Run: `npm run build 2>&1 | tail -20` — expected: succeeds. TypeScript will flag any other `AppInfo` literal (test fixtures, mocks) that now lacks the field; add `priority_is_group_scoped: false` to each.
+`npm run build` is `tsc && vite build`, and `tsconfig.json` includes `src`, so making `encode_priority` a required field on `AppSettings` breaks every fixture whose return type is annotated `AppSettings`. There are exactly five, all declared `function makeSettings(...): AppSettings`:
 
-- [ ] **Step 5: Commit**
+- `src/pages/SettingsPage.test.tsx:16`
+- `src/App.layoutTransition.test.tsx:44`
+- `src/App.settingsPanels.test.tsx:53`
+- `src/hooks/useSettings.test.ts:13`
+- `src/pages/HistoryPage.test.tsx:73`
+
+Add `encode_priority: "normal",` to the object each one returns.
+
+The `AppInfo` mocks are a different story and need **no** change: they all live inside untyped `vi.mock` factories (`src/App.panelIdentity.test.tsx:42`, `src/components/FileBrowserModal.test.tsx:12`, and the fetch fixture at `SettingsPage.test.tsx:133`), which tsc does not check against the module's real shape. At runtime a missing `priority_is_group_scoped` reads as `undefined`, which is falsy — the note simply stays hidden, which is the correct default.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cargo test -p convertbar-server api_info 2>&1 | tail -20` — expected PASS.
+Run: `npm run build 2>&1 | tail -20` — expected: succeeds.
+
+- [ ] **Step 6: Commit**
+
+The five fixture files are staged here. No later task's `git add` covers four of them, so leaving them out means committing a red build.
 
 ```bash
 git add crates/convertbar-server/src/routes src-tauri/src/commands/converter.rs src/lib/transport
+git add src/pages/SettingsPage.test.tsx src/App.layoutTransition.test.tsx \
+        src/App.settingsPanels.test.tsx src/hooks/useSettings.test.ts \
+        src/pages/HistoryPage.test.tsx
 git commit -m "feat: report whether scheduling priority is group-scoped"
 ```
 
@@ -899,34 +961,67 @@ git commit -m "feat: report whether scheduling priority is group-scoped"
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `src/pages/SettingsPage.test.tsx`, following the file's existing render/mock setup:
+This file has **no** `renderSettings` helper and **no** `updateSetting` binding. It uses `makeSettings(overrides)` (`:16`), an `invokeMock.mockImplementation` switch in `beforeEach` (`:73`), `updateCallsFor(key)` (`:95`), and direct `render(<SettingsPage onHbPathChanged={() => {}} />)`. The tests below use those.
+
+Two pieces of mock plumbing are needed first, because `getAppInfo()` currently **rejects** in this file. The desktop transport composes it (`tauri.ts:112-124`) from `getVersion()` and `invoke("get_platform_capabilities")` — both hit the switch's `default: reject`, and the component's `.catch(() => {})` would swallow it, leaving `groupScoped` permanently false and the note untestable.
+
+First, add the module mock at the top of the file, next to the existing `vi.mock` calls (this is how `src/components/ActiveJob.test.tsx:7` does it):
+
+```tsx
+vi.mock("@tauri-apps/api/app", () => ({ getVersion: () => Promise.resolve("1.2.3") }));
+```
+
+Second, add a module-level flag and a switch case. Put the flag near `makeSettings`:
+
+```tsx
+// Drives get_platform_capabilities per test. Reset in beforeEach so a test that flips it
+// cannot leak the note into an unrelated assertion.
+let groupScopedFlag = false;
+```
+
+In `beforeEach`, add `groupScopedFlag = false;` after `vi.clearAllMocks();`, and add this case to the switch:
+
+```tsx
+      case "get_platform_capabilities":
+        return Promise.resolve({
+          can_pause_process: true,
+          priority_is_group_scoped: groupScopedFlag,
+        });
+```
+
+Now the tests:
 
 ```tsx
 it("writes the chosen encode priority", async () => {
-  renderSettings({ encode_priority: "normal" });
+  render(<SettingsPage onHbPathChanged={() => {}} />);
 
   const idle = await screen.findByLabelText(/only when the machine is idle/i);
   fireEvent.click(idle);
 
-  expect(updateSetting).toHaveBeenCalledWith("encode_priority", "idle");
+  await waitFor(() => expect(updateCallsFor("encode_priority")).toHaveLength(1));
+  expect(
+    (updateCallsFor("encode_priority")[0][1] as { value: string }).value,
+  ).toBe("idle");
 });
 
 it("shows the Linux caveat only when priority is group-scoped", async () => {
   // The setting is offered on Linux rather than hidden — autogrouping can be disabled, and a
   // process with no cpu controller on its path does get real host-wide nice — so the note is
   // what keeps it honest for the users where it does nothing.
-  renderSettings({ encode_priority: "low" }, { priority_is_group_scoped: true });
+  groupScopedFlag = true;
+  render(<SettingsPage onHbPathChanged={() => {}} />);
   expect(await screen.findByText(/--cpu-shares/)).toBeInTheDocument();
 });
 
 it("shows no caveat where priority works normally", async () => {
-  renderSettings({ encode_priority: "low" }, { priority_is_group_scoped: false });
+  groupScopedFlag = false;
+  render(<SettingsPage onHbPathChanged={() => {}} />);
+  // Await the control itself so the assertion cannot pass merely because nothing has
+  // rendered yet — the failure mode a bare queryBy would hide.
   await screen.findByLabelText(/only when the machine is idle/i);
   expect(screen.queryByText(/--cpu-shares/)).not.toBeInTheDocument();
 });
 ```
-
-Adapt `renderSettings` to the helper this test file already uses; its second argument must control what `commands.getAppInfo()` resolves to.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1064,7 +1159,13 @@ State plainly which of the three platforms were actually exercised and which wer
 
 ## Self-Review Notes
 
-**Spec coverage.** Every section of the spec maps to a task: the setting and its normalizer (Task 2), the platform table and parent-side application (Task 1), the spawn wiring and per-job read semantics (Task 3), `DbInit` and fresh-install seeding (Task 4), the capability flag through both heads (Task 5), the control and Linux note (Task 6).
+**Spec coverage.** Every *behavior* in the spec maps to a task: the setting and its normalizer (Task 2), the platform table and parent-side application (Task 1), the spawn wiring and per-job read semantics (Task 3), `DbInit` and fresh-install seeding (Task 4), the capability flag through both heads (Task 5), the control and Linux note (Task 6).
+
+**Three tests the spec asks for that this plan does not write.** Listing them rather than letting "every section maps to a task" imply coverage that is not there:
+
+1. *"The desktop head seeds `low` on `Fresh` and leaves an `Existing` database alone."* Task 4 tests `DbInit` but not the seeding, which lives inline in `src-tauri/src/lib.rs`'s `.setup()` closure and is not reachable from a unit test without extracting it to a function. Extracting it for testability is defensible and would be a small addition to Task 4; it is left out because the branch is three lines over an already-tested predicate. **If a reviewer disagrees, this is the cheapest gap to close.**
+2. *"Both heads report `priority_is_group_scoped`."* Only the server head is asserted (Task 5). The desktop's `get_platform_capabilities` returns a `cfg!` constant with no logic to get wrong, and `src-tauri` has no existing test module for the commands.
+3. *A job per tier end to end.* Covered for `low`, `idle` (Linux), and the absent-row default. macOS `idle` is covered only by Task 1's unit test, because the `ps`-based probe cannot observe a background QoS class — the reason Task 1 tests the mechanism against a directly-spawned child in the first place.
 
 **Two deliberate deviations from the spec, both noted at the point of use:**
 
