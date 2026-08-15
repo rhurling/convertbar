@@ -86,7 +86,18 @@ pub fn run() {
         .setup(|app| {
             let db_path = db::get_db_path();
             let conn = Connection::open(&db_path).expect("Failed to open database");
-            db::init_db(&conn).expect("Failed to initialize database");
+            let db_state = db::init_db(&conn).expect("Failed to initialize database");
+            // Fresh desktop installs start at `low`: a menu-bar app shares the machine with
+            // the user's actual work. Existing installs are left alone — an auto-update must
+            // not silently change how fast anyone's encodes run. The server head seeds
+            // nothing and inherits `normal`.
+            if db_state == db::DbInit::Fresh {
+                conn.execute(
+                    "INSERT OR IGNORE INTO settings (key, value) VALUES ('encode_priority', 'low')",
+                    [],
+                )
+                .expect("seed encode_priority");
+            }
 
             let events: Arc<dyn EventSink> = Arc::new(sink::TauriSink(app.handle().clone()));
             let ctx = Ctx::new(
