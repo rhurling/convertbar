@@ -34,6 +34,7 @@ function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings {
     bad_source_action: "trash",
     update_mode: "automatic",
     history_show_duration: true,
+    encode_priority: "normal",
     ...overrides,
   };
 }

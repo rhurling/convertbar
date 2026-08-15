@@ -49,12 +49,14 @@ pub fn get_low_disk_pause(ctx: State<'_, Arc<Ctx>>) -> Option<crate::converter::
 #[derive(serde::Serialize)]
 pub struct PlatformCapabilities {
     pub can_pause_process: bool,
+    pub priority_is_group_scoped: bool,
 }
 
 #[tauri::command]
 pub fn get_platform_capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         can_pause_process: ConverterState::can_pause_process(),
+        priority_is_group_scoped: cfg!(target_os = "linux"),
     }
 }
 

@@ -13,6 +13,10 @@ pub struct AppInfo {
     pub version: String,
     pub head: String,
     pub can_pause_process: bool,
+    /// True on Linux, where the kernel confines scheduling priority to an autogroup or
+    /// cgroup, so `encode_priority` largely cannot yield CPU to the rest of the host. Runtime
+    /// data rather than a build-time frontend flag: the bundle is built per head, not per OS.
+    pub priority_is_group_scoped: bool,
     pub auth_required: bool,
     /// Lets the file-browser modal start (and confine breadcrumb up-navigation) at a
     /// configured root instead of always guessing "/" — which 403s on any deployment that
@@ -34,6 +38,7 @@ pub async fn get_app_info(State(state): State<ServerState>) -> Response {
             version: env!("CARGO_PKG_VERSION").to_string(),
             head: "server".to_string(),
             can_pause_process: cfg!(unix),
+            priority_is_group_scoped: cfg!(target_os = "linux"),
             auth_required: !matches!(state.config.auth, AuthMode::Open),
             browse_roots: state
                 .config

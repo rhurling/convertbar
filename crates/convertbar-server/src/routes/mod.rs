@@ -1051,7 +1051,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn get_api_info_returns_the_five_fields() {
+    async fn get_api_info_returns_the_six_fields() {
         let app = api_router(test_state());
 
         let response = app
@@ -1074,6 +1074,10 @@ pub(crate) mod tests {
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(json["head"], "server");
         assert_eq!(json["can_pause_process"], cfg!(unix));
+        // Linux confines scheduling priority to a cgroup/autogroup, so the encode-priority
+        // setting largely does not reach the rest of the host there. The UI needs to know at
+        // runtime, not build time: one frontend bundle per head serves every OS.
+        assert_eq!(json["priority_is_group_scoped"], cfg!(target_os = "linux"));
         // AuthMode::Open in test_state() -> auth is not required.
         assert_eq!(json["auth_required"], false);
         // test_state() sets no CONVERTBAR_BROWSE_ROOTS, so ServerConfig defaults to ["/"].
