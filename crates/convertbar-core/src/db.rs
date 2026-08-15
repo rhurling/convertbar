@@ -87,6 +87,10 @@ pub enum DbInit {
 
 pub fn init_db(conn: &Connection) -> Result<DbInit> {
     // Probed before any CREATE TABLE below, which is what makes the answer meaningful.
+    // Accepted tradeoff: a boot that crashed after CREATE TABLE IF NOT EXISTS settings but
+    // before the defaults INSERT loop below leaves a genuinely fresh install reporting
+    // Existing on the next init_db, landing it at `normal` instead of `low`. Harmless —
+    // read_encode_priority already defaults an absent row to `normal`.
     let state = if conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'settings'",
         [],
