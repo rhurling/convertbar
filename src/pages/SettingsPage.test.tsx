@@ -643,7 +643,7 @@ describe("SettingsPage", () => {
   it("writes the chosen encode priority", async () => {
     render(<SettingsPage onHbPathChanged={() => {}} />);
 
-    const idle = await screen.findByLabelText(/only when the machine is idle/i);
+    const idle = await screen.findByLabelText(/run only with cpu nothing else wants/i);
     fireEvent.click(idle);
 
     await waitFor(() => expect(updateCallsFor("encode_priority")).toHaveLength(1));
@@ -666,7 +666,7 @@ describe("SettingsPage", () => {
     render(<SettingsPage onHbPathChanged={() => {}} />);
     // Await the control itself so the assertion cannot pass merely because nothing has
     // rendered yet — the failure mode a bare queryBy would hide.
-    await screen.findByLabelText(/only when the machine is idle/i);
+    await screen.findByLabelText(/run only with cpu nothing else wants/i);
     expect(screen.queryByText(/--cpu-shares/)).not.toBeInTheDocument();
   });
 });

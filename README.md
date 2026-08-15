@@ -82,6 +82,15 @@ target are skipped instead of being pointlessly re-encoded.
 **Low disk guard** — Set a floor in GB and the queue pauses rather than filling
 the destination volume.
 
+**Encode priority** — Normal, Low, or Idle, lowering the HandBrakeCLI child
+process's scheduling priority so it yields CPU to whatever else you're running.
+It's a proportional share, not a cap: a lowered encode still uses every core
+nothing else wants. Fresh desktop installs default to Low; existing installs
+stay on Normal so nobody's encodes change speed after an update. On Linux this
+setting largely has no effect — kernel autogrouping and cgroup CPU controllers
+both confine a nice value to the process's own scheduling group — so use
+`--cpu-shares` on a Docker container or `CPUWeight=` on a systemd unit instead.
+
 ## How a conversion works
 
 1. ConvertBar runs HandBrakeCLI with your chosen preset. The default is

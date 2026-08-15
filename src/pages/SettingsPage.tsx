@@ -339,7 +339,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
               checked={settings.encode_priority === "idle"}
               onChange={() => updateSetting("encode_priority", "idle")}
             />
-            Idle — encode only when the machine is idle
+            Idle — run only with CPU nothing else wants
           </label>
         </div>
         <p className="setting-hint">
