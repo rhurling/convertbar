@@ -31,7 +31,7 @@ symmetric across platforms:
 
 | Platform | Effective? |
 |---|---|
-| macOS | **Yes.** No cgroups, no autogroups. `idle` additionally buys efficiency-core placement and I/O throttling |
+| macOS | **Yes.** No cgroups, no autogroups |
 | Windows | **Yes.** Priority classes are system-wide |
 | Linux | **Largely no.** Confined to a scheduling group — in a container *and* out of one |
 
@@ -76,11 +76,12 @@ Docker container, `CPUWeight=` on a systemd unit.
 
 ## Rejected alternatives
 
-- **Two levels (`normal` / `low`).** Simpler, but `idle` is genuinely different
-  on macOS, where it maps to a background QoS class rather than a nice value.
-  The tiers do not collapse elsewhere either: Linux nice 10 vs 19 is a CFS
-  weight of 110 vs 15, and Windows `BELOW_NORMAL` and `IDLE` are distinct
-  classes.
+- **Two levels (`normal` / `low`).** Reconsidered once macOS `idle` lost its
+  background-QoS behavior (above), since that was the original argument for a
+  third tier. Kept anyway: the tiers remain genuinely distinct on their own
+  merits. Nice 10 vs 19 is a CFS weight of 110 vs 15 — roughly 7× under
+  contention — and Windows `BELOW_NORMAL` and `IDLE` are separate priority
+  classes. What was lost is a macOS bonus, not the distinction itself.
 - **A raw nice value, 0–19.** Maximum control over a scale most users cannot
   interpret, and one that does not exist on Windows — the mapping to priority
   classes would have to be invented anyway, making the precision partly
@@ -145,14 +146,35 @@ for free.
 | | `normal` | `low` | `idle` |
 |---|---|---|---|
 | Linux | nice 0 | nice 10 | nice 19 |
-| macOS | nice 0 | nice 10 | `PRIO_DARWIN_BG` |
+| macOS | nice 0 | nice 10 | nice 19 |
 | Windows | `NORMAL_PRIORITY_CLASS` | `BELOW_NORMAL_PRIORITY_CLASS` | `IDLE_PRIORITY_CLASS` |
 
-The macOS `idle` cell is **not a nice value and does not use the same call**.
-`PRIO_DARWIN_BG` is a flag passed with `which = PRIO_DARWIN_PROCESS`, where the
-other two cells use `PRIO_PROCESS`. It places the process in a background QoS
-class, which on Apple Silicon parks it on efficiency cores and throttles its
-disk I/O — the reason `idle` exists as a separate tier.
+**macOS `idle` was designed as `PRIO_DARWIN_BG` and cannot be.** That flag puts
+a process in a background QoS class — efficiency cores, throttled disk I/O —
+and it was the original argument for `idle` being a separate tier. Measured on
+macOS 26.6, in plain C, with no Rust or sandbox involved:
+
+- The parent setting it on the child's pid returns `rc = 0` with `errno = 0`
+  and **silently does nothing**. The readback stays 0. There is no error to
+  detect.
+- The child setting it on *itself* in `pre_exec` succeeds — and `execve`
+  **clears it**. So the `pre_exec` route this design already rejected on other
+  grounds would not have worked either.
+
+`PRIO_DARWIN_BG` therefore cannot reach a spawned HandBrakeCLI by any route
+available to `std::process::Command`. Apple's supported mechanism is
+`posix_spawnattr_setprocesstype_np` with `POSIX_SPAWN_PROC_TYPE_DAEMON_BACKGROUND`,
+which `Command` does not expose; using it means hand-rolling the spawn and
+losing the `Stdio` piping, the `Child` handle that pause and cancel signal, and
+the progress plumbing built on both. Not worth it for one tier on one platform.
+
+macOS `idle` is therefore plain nice 19, and there are no platform special cases
+left in the table. The `posix_spawn` route is filed as
+[#183](https://github.com/rhurling/convertbar/issues/183) — a real improvement
+for macOS users, not a fix for something broken, since `idle` works on every
+platform today. Related correction: `getpriority(PRIO_DARWIN_PROCESS, …)`
+returns `0` or `1`, never `PRIO_DARWIN_BG` — an earlier draft of the test
+asserted the wrong value and would have failed even where the mechanism worked.
 
 **Unix: set from the parent, immediately after spawn** —
 `libc::setpriority(which, child.id(), value)`. Not `pre_exec`. The parent-side
@@ -262,19 +284,8 @@ entirely, so the `PanickingLocator` rule in CLAUDE.md does not apply
 (`converter.rs:2802` documents that the configured-path branch never consults
 it).
 
-The probe must be per-OS, and this is the detail an earlier draft got wrong:
-
-- Linux: `getpriority(PRIO_PROCESS, pid)` → 0 / 10 / 19.
-- macOS: `getpriority(PRIO_PROCESS, pid)` for `normal` and `low`, but
-  `getpriority(PRIO_DARWIN_PROCESS, pid)` for `idle`, which returns
-  `PRIO_DARWIN_BG` and leaves the nice value at 0. A test that reads only the
-  nice value would assert nothing for the one tier whose macOS behavior is the
-  argument for having three tiers.
-
-PR CI's rust matrix is ubuntu-only (macOS runs on `main`), so a Darwin-only
-defect in this test lands after merge. The macOS assertions must therefore be
-written from the documented `PRIO_DARWIN_*` contract rather than by iterating
-against CI.
+One probe covers every Unix tier, now that macOS has no special case:
+`getpriority(PRIO_PROCESS, pid)` → 0 / 10 / 19.
 
 Also:
 
@@ -305,7 +316,8 @@ passes with the feature removed is not a test of the feature.
   to want it.
 - **Prioritizing the probe/scan spawns.** See "Probes are deliberately
   excluded".
-- **I/O priority (`ionice`) as a separate control.** macOS `idle` gets I/O
-  throttling for free via `PRIO_DARWIN_BG`; a separate Linux knob is not
-  justified by any stated need, least of all on the platform where the CPU half
-  already does not work.
+- **I/O priority (`ionice`) as a separate control.** No platform gets I/O
+  throttling from this feature — the macOS route that would have provided it
+  turned out to be unreachable for a spawned process (above). A separate Linux
+  `ionice` knob is not justified by any stated need, least of all on the
+  platform where the CPU half already does not work.

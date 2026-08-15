@@ -44,7 +44,7 @@
 
 ### Task 1: The `EncodePriority` type and platform mechanism
 
-Pure mechanism, isolated from settings and from the converter. It is testable against a child process the test itself spawns, which is what makes the macOS `idle` behavior observable at all.
+Pure mechanism, isolated from settings and from the converter. It is tested against a child process the test spawns directly, so each tier's effect is read back from the kernel rather than inferred.
 
 **Files:**
 - Create: `crates/convertbar-core/src/priority.rs`
@@ -96,10 +96,8 @@ mod tests {
         }
     }
 
-    /// Spawns a real child, applies a tier, and reads the kernel's answer back. A stub that
-    /// reports its own nice value cannot serve here: on macOS `Idle` is a background QoS
-    /// class, not a nice value, so the nice-based probe would assert nothing for exactly the
-    /// tier that justifies having three tiers.
+    /// Spawns a real child, applies a tier, and reads the kernel's answer back — the effect
+    /// is observed from the kernel, not inferred from the call returning Ok.
     #[cfg(unix)]
     fn spawn_sleeper() -> std::process::Child {
         std::process::Command::new("sleep")
@@ -141,27 +139,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     fn idle_sets_nice_nineteen() {
         let mut child = spawn_sleeper();
         apply_to_child(child.id(), EncodePriority::Idle).unwrap();
         assert_eq!(nice_of(child.id()), 19);
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    /// On macOS, `Idle` is `PRIO_DARWIN_BG` on `PRIO_DARWIN_PROCESS`: it puts the process in
-    /// a background QoS class (efficiency cores, throttled disk I/O) and leaves the nice
-    /// value alone. Both halves are asserted, because a regression to plain nice 19 would
-    /// still "work" under a nice-only probe while losing the behavior we chose it for.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn idle_sets_darwin_background_class_and_not_nice() {
-        let mut child = spawn_sleeper();
-        apply_to_child(child.id(), EncodePriority::Idle).unwrap();
-        let bg = unsafe { libc::getpriority(libc::PRIO_DARWIN_PROCESS as _, child.id() as _) };
-        assert_eq!(bg, libc::PRIO_DARWIN_BG, "child must be in the background class");
-        assert_eq!(nice_of(child.id()), 0, "PRIO_DARWIN_BG is not a nice value");
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -242,18 +224,15 @@ pub fn normalize_encode_priority(value: &str) -> EncodePriority {
 /// `Normal` is a no-op by construction, not by writing a zero.
 #[cfg(unix)]
 pub fn apply_to_child(pid: u32, priority: EncodePriority) -> std::io::Result<()> {
-    let (which, value) = match priority {
+    let value = match priority {
         EncodePriority::Normal => return Ok(()),
-        EncodePriority::Low => (libc::PRIO_PROCESS, 10),
-        #[cfg(target_os = "macos")]
-        EncodePriority::Idle => (libc::PRIO_DARWIN_PROCESS, libc::PRIO_DARWIN_BG),
-        #[cfg(not(target_os = "macos"))]
-        EncodePriority::Idle => (libc::PRIO_PROCESS, 19),
+        EncodePriority::Low => 10,
+        EncodePriority::Idle => 19,
     };
 
-    // `as _` on both: `setpriority`'s first parameter is `c_int` on macOS but `c_uint` on
+    // `as _` on each: `setpriority`'s first parameter is `c_int` on macOS but `c_uint` on
     // glibc, and `who` is `id_t`. Inference picks the right one per target.
-    let rc = unsafe { libc::setpriority(which as _, pid as _, value as _) };
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS as _, pid as _, value as _) };
     if rc == -1 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -289,7 +268,7 @@ pub fn creation_flags(priority: EncodePriority) -> u32 {
 Run: `cargo test -p convertbar-core priority:: 2>&1 | tail -20`
 Expected: PASS — 4 tests on Linux, 4 on macOS (different `idle` test selected by `cfg`).
 
-**If `idle_sets_darwin_background_class_and_not_nice` fails with `EPERM`:** `setpriority(PRIO_DARWIN_PROCESS, …)` on a *different* process may be restricted on some macOS versions. This is the one platform behavior in this plan that could not be verified from documentation alone. If it fails, stop and report it — the fallback is mapping macOS `Idle` to nice 19 like Linux, which loses the efficiency-core and I/O-throttling benefit and therefore weakens the case for a third tier. That is a spec-level decision, not an implementation detail to paper over.
+**Why there is no macOS special case:** an earlier revision mapped macOS `Idle` to `PRIO_DARWIN_BG` for background QoS (efficiency cores, throttled disk I/O). Measured on macOS 26.6 in plain C, that is unreachable for a spawned process: the parent setting it on the child's pid returns `rc = 0` with `errno = 0` and silently does nothing, and a child setting it on itself in `pre_exec` has it cleared by `execve`. Do not reintroduce it. Tracked for a future `posix_spawn`-based approach in issue #183.
 
 - [ ] **Step 6: Commit**
 
@@ -571,11 +550,10 @@ fn process_queue_leaves_the_child_at_the_parent_priority_by_default() {
     );
 }
 
-/// The third tier, end to end. Linux-only: on macOS `Idle` is a background QoS class that
-/// leaves the nice value at 0, so this probe cannot see it — that platform's coverage is the
-/// `idle_sets_darwin_background_class_and_not_nice` unit test in Task 1.
+/// The third tier, end to end. Runs on every Unix platform: `Idle` is nice 19 everywhere,
+/// so the same `ps` probe sees it.
 #[test]
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn process_queue_applies_the_idle_tier() {
     let (ctx, _sink, _disposer) = test_ctx(test_conn());
 
@@ -1141,15 +1119,13 @@ cargo fmt --all && git diff --stat
 
 Expected: no changes. If `cargo fmt` rewrote anything, commit it — CI does not gate formatting, but the tree is currently fmt-clean.
 
-- [ ] **Step 3: Confirm the macOS `idle` path actually ran**
-
-On a macOS machine:
+- [ ] **Step 3: Confirm the Unix tiers ran on this machine**
 
 ```bash
-cargo test -p convertbar-core idle_sets_darwin 2>&1 | tail -10
+cargo test -p convertbar-core priority:: 2>&1 | tail -10
 ```
 
-Expected: PASS. PR CI's Rust matrix is ubuntu-only (macOS runs on `main`), so this is the one assertion that will not be checked before merge. If it cannot be run locally, say so explicitly rather than reporting the feature as verified — `PRIO_DARWIN_BG` on another process is the single behavior in this plan that documentation alone could not confirm.
+Expected: PASS, with all three tier tests executed (none `cfg`-excluded on Unix). The Windows `creation_flags` test compiles out here and is exercised only by the Windows CI leg — say so rather than reporting the feature as verified on Windows.
 
 - [ ] **Step 4: Report**
 
@@ -1165,7 +1141,7 @@ State plainly which of the three platforms were actually exercised and which wer
 
 1. *"The desktop head seeds `low` on `Fresh` and leaves an `Existing` database alone."* Task 4 tests `DbInit` but not the seeding, which lives inline in `src-tauri/src/lib.rs`'s `.setup()` closure and is not reachable from a unit test without extracting it to a function. Extracting it for testability is defensible and would be a small addition to Task 4; it is left out because the branch is three lines over an already-tested predicate. **If a reviewer disagrees, this is the cheapest gap to close.**
 2. *"Both heads report `priority_is_group_scoped`."* Only the server head is asserted (Task 5). The desktop's `get_platform_capabilities` returns a `cfg!` constant with no logic to get wrong, and `src-tauri` has no existing test module for the commands.
-3. *A job per tier end to end.* Covered for `low`, `idle` (Linux), and the absent-row default. macOS `idle` is covered only by Task 1's unit test, because the `ps`-based probe cannot observe a background QoS class — the reason Task 1 tests the mechanism against a directly-spawned child in the first place.
+3. *A job per tier end to end.* Covered on Unix for `low`, `idle`, and the absent-row default. Windows has no end-to-end priority test: its mechanism is a spawn flag rather than a call on a live pid, and asserting a priority class would need a Windows-only probe. Task 1's `creation_flags` test covers the mapping; that the flag reaches `Command` is not asserted anywhere.
 
 **Two deliberate deviations from the spec, both noted at the point of use:**
 
