@@ -71,6 +71,7 @@ function makeSettings(): AppSettings {
     bad_source_action: "trash",
     update_mode: "automatic",
     history_show_duration: false,
+    encode_priority: "normal",
   };
 }
 

@@ -56,6 +56,7 @@ pub const ALLOWED_KEYS: &[&str] = &[
     "bad_source_action",
     "update_mode",
     "history_show_duration",
+    "encode_priority",
 ];
 
 /// Coerce a stored `bad_source_action` to a known value. Anything other than an exact
@@ -94,6 +95,21 @@ pub fn read_cleanup_mode(conn: &rusqlite::Connection) -> String {
     normalize_cleanup_mode(&raw).to_string()
 }
 
+/// The stored `encode_priority`, normalized. The single read path, so no call site ever
+/// string-compares a raw column. An absent row reads as `Normal`: core seeds no default for
+/// this key, because the default is head-dependent (fresh desktop installs get `low`, the
+/// server head gets `normal`) and core is head-agnostic.
+pub fn read_encode_priority(conn: &rusqlite::Connection) -> crate::priority::EncodePriority {
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'encode_priority'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    crate::priority::normalize_encode_priority(&raw)
+}
+
 /// Reads every stored setting into a [`Settings`] snapshot, falling back to defaults for keys
 /// that have no row yet. `launch_at_login` is the *stored* value here — on desktop the autostart
 /// plugin is the actual source of truth, and the desktop wrapper overlays that on top.
@@ -125,6 +141,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
     // lives in the shell (`commands::settings::get_settings`), like `launch_at_login`.
     let mut update_mode = String::from("automatic");
     let mut history_show_duration = true;
+    let mut encode_priority = String::from("normal");
 
     let rows = stmt
         .query_map([], |row| {
@@ -158,6 +175,11 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
             }
             "update_mode" => update_mode = value,
             "history_show_duration" => history_show_duration = value == "true",
+            "encode_priority" => {
+                encode_priority = crate::priority::normalize_encode_priority(&value)
+                    .as_str()
+                    .to_string()
+            }
             _ => {}
         }
     }
@@ -182,6 +204,7 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
         bad_source_action,
         update_mode,
         history_show_duration,
+        encode_priority,
     })
 }
 
@@ -625,6 +648,73 @@ mod tests {
         assert_eq!(normalize_cleanup_mode(""), "trash");
         assert_eq!(normalize_cleanup_mode("KEEP"), "trash");
         assert_eq!(normalize_cleanup_mode("nonsense"), "trash");
+    }
+
+    #[test]
+    fn read_encode_priority_defaults_to_normal_when_the_row_is_absent() {
+        let conn = test_conn();
+        // init_db deliberately does NOT seed this key: the default is head-dependent, and core
+        // is head-agnostic. An absent row must therefore be the safe tier, not a panic.
+        assert_eq!(
+            crate::priority::EncodePriority::Normal,
+            read_encode_priority(&conn)
+        );
+    }
+
+    #[test]
+    fn read_encode_priority_normalizes_what_it_reads() {
+        let conn = test_conn();
+        for (stored, expected) in [
+            ("low", crate::priority::EncodePriority::Low),
+            ("idle", crate::priority::EncodePriority::Idle),
+            ("normal", crate::priority::EncodePriority::Normal),
+            ("", crate::priority::EncodePriority::Normal),
+            ("nice-19", crate::priority::EncodePriority::Normal),
+        ] {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('encode_priority', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = ?1",
+                rusqlite::params![stored],
+            )
+            .unwrap();
+            assert_eq!(
+                expected,
+                read_encode_priority(&conn),
+                "stored {:?} must read as {:?}",
+                stored,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn get_settings_returns_a_normalized_encode_priority() {
+        let (ctx, _sink, _d) = test_ctx(test_conn());
+
+        // No row yet — the snapshot the UI renders must still be a value it can render.
+        assert_eq!(get_settings(&ctx).unwrap().encode_priority, "normal");
+
+        update_setting(&ctx, "encode_priority", "idle").unwrap();
+        assert_eq!(get_settings(&ctx).unwrap().encode_priority, "idle");
+
+        // A value written by a newer version must not reach the frontend as-is.
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value = 'ultra-idle' WHERE key = 'encode_priority'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(get_settings(&ctx).unwrap().encode_priority, "normal");
+    }
+
+    #[test]
+    fn encode_priority_is_an_allowed_key() {
+        let (ctx, _sink, _d) = test_ctx(test_conn());
+        // update_setting validates the key against ALLOWED_KEYS and nothing else; a key missing
+        // from that list is rejected outright, which would make the setting unwritable.
+        assert!(update_setting(&ctx, "encode_priority", "low").is_ok());
     }
 
     #[test]

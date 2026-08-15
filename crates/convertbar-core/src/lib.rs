@@ -8,6 +8,7 @@ pub mod events;
 pub mod failure_class;
 pub mod handbrake;
 pub mod media_skip;
+pub mod priority;
 pub mod probe;
 pub mod probe_cache;
 pub mod queue_ops;

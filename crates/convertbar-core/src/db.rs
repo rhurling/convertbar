@@ -75,7 +75,33 @@ fn default_preset() -> &'static str {
     }
 }
 
-pub fn init_db(conn: &Connection) -> Result<()> {
+/// Whether [`init_db`] found an existing database or created one.
+///
+/// A head uses this to seed a default that must apply to new installs only. Deliberately
+/// **not** `#[must_use]`: 74 call sites legitimately discard it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbInit {
+    Fresh,
+    Existing,
+}
+
+pub fn init_db(conn: &Connection) -> Result<DbInit> {
+    // Probed before any CREATE TABLE below, which is what makes the answer meaningful.
+    // Accepted tradeoff: a boot that crashed after CREATE TABLE IF NOT EXISTS settings but
+    // before the defaults INSERT loop below leaves a genuinely fresh install reporting
+    // Existing on the next init_db, landing it at `normal` instead of `low`. Harmless —
+    // read_encode_priority already defaults an absent row to `normal`.
+    let state = if conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'settings'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? == 0
+    {
+        DbInit::Fresh
+    } else {
+        DbInit::Existing
+    };
+
     let preset = default_preset();
 
     conn.execute_batch(
@@ -233,7 +259,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         rusqlite::params![preset, ".{resolution}-{codec}"],
     )?;
 
-    Ok(())
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -321,6 +347,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(suffix, ".{resolution}-{codec}");
+    }
+
+    #[test]
+    fn init_db_reports_fresh_only_the_first_time() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            init_db(&conn).unwrap(),
+            DbInit::Fresh,
+            "a database with no settings table has never been initialized"
+        );
+        assert_eq!(
+            init_db(&conn).unwrap(),
+            DbInit::Existing,
+            "re-running init_db on the same connection must not look like a new install"
+        );
     }
 
     #[test]

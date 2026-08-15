@@ -5,6 +5,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => Promise.resolve(() => {})),
 }));
+vi.mock("@tauri-apps/api/app", () => ({ getVersion: () => Promise.resolve("1.2.3") }));
 vi.mock("../components/UpdatePanel", () => ({ default: () => null }));
 
 import { invoke } from "@tauri-apps/api/core";
@@ -34,9 +35,14 @@ function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings {
     bad_source_action: "trash",
     update_mode: "automatic",
     history_show_duration: true,
+    encode_priority: "normal",
     ...overrides,
   };
 }
+
+// Drives get_platform_capabilities per test. Reset in beforeEach so a test that flips it
+// cannot leak the note into an unrelated assertion.
+let groupScopedFlag = false;
 
 const META: PresetMetadata = {
   codec: "h265",
@@ -71,6 +77,7 @@ afterEach(() => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  groupScopedFlag = false;
   invokeMock.mockImplementation(((cmd: string) => {
     switch (cmd) {
       case "get_settings":
@@ -86,6 +93,11 @@ beforeEach(() => {
       case "update_setting":
       case "set_preset_suffix":
         return Promise.resolve(undefined);
+      case "get_platform_capabilities":
+        return Promise.resolve({
+          can_pause_process: true,
+          priority_is_group_scoped: groupScopedFlag,
+        });
       default:
         return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
     }
@@ -305,8 +317,13 @@ describe("SettingsPage", () => {
     // Until get_settings lands, every draft holds a placeholder ("" for the paths, "0" for the
     // threshold). A commit-on-unmount that fired anyway would persist those over the user's
     // stored values — an unmount during the initial load must write nothing at all.
+    // get_platform_capabilities is the read-only getAppInfo() effect (runs independently of
+    // settings loading), not a write, so it's allowed here alongside get_settings.
     invokeMock.mockImplementation(((cmd: string) => {
       if (cmd === "get_settings") return new Promise(() => {}); // never resolves
+      if (cmd === "get_platform_capabilities") {
+        return Promise.resolve({ can_pause_process: true, priority_is_group_scoped: false });
+      }
       return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
     }) as typeof invoke);
 
@@ -315,7 +332,9 @@ describe("SettingsPage", () => {
 
     unmount();
 
-    expect(invokeMock.mock.calls.map((c) => c[0])).toEqual(["get_settings"]);
+    expect(invokeMock.mock.calls.map((c) => c[0]).sort()).toEqual(
+      ["get_platform_capabilities", "get_settings"].sort(),
+    );
   });
 
   it("switches the bad-source action to permanent deletion", async () => {
@@ -619,5 +638,72 @@ describe("SettingsPage", () => {
     const warning = await screen.findByText(/cannot keep the original/i);
     expect(warning.textContent).not.toMatch(/Trash/);
     expect(warning.textContent).toMatch(/Delete/);
+  });
+
+  it("writes the chosen encode priority", async () => {
+    render(<SettingsPage onHbPathChanged={() => {}} />);
+
+    const idle = await screen.findByLabelText(/run only with cpu nothing else wants/i);
+    fireEvent.click(idle);
+
+    await waitFor(() => expect(updateCallsFor("encode_priority")).toHaveLength(1));
+    expect(
+      (updateCallsFor("encode_priority")[0][1] as { value: string }).value,
+    ).toBe("idle");
+  });
+
+  it("checks only the radio matching the loaded encode priority", async () => {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings({ encode_priority: "low" }));
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "update_setting":
+        case "set_preset_suffix":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage onHbPathChanged={() => {}} />);
+
+    const normal = await screen.findByLabelText(/compete equally with other apps/i);
+    const low = await screen.findByLabelText(/yield to other apps when the cpu is busy/i);
+    const idle = await screen.findByLabelText(/run only with cpu nothing else wants/i);
+
+    expect(low).toBeChecked();
+    expect(normal).not.toBeChecked();
+    expect(idle).not.toBeChecked();
+  });
+
+  it("shows the Linux caveat only when priority is group-scoped", async () => {
+    // The setting is offered on Linux rather than hidden — autogrouping can be disabled, and a
+    // process with no cpu controller on its path does get real host-wide nice — so the note is
+    // what keeps it honest for the users where it does nothing.
+    groupScopedFlag = true;
+    render(<SettingsPage onHbPathChanged={() => {}} />);
+    expect(await screen.findByText(/--cpu-shares/)).toBeInTheDocument();
+  });
+
+  it("shows no caveat where priority works normally", async () => {
+    groupScopedFlag = false;
+    render(<SettingsPage onHbPathChanged={() => {}} />);
+    // Await the control itself so the assertion cannot pass merely because nothing has
+    // rendered yet — the failure mode a bare queryBy would hide.
+    await screen.findByLabelText(/run only with cpu nothing else wants/i);
+    expect(screen.queryByText(/--cpu-shares/)).not.toBeInTheDocument();
   });
 });

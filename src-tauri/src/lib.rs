@@ -23,6 +23,21 @@ fn truncate_tray_title(name: &str) -> String {
     }
 }
 
+/// Seed the desktop-only defaults that must apply to fresh installs and never to existing
+/// ones. Fresh desktop installs start `encode_priority` at `low`: a menu-bar app shares the
+/// machine with the user's actual work. Existing installs are left alone — an auto-update
+/// must not silently change how fast anyone's encodes run. The server head never calls this
+/// and inherits `normal`.
+fn seed_fresh_install_defaults(conn: &Connection, state: db::DbInit) -> rusqlite::Result<()> {
+    if state == db::DbInit::Fresh {
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('encode_priority', 'low')",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -86,7 +101,8 @@ pub fn run() {
         .setup(|app| {
             let db_path = db::get_db_path();
             let conn = Connection::open(&db_path).expect("Failed to open database");
-            db::init_db(&conn).expect("Failed to initialize database");
+            let db_state = db::init_db(&conn).expect("Failed to initialize database");
+            seed_fresh_install_defaults(&conn, db_state).expect("seed encode_priority");
 
             let events: Arc<dyn EventSink> = Arc::new(sink::TauriSink(app.handle().clone()));
             let ctx = Ctx::new(
@@ -413,5 +429,52 @@ mod tests {
         // A 20-char name must NOT be truncated (the old code cut at >20 bytes).
         let exactly_20 = "a".repeat(20);
         assert_eq!(truncate_tray_title(&exactly_20), exactly_20);
+    }
+
+    fn settings_only_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn setting(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .ok()
+    }
+
+    #[test]
+    fn seed_fresh_install_defaults_only_primes_a_fresh_install() {
+        // Fresh install: encode_priority gets seeded to `low`.
+        let fresh = settings_only_conn();
+        seed_fresh_install_defaults(&fresh, db::DbInit::Fresh).unwrap();
+        assert_eq!(setting(&fresh, "encode_priority").as_deref(), Some("low"));
+
+        // Existing install with no encode_priority row: an inverted condition here would
+        // silently re-prime an existing install to `low`, changing how fast its encodes
+        // run after an auto-update — exactly what this function exists to prevent.
+        let existing = settings_only_conn();
+        seed_fresh_install_defaults(&existing, db::DbInit::Existing).unwrap();
+        assert_eq!(setting(&existing, "encode_priority"), None);
+
+        // Existing install that already chose `normal` explicitly: must be left untouched,
+        // not silently overwritten.
+        let existing_with_normal = settings_only_conn();
+        existing_with_normal
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('encode_priority', 'normal')",
+                [],
+            )
+            .unwrap();
+        seed_fresh_install_defaults(&existing_with_normal, db::DbInit::Existing).unwrap();
+        assert_eq!(
+            setting(&existing_with_normal, "encode_priority").as_deref(),
+            Some("normal")
+        );
     }
 }

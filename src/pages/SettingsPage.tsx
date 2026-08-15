@@ -41,6 +41,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   // Desktop's version display now lives inside UpdatePanel (via useUpdate/getUpdateState); this
   // is only rendered on the server head, which has no updater UI of its own.
   const [appVersion, setAppVersion] = useState<string>("");
+  const [groupScoped, setGroupScoped] = useState(false);
 
   // Local drafts so text inputs echo keystrokes instantly and commit once (on blur/Enter),
   // instead of round-tripping an IPC write per character (which dropped/reordered characters).
@@ -51,12 +52,16 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [resolvedSuffix, setResolvedSuffix] = useState("");
 
   // getAppInfo() works on both heads (desktop composes it from getVersion() internally, server
-  // hits /api/info), but only the server head's render path uses the result — desktop's version
-  // display lives inside UpdatePanel instead.
+  // hits /api/info). The version is only rendered on the server head, but the priority caveat is
+  // per-OS and so is needed on both.
   useEffect(() => {
-    if (isServerHead) {
-      commands.getAppInfo().then((info) => setAppVersion(info.version)).catch(() => {});
-    }
+    commands
+      .getAppInfo()
+      .then((info) => {
+        setAppVersion(info.version);
+        setGroupScoped(info.priority_is_group_scoped);
+      })
+      .catch(() => {});
   }, []);
   useEffect(() => {
     if (settings) setHbDraft(settings.handbrake_path);
@@ -304,6 +309,51 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           machine, remove the originals yourself, then switch to Delete once you trust the
           results.
         </p>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label">Encode priority</label>
+        <div className="setting-radios">
+          <label className="radio-label">
+            <input
+              type="radio"
+              name="encode-priority"
+              checked={settings.encode_priority === "normal"}
+              onChange={() => updateSetting("encode_priority", "normal")}
+            />
+            Normal — compete equally with other apps
+          </label>
+          <label className="radio-label">
+            <input
+              type="radio"
+              name="encode-priority"
+              checked={settings.encode_priority === "low"}
+              onChange={() => updateSetting("encode_priority", "low")}
+            />
+            Low — yield to other apps when the CPU is busy
+          </label>
+          <label className="radio-label">
+            <input
+              type="radio"
+              name="encode-priority"
+              checked={settings.encode_priority === "idle"}
+              onChange={() => updateSetting("encode_priority", "idle")}
+            />
+            Idle — run only with CPU nothing else wants
+          </label>
+        </div>
+        <p className="setting-hint">
+          This is not a CPU limit: encodes still use every core nothing else wants. It applies
+          to the next encode, not one already running.
+        </p>
+        {groupScoped && (
+          <p className="setting-hint">
+            On Linux this often has little effect — the kernel confines priority to a process
+            group, so the encode yields to ConvertBar itself rather than to the rest of the
+            machine. To free CPU for other work, use <code>--cpu-shares</code> on the Docker
+            container or <code>CPUWeight=</code> on the systemd unit.
+          </p>
+        )}
       </div>
 
       <div className="setting-group">

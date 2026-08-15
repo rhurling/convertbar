@@ -91,6 +91,7 @@ function makeSettings(badSourceAction: "trash" | "delete"): AppSettings {
     bad_source_action: badSourceAction,
     update_mode: "automatic",
     history_show_duration: true,
+    encode_priority: "normal",
   };
 }
 

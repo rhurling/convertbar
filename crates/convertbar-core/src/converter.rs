@@ -832,6 +832,7 @@ fn process_queue(ctx: &Ctx) {
         let job;
         let handbrake_path_opt;
         let low_disk_min_gb;
+        let encode_priority;
         {
             let db = ctx.db.lock().unwrap();
             job = match get_next_job(&db) {
@@ -840,6 +841,9 @@ fn process_queue(ctx: &Ctx) {
             };
             handbrake_path_opt = get_handbrake_path(&db, &*ctx.handbrake);
             low_disk_min_gb = get_low_disk_min_gb(&db);
+            // Read per job, not once per queue run: "applies to the next encode" is the
+            // documented semantics, and handbrake_path is already re-read the same way.
+            encode_priority = crate::settings_ops::read_encode_priority(&db);
             // The job is flipped to 'encoding' below, AFTER the low-disk gate — a gated job
             // must stay 'queued' so the Resume button can retry it.
             //
@@ -1001,8 +1005,8 @@ fn process_queue(ctx: &Ctx) {
         }
 
         // Spawn HandBrakeCLI
-        let child = Command::new(&handbrake_path)
-            .arg("-Z")
+        let mut cmd = Command::new(&handbrake_path);
+        cmd.arg("-Z")
             .arg(&job.preset)
             .arg("-O")
             .arg("-i")
@@ -1010,8 +1014,13 @@ fn process_queue(ctx: &Ctx) {
             .arg("-o")
             .arg(&encode_target)
             .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn();
+            .stdout(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(crate::priority::creation_flags(encode_priority));
+        }
+        let child = cmd.spawn();
 
         let mut child = match child {
             Ok(c) => c,
@@ -1030,6 +1039,14 @@ fn process_queue(ctx: &Ctx) {
         };
 
         let pid = child.id();
+        // Best-effort by design: EACCES when ConvertBar is itself already niced (setpriority
+        // sets an absolute value, so `low` is then a *raise*, which RLIMIT_NICE forbids), and
+        // ESRCH if HandBrake already died on a bad input. Neither is a reason to fail an
+        // encode that is otherwise fine.
+        #[cfg(unix)]
+        if let Err(e) = crate::priority::apply_to_child(pid, encode_priority) {
+            eprintln!("could not set encode priority for pid {}: {}", pid, e);
+        }
         *ctx.converter.current_pid.lock().unwrap() = Some(pid);
 
         // Read stdout for progress (HandBrakeCLI sends progress to stdout when piped)
@@ -4547,6 +4564,226 @@ HandBrake has exited.";
         assert!(
             !claim_queue_slot(&converter),
             "second claim is refused while running"
+        );
+    }
+    /// A stand-in for HandBrakeCLI that records the nice value it was given, then exits.
+    /// `ps -o nice=` is used rather than /proc so the same script works on macOS and Linux.
+    ///
+    /// The `sleep 0.2` closes a race: the parent sets the priority just *after* spawn, so a stub
+    /// that measured itself immediately would be sampling concurrently with the call it is meant
+    /// to observe. The parent path is a match plus one syscall against the child's execve, so the
+    /// parent wins in practice — but "in practice" is how flaky CI tests are written.
+    #[cfg(unix)]
+    fn nice_recording_fake_handbrake_script(
+        dir: &std::path::Path,
+        record_to: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("hb-nice.sh");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nsleep 0.2\nps -o nice= -p $$ | tr -d ' ' > {}\nexit 0\n",
+                record_to.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// Proves `process_queue` actually reads the setting and applies it to the process it
+    /// spawned — Task 1's unit tests only prove the mechanism works when called directly.
+    ///
+    /// `low` is asserted rather than `idle` because `low` is nice 10 on both Unix platforms,
+    /// while `idle` is a non-nice background class on macOS that this probe cannot see.
+    #[test]
+    #[cfg(unix)]
+    fn process_queue_applies_the_configured_priority_to_the_child() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("nice.txt");
+        let script = nice_recording_fake_handbrake_script(dir.path(), &record);
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "encode_priority", "low");
+
+        let src = real_source(dir.path(), "a.mp4");
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        let recorded = std::fs::read_to_string(&record)
+            .expect("the stub ran and recorded its nice value")
+            .trim()
+            .to_string();
+        assert_eq!(
+            recorded, "10",
+            "the encode must run at the configured priority, not the parent's"
+        );
+    }
+
+    /// The default path must be untouched: a user who never opens Settings gets exactly the
+    /// spawn behavior they had before this feature existed.
+    #[test]
+    #[cfg(unix)]
+    fn process_queue_leaves_the_child_at_the_parent_priority_by_default() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("nice.txt");
+        let script = nice_recording_fake_handbrake_script(dir.path(), &record);
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        // No encode_priority row at all — core seeds none.
+
+        let src = real_source(dir.path(), "a.mp4");
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        let recorded = std::fs::read_to_string(&record).unwrap().trim().to_string();
+        let parent_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS as _, 0) };
+        assert_eq!(
+            recorded,
+            parent_nice.to_string(),
+            "with no setting stored, the child must inherit the parent's priority untouched"
+        );
+    }
+
+    /// The third tier, end to end. Runs on every Unix platform: `Idle` is nice 19 everywhere,
+    /// so the same `ps` probe sees it.
+    #[test]
+    #[cfg(unix)]
+    fn process_queue_applies_the_idle_tier() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("nice.txt");
+        let script = nice_recording_fake_handbrake_script(dir.path(), &record);
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "encode_priority", "idle");
+
+        let src = real_source(dir.path(), "a.mp4");
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        let recorded = std::fs::read_to_string(&record).unwrap().trim().to_string();
+        assert_eq!(recorded, "19");
+    }
+
+    /// Windows counterpart to `nice_recording_fake_handbrake_script`. Instead of `ps -o nice=`,
+    /// the stub shells out to `powershell` to read `(Get-Process -Id $PID).PriorityClass` and
+    /// redirects it to `record_to`.
+    ///
+    /// `$PID` there is PowerShell's *own* automatic variable — it names the `powershell.exe`
+    /// process this `.cmd` launches as a child, not the `.cmd` itself (cmd.exe has no `%PID%`
+    /// equivalent to read instead). See the comment on the test below for why measuring that
+    /// grandchild is still a valid proxy for the priority class `creation_flags` actually set.
+    #[cfg(windows)]
+    fn priority_recording_fake_handbrake_script(
+        dir: &std::path::Path,
+        record_to: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let p = dir.join("hb-priority.cmd");
+        std::fs::write(
+            &p,
+            format!(
+                "@echo off\r\npowershell -NoProfile -Command \"(Get-Process -Id $PID).PriorityClass\" > \"{}\"\r\nexit /b 0\r\n",
+                record_to.display()
+            ),
+        )
+        .unwrap();
+        p
+    }
+
+    /// Proves `process_queue` actually threads `encode_priority` into the Windows spawn path
+    /// (the `#[cfg(windows)] cmd.creation_flags(...)` block in the body above) rather than just
+    /// proving, as `priority::creation_flags`'s own unit test does, that the tier-to-flag
+    /// mapping is correct in isolation. Deleting that block, or passing the wrong flags, leaves
+    /// this the only thing that would go red — everything else in the suite (including the
+    /// mapping test) is silent to it.
+    ///
+    /// What is actually measured is not the stub itself but its PowerShell *grandchild*
+    /// (`priority_recording_fake_handbrake_script`'s `$PID` is PowerShell's own pid, not the
+    /// `.cmd`'s) — the process `creation_flags` sets the priority class of is the `cmd.exe`
+    /// Windows implicitly spawns to run a `.cmd` passed to `CreateProcess`, one level up from
+    /// what gets measured. That is only a valid proxy because of one specific, documented
+    /// `CreateProcess` rule (Scheduling Priorities, under `dwCreationFlags`): a child spawned
+    /// with no priority-class flag of its own defaults to `NORMAL_PRIORITY_CLASS` — *unless*
+    /// the creating process is itself `IDLE_PRIORITY_CLASS` or `BELOW_NORMAL_PRIORITY_CLASS`,
+    /// in which case the child inherits the parent's class instead of defaulting to normal.
+    /// PowerShell is launched with no priority flags, so it inherits `cmd.exe`'s class under
+    /// that exception.
+    ///
+    /// That exception covers exactly the two classes `creation_flags` sets (`BelowNormal` for
+    /// `low`, `Idle` for `idle`), which is why asserting `low` here is sound. It is also a hard
+    /// constraint: the rule does NOT cover `NORMAL_PRIORITY_CLASS`, so this technique cannot be
+    /// reused to assert `normal` — a grandchild of a `Normal`-class `cmd.exe` would report
+    /// `Normal` regardless of what `creation_flags` actually passed, because normal is the
+    /// unconditional default, not an inherited value. If a future change swapped `low`'s mapped
+    /// class for anything other than `BelowNormal`/`Idle`, this test would start failing for a
+    /// reason unrelated to the bug it hunts (grandchild no longer inherits) rather than
+    /// detecting the real regression — worth remembering before "simplifying" the tier mapping.
+    /// `normal` itself stays covered only by `priority::creation_flags`'s direct-call unit test
+    /// and Unix's `normal_leaves_the_child_untouched`, per the same reasoning
+    /// `nice_recording_...`'s sibling tests already apply by testing `low`/`idle` end-to-end.
+    ///
+    /// UNCOMPILED: written on macOS, no Windows target available here. The inheritance rule
+    /// above was confirmed against Microsoft's documented `CreateProcess` behavior (not left as
+    /// an open assumption), but the test itself has not run on Windows. See the mutation-fix
+    /// report for what would verify it.
+    #[test]
+    #[cfg(windows)]
+    fn process_queue_applies_the_configured_priority_class_to_the_child_on_windows() {
+        let (ctx, _sink, _disposer) = test_ctx(test_conn());
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("priority.txt");
+        let script = priority_recording_fake_handbrake_script(dir.path(), &record);
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        set_setting(&ctx.db, "encode_priority", "low");
+
+        let src = real_source(dir.path(), "a.mp4");
+        let out = dir.path().join("out.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        let recorded = std::fs::read_to_string(&record)
+            .expect("the stub ran and recorded its priority class")
+            .trim()
+            .to_string();
+        assert_eq!(
+            recorded, "BelowNormal",
+            "the encode must run at the configured priority class, not the parent's"
         );
     }
 }

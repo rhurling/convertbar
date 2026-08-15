@@ -98,6 +98,9 @@ export interface AppSettings {
   // `normalize_update_mode` before returning it, so only these three ever reach the frontend.
   update_mode: UpdateMode;
   history_show_duration: boolean;
+  // Narrowed like bad_source_action: get_settings normalizes the raw stored string before
+  // returning it, so only these three ever reach the frontend.
+  encode_priority: "normal" | "low" | "idle";
 }
 
 export interface PathsExist {
@@ -144,6 +147,7 @@ export interface HandbrakeStatus {
 
 export interface PlatformCapabilities {
   can_pause_process: boolean;
+  priority_is_group_scoped: boolean;
 }
 
 export interface LowDiskPause {
@@ -211,6 +215,10 @@ export interface AppInfo {
   version: string;
   head: "desktop" | "server";
   can_pause_process: boolean;
+  // True on Linux, where the kernel confines scheduling priority to an autogroup or cgroup —
+  // in a container and out of one — so encode_priority largely cannot yield CPU to the rest
+  // of the host. Runtime data, not a build-time flag: one bundle per head serves every OS.
+  priority_is_group_scoped: boolean;
   auth_required: boolean;
   // Confines the file-browser modal's starting path and up-navigation. Always empty on
   // desktop (no browse roots there); on server it mirrors ServerConfig::browse_roots.

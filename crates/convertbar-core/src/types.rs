@@ -44,6 +44,8 @@ pub struct Settings {
     pub bad_source_action: String,
     pub update_mode: String,
     pub history_show_duration: bool,
+    /// Always normalized on read — `"normal"`, `"low"`, or `"idle"`, never a raw column value.
+    pub encode_priority: String,
 }
 
 /// Existence of a history entry's two paths, checked when its context menu opens.
