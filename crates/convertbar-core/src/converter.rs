@@ -215,6 +215,16 @@ pub struct ConverterState {
     /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
     /// backend state on mount, not just the live `queue-paused-low-disk` event.
     pub(crate) low_disk_pause: Mutex<Option<LowDiskPause>>,
+    /// Whether this queue run has already notified about a hook failure. Lives on the state
+    /// rather than as a `process_queue` local because one fire point is inside
+    /// `record_job_error_quiet`, a free function reached from nine places: threading `&mut`
+    /// state into it would force a signature change at every one, and the obvious shortcut —
+    /// hoisting the fire out to the nine call sites — recreates exactly the drift the
+    /// single-entry-point design prevents. Cleared at the top of every run.
+    pub(crate) hook_failure_notified: Mutex<bool>,
+    /// How many hook dispatches have failed. Task 6's queue-drained fire reads it to tell
+    /// whether ITS dispatch failed and therefore whether the watermark may advance.
+    pub(crate) hook_failure_count: std::sync::atomic::AtomicUsize,
 }
 
 impl ConverterState {
@@ -229,6 +239,8 @@ impl ConverterState {
             shutdown: std::sync::atomic::AtomicBool::new(false),
             installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
+            hook_failure_notified: Mutex::new(false),
+            hook_failure_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -754,6 +766,11 @@ fn record_job_error_quiet(
         "job-status-changed",
         serde_json::json!({ "job_id": job_id, "status": "error" }),
     );
+
+    // The error fire point, and deliberately HERE rather than in the `record_job_error`
+    // wrapper: this is the single choke point for all nine error bookings, and the wrapper
+    // misses the direct call from process_queue's vanished-source gate.
+    crate::hooks::fire_post_convert(ctx, job_id);
 }
 
 /// Record a failed job: everything `record_job_error_quiet` does, plus the per-file
@@ -821,6 +838,9 @@ fn process_queue(ctx: &Ctx) {
     // Every run/resume starts fresh: a stale reason from a prior pause must not linger once
     // the queue is running again (and be gone entirely if this run never hits the gate).
     *ctx.converter.low_disk_pause.lock().unwrap() = None;
+    // Once per run, not once per file: a broken receiver on a 200-file queue must produce one
+    // notification, and the next run must be able to notify again.
+    *ctx.converter.hook_failure_notified.lock().unwrap() = false;
     let mut had_errors = false;
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
@@ -1411,6 +1431,10 @@ fn process_queue(ctx: &Ctx) {
                         "status": status_str,
                     }),
                 );
+
+                // The completion fire point (done/skipped). Outside the db block above — never
+                // hold ctx.db across a hook, which is slower than an emit.
+                crate::hooks::fire_post_convert(ctx, &job.id);
 
                 // Notification logic for successful/skipped jobs
                 {
@@ -4874,5 +4898,584 @@ HandBrake has exited.";
             recorded, "BelowNormal",
             "the encode must run at the configured priority class, not the parent's"
         );
+    }
+    // --- Task 5: per-file hook fire points -------------------------------------------------
+    //
+    // Every test below that names a hook runs a REAL queue against `successful_fake_handbrake_
+    // script` with `handbrake_path` configured, which is what makes an `AbsentLocator` fixture
+    // work: a configured path short-circuits HandBrake discovery.
+
+    /// A hooks fixture wired for a real encode: the fake HandBrake installed as the configured
+    /// path, and a tempdir to keep sources/outputs in.
+    fn hook_encode_fixture(ctx: &Arc<Ctx>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let source = real_source(dir.path(), "movie.mkv");
+        (dir, source)
+    }
+
+    /// The single sent webhook body, parsed. Fails loud when the count is not exactly one, so a
+    /// test can never assert against a body it did not actually cause.
+    fn only_webhook_body(hooks: &crate::hooks::RecordingHookRunner) -> serde_json::Value {
+        let sent = hooks.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 1, "expected exactly one webhook");
+        serde_json::from_str(&sent[0].body).unwrap()
+    }
+
+    #[test]
+    fn done_job_fires_post_convert_once_with_the_result_path() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        // 1000 declared bytes against the fake's few-byte output: the re-encode wins, so the
+        // job books 'done' with kept_file = 'converted'.
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+
+        let body = only_webhook_body(&hooks);
+        assert_eq!(body["event"], "post-convert");
+        assert_eq!(body["status"], "done");
+        assert_eq!(body["result_path"], body["output_path"]);
+        assert_eq!(body["job_id"], "j1");
+    }
+
+    #[test]
+    fn skipped_job_fires_with_result_path_equal_to_the_source() {
+        // Converted came out larger, so the original was kept and the encode discarded.
+        // A receiver told to scan output_path would scan a file that no longer exists.
+        let (ctx, _sink, disposer, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        // 3 declared bytes is smaller than the fake encode's output (5-6 bytes), so the
+        // re-encode loses: status 'skipped', kept_file 'original', output disposed.
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            3,
+        );
+
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "skipped");
+        assert_eq!(
+            disposer.0.lock().unwrap().as_slice(),
+            [out.to_str().unwrap().to_string()],
+            "the losing re-encode really was discarded — result_path must not name it"
+        );
+        assert!(!out.exists());
+
+        let body = only_webhook_body(&hooks);
+        assert_eq!(body["status"], "skipped");
+        assert_eq!(body["result_path"], body["source_path"]);
+        assert_ne!(
+            body["result_path"], body["output_path"],
+            "output_path names a file that was just deleted"
+        );
+    }
+
+    #[test]
+    fn error_job_fires_through_a_real_failure_arm() {
+        // Driven through an actual failing encode, NOT by calling record_job_error_quiet
+        // directly: that is what makes this catch the hook being attached to the
+        // record_job_error wrapper and thereby missing the direct call at the vanished-source
+        // gate, which is the one error booking that bypasses the wrapper.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        // A fake that DOES write its output: if the gate let the spawn through the job would
+        // end 'done', so the assertions below can only pass on the vanished-source arm.
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let gone = dir.path().join("gone.mkv"); // deliberately never created
+        let out = dir.path().join("gone.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            gone.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        let (status, msg) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "error");
+        assert!(
+            msg.unwrap().contains("Source file no longer exists"),
+            "this must be the record_job_error_quiet arm, not a wrapper arm"
+        );
+
+        let body = only_webhook_body(&hooks);
+        assert_eq!(body["status"], "error");
+        assert!(body["result_path"].is_null());
+    }
+
+    #[test]
+    fn no_hook_fires_when_nothing_is_configured() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        // Guards the guard: the conversion really happened, so "nothing sent" is the hook
+        // config being off rather than the queue never running.
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+        assert!(hooks.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_place_keep_deletes_the_row_and_fires_nothing() {
+        // The row is deleted rather than booked, so there is no conversion to report.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        set_setting(&ctx.db, "cleanup_mode", "keep");
+
+        let (_dir, source) = hook_encode_fixture(&ctx);
+        let p = source.to_str().unwrap();
+        // in-place: output_path == source_path, and the job reaches 'encoding' before the
+        // fresh cleanup_mode read sees "keep".
+        queue_job(&ctx.db, "j1", p, p, 10);
+
+        process_queue(&ctx);
+
+        assert!(
+            !job_exists(&ctx.db, "j1"),
+            "the arrangement must actually reach the row-deleting branch"
+        );
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+        assert!(hooks.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failing_hook_does_not_fail_the_job() {
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            job_row(&ctx.db, "j1").0,
+            "done",
+            "a broken receiver is not a failed encode"
+        );
+    }
+
+    #[test]
+    fn hook_failure_notifies_once_per_run_not_once_per_file() {
+        // A broken receiver on a 200-file queue must not produce 200 notifications.
+        // The flag lives on ConverterState, so this also pins that it resets between runs.
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+
+        let queue_three = |run: &str| {
+            for i in 0..3 {
+                let src = real_source(dir.path(), &format!("{run}-{i}.mkv"));
+                let out = dir.path().join(format!("{run}-{i}.mp4"));
+                queue_job(
+                    &ctx.db,
+                    &format!("{run}-{i}"),
+                    src.to_str().unwrap(),
+                    out.to_str().unwrap(),
+                    1000,
+                );
+            }
+        };
+        let hook_notes = || {
+            sink.notifications
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, body)| body.contains("hook"))
+                .count()
+        };
+
+        queue_three("a");
+        process_queue(&ctx);
+
+        assert_eq!(
+            sink.payloads("hook-failed").len(),
+            3,
+            "all three failures must still be surfaced as events — only the toast is deduped"
+        );
+        assert_eq!(
+            hook_notes(),
+            1,
+            "expected exactly one hook-failure notification per run"
+        );
+
+        // Second run: the flag is per-run, so a later run may notify again.
+        queue_three("b");
+        process_queue(&ctx);
+        assert_eq!(
+            hook_notes(),
+            2,
+            "the once-per-run flag must reset at the top of every run, not latch forever"
+        );
+    }
+
+    /// Books a completed job row directly, for the tests below that call
+    /// `fire_post_convert` without running a queue.
+    fn book_done_job(db: &Arc<Mutex<Connection>>, id: &str) {
+        queue_job(db, id, "/media/s.mkv", "/media/o.mkv", 100);
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status='done', kept_file='converted', converted_size=50, \
+                 space_saved=50, completed_at='2026-01-01T00:00:00+00:00' WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn shutdown_skips_the_hook_entirely() {
+        // is_shutting_down is otherwise only checked at the loop head, so a quit would block
+        // the queue thread for up to the timeout and could orphan a command child.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        // The row MUST exist: fire_post_convert returns early when load_job_payload finds
+        // nothing, so without it this test passes even with the shutdown guard deleted.
+        book_done_job(&ctx.db, "j1");
+
+        kill_active_child(&ctx.converter); // this is how the shutdown flag is armed
+        crate::hooks::fire_post_convert(&ctx, "j1");
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_shutdown_arrangement_does_fire_when_not_shutting_down() {
+        // Guards the guard: proves the arrangement above is capable of firing, so a green
+        // shutdown test means the guard worked rather than that nothing happened at all.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_done_job(&ctx.db, "j1");
+        crate::hooks::fire_post_convert(&ctx, "j1");
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_db_lock_is_not_held_while_a_hook_runs() {
+        // The invariant most likely to regress, and the one that has already caused two
+        // shipped deadlocks. A hook is slower than an emit, so the window is wider here.
+        // try_lock, never lock: a real regression must fail this test, not hang it forever.
+        #[derive(Default)]
+        struct LockProbeRunner {
+            db: Mutex<Option<Arc<Mutex<Connection>>>>,
+            was_free: Mutex<bool>,
+        }
+        impl LockProbeRunner {
+            fn probe(&self) -> Result<(), String> {
+                let db = self.db.lock().unwrap().clone().expect("db handle set");
+                let verdict = match db.try_lock() {
+                    Ok(_) => {
+                        *self.was_free.lock().unwrap() = true;
+                        Ok(())
+                    }
+                    Err(_) => Err("ctx.db was held across the hook".into()),
+                };
+                verdict
+            }
+        }
+        impl crate::hooks::HookRunner for LockProbeRunner {
+            fn run_webhook(&self, _r: &crate::hooks::WebhookRequest) -> Result<(), String> {
+                self.probe()
+            }
+            fn run_command(&self, _r: &crate::hooks::CommandRequest) -> Result<(), String> {
+                self.probe()
+            }
+        }
+
+        let probe = Arc::new(LockProbeRunner::default());
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), probe.clone());
+        *probe.db.lock().unwrap() = Some(ctx.db.clone());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_done_job(&ctx.db, "j1");
+
+        crate::hooks::fire_post_convert(&ctx, "j1");
+        assert!(
+            *probe.was_free.lock().unwrap(),
+            "ctx.db must be released before the hook runs"
+        );
+    }
+
+    #[test]
+    fn a_hook_failure_emits_hook_failed() {
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_done_job(&ctx.db, "j1");
+        crate::hooks::fire_post_convert(&ctx, "j1");
+
+        let events = sink.payloads("hook-failed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "post-convert");
+    }
+
+    #[test]
+    fn a_job_cancelled_while_encoding_fires_nothing() {
+        // cancel_conversion books status='error' itself and THEN kills the child, so the
+        // failure arm's `current_status != Some("error")` guard skips record_job_error and
+        // neither fire point is reached. Driven through a real control::cancel_conversion —
+        // a hand-written error row would not exercise that guard.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = slow_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        run_queue(ctx.clone());
+        wait_until("the fake encode to be running", || {
+            job_row(&ctx.db, "j1").0 == "encoding"
+                && ctx.converter.current_child.lock().unwrap().is_some()
+        });
+
+        crate::control::cancel_conversion(&ctx).unwrap();
+        wait_until("the queue thread to exit", || {
+            !*ctx.converter.is_running.lock().unwrap()
+        });
+
+        let (status, msg) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "error");
+        assert_eq!(
+            msg.as_deref(),
+            Some("Cancelled by user"),
+            "the arrangement must be a real cancel, not some other failure"
+        );
+        assert!(
+            hooks.webhooks.lock().unwrap().is_empty(),
+            "a user cancel is not a conversion result: {:?}",
+            hooks.webhooks.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_job_cancelled_while_queued_fires_nothing() {
+        // No encode ever ran, so process_queue never sees the row. `remove_job` is what the
+        // UI's cancel does to a still-queued job.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        for id in ["j1", "j2"] {
+            let src = real_source(dir.path(), &format!("{id}.mkv"));
+            let out = dir.path().join(format!("{id}.mp4"));
+            queue_job(
+                &ctx.db,
+                id,
+                src.to_str().unwrap(),
+                out.to_str().unwrap(),
+                1000,
+            );
+        }
+
+        crate::queue_ops::remove_job(&ctx, "j1").unwrap();
+        process_queue(&ctx);
+
+        // The surviving job DID fire, so "j1 fired nothing" is a real observation rather
+        // than a queue that never ran.
+        let body = only_webhook_body(&hooks);
+        assert_eq!(
+            body["job_id"], "j2",
+            "a job cancelled while queued must never reach a fire point"
+        );
+    }
+
+    #[test]
+    fn command_hook_receives_unmapped_paths_while_the_webhook_is_mapped() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        set_setting(&ctx.db, "post_convert_command", "/bin/true");
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        // The spec's example is `/media => /data`; a test cannot write under /media, so the
+        // rule is anchored at the tempdir the real files actually live in. The behaviour under
+        // test — webhook paths rewritten, command paths raw — is identical.
+        set_setting(
+            &ctx.db,
+            "hook_path_map",
+            &format!("{} => /data", dir.path().to_str().unwrap()),
+        );
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+
+        let webhook_body = only_webhook_body(&hooks);
+        // `/data` not `/data/`: on Windows the untouched remainder keeps its `\` separator.
+        assert!(
+            webhook_body["result_path"]
+                .as_str()
+                .unwrap()
+                .starts_with("/data"),
+            "webhook paths are rewritten: {webhook_body}"
+        );
+
+        let commands = hooks.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        let raw = commands[0]
+            .env
+            .iter()
+            .find(|(k, _)| k == "CONVERTBAR_RESULT_PATH")
+            .unwrap();
+        assert_eq!(
+            raw.1,
+            out.to_str().unwrap(),
+            "commands get raw paths; scripts rewrite them"
+        );
+    }
+
+    #[test]
+    fn server_policy_ignores_a_stored_command_row() {
+        // A convertbar.db copied from a desktop install must not make the container execute
+        // the desktop user's command.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks_with_policy(test_conn(), false);
+        // post_convert_command is deliberately absent from settings_ops::ALLOWED_KEYS, so it
+        // can only get into the DB the way a copied database would: written directly.
+        set_setting(&ctx.db, "post_convert_command", "/bin/true");
+        // The webhook stays allowed, so a green result means the COMMAND was refused rather
+        // than the whole hook config reading as off.
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            hooks.webhooks.lock().unwrap().len(),
+            1,
+            "the webhook still fires"
+        );
+        assert!(hooks.commands.lock().unwrap().is_empty());
     }
 }

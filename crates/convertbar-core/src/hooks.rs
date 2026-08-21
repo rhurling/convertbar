@@ -3,6 +3,9 @@
 
 use serde_json::{json, Value};
 
+// emit_t lives on the EventSinkExt extension trait, not on EventSink itself.
+use crate::events::EventSinkExt;
+
 /// One finished job, exactly as booked in the `jobs` table plus three derived fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobPayload {
@@ -497,6 +500,287 @@ impl HookRunner for FailingHookRunner {
 pub struct HookSetup {
     pub runner: std::sync::Arc<dyn HookRunner>,
     pub allow_stored_command: bool,
+}
+
+// --- The fire path: configuration, dispatch, and failure surfacing ---
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Trigger {
+    PostConvert,
+    QueueDrained,
+}
+
+impl Trigger {
+    fn event_name(self) -> &'static str {
+        match self {
+            Trigger::PostConvert => "post-convert",
+            Trigger::QueueDrained => "queue-drained",
+        }
+    }
+    fn url_key(self) -> &'static str {
+        match self {
+            Trigger::PostConvert => "post_convert_webhook_url",
+            Trigger::QueueDrained => "queue_drained_webhook_url",
+        }
+    }
+    fn headers_key(self) -> &'static str {
+        match self {
+            Trigger::PostConvert => "post_convert_webhook_headers",
+            Trigger::QueueDrained => "queue_drained_webhook_headers",
+        }
+    }
+    fn body_key(self) -> &'static str {
+        match self {
+            Trigger::PostConvert => "post_convert_webhook_body",
+            Trigger::QueueDrained => "queue_drained_webhook_body",
+        }
+    }
+    fn command_key(self) -> &'static str {
+        match self {
+            Trigger::PostConvert => "post_convert_command",
+            Trigger::QueueDrained => "queue_drained_command",
+        }
+    }
+    fn command_env_var(self) -> &'static str {
+        match self {
+            Trigger::PostConvert => "CONVERTBAR_POST_CONVERT_COMMAND",
+            Trigger::QueueDrained => "CONVERTBAR_QUEUE_DRAINED_COMMAND",
+        }
+    }
+}
+
+pub struct HookConfig {
+    pub url: String,
+    pub headers: String,
+    pub body: String,
+    pub command: String,
+    pub path_map: PathMap,
+    pub timeout: Duration,
+}
+
+impl HookConfig {
+    pub fn is_off(&self) -> bool {
+        self.url.trim().is_empty() && self.command.trim().is_empty()
+    }
+}
+
+fn setting(db: &rusqlite::Connection, key: &str) -> String {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        rusqlite::params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .unwrap_or_default()
+}
+
+/// Reads a trigger's configuration. CALLER MUST HOLD `ctx.db` and drop the guard before
+/// dispatching — never hold it across a hook (CLAUDE.md, "Emitting Events Under the DB Lock").
+pub fn read_hook_config(
+    db: &rusqlite::Connection,
+    trigger: Trigger,
+    allow_stored_command: bool,
+) -> HookConfig {
+    // Environment wins. The stored row is consulted only where the head allows it.
+    let command = std::env::var(trigger.command_env_var())
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| {
+            if allow_stored_command {
+                setting(db, trigger.command_key())
+            } else {
+                String::new()
+            }
+        });
+
+    HookConfig {
+        url: setting(db, trigger.url_key()),
+        headers: setting(db, trigger.headers_key()),
+        body: setting(db, trigger.body_key()),
+        command,
+        path_map: PathMap::parse(&setting(db, "hook_path_map")),
+        timeout: Duration::from_secs(parse_timeout_seconds(&setting(db, "hook_timeout_seconds"))),
+    }
+}
+
+/// Runs a trigger's configured hooks. MUST be called with no `ctx.db` guard held.
+pub fn dispatch(ctx: &crate::ctx::Ctx, trigger: Trigger, cfg: &HookConfig, payload: Value) {
+    if cfg.is_off() {
+        return;
+    }
+    // Checked here, not only at the queue loop head: a quit during a hook would otherwise
+    // block the queue thread for up to the timeout and could orphan a command child.
+    if ctx.converter.is_shutting_down() {
+        return;
+    }
+
+    if !cfg.url.trim().is_empty() {
+        // Path mapping is a webhook concern only — a script rewrites paths itself.
+        let mut mapped = payload.clone();
+        map_payload_paths(&mut mapped, &cfg.path_map);
+        let result = parse_headers(&cfg.headers).and_then(|headers| {
+            let body = if cfg.body.trim().is_empty() {
+                mapped.to_string()
+            } else {
+                render_body(&cfg.body, &mapped)
+            };
+            ctx.hooks.runner.run_webhook(&WebhookRequest {
+                url: cfg.url.trim().to_string(),
+                headers,
+                body,
+                timeout: cfg.timeout,
+            })
+        });
+        if let Err(e) = result {
+            report_failure(ctx, trigger, &format!("webhook: {e}"));
+        }
+    }
+
+    if !cfg.command.trim().is_empty() {
+        let result = ctx.hooks.runner.run_command(&CommandRequest {
+            command: cfg.command.trim().to_string(),
+            env: command_env(&payload), // raw, unmapped
+            timeout: cfg.timeout,
+        });
+        if let Err(e) = result {
+            report_failure(ctx, trigger, &format!("command: {e}"));
+        }
+    }
+}
+
+/// A hook failure never changes a job's status — the encode succeeded. It always logs and
+/// emits; it notifies only once per queue run, because a broken receiver on a 200-file queue
+/// would otherwise produce 200 notifications.
+fn report_failure(ctx: &crate::ctx::Ctx, trigger: Trigger, reason: &str) {
+    let event = trigger.event_name();
+    eprintln!("convertbar: {event} hook failed — {reason}");
+    ctx.events
+        .emit_t("hook-failed", json!({ "event": event, "reason": reason }));
+
+    // Counted so Task 6's queue-drained fire can tell whether ITS dispatch failed and
+    // therefore whether the watermark may advance.
+    ctx.converter
+        .hook_failure_count
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let already = {
+        let mut flag = ctx.converter.hook_failure_notified.lock().unwrap();
+        std::mem::replace(&mut *flag, true)
+    };
+    if !already {
+        ctx.events
+            .notify("ConvertBar", &format!("{event} hook failed — {reason}"));
+    }
+}
+
+/// Builds a payload from a job row. Returns None when the row is gone (the in-place + keep
+/// case deletes it), which is exactly when there is nothing to report.
+pub fn load_job_payload(db: &rusqlite::Connection, job_id: &str) -> Option<JobPayload> {
+    db.query_row(
+        "SELECT id, status, source_path, output_path, preset, kept_file, original_size, \
+         converted_size, space_saved, error_message, failure_class, started_at, completed_at \
+         FROM jobs WHERE id = ?1",
+        rusqlite::params![job_id],
+        |r| {
+            Ok(row_to_payload(
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+            ))
+        },
+    )
+    .ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn row_to_payload(
+    job_id: String,
+    status: String,
+    source_path: String,
+    output_path: String,
+    preset: String,
+    kept_file: Option<String>,
+    original_size: Option<i64>,
+    converted_size: Option<i64>,
+    space_saved: Option<i64>,
+    error_message: Option<String>,
+    failure_class: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+) -> JobPayload {
+    // The file that EXISTS now. "original" covers the skipped case and the cleanup-failure
+    // case, where the converted file was discarded. Never blindly output_path.
+    let result_path = match kept_file.as_deref() {
+        Some("converted") => Some(output_path.clone()),
+        Some("original") => Some(source_path.clone()),
+        _ => None,
+    };
+    let output_dir = result_path.as_ref().and_then(|p| {
+        std::path::Path::new(p)
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+    });
+    let duration_seconds = match (&started_at, &completed_at) {
+        (Some(s), Some(c)) => {
+            let s = chrono::DateTime::parse_from_rfc3339(s).ok();
+            let c = chrono::DateTime::parse_from_rfc3339(c).ok();
+            match (s, c) {
+                (Some(s), Some(c)) => Some((c - s).num_seconds()),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    JobPayload {
+        job_id,
+        status,
+        source_path: source_path.clone(),
+        output_path: output_path.clone(),
+        result_path,
+        output_dir,
+        in_place: crate::converter::is_in_place(&source_path, &output_path),
+        preset,
+        kept_file,
+        original_size,
+        converted_size,
+        space_saved,
+        duration_seconds,
+        error_message,
+        failure_class,
+        started_at,
+        completed_at,
+    }
+}
+
+/// The single per-file entry point, called from BOTH fire points so neither builds a payload
+/// and the two cannot drift.
+pub fn fire_post_convert(ctx: &crate::ctx::Ctx, job_id: &str) {
+    let (cfg, job) = {
+        let db = match ctx.db.lock() {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let cfg = read_hook_config(&db, Trigger::PostConvert, ctx.hooks.allow_stored_command);
+        if cfg.is_off() {
+            return;
+        }
+        let job = load_job_payload(&db, job_id);
+        (cfg, job)
+    }; // guard dropped BEFORE dispatch — a hook is slower than an emit, so the deadlock
+       // window documented in CLAUDE.md is wider here, not narrower.
+
+    let Some(job) = job else { return };
+    dispatch(ctx, Trigger::PostConvert, &cfg, post_convert_payload(&job));
 }
 
 #[cfg(test)]
