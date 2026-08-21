@@ -895,31 +895,33 @@ fn process_queue(ctx: &Ctx) {
     // guard is disarmed — see there for why that release cannot be a plain drop.
     let mut running = RunningGuard::new(&ctx.converter);
 
-    loop {
+    'passes: loop {
         if process_queue_pass(ctx) != PassOutcome::Drained {
             return;
         }
-        if work_arrived_while_busy(ctx) {
+        // Settle "is there more work?" and release the slot only when the answer is still no at
+        // the instant of the release. `work_arrived_while_busy` is the SINGLE decision point:
+        // every loop-back goes through it, so no branch can loop on the flag alone.
+        loop {
+            if work_arrived_while_busy(ctx) {
+                eprintln!(
+                    "convertbar: work was queued while the queue was busy — running another \
+                     pass instead of leaving it stranded"
+                );
+                continue 'passes;
+            }
+            if release_queue_slot_unless_work_arrived(&ctx.converter) {
+                running.disarm();
+                return;
+            }
+            // A start was refused in the release instant. The slot is still ours and the flag is
+            // still set, so this loop's head consumes it and lets the DB decide — another pass
+            // if there is really something queued, another release attempt if there is not.
             eprintln!(
-                "convertbar: work was queued while the queue was busy — running another pass \
-                 instead of leaving it stranded"
+                "convertbar: a queue start was refused as this run was releasing its slot — \
+                 re-checking rather than stranding whatever it was for"
             );
-            continue;
         }
-        // Nothing recorded, or nothing left in the DB. Release the slot atomically against
-        // `claim_queue_slot` so a refusal landing in this instant cannot be lost between the
-        // check above and the release.
-        if release_queue_slot_unless_work_arrived(&ctx.converter) {
-            running.disarm();
-            return;
-        }
-        // A start was refused in that instant. We still hold the slot, so the refusal is ours to
-        // honour: loop, and let the next pass be authoritative about whether there is work. At
-        // worst that is one no-op pass — the flag was consumed, so it cannot repeat.
-        eprintln!(
-            "convertbar: a queue start was refused as this run was releasing its slot — running \
-             another pass rather than stranding whatever it was for"
-        );
     }
 }
 
@@ -1712,9 +1714,13 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
 }
 
 /// Atomically claims the right to run the queue. Returns false when the queue is already
-/// running or an update install holds the interlock. Poison-tolerant: if a prior queue thread
+/// running or an update install holds the interlock.
+///
+/// `#[must_use]`: a discarded `true` is a CLAIMED, leaked slot — `is_running` stays set with no
+/// queue thread behind it and every future start is refused for the life of the process. Poison-tolerant: if a prior queue thread
 /// panicked while briefly holding this lock, recover the flag rather than propagating the
 /// poison and permanently wedging starts.
+#[must_use]
 pub fn claim_queue_slot(converter: &ConverterState) -> bool {
     let mut running = converter
         .is_running
@@ -1750,15 +1756,30 @@ pub fn claim_queue_slot(converter: &ConverterState) -> bool {
 ///
 /// Returns true when the slot was released (the caller must stop and MUST disarm its
 /// `RunningGuard`), false when a refusal was seen, in which case `is_running` stays claimed and
-/// the caller keeps going. Takes no other lock — in particular not `ctx.db` — so it adds no lock
-/// ordering edge to the one CLAUDE.md warns about.
+/// the caller decides again. Takes no other lock — in particular not `ctx.db` — so it adds no
+/// lock ordering edge to the one CLAUDE.md warns about.
+///
+/// A blocked release READS the flag and deliberately leaves it SET, rather than consuming it.
+/// Consuming here would force the caller to loop on the flag alone — the one thing
+/// `work_arrived_while_busy` exists to forbid — and an empty pass is not free: it re-enters
+/// `fire_queue_drained`, which re-dispatches a pinned mechanism's whole backlog at up to 300s a
+/// batch. A hook whose side effect starts the queue would then refuse itself into a livelock.
+/// Left set, the refusal is settled by the caller's ordinary DB-backed check.
+///
+/// The plain `load` is as atomic as a swap here: `claim_queue_slot` sets the flag while holding
+/// this same mutex, so a refusal either happened before we took the lock (we see the flag) or
+/// happens after we drop it (by which point `is_running` is false, so it is not a refusal at all
+/// — the claim succeeds and starts a fresh queue thread).
 fn release_queue_slot_unless_work_arrived(converter: &ConverterState) -> bool {
     let mut running = converter
         .is_running
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if converter.take_work_arrived_while_busy() {
-        return false; // keep the slot; the caller runs another pass
+    if converter
+        .work_arrived_while_busy
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return false; // keep the slot; the caller settles the refusal against the DB
     }
     *running = false;
     true
@@ -1780,8 +1801,11 @@ pub fn run_queue(ctx: Arc<Ctx>) {
 /// refusal means.
 ///
 /// The caller must hold the slot: `process_queue`'s `RunningGuard` releases it, so calling this
-/// without a claim clears an `is_running` that belongs to somebody else.
-pub fn spawn_queue_thread(ctx: Arc<Ctx>) {
+/// without a claim clears an `is_running` that belongs to somebody else. `pub(crate)` for exactly
+/// that reason — the obligation stays inside this crate, where `control` is the only other
+/// caller, instead of being exported to the heads, where a well-meaning "just start the queue"
+/// call would silently run two queue threads.
+pub(crate) fn spawn_queue_thread(ctx: Arc<Ctx>) {
     std::thread::spawn(move || {
         process_queue(&ctx);
     });
@@ -6489,6 +6513,41 @@ HandBrake has exited.";
     }
 
     #[test]
+    fn an_outstanding_refusal_with_an_empty_queue_does_not_produce_another_pass() {
+        // The DB, never the flag, decides — and this is the case where it matters most. A
+        // blocked release leaves the refusal set and hands it to this same check, so the
+        // false-release arm is not an exception to the rule: with nothing queued it buys another
+        // release attempt, not another pass. An empty pass is not free — it re-enters
+        // `fire_queue_drained`, which re-dispatches a pinned mechanism's whole backlog at up to
+        // 300s a batch — so a hook whose side effect starts the queue could otherwise refuse
+        // itself into a livelock, each refusal buying a pass that produces the next refusal.
+        //
+        // An empty queue never reaches HandBrake resolution, hence the PanickingLocator fixture:
+        // one `menu-bar-update` is emitted per pass, which makes the emit count the pass count.
+        let (ctx, sink, _disp) = test_ctx(test_conn());
+        *ctx.converter.is_running.lock().unwrap() = true;
+        ctx.converter
+            .work_arrived_while_busy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            sink.payloads("menu-bar-update").len(),
+            1,
+            "exactly one pass: the refusal referred to no queued job"
+        );
+        assert!(
+            !ctx.converter.take_work_arrived_while_busy(),
+            "and the refusal was consumed, not left to trigger a later run"
+        );
+        assert!(
+            !*ctx.converter.is_running.lock().unwrap(),
+            "the slot is released"
+        );
+    }
+
+    #[test]
     fn releasing_the_slot_honours_a_refusal_that_lands_in_the_same_instant() {
         // The consume/release race. Reading the flag and then letting `RunningGuard` drop are
         // two steps, and a refusal landing between them sets a flag nobody will read for this
@@ -6507,10 +6566,19 @@ HandBrake has exited.";
             *converter.is_running.lock().unwrap(),
             "and the slot must stay claimed, so no second queue thread can start underneath"
         );
+        assert!(
+            converter
+                .work_arrived_while_busy
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a blocked release must LEAVE the refusal for the DB-backed decision point — \
+             consuming it here is what would force a branch that loops on the flag alone"
+        );
 
+        // Which is what the caller then does: consume it, decide against the DB, come back.
+        assert!(converter.take_work_arrived_while_busy());
         assert!(
             release_queue_slot_unless_work_arrived(&converter),
-            "with the refusal consumed, the release goes through"
+            "with the refusal settled, the release goes through"
         );
         assert!(!*converter.is_running.lock().unwrap());
     }

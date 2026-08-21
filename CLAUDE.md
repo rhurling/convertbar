@@ -139,13 +139,17 @@ change is most likely to break:
   `control::start_queue` (the path both heads use after an add) claims through it too, rather
   than short-circuiting on its own `is_running` read, which is how that path stayed broken after
   the watcher path was fixed. `process_queue` runs another pass when `work_arrived_while_busy`
-  was set *and* the DB really holds a `queued` job; the flag alone must never drive the loop (a
-  refusal can race a `clear_queue`), and only a `PassOutcome::Drained` may be followed by another
-  pass, since `get_next_job` does not consult `queue_paused`. The update interlock's refusal must
-  not set the flag. The final release goes through `release_queue_slot_unless_work_arrived`, which
-  consumes the flag and clears `is_running` in ONE critical section — a plain read followed by
-  `RunningGuard`'s drop loses any refusal landing between the two — and the guard is disarmed
-  afterwards so its drop cannot free a slot another run has since claimed.
+  was set *and* the DB really holds a `queued` job; **no branch may loop on the flag alone** (a
+  refusal can race a `clear_queue`, and an empty pass re-enters `fire_queue_drained`, which
+  re-dispatches a pinned mechanism's whole backlog at up to 300s a batch — a hook whose side
+  effect starts the queue would livelock). Only a `PassOutcome::Drained` may be followed by
+  another pass, since `get_next_job` does not consult `queue_paused`. The update interlock's
+  refusal must not set the flag. The final release goes through
+  `release_queue_slot_unless_work_arrived`, which reads the flag and clears `is_running` in ONE
+  critical section — a read followed by `RunningGuard`'s drop loses any refusal landing between
+  the two — and deliberately LEAVES the flag set when it refuses to release, so that refusal is
+  settled by the same DB-backed check as every other. The guard is disarmed after a successful
+  release so its drop cannot free a slot another run has since claimed.
 
 ## Cross-Platform
 

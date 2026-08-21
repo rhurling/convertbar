@@ -1140,14 +1140,17 @@ mod tests {
         assert_eq!(super::batch_label(&[]), "", "empty batch → empty label");
     }
 
-    // ---- enqueue_and_start's installing bail: sibling of control::start_queue's ----
+    // ---- enqueue_and_start's installing bail ----
 
     #[test]
     fn enqueue_and_start_leaves_the_persisted_pause_alone_while_an_update_installs() {
-        // Mirrors control::start_queue's own installing bail and its pinning test
-        // (start_queue_leaves_the_persisted_pause_alone_while_an_update_installs): an update
-        // install holds the queue interlock, so clearing the remembered pause here anyway would
-        // leave the queue neither running nor paused once `run_queue`'s own claim refuses it.
+        // Same hazard `start_queue_leaves_the_persisted_pause_alone_while_an_update_installs`
+        // pins, reached differently: an update install holds the queue interlock, so clearing the
+        // remembered pause here anyway would leave the queue neither running nor paused once
+        // `run_queue`'s own claim refuses it. `control::start_queue` no longer needs an
+        // installing bail of its own — it claims BEFORE it touches the pause, so the interlock
+        // refusal arrives before there is anything to undo. This path still clears the pause
+        // first, so it keeps the explicit check.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
         conn.execute(
