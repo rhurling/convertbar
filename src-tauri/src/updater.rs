@@ -1869,6 +1869,10 @@ mod tests {
             std::sync::Arc::new(convertbar_core::events::TestSink::default()),
             std::sync::Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
             std::sync::Arc::new(convertbar_core::handbrake::PanickingLocator),
+            convertbar_core::hooks::HookSetup {
+                runner: std::sync::Arc::new(convertbar_core::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         ));
         app.manage(std::sync::Arc::new(UpdaterRuntime::default()));
         app

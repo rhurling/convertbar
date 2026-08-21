@@ -284,6 +284,10 @@ pub(crate) mod tests {
             Arc::new(TestSink::default()),
             Arc::new(RecordingDisposer::default()),
             locator,
+            convertbar_core::hooks::HookSetup {
+                runner: Arc::new(convertbar_core::hooks::RecordingHookRunner::default()),
+                allow_stored_command: false,
+            },
         );
         let (events_tx, _rx) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

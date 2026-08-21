@@ -1662,7 +1662,16 @@ mod tests {
     ) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
         let sink = Arc::new(TestSink::default());
         let disposer = Arc::new(RecordingDisposer::default());
-        let ctx = Ctx::new(conn, sink.clone(), disposer.clone(), locator);
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer.clone(),
+            locator,
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
+        );
         (ctx, sink, disposer)
     }
 
@@ -1678,8 +1687,88 @@ mod tests {
             sink.clone(),
             disposer,
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         (ctx, sink)
+    }
+
+    /// Like `test_ctx`, but also hands back the recording hook runner so a test can assert on
+    /// what was sent. Use this for any test that configures a hook.
+    #[allow(dead_code)]
+    fn test_ctx_hooks(
+        conn: Connection,
+    ) -> (
+        Arc<Ctx>,
+        Arc<TestSink>,
+        Arc<RecordingDisposer>,
+        Arc<crate::hooks::RecordingHookRunner>,
+    ) {
+        test_ctx_hooks_with_policy(conn, true)
+    }
+
+    /// `allow_stored_command` false reproduces the server head's policy, where the
+    /// post_convert_command settings ROW must be ignored entirely.
+    #[allow(dead_code)]
+    fn test_ctx_hooks_with_policy(
+        conn: Connection,
+        allow_stored_command: bool,
+    ) -> (
+        Arc<Ctx>,
+        Arc<TestSink>,
+        Arc<RecordingDisposer>,
+        Arc<crate::hooks::RecordingHookRunner>,
+    ) {
+        let sink = Arc::new(TestSink::default());
+        let disposer = Arc::new(RecordingDisposer::default());
+        let runner = Arc::new(crate::hooks::RecordingHookRunner::default());
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer.clone(),
+            Arc::new(crate::handbrake::AbsentLocator),
+            crate::hooks::HookSetup {
+                runner: runner.clone(),
+                allow_stored_command,
+            },
+        );
+        (ctx, sink, disposer, runner)
+    }
+
+    /// For tests that need a FailingHookRunner or a bespoke probe instead of the recorder.
+    #[allow(dead_code)]
+    fn test_ctx_with_hook_runner(
+        conn: Connection,
+        runner: Arc<dyn crate::hooks::HookRunner>,
+    ) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
+        let sink = Arc::new(TestSink::default());
+        let disposer = Arc::new(RecordingDisposer::default());
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer.clone(),
+            Arc::new(crate::handbrake::AbsentLocator),
+            crate::hooks::HookSetup {
+                runner,
+                allow_stored_command: true,
+            },
+        );
+        (ctx, sink, disposer)
+    }
+
+    /// Reads a settings row back — Task 6 asserts on the watermark with this.
+    #[allow(dead_code)]
+    fn setting_value(db: &Arc<Mutex<Connection>>, key: &str) -> String {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_default()
     }
 
     fn saved_of(db: &Arc<Mutex<Connection>>, id: &str) -> Option<i64> {

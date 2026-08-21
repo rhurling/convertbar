@@ -1169,6 +1169,10 @@ mod tests {
             Arc::new(crate::handbrake::StubLocator(
                 "/opt/fake/HandBrakeCLI".into(),
             )),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         crate::handbrake::seed_preset_cache(&ctx);
         // Cover the fake path with a watch so it survives `filter_watched`; nothing else needs

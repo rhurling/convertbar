@@ -1562,7 +1562,16 @@ mod tests {
     ) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
         let sink = Arc::new(TestSink::default());
         let disposer = Arc::new(RecordingDisposer::default());
-        let ctx = Ctx::new(conn, sink.clone(), disposer.clone(), locator);
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer.clone(),
+            locator,
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
+        );
         (ctx, sink, disposer)
     }
 

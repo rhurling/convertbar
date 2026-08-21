@@ -241,6 +241,10 @@ mod tests {
             sink.clone(),
             Arc::new(RecordingDisposer::default()),
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         (ctx, sink)
     }

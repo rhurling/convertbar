@@ -70,6 +70,10 @@ mod tests {
             Arc::new(convertbar_core::events::TestSink::default()),
             Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
             Arc::new(convertbar_core::handbrake::PanickingLocator),
+            convertbar_core::hooks::HookSetup {
+                runner: Arc::new(convertbar_core::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         ));
         let runtime = Arc::new(UpdaterRuntime::default());
         *runtime.pending.lock().unwrap() = Some(PendingInstall {
@@ -131,6 +135,10 @@ mod tests {
             Arc::new(convertbar_core::events::TestSink::default()),
             Arc::new(convertbar_core::dispose::RecordingDisposer::default()),
             Arc::new(convertbar_core::handbrake::PanickingLocator),
+            convertbar_core::hooks::HookSetup {
+                runner: Arc::new(convertbar_core::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         let converter = ctx.converter.clone();
         let child = long_running_child();

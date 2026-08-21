@@ -486,6 +486,19 @@ impl HookRunner for FailingHookRunner {
 // behaviour is covered by `http_runner_kills_a_command_that_outruns_the_timeout` above,
 // against a real child process.
 
+/// How a head wires up hooks. `allow_stored_command` is the head's policy on whether the
+/// `post_convert_command` / `queue_drained_command` settings ROWS are an accepted source.
+///
+/// The server head sets this false and reads the command from the environment only. "Env
+/// first, then fall back to the row" applied uniformly would be a live hazard: a
+/// convertbar.db copied or migrated from a desktop install carries a command row, and the
+/// container would execute it. Copying a live database into a head has already caused one
+/// incident in this project.
+pub struct HookSetup {
+    pub runner: std::sync::Arc<dyn HookRunner>,
+    pub allow_stored_command: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

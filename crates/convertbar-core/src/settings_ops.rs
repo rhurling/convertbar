@@ -304,6 +304,10 @@ mod tests {
             sink.clone(),
             disposer.clone(),
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         (ctx, sink, disposer)
     }

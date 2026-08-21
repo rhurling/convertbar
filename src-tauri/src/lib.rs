@@ -110,6 +110,10 @@ pub fn run() {
                 events,
                 Arc::new(sink::TrashDisposer),
                 Arc::new(convertbar_core::handbrake::PathLocator),
+                convertbar_core::hooks::HookSetup {
+                    runner: Arc::new(convertbar_core::hooks::HttpHookRunner),
+                    allow_stored_command: true,
+                },
             );
             app.manage(ctx.clone());
 

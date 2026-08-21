@@ -401,6 +401,10 @@ mod tests {
             Arc::new(crate::events::TestSink::default()),
             Arc::new(crate::dispose::DeleteDisposer),
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         )
     }
 
@@ -630,6 +634,10 @@ mod tests {
             sink.clone(),
             Arc::new(crate::dispose::DeleteDisposer),
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         sink.db.set(ctx.db.clone()).unwrap();
 
