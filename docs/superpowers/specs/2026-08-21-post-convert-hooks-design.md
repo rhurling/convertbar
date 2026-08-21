@@ -184,13 +184,18 @@ This is the correct outcome and is left as-is: a cancellation is a user action, 
 result, and a receiver asked to rescan a file the user just abandoned is being told a lie. Do not
 "fix" this by adding a third fire point inside the already-error branch.
 
-One consequence must be handled rather than inherited: `had_errors = true` is set at
-`converter.rs:1493` *before* that guard, so a cancelled job makes
-`converter::final_run_status` report `"error"` while contributing no row to the `queue-drained`
-job set. `run_status` in the payload is therefore derived from the payload's **own** job set
-(`errors > 0`), not from `had_errors`, so `{"run_status": "error", "errors": 0}` is unrepresentable.
-This can differ from the tray's status after a cancel; that is intended, and the tray is not a
-hook consumer.
+A cancelled job **does** still appear in the next `queue-drained` payload, as an `error` row.
+That is not an inconsistency with the above: `queue-drained` reports what History records since
+the watermark, and History records the cancellation. The per-file hook is a live notification
+about a conversion that happened; the drain payload is a ledger of what the queue did. A
+cancelled job belongs in the ledger and not in the live notification.
+
+One consequence must still be handled rather than inherited: `had_errors = true` is set at
+`converter.rs:1493` *before* that guard, and the low-disk and shutdown paths can set it for a run
+whose rows fall outside the reported window. `run_status` in the payload is therefore derived
+from the payload's **own** job set (`errors > 0`), never from `had_errors`, so
+`{"run_status": "error", "errors": 0}` is unrepresentable. This can differ from the tray's
+status; that is intended, and the tray is not a hook consumer.
 
 ### `queue-drained`
 
@@ -209,10 +214,10 @@ hook consumer.
 `run_status` is `"error"` when the reported job set contains an `error` row and `"idle"`
 otherwise. It is deliberately **not** `converter::final_run_status(had_errors)` — see
 "Cancellation" for why that would report `"error"` alongside `"errors": 0`.
-`output_dirs` is the deduplicated, path-mapped list of directories touched by the run, in
-first-seen order, derived from each job's `result_path` and therefore naming only directories
-that contain a file that exists. Jobs with `status: "error"` contribute nothing to it, since
-they have no `result_path`. It exists because it is exactly what a library rescan wants as its
+`output_dirs` is the deduplicated, path-mapped list of directories, in first-seen order,
+derived from each job's `result_path` and therefore naming only directories that contain a file
+that exists. Jobs with `status: "error"` — including cancelled ones — contribute nothing to it,
+since they have no `result_path`. It exists because it is exactly what a library rescan wants as its
 argument, and a rescan of a path that was deleted is at best wasted work.
 
 `completed` counts `done` and `skipped` jobs; `errors` counts `error` jobs. `space_saved` is the
