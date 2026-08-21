@@ -428,7 +428,9 @@ guaranteed and a hung receiver cannot wedge the app.
 Failures surface three ways:
 
 - `ctx.events.notify("ConvertBar", "Post-convert hook failed: <reason>")`
-- `ctx.events.emit_t("hook-failed", { "event": …, "reason": … })` so the web UI can toast
+- `ctx.events.emit_t("hook-failed", { "event": …, "reason": … })`, so a head can surface it.
+  No UI consumer ships in this change — the event exists so one can be added without touching
+  the engine, and a test asserts it is emitted.
 - a line on stderr
 
 Ordering note for the error fire point: `record_job_error` calls `record_job_error_quiet` first
@@ -478,7 +480,6 @@ Implementations:
 | `HttpHookRunner` | both heads | real HTTP and real process spawn |
 | `RecordingHookRunner` | test fixture default | records requests, returns `Ok`, touches nothing |
 | `FailingHookRunner` | tests | returns `Err` — drives the failure-surfacing tests |
-| `SlowHookRunner` | tests | blocks past the timeout — drives the timeout tests |
 
 Payload construction, templating, header parsing, and path mapping are **pure functions** in
 `hooks.rs`, tested directly without any runner. The runner trait covers only the I/O edge.
@@ -566,7 +567,10 @@ Through `process_queue`, with an injected runner:
   `had_errors`.
 - `FailingHookRunner`: job status stays `done`, `had_errors` stays false, `hook-failed` is
   emitted, and the second failure of a run does not notify again.
-- `SlowHookRunner`: the hook is abandoned at the timeout and the queue proceeds.
+- Timeout enforcement is tested against a **real** child process that outlives its timeout,
+  not against a slow test double. A double would only prove `dispatch` blocks for however long
+  the double sleeps: the timeout lives inside `HttpHookRunner` (the ureq agent config for
+  webhooks, `recv_timeout` for commands), so a double bypasses the thing under test entirely.
 - A `LockProbeSink`-style check that `ctx.db` is not held while the hook runs — the existing
   probe in `control.rs` is the model, and this is the invariant most likely to regress.
 

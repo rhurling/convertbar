@@ -31,7 +31,7 @@
 | `crates/convertbar-core/src/settings_ops.rs` | New keys in `ALLOWED_KEYS` + `Settings`, hook settings reader |
 | `crates/convertbar-core/src/db.rs` | Seed new settings defaults |
 | `src-tauri/src/commands/hooks.rs` (new) | Desktop-only get/set for the command hook |
-| `src/components/SettingsPage.tsx` | Hooks section, desktop + web variants |
+| `src/pages/SettingsPage.tsx` | Hooks section, desktop + web variants |
 | `README.md`, `docker-compose.example.yml`, `unraid-template.xml`, `CLAUDE.md` | Documentation |
 
 ---
@@ -264,6 +264,12 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert!(parsed["query"].as_str().unwrap().contains("/media/movies"));
+    }
+
+    #[test]
+    fn an_unterminated_placeholder_is_emitted_once_verbatim() {
+        let v = post_convert_payload(&sample());
+        assert_eq!(render_body("abc{{def", &v), "abc{{def");
     }
 
     #[test]
@@ -574,7 +580,13 @@ pub fn render_body(template: &str, payload: &Value) -> String {
         let after = &rest[start + 2..];
         let end = match after.find("}}") {
             Some(e) => e,
-            None => break, // unterminated: emit the remainder verbatim
+            None => {
+                // Unterminated: emit the rest verbatim and stop. Must RETURN, not break — the
+                // prefix before `{{` is already in `out`, so falling through to the trailing
+                // push would append it a second time ("abc{{def" -> "abcabc{{def").
+                out.push_str(&rest[start..]);
+                return out;
+            }
         };
         let name = after[..end].trim();
         let tail = &after[end + 2..];
@@ -732,7 +744,7 @@ git commit -m "feat(hooks): pure payload, templating, path-mapping and parsing l
 
 **Interfaces:**
 - Consumes: `split_command`, `parse_headers` (Task 1).
-- Produces: `WebhookRequest`, `CommandRequest`, `HookRunner`, `HttpHookRunner`, `RecordingHookRunner`, `FailingHookRunner`, `SlowHookRunner`.
+- Produces: `WebhookRequest`, `CommandRequest`, `HookRunner`, `HttpHookRunner`, `RecordingHookRunner`, `FailingHookRunner`.
 
 - [ ] **Step 1: Add the dependency**
 
@@ -896,8 +908,18 @@ pub struct HttpHookRunner;
 
 impl HookRunner for HttpHookRunner {
     fn run_webhook(&self, req: &WebhookRequest) -> Result<(), String> {
+        // RootCerts::PlatformVerifier is REQUIRED, not merely the cargo feature: enabling
+        // the feature only makes the verifier available, and the default stays webpki's
+        // bundled Mozilla roots. Without this line a receiver behind a private CA or a
+        // self-signed homelab proxy fails, and no test can catch it because every test uses
+        // a recording runner.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(req.timeout))
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                    .build(),
+            )
             .build()
             .into();
 
@@ -999,19 +1021,11 @@ impl HookRunner for FailingHookRunner {
     }
 }
 
-/// Blocks past any sane timeout, for tests that assert the queue is not wedged.
-pub struct SlowHookRunner(pub Duration);
-
-impl HookRunner for SlowHookRunner {
-    fn run_webhook(&self, _req: &WebhookRequest) -> Result<(), String> {
-        std::thread::sleep(self.0);
-        Ok(())
-    }
-    fn run_command(&self, _req: &CommandRequest) -> Result<(), String> {
-        std::thread::sleep(self.0);
-        Ok(())
-    }
-}
+// Deliberately NO SlowHookRunner. Timeout enforcement lives inside `HttpHookRunner` — the
+// ureq agent config for webhooks, `recv_timeout` for commands — so a slow *double* would only
+// block `dispatch` for its full sleep and prove nothing about the timeout. Real timeout
+// behaviour is covered by `http_runner_kills_a_command_that_outruns_the_timeout` above,
+// against a real child process.
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
@@ -1037,8 +1051,12 @@ git commit -m "feat(hooks): add HookRunner seam, ureq webhook and command runner
 ### Task 3: Settings keys and the security boundary
 
 **Files:**
-- Modify: `crates/convertbar-core/src/settings_ops.rs`
-- Modify: `crates/convertbar-core/src/db.rs:240-248`
+- Modify: `crates/convertbar-core/src/types.rs:27` — the `Settings` struct itself lives here,
+  not in `settings_ops.rs`. It derives `Serialize` and carries **no** `serde(rename_all)`, so
+  its JSON keys are the Rust field names: **snake_case**.
+- Modify: `crates/convertbar-core/src/settings_ops.rs` — `ALLOWED_KEYS` and `get_settings`
+- Modify: `crates/convertbar-core/src/db.rs:240-248` — defaults
+- Modify: `src/lib/transport/types.ts:79` — the `AppSettings` TypeScript mirror, also snake_case
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
@@ -1148,7 +1166,8 @@ In `settings_ops.rs`, add to `ALLOWED_KEYS` (after `"encode_priority"`):
     "hook_timeout_seconds",
 ```
 
-Add eight `pub` `String` fields with the same names to the `Settings` struct. In `get_settings`,
+Add eight `pub` `String` fields with the same names to the `Settings` struct in
+`crates/convertbar-core/src/types.rs`. In `get_settings`,
 declare a `let mut <name> = String::new();` for each (except `hook_timeout_seconds`, which
 starts as `String::from("30")`), add a `match` arm per key assigning `value`, and add each to the
 returned struct literal.
@@ -1176,9 +1195,13 @@ Expected: PASS.
 
 - [ ] **Step 5: Check the frontend type still matches**
 
-The `Settings` struct is mirrored in TypeScript. Run: `npx tsc`
-Expected: PASS. If the mirror is a hand-written interface, add the eight `string` fields to it
-now; Tasks 7 and 8 rely on them existing.
+The mirror is the hand-written `AppSettings` interface at `src/lib/transport/types.ts:79`.
+Add the eight fields to it now — Task 8 relies on them. Use **snake_case** names matching the
+Rust fields exactly (`post_convert_webhook_url`, not `postConvertWebhookUrl`); every existing
+field in that interface is snake_case because `Settings` has no `rename_all`.
+
+Run: `npx tsc`
+Expected: PASS.
 
 - [ ] **Step 6: Format and commit**
 
@@ -1256,16 +1279,24 @@ In `ctx.rs`, add `pub hooks: crate::hooks::HookSetup,` to the struct and a
 
 - [ ] **Step 4: Fix every call site**
 
-The compiler lists them. Production heads:
+The compiler lists them. **Exactly two are production**; check for an enclosing
+`#[cfg(test)]` before assuming, because five sites that look like head wiring are test fixtures:
+
+Production — the only two that get a real `HttpHookRunner`:
 
 - `src-tauri/src/lib.rs:108` — `HookSetup { runner: Arc::new(HttpHookRunner), allow_stored_command: true }`
-- `src-tauri/src/updater.rs:1867`, `src-tauri/src/commands/updater.rs:68,129` — same as above
-- `crates/convertbar-server/src/main.rs:56`, `startup.rs:150`, `routes/mod.rs:282` —
-  `HookSetup { runner: Arc::new(HttpHookRunner), allow_stored_command: false }`
+- `crates/convertbar-server/src/main.rs:56` — `HookSetup { runner: Arc::new(HttpHookRunner), allow_stored_command: false }`
 
-Tests, in `converter.rs:1665,1676`, `settings_ops.rs:270`, `control.rs:399,628`,
-`watch_ops.rs:239`, `queue_ops.rs:1565`, `watcher.rs:1165`, `handbrake.rs:536` —
-`HookSetup { runner: Arc::new(RecordingHookRunner::default()), allow_stored_command: true }`.
+Test fixtures — all get `RecordingHookRunner`, never `HttpHookRunner`, or the Done Criterion
+"no test performs real network I/O" is violated:
+
+- `src-tauri/src/updater.rs:1867` (inside the `#[cfg(test)]` at :1412),
+  `src-tauri/src/commands/updater.rs:68,129` → `allow_stored_command: true`
+- `crates/convertbar-server/src/startup.rs:150` (inside the `#[cfg(test)]` at :136),
+  `crates/convertbar-server/src/routes/mod.rs:282` → `allow_stored_command: false`, so they
+  mirror the server's real policy
+- `converter.rs:1665,1676`, `settings_ops.rs:270`, `control.rs:399,628`, `watch_ops.rs:239`,
+  `queue_ops.rs:1565`, `watcher.rs:1165`, `handbrake.rs:536` → `allow_stored_command: true`
 
 **Keep `test_ctx`'s existing 3-tuple return type.** Dozens of tests destructure it, and
 widening it would churn every one of them for no benefit. Instead add three helpers next to it
@@ -1313,7 +1344,7 @@ use all three by these exact names:
         (ctx, sink, disposer, runner)
     }
 
-    /// For tests that need a FailingHookRunner or SlowHookRunner instead of the recorder.
+    /// For tests that need a FailingHookRunner or a bespoke probe instead of the recorder.
     fn test_ctx_with_hook_runner(
         conn: Connection,
         runner: Arc<dyn crate::hooks::HookRunner>,
@@ -1479,14 +1510,120 @@ Add to `mod tests` in `converter.rs`:
         assert_eq!(hook_notes, 1, "expected exactly one hook-failure notification per run");
     }
 
+    /// Books a completed job row directly, for the two tests below that call
+    /// `fire_post_convert` without running a queue.
+    fn book_done_job(db: &Arc<Mutex<Connection>>, id: &str) {
+        queue_job(db, id, "/media/s.mkv", "/media/o.mkv", 100);
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status='done', kept_file='converted', converted_size=50, \
+                 space_saved=50, completed_at='2026-01-01T00:00:00+00:00' WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn shutdown_skips_the_hook_entirely() {
         // is_shutting_down is otherwise only checked at the loop head, so a quit would block
         // the queue thread for up to the timeout and could orphan a command child.
         let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
         set_setting(&ctx.db, "post_convert_webhook_url", "http://receiver.invalid/hook");
+        // The row MUST exist: fire_post_convert returns early when load_job_payload finds
+        // nothing, so without it this test passes even with the shutdown guard deleted and the
+        // Step 6 mutation would read as SURVIVED.
+        book_done_job(&ctx.db, "j1");
+
         kill_active_child(&ctx.converter); // this is how the shutdown flag is armed
         crate::hooks::fire_post_convert(&ctx, "j1");
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_shutdown_arrangement_does_fire_when_not_shutting_down() {
+        // Guards the guard: proves the arrangement above is capable of firing, so a green
+        // shutdown test means the guard worked rather than that nothing happened at all.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(&ctx.db, "post_convert_webhook_url", "http://receiver.invalid/hook");
+        book_done_job(&ctx.db, "j1");
+        crate::hooks::fire_post_convert(&ctx, "j1");
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_db_lock_is_not_held_while_a_hook_runs() {
+        // The invariant most likely to regress, and the one that has already caused two
+        // shipped deadlocks. A hook is slower than an emit, so the window is wider here.
+        // try_lock, never lock: a real regression must fail this test, not hang it forever.
+        #[derive(Default)]
+        struct LockProbeRunner {
+            db: Mutex<Option<Arc<Mutex<Connection>>>>,
+            was_free: Mutex<bool>,
+        }
+        impl LockProbeRunner {
+            fn probe(&self) -> Result<(), String> {
+                let db = self.db.lock().unwrap().clone().expect("db handle set");
+                match db.try_lock() {
+                    Ok(_) => {
+                        *self.was_free.lock().unwrap() = true;
+                        Ok(())
+                    }
+                    Err(_) => Err("ctx.db was held across the hook".into()),
+                }
+            }
+        }
+        impl crate::hooks::HookRunner for LockProbeRunner {
+            fn run_webhook(&self, _r: &crate::hooks::WebhookRequest) -> Result<(), String> {
+                self.probe()
+            }
+            fn run_command(&self, _r: &crate::hooks::CommandRequest) -> Result<(), String> {
+                self.probe()
+            }
+        }
+
+        let probe = Arc::new(LockProbeRunner::default());
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), probe.clone());
+        *probe.db.lock().unwrap() = Some(ctx.db.clone());
+        set_setting(&ctx.db, "post_convert_webhook_url", "http://receiver.invalid/hook");
+        book_done_job(&ctx.db, "j1");
+
+        crate::hooks::fire_post_convert(&ctx, "j1");
+        assert!(
+            *probe.was_free.lock().unwrap(),
+            "ctx.db must be released before the hook runs"
+        );
+    }
+
+    #[test]
+    fn a_hook_failure_emits_hook_failed() {
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(&ctx.db, "post_convert_webhook_url", "http://receiver.invalid/hook");
+        book_done_job(&ctx.db, "j1");
+        crate::hooks::fire_post_convert(&ctx, "j1");
+
+        let events = sink.payloads("hook-failed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "post-convert");
+    }
+
+    #[test]
+    fn a_job_cancelled_while_encoding_fires_nothing() {
+        // cancel_conversion books status='error' itself and THEN kills the child, so the
+        // failure arm's `current_status != Some("error")` guard at converter.rs:1501 skips
+        // record_job_error and neither fire point is reached. Drive a real cancel through
+        // control::cancel_conversion — a hand-written error row would not exercise the guard.
+        // ... arrange a running encode, call control::cancel_conversion, let the queue finish ...
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_job_cancelled_while_queued_fires_nothing() {
+        // No encode ever ran, so process_queue never sees the row.
+        // ... queue a job, cancel it before the queue starts, run the queue ...
         assert!(hooks.webhooks.lock().unwrap().is_empty());
     }
 
@@ -1519,9 +1656,15 @@ Add to `mod tests` in `converter.rs`:
 
 **Note to the engineer:** the `unimplemented!()` and `// ...` lines above mark where you copy
 the arrangement from the nearest existing `process_queue` test — these tests must run a real
-queue, not a hand-built row. Every fixture must declare its HandBrake world (`StubLocator` for
-the installed world, `AbsentLocator` for CI); the default `PanickingLocator` panics on the queue
-thread and poisons `ctx.db`, which surfaces as a confusing `PoisonError` in the test thread.
+queue, not a hand-built row.
+
+`test_ctx_hooks` installs `AbsentLocator` and takes no locator parameter, so "use `StubLocator`"
+is not literally available here. That is fine: the existing successful-conversion tests do not
+use `StubLocator` either — they set the `handbrake_path` setting to `fake_handbrake_script`,
+which works under `AbsentLocator` because a configured path short-circuits discovery. Copy that
+arrangement. Never leave a fixture on the default `PanickingLocator`: it panics on the queue
+thread and poisons `ctx.db`, which surfaces in the test thread as a confusing `PoisonError`
+rather than the locator's message.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -1531,6 +1674,9 @@ Expected: FAIL — `fire_post_convert` not found, `test_ctx_hooks` not found.
 - [ ] **Step 3: Implement the fire path in `hooks.rs`**
 
 ```rust
+// emit_t lives on the EventSinkExt extension trait, not on EventSink itself.
+use crate::events::EventSinkExt;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Trigger {
     PostConvert,
@@ -1857,8 +2003,13 @@ Then, one at a time, apply the mutation, run the named test, confirm RED, and
 2. Move the `fire_post_convert` call from `record_job_error_quiet` into `record_job_error` →
    `error_job_fires_through_a_real_failure_arm` must FAIL (it drives the `:869` path).
 3. Remove the `is_shutting_down` guard in `dispatch` → `shutdown_skips_the_hook_entirely` must FAIL.
-4. Change `command_env(&payload)` to `command_env(&mapped)` →
-   `command_hook_receives_unmapped_paths_while_the_webhook_is_mapped` must FAIL.
+4. In `dispatch`'s command block, insert
+   `let mut p2 = payload.clone(); map_payload_paths(&mut p2, &cfg.path_map);` and pass `&p2` to
+   `command_env` → `command_hook_receives_unmapped_paths_while_the_webhook_is_mapped` must FAIL.
+   Do **not** try `command_env(&mapped)`: `mapped` is scoped inside the webhook `if` block, so
+   that mutation does not compile — and a non-compiling mutation reads as SURVIVED.
+5. Delete the `ctx.db` guard's enclosing block in `fire_post_convert` so the guard lives to the
+   end of the function → `the_db_lock_is_not_held_while_a_hook_runs` must FAIL (not hang).
 
 A mutation that does not compile reads as SURVIVED — check the build succeeded before believing
 a green result, and check `git diff` confirmed the pattern actually matched.
@@ -2234,55 +2385,94 @@ git commit -m "feat(hooks): desktop-only commands for the command hook"
   from Task 7.
 - Produces: no new exports.
 
-**Background the engineer needs:** `isServerHead` from `src/lib/head.ts` distinguishes the two
-builds and is already used this way in `TabBar.tsx`. The command-hook field must **not render
-at all** on the server head — not disabled, not read-only. The server cannot serve its value, so
-a field that always renders empty invites a bug report. Note that RTL's `render()` does not wrap
-in `StrictMode`.
+**Background the engineer needs — read this before writing a single test.** `SettingsPage`
+takes exactly one prop, `onHbPathChanged?: () => void` (`src/pages/SettingsPage.tsx:21-25`).
+Settings are NOT passed in: the component loads them through a mocked
+`invoke("get_settings")`, and writes go out as
+`invoke("update_setting", { key, value })` (`src/lib/transport/tauri.ts:50`). The existing test
+file already provides everything you need — `makeSettings(overrides)` to build an `AppSettings`,
+and `updateCallsFor(key)` to filter the write calls. Reuse them; do not invent a `propsWith` or
+an `onUpdateSetting` prop, because neither exists.
+
+Field names are **snake_case** everywhere — `AppSettings` mirrors the Rust `Settings`, which
+carries no `serde(rename_all)`. Add your eight fields to `makeSettings`'s literal too, or every
+existing test breaks on the missing keys.
+
+The file uses `fireEvent`, not `userEvent`. And `useSettings` keeps loading after the inputs
+mount, re-syncing drafts as each value lands, so a test that types too early has its edit
+silently overwritten — wait for `presetSuffix` (the last value to arrive) before interacting.
+The file's existing helper comment at the top explains this; follow it.
+
+`isServerHead` from `src/lib/head.ts` distinguishes the two builds and is already used this way
+in `TabBar.tsx`. The command-hook field must **not render at all** on the server head — not
+disabled, not read-only. The server cannot serve its value, so a field that always renders empty
+invites a bug report. Note that RTL's `render()` does not wrap in `StrictMode`.
 
 - [ ] **Step 1: Write the failing tests**
 
 Add to `src/pages/SettingsPage.test.tsx`:
 
+First, extend the shared `makeSettings()` literal with the eight new snake_case fields, all
+defaulting to `""` except `hook_timeout_seconds: "30"`. Then:
+
 ```tsx
-it("renders the webhook fields for both trigger points", () => {
-  render(<SettingsPage {...propsWith({ postConvertWebhookUrl: "http://a/", queueDrainedWebhookUrl: "http://b/" })} />);
-  expect(screen.getByLabelText(/after each conversion.*url/i)).toHaveValue("http://a/");
+it("renders the webhook url for both trigger points", async () => {
+  // The default invokeMock in beforeEach serves makeSettings(); override it for this test the
+  // same way the existing cleanup-mode tests do, then wait for the suffix to land.
+  renderWithSettings(
+    makeSettings({
+      post_convert_webhook_url: "http://a/",
+      queue_drained_webhook_url: "http://b/",
+    }),
+  );
+  expect(await screen.findByLabelText(/after each conversion.*url/i)).toHaveValue("http://a/");
   expect(screen.getByLabelText(/when the queue finishes.*url/i)).toHaveValue("http://b/");
 });
 
-it("shows the command hook field on the desktop head", () => {
-  render(<SettingsPage {...propsWith({})} />);
-  expect(screen.getByLabelText(/command to run/i)).toBeInTheDocument();
+it("shows the command hook field on the desktop head", async () => {
+  renderWithSettings(makeSettings());
+  expect(await screen.findByLabelText(/command to run/i)).toBeInTheDocument();
 });
 
 it("does not render the command hook field on the server head", async () => {
-  // Not disabled, not read-only — absent. The server head cannot serve the value, so a field
-  // that always renders empty would read as a bug.
+  // Absent, not disabled and not read-only: the server head cannot serve the value, so a
+  // field that always renders empty would read as a bug.
   vi.doMock("../lib/head", () => ({ isServerHead: true }));
   vi.resetModules();
   const { default: ServerSettingsPage } = await import("./SettingsPage");
-  render(<ServerSettingsPage {...propsWith({})} />);
+  render(<ServerSettingsPage />);
+  expect(await screen.findByText(/set by environment variable/i)).toBeInTheDocument();
   expect(screen.queryByLabelText(/command to run/i)).not.toBeInTheDocument();
-  expect(screen.getByText(/set by environment variable/i)).toBeInTheDocument();
 });
 
-it("warns that path mapping does not apply to the command hook", () => {
-  render(<SettingsPage {...propsWith({})} />);
-  expect(screen.getByText(/applies to webhooks only/i)).toBeInTheDocument();
+it("warns that path mapping does not apply to the command hook", async () => {
+  renderWithSettings(makeSettings());
+  expect(await screen.findByText(/applies to webhooks only/i)).toBeInTheDocument();
 });
 
-it("saves the timeout setting on change", async () => {
-  const onUpdate = vi.fn();
-  render(<SettingsPage {...propsWith({})} onUpdateSetting={onUpdate} />);
-  await userEvent.clear(screen.getByLabelText(/timeout/i));
-  await userEvent.type(screen.getByLabelText(/timeout/i), "60");
-  expect(onUpdate).toHaveBeenCalledWith("hook_timeout_seconds", "60");
+it("writes the timeout setting on blur", async () => {
+  renderWithSettings(makeSettings());
+  const input = await screen.findByLabelText(/timeout/i);
+  fireEvent.change(input, { target: { value: "60" } });
+  fireEvent.blur(input);
+  await waitFor(() =>
+    expect(updateCallsFor("hook_timeout_seconds")).toHaveLength(1),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+    key: "hook_timeout_seconds",
+    value: "60",
+  });
 });
 ```
 
-Match `propsWith` and the update-callback name to whatever `SettingsPage.test.tsx` already uses
-— copy the arrangement from the nearest existing settings test rather than inventing one.
+`renderWithSettings(settings)` is a small local helper you add: it points `invokeMock` at the
+given settings object using the same `switch (cmd)` shape as the file's `beforeEach`, then
+renders `<SettingsPage />`. If the file already has an equivalent (`withMode` is close), extend
+that instead of adding a second one.
+
+Commit-on-blur matches how `watch_skip_marker` already behaves in this component — see the
+existing test "does not write the skip marker per edit; commits on blur". Follow that pattern
+for all the free-text hook fields so a webhook is not written once per keystroke.
 
 - [ ] **Step 2: Run to verify they fail**
 
