@@ -259,11 +259,27 @@ mod tests {
     fn the_stash_template_renders_to_valid_graphql_json() {
         let v = queue_drained_payload(&[sample()]);
         let out = render_body(
-            r#"{"query":"mutation { metadataScan(input: {paths: {{output_dirs_json}}}) }"}"#,
+            r#"{"query":"mutation($input: ScanMetadataInput!) { metadataScan(input: $input) }","variables":{"input":{"paths":{{output_dirs_json}}}}}"#,
             &v,
         );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-        assert!(parsed["query"].as_str().unwrap().contains("/media/movies"));
+        // The array is passed as a GraphQL VARIABLE, so the placeholder sits at a JSON value
+        // position and raw insertion is correct. Interpolating it into the query string
+        // instead would splice unescaped quotes into that string and break the outer JSON.
+        assert_eq!(
+            parsed["variables"]["input"]["paths"],
+            serde_json::json!(["/media/movies"])
+        );
+    }
+
+    #[test]
+    fn a_json_placeholder_inside_a_string_is_not_special_cased() {
+        // Documents the rule's boundary: `_json` means "insert raw at a value position". It is
+        // deliberately NOT context-sensitive, so this template produces invalid JSON rather
+        // than silently escaping. The Stash example uses GraphQL variables to avoid it.
+        let v = queue_drained_payload(&[sample()]);
+        let out = render_body(r#"{"q":"x {{output_dirs_json}} y"}"#, &v);
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_err());
     }
 
     #[test]
@@ -2552,10 +2568,15 @@ Set the **queue-drained** webhook to:
 |---|---|
 | URL | `http://stash:9999/graphql` |
 | Headers | `ApiKey: your-stash-api-key` |
-| Body | `{"query":"mutation { metadataScan(input: {paths: {{output_dirs_json}}}) }"}` |
+| Body | `{"query":"mutation($input: ScanMetadataInput!) { metadataScan(input: $input) }","variables":{"input":{"paths":{{output_dirs_json}}}}}` |
 
 If Stash mounts the same media at a different path, add a path-map rule — `/media => /data`.
 ````
+
+Explain why the example passes the paths as a GraphQL **variable** rather than interpolating
+them into the query text: `_json` placeholders insert raw JSON, so they belong at a JSON value
+position. Inside a string literal they would splice in unescaped quotes and produce an invalid
+body.
 
 State plainly that webhook headers are stored in plaintext in `convertbar.db` and readable by
 any authenticated web-UI user, and that an authenticated user can aim the webhook at any address

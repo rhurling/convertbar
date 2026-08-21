@@ -244,7 +244,16 @@ A non-empty body is a template. `{{placeholder}}` is substituted from the payloa
   surrounding JSON. They are substituted *without* surrounding quotes, so the template supplies
   them: `"path": "{{output_path}}"`.
 - **`_json` placeholders** (`{{output_dirs_json}}`, `{{jobs_json}}`, `{{payload_json}}`) render
-  pre-formed valid JSON and are inserted **raw**.
+  pre-formed valid JSON and are inserted **raw**. Raw means they belong at a JSON *value*
+  position, never inside a string literal: `"paths": {{output_dirs_json}}` is right, and
+  `"query": "... {{output_dirs_json}} ..."` would splice unescaped quotes into that string and
+  produce invalid JSON. This is why the worked example below passes the array as a GraphQL
+  **variable** rather than interpolating it into the query text — the query stays a constant
+  string and the data sits where JSON data belongs. The alternative, making substitution
+  context-sensitive by tracking whether the placeholder falls inside an open string, was
+  rejected: it makes one placeholder syntax mean two different things depending on surrounding
+  text, and the template scanner would then have to model escaped quotes correctly to stay
+  right.
 
 A **`null`** field substitutes as the empty string, so `"path": "{{result_path}}"` on an error
 job yields `"path": ""` — valid JSON that the receiver can test. It does not render the bare token
@@ -258,7 +267,7 @@ Worked example, the driving case, on `queue-drained`:
 ```
 URL      http://stash:9999/graphql
 Headers  ApiKey: <key>
-Body     {"query":"mutation { metadataScan(input: {paths: {{output_dirs_json}}}) }"}
+Body     {"query":"mutation($input: ScanMetadataInput!) { metadataScan(input: $input) }","variables":{"input":{"paths":{{output_dirs_json}}}}}
 ```
 
 ### Headers
