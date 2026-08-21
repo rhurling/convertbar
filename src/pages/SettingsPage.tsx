@@ -72,11 +72,15 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [pathMapDraft, setPathMapDraft] = useState(settings?.hook_path_map ?? "");
   const [timeoutDraft, setTimeoutDraft] = useState(settings?.hook_timeout_seconds ?? "30");
 
-  // Command hook: fetched via get_command_hooks (not part of `settings`), so `null` here means
+  // Command hooks: fetched via get_command_hooks (not part of `settings`), so `null` here means
   // "not yet loaded" — distinct from "" (loaded, empty) — the same guard shape `commitDrafts`
-  // uses for `settings` itself, so an unmount before the fetch lands writes nothing.
-  const [commandHook, setCommandHook] = useState<string | null>(null);
-  const [commandDraft, setCommandDraft] = useState("");
+  // uses for `settings` itself, so an unmount before the fetch lands writes nothing. Two
+  // independent pairs, one per trigger — queue_drained is the primary use case (a library
+  // rescan once per batch), so it gets full parity with post_convert, not a lesser field.
+  const [pcCommandHook, setPcCommandHook] = useState<string | null>(null);
+  const [pcCommandDraft, setPcCommandDraft] = useState("");
+  const [qdCommandHook, setQdCommandHook] = useState<string | null>(null);
+  const [qdCommandDraft, setQdCommandDraft] = useState("");
 
   // getAppInfo() works on both heads (desktop composes it from getVersion() internally, server
   // hits /api/info). The version is only rendered on the server head, but the priority caveat is
@@ -133,12 +137,18 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   useEffect(() => {
     if (isServerHead || !settings) return;
     invoke<CommandHooksResponse>("get_command_hooks")
-      .then((hooks) => setCommandHook(hooks.postConvert))
+      .then((hooks) => {
+        setPcCommandHook(hooks.postConvert);
+        setQdCommandHook(hooks.queueDrained);
+      })
       .catch(() => {});
   }, [!!settings]);
   useEffect(() => {
-    if (commandHook !== null) setCommandDraft(commandHook);
-  }, [commandHook]);
+    if (pcCommandHook !== null) setPcCommandDraft(pcCommandHook);
+  }, [pcCommandHook]);
+  useEffect(() => {
+    if (qdCommandHook !== null) setQdCommandDraft(qdCommandHook);
+  }, [qdCommandHook]);
 
   // Preview resolves the *draft* (so it updates as you type) via the backend resolver —
   // never a JS reimplementation, which diverged from the real output-name algorithm.
@@ -226,12 +236,24 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   // Not routed through useSettings/updateSetting: set_command_hook is the bespoke desktop-only
   // command (see the CommandHooksResponse comment above), so this manages its own "last known
   // committed value" instead of relying on the settings object's optimistic-merge machinery.
-  const commitCommand = () => {
-    if (commandHook !== null && commandDraft !== commandHook) {
-      invoke("set_command_hook", { trigger: "post_convert", command: commandDraft }).catch(
-        () => {},
+  // The page has no general mechanism to surface a failed bespoke `invoke()` the way
+  // `useSettings.updateSetting` surfaces failed setting writes via its `error` state (that
+  // banner is wired to useSettings's own writes only) — console.error at minimum keeps a
+  // rejected write from vanishing silently.
+  const commitPcCommand = () => {
+    if (pcCommandHook !== null && pcCommandDraft !== pcCommandHook) {
+      invoke("set_command_hook", { trigger: "post_convert", command: pcCommandDraft }).catch(
+        (e) => console.error("Couldn't save post-convert command hook:", e),
       );
-      setCommandHook(commandDraft);
+      setPcCommandHook(pcCommandDraft);
+    }
+  };
+  const commitQdCommand = () => {
+    if (qdCommandHook !== null && qdCommandDraft !== qdCommandHook) {
+      invoke("set_command_hook", { trigger: "queue_drained", command: qdCommandDraft }).catch(
+        (e) => console.error("Couldn't save queue-drained command hook:", e),
+      );
+      setQdCommandHook(qdCommandDraft);
     }
   };
 
@@ -245,7 +267,9 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     // those would persist them over the user's stored values, so a pre-load unmount writes
     // nothing; each commit's own equality guard covers the loaded case. This is also what keeps
     // StrictMode's dev-only mount/unmount/mount cycle from writing anything.
-    commitCommand(); // independently guarded by `commandHook !== null`, not by `settings`
+    // Both independently guarded by their own `*CommandHook !== null`, not by `settings`.
+    commitPcCommand();
+    commitQdCommand();
     if (!settings) return;
     commitHbPath();
     commitMarker();
@@ -629,9 +653,28 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           onBlur={commitPcBody}
           placeholder="Leave empty to send the raw JSON payload"
         />
+        {!isServerHead && (
+          <>
+            <label className="setting-label" htmlFor="post-convert-command">
+              Command to run after each conversion
+            </label>
+            <input
+              id="post-convert-command"
+              className="setting-input"
+              type="text"
+              value={pcCommandDraft}
+              onChange={(e) => setPcCommandDraft(e.target.value)}
+              onBlur={commitPcCommand}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+              placeholder="/path/to/script.sh"
+            />
+          </>
+        )}
         <p className="setting-hint">
           Fires after every file finishes converting, whether it succeeded or failed. Leave the
-          URL empty to disable.
+          URL and command empty to disable.
         </p>
       </div>
 
@@ -675,9 +718,28 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           onBlur={commitQdBody}
           placeholder="Leave empty to send the raw JSON payload"
         />
+        {!isServerHead && (
+          <>
+            <label className="setting-label" htmlFor="queue-drained-command">
+              Command to run when the queue finishes
+            </label>
+            <input
+              id="queue-drained-command"
+              className="setting-input"
+              type="text"
+              value={qdCommandDraft}
+              onChange={(e) => setQdCommandDraft(e.target.value)}
+              onBlur={commitQdCommand}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+              placeholder="/path/to/script.sh"
+            />
+          </>
+        )}
         <p className="setting-hint">
           Fires once the queue empties — not on every pause, only a true drain. Leave the URL
-          empty to disable.
+          and command empty to disable.
         </p>
       </div>
 
@@ -722,36 +784,13 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         </p>
       </div>
 
-      {!isServerHead ? (
+      {isServerHead && (
         <div className="setting-group">
-          <label className="setting-label" htmlFor="post-convert-command">
-            Command to run
-          </label>
-          <div className="setting-row">
-            <input
-              id="post-convert-command"
-              className="setting-input flex-1"
-              type="text"
-              value={commandDraft}
-              onChange={(e) => setCommandDraft(e.target.value)}
-              onBlur={commitCommand}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") e.currentTarget.blur();
-              }}
-              placeholder="/path/to/script.sh"
-            />
-          </div>
-          <p className="setting-hint">
-            Runs after each conversion. Receives job details as environment variables. Leave
-            empty to disable.
-          </p>
-        </div>
-      ) : (
-        <div className="setting-group">
-          <span className="setting-label">Command to run</span>
+          <span className="setting-label">Command hooks</span>
           <p className="setting-hint">
             Set by environment variable on the server head (
-            <code>CONVERTBAR_POST_CONVERT_COMMAND</code>).
+            <code>CONVERTBAR_POST_CONVERT_COMMAND</code> and{" "}
+            <code>CONVERTBAR_QUEUE_DRAINED_COMMAND</code>).
           </p>
         </div>
       )}

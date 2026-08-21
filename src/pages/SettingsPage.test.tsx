@@ -763,23 +763,36 @@ describe("SettingsPage", () => {
         queue_drained_webhook_url: "http://b/",
       }),
     );
+    // Waits out the same late-arriving-draft-sync race waitForSettingsToSettle documents above:
+    // adding the command-hook fetch effect gave this field one more render cycle to land in.
+    await waitForSettingsToSettle();
     expect(await screen.findByLabelText(/after each conversion.*url/i)).toHaveValue("http://a/");
     expect(screen.getByLabelText(/when the queue finishes.*url/i)).toHaveValue("http://b/");
   });
 
-  it("shows the command hook field on the desktop head", async () => {
+  it("shows both command hook fields on the desktop head", async () => {
+    // queue_drained is the more important of the two triggers (a library rescan once per
+    // batch, the driving use case), so both must be individually configurable, not just
+    // post_convert.
     renderWithSettings(makeSettings());
-    expect(await screen.findByLabelText(/command to run/i)).toBeInTheDocument();
+    expect(
+      await screen.findByLabelText(/command to run after each conversion/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(/command to run when the queue finishes/i),
+    ).toBeInTheDocument();
   });
 
-  it("does not render the command hook field on the server head", async () => {
+  it("does not render either command hook field on the server head", async () => {
     // Absent, not disabled and not read-only: the server head cannot serve the value, so a
     // field that always renders empty would read as a bug.
     vi.doMock("../lib/head", () => ({ isServerHead: true }));
     vi.resetModules();
     const { default: ServerSettingsPage } = await import("./SettingsPage");
     render(<ServerSettingsPage />);
-    expect(await screen.findByText(/set by environment variable/i)).toBeInTheDocument();
+    const note = await screen.findByText(/set by environment variable/i);
+    expect(note.textContent).toMatch(/CONVERTBAR_POST_CONVERT_COMMAND/);
+    expect(note.textContent).toMatch(/CONVERTBAR_QUEUE_DRAINED_COMMAND/);
     expect(screen.queryByLabelText(/command to run/i)).not.toBeInTheDocument();
   });
 
@@ -820,7 +833,7 @@ describe("SettingsPage", () => {
     );
   });
 
-  it("writes the command hook via set_command_hook on blur, not per keystroke", async () => {
+  function withCommandHooks(postConvert: string, queueDrained: string) {
     invokeMock.mockImplementation(((cmd: string) => {
       switch (cmd) {
         case "get_settings":
@@ -834,7 +847,7 @@ describe("SettingsPage", () => {
         case "resolve_suffix_template":
           return Promise.resolve(".RESOLVED");
         case "get_command_hooks":
-          return Promise.resolve({ postConvert: "/original.sh", queueDrained: "" });
+          return Promise.resolve({ postConvert, queueDrained });
         case "update_setting":
         case "set_preset_suffix":
         case "set_command_hook":
@@ -848,10 +861,16 @@ describe("SettingsPage", () => {
           return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
       }
     }) as typeof invoke);
+  }
+
+  it("writes the post-convert command via set_command_hook on blur, not per keystroke", async () => {
+    // Distinct initial values for the two triggers so a swapped binding would also show up as
+    // the wrong field displaying the wrong starting value, not just the wrong trigger on write.
+    withCommandHooks("/post-convert-original.sh", "/queue-drained-original.sh");
 
     render(<SettingsPage />);
-    const input = await screen.findByLabelText(/command to run/i);
-    await waitFor(() => expect(input).toHaveValue("/original.sh"));
+    const input = await screen.findByLabelText(/command to run after each conversion/i);
+    await waitFor(() => expect(input).toHaveValue("/post-convert-original.sh"));
 
     fireEvent.change(input, { target: { value: "/new.sh" } });
     expect(
@@ -866,5 +885,37 @@ describe("SettingsPage", () => {
         command: "/new.sh",
       }),
     );
+    // Guards the obvious copy-paste bug: both fields wired to the same trigger.
+    expect(invokeMock).not.toHaveBeenCalledWith("set_command_hook", {
+      trigger: "queue_drained",
+      command: "/new.sh",
+    });
+  });
+
+  it("writes the queue-drained command via set_command_hook on blur, not per keystroke", async () => {
+    withCommandHooks("/post-convert-original.sh", "/queue-drained-original.sh");
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run when the queue finishes/i);
+    await waitFor(() => expect(input).toHaveValue("/queue-drained-original.sh"));
+
+    fireEvent.change(input, { target: { value: "/new.sh" } });
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook"),
+    ).toHaveLength(0);
+
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_command_hook", {
+        trigger: "queue_drained",
+        command: "/new.sh",
+      }),
+    );
+    // Guards the obvious copy-paste bug: both fields wired to the same trigger.
+    expect(invokeMock).not.toHaveBeenCalledWith("set_command_hook", {
+      trigger: "post_convert",
+      command: "/new.sh",
+    });
   });
 });
