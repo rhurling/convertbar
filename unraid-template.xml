@@ -126,7 +126,6 @@
     Type="Variable"
     Display="advanced"
     Required="false"
-    Mode=""
     Mask="false"/>
 
   <Config
@@ -137,7 +136,6 @@
     Type="Variable"
     Display="advanced"
     Required="false"
-    Mode=""
     Mask="false"/>
 
   <Config

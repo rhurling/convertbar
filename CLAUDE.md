@@ -114,7 +114,8 @@ Window position is persisted across restarts via `tauri-plugin-window-state`. Sc
 change is most likely to break:
 
 - `post-convert` has two fire points; the error one must stay on `record_job_error_quiet`, not
-  the `record_job_error` wrapper, or the direct call at `converter.rs:869` is missed.
+  the `record_job_error` wrapper, or the direct `record_job_error_quiet` call in the
+  vanished-source gate (the one that bypasses the `record_job_error` wrapper) is missed.
 - `queue-drained` fires only on a true drain. The queue-done block is also reached by
   `pause_after_current`, which is every pause on Windows.
 - `post_convert_command` / `queue_drained_command` are absent from `ALLOWED_KEYS` and from the

@@ -47,18 +47,23 @@ Two, both on the queue thread in `converter::process_queue`:
 | Hook | Fires | Site |
 |---|---|---|
 | `post-convert` | after each job reaches a terminal state (`done`, `skipped`, or `error`) | two sites, see below |
-| `queue-drained` | once when the queue genuinely drains | `converter.rs:1524`, guarded — see below |
+| `queue-drained` | once when the queue genuinely drains | the post-loop queue-done block, guarded — see below |
 
 Both fire on **every** terminal outcome. There is no configurable outcome filter.
 
 `post-convert` has **two** fire points, because `process_queue` books completions and failures
 through entirely separate code paths:
 
-- `converter.rs:1387`, the completion booking, for `done` and `skipped`.
-- `converter::record_job_error_quiet` (`converter.rs:734`), for `error`. This is the single
-  choke point for all nine error bookings in `process_queue` — one direct call at :869 and
-  eight through the notifying wrapper `record_job_error` at :921, :951, :1029, :1172, :1199,
-  :1309, :1341, and :1512. Firing at the wrapper instead would silently miss the :869 path.
+- `process_queue`'s success arm, where a job's `done`/`skipped` completion is booked — look for
+  the `// The completion fire point (done/skipped).` comment immediately after the booking
+  `UPDATE`.
+- `converter::record_job_error_quiet`, for `error`. This is the single choke point for all nine
+  error bookings in `process_queue` — one direct call in the vanished-source gate (the comment
+  reads `// Vanished-source gate: ...`) and eight through the notifying wrapper
+  `record_job_error` (`grep -n 'record_job_error(' converter.rs` finds the current call sites).
+  Firing at the wrapper instead would silently miss the vanished-source gate's direct call — line
+  numbers for all of this drift as the surrounding code changes, so cite the comment/function
+  name, not the line, when this needs re-verifying.
 
 To keep the two sites from drifting, **neither builds the payload**. Both call one
 `hooks::fire_post_convert(ctx, &job_id)` which re-reads the freshly booked `jobs` row and
@@ -71,13 +76,15 @@ configured together, separately, or not at all. An unset URL or command means th
 
 ### `queue-drained` is not simply "the queue-done block was reached"
 
-The existing queue-done block at `converter.rs:1524` is **not** a drain signal. Two `break`s
-reach it:
+The existing queue-done block (the `// No more jobs — queue done notification` block at the
+bottom of `process_queue`'s loop, immediately followed by the `queue-drained` fire) is **not** a
+drain signal. Two `break`s reach it:
 
 - `get_next_job` returns `None` — a true drain.
-- `take_pause_after_current` fires (`converter.rs:1457`, breaking at :1470) — "pause after this
-  job", **and every pause on Windows**, since `pause_conversion` falls back to
-  `pause_after_current` when `can_pause_process()` is false (`control.rs:46-53`).
+- `take_pause_after_current` fires (the `if take_pause_after_current(&ctx.converter) { ...
+  break; }` arm inside the per-job loop) — "pause after this job", **and every pause on
+  Windows**, since `pause_conversion` falls back to `pause_after_current` when
+  `can_pause_process()` is false (`control.rs:46-53`).
 
 And two paths never reach it at all: the low-disk pause and the shutdown path both `return`
 early. So the naive placement would fire mid-run on every Windows pause, fire again after
@@ -202,9 +209,10 @@ to report. This is deliberate and gets a test.
 `control::cancel_conversion` books `status = 'error', error_message = 'Cancelled by user'`
 directly (`control.rs:260`) and *then* kills the child. It does not call
 `record_job_error_quiet`. When the killed child makes `wait_for_active_child` return non-success,
-`process_queue`'s failure arm reads the row back and guards on it —
-`if current_status.as_deref() != Some("error")` at `converter.rs:1501` — so `record_job_error` is
-skipped precisely because cancel already wrote the row. Neither fire point is reached.
+`process_queue`'s failure arm reads the row back and guards on it — the
+`if current_status.as_deref() != Some("error") { ... }` check that wraps the failure arm's
+booking — so `record_job_error` is skipped precisely because cancel already wrote the row.
+Neither fire point is reached.
 
 This is the correct outcome and is left as-is: a cancellation is a user action, not a conversion
 result, and a receiver asked to rescan a file the user just abandoned is being told a lie. Do not
@@ -216,8 +224,8 @@ the watermark, and History records the cancellation. The per-file hook is a live
 about a conversion that happened; the drain payload is a ledger of what the queue did. A
 cancelled job belongs in the ledger and not in the live notification.
 
-One consequence must still be handled rather than inherited: `had_errors = true` is set at
-`converter.rs:1493` *before* that guard, and the low-disk and shutdown paths can set it for a run
+One consequence must still be handled rather than inherited: `had_errors = true` is set in that
+same failure arm, *before* that guard runs, and the low-disk and shutdown paths can set it for a run
 whose rows fall outside the reported window. `run_status` in the payload is therefore derived
 from the payload's **own** job set (`errors > 0`), never from `had_errors`, so
 `{"run_status": "error", "errors": 0}` is unrepresentable. This can differ from the tray's
@@ -473,8 +481,10 @@ guaranteed and a hung receiver cannot wedge the app.
 - **Worst case is a multiple of the timeout.** With both a webhook and a command configured on
   `post-convert`, a dead receiver costs `2 ×` the timeout per job. The 30s default is the
   per-hook bound, not the per-job bound; the UI help text says so next to the field.
-- **Cancelling during a hook does nothing.** `current_job_id` is already cleared by then
-  (`converter.rs:1135`), so cancel has no target. The hook runs to completion or timeout.
+- **Cancelling during a hook does nothing.** `current_job_id` is already cleared by then — reset,
+  along with `current_pid`/`current_child`, immediately once `wait_for_active_child` returns and
+  shared by every arm of the match on its result — so cancel has no target. The hook runs to
+  completion or timeout.
 - A hook failure — non-2xx, transport error, timeout, malformed header line, non-zero exit
   status, command not found — **never** changes the job's status and never sets `had_errors`.
 
@@ -488,10 +498,11 @@ Failures surface three ways:
 - a line on stderr
 
 Ordering note for the error fire point: `record_job_error` calls `record_job_error_quiet` first
-and *then* re-locks the db to send its "X failed" notification (`converter.rs:768-784`). A hook
-firing inside `quiet` therefore delays that notification by up to the hook timeout, and a
-hook-failure notification arrives before the job-failure one. Accepted: moving the fire after the
-notification would miss the direct `record_job_error_quiet` call at `converter.rs:869`.
+and *then* re-locks the db to send its "X failed" notification. A hook firing inside `quiet`
+therefore delays that notification by up to the hook timeout, and a hook-failure notification
+arrives before the job-failure one. Accepted: moving the fire after the notification would miss
+the direct `record_job_error_quiet` call in the vanished-source gate, which never goes through
+`record_job_error` at all.
 
 **Notification is suppressed after the first failure of a queue run.** A broken receiver on a
 200-file queue would otherwise produce 200 notifications. Subsequent failures still log and still
@@ -598,10 +609,10 @@ Through `process_queue`, with an injected runner:
 - A **`skipped`** job fires once, with `status: "skipped"` and `result_path == source_path`.
 - An `error` job fires once — driven through a real failure arm, not by calling
   `record_job_error_quiet` directly, so the test would catch the hook being attached to the
-  `record_job_error` wrapper and thereby missing the :869 path.
+  `record_job_error` wrapper and thereby missing the vanished-source gate's direct call.
 - A cancelled job fires nothing, cancelled while encoding **and** while queued. The
   encoding case must drive a real cancel through `control::cancel_conversion` so it exercises
-  the `!= Some("error")` guard at `converter.rs:1501`, not a hand-written error row.
+  the `!= Some("error")` guard in `process_queue`'s failure arm, not a hand-written error row.
 - No path fires `post-convert` twice for one job.
 - The hook-failure notification fires once per run and not once per file, and the flag resets on
   the next run — it lives on `ConverterState`, so a stale flag would silence a later run.
