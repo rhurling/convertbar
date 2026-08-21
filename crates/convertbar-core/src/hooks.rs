@@ -630,17 +630,46 @@ pub fn read_hook_config(
     }
 }
 
+/// What a `dispatch` call actually did.
+///
+/// Returned explicitly rather than inferred from a failure counter, because the three
+/// non-success outcomes are not interchangeable and only ONE of them is a delivery. A shutdown
+/// return is neither a success nor a failure; read through a failure-count delta it looked
+/// exactly like a success, and `fire_queue_drained` then advanced `last_queue_drained_at` past
+/// jobs nothing had ever been sent for — silently, with no log, no `hook-failed` and no
+/// notification, and in a backlog for an entire History in one pass.
+///
+/// `#[must_use]`: dropping this on the floor is how that bug reappears.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// Delivered to every configured mechanism.
+    Delivered,
+    /// At least one configured mechanism failed. Already reported via `report_failure`.
+    Failed,
+    /// Shutting down — we deliberately did not try. NOT a success.
+    Skipped,
+    /// Nothing configured for this trigger.
+    NotConfigured,
+}
+
 /// Runs a trigger's configured hooks. MUST be called with no `ctx.db` guard held.
-pub fn dispatch(ctx: &crate::ctx::Ctx, trigger: Trigger, cfg: &HookConfig, payload: Value) {
+pub fn dispatch(
+    ctx: &crate::ctx::Ctx,
+    trigger: Trigger,
+    cfg: &HookConfig,
+    payload: Value,
+) -> DispatchOutcome {
     if cfg.is_off() {
-        return;
+        return DispatchOutcome::NotConfigured;
     }
     // Checked here, not only at the queue loop head: a quit during a hook would otherwise
     // block the queue thread for up to the timeout and could orphan a command child.
     if ctx.converter.is_shutting_down() {
-        return;
+        return DispatchOutcome::Skipped;
     }
 
+    let mut failed = false;
     if !cfg.url.trim().is_empty() {
         // Path mapping is a webhook concern only — a script rewrites paths itself.
         let mut mapped = payload.clone();
@@ -660,6 +689,7 @@ pub fn dispatch(ctx: &crate::ctx::Ctx, trigger: Trigger, cfg: &HookConfig, paylo
         });
         if let Err(e) = result {
             report_failure(ctx, trigger, &format!("webhook: {e}"));
+            failed = true;
         }
     }
 
@@ -671,7 +701,14 @@ pub fn dispatch(ctx: &crate::ctx::Ctx, trigger: Trigger, cfg: &HookConfig, paylo
         });
         if let Err(e) = result {
             report_failure(ctx, trigger, &format!("command: {e}"));
+            failed = true;
         }
+    }
+
+    if failed {
+        DispatchOutcome::Failed
+    } else {
+        DispatchOutcome::Delivered
     }
 }
 
@@ -683,12 +720,6 @@ fn report_failure(ctx: &crate::ctx::Ctx, trigger: Trigger, reason: &str) {
     eprintln!("convertbar: {event} hook failed — {reason}");
     ctx.events
         .emit_t("hook-failed", json!({ "event": event, "reason": reason }));
-
-    // Counted so Task 6's queue-drained fire can tell whether ITS dispatch failed and
-    // therefore whether the watermark may advance.
-    ctx.converter
-        .hook_failure_count
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let already = {
         let mut flag = ctx.converter.hook_failure_notified.lock().unwrap();
@@ -812,7 +843,9 @@ pub fn fire_post_convert(ctx: &crate::ctx::Ctx, job_id: &str) {
        // window documented in CLAUDE.md is wider here, not narrower.
 
     let Some(job) = job else { return };
-    dispatch(ctx, Trigger::PostConvert, &cfg, post_convert_payload(&job));
+    // Discarded deliberately: the per-file fire has no watermark to protect, and every failure
+    // is already surfaced by `report_failure` inside `dispatch`.
+    let _ = dispatch(ctx, Trigger::PostConvert, &cfg, post_convert_payload(&job));
 }
 
 /// Where the last successful queue-drained report stopped. Persisted, not run-local: a pause,
@@ -875,14 +908,6 @@ pub fn load_jobs_since(
             Vec::new()
         }
     }
-}
-
-/// Read as a DELTA around a single dispatch, never absolutely — see the field's own doc on
-/// `ConverterState::hook_failure_count`.
-fn hook_failures_seen(ctx: &crate::ctx::Ctx) -> usize {
-    ctx.converter
-        .hook_failure_count
-        .load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Fires on a TRUE drain, in batches of `QUEUE_DRAINED_BATCH`. Advances the watermark only
@@ -952,15 +977,20 @@ pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
         // AFTER the truncation, so the watermark names the last row actually reported.
         let newest = jobs.iter().filter_map(|j| j.completed_at.clone()).max();
 
-        let failures_before = hook_failures_seen(ctx);
-        dispatch(
+        // ONLY `Delivered` may advance the watermark. `Failed` is the receiver refusing;
+        // `Skipped` is a shutdown that deliberately sent nothing; `NotConfigured` cannot occur
+        // here (`cfg.is_off()` was checked above) but is not a delivery either. All three stop
+        // the loop, so the same batch is re-reported on the next drain instead of being lost.
+        match dispatch(
             ctx,
             Trigger::QueueDrained,
             &cfg,
             queue_drained_payload(&jobs),
-        );
-        if hook_failures_seen(ctx) != failures_before {
-            return; // do not advance past jobs the receiver never heard about
+        ) {
+            DispatchOutcome::Delivered => {}
+            DispatchOutcome::Failed | DispatchOutcome::Skipped | DispatchOutcome::NotConfigured => {
+                return
+            }
         }
 
         // TERMINATION GUARD. Everything past here must either advance the watermark or stop:

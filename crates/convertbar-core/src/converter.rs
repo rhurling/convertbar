@@ -222,14 +222,6 @@ pub struct ConverterState {
     /// hoisting the fire out to the nine call sites — recreates exactly the drift the
     /// single-entry-point design prevents. Cleared at the top of every run.
     pub(crate) hook_failure_notified: Mutex<bool>,
-    /// How many hook dispatches have failed, for the lifetime of this `ConverterState`.
-    ///
-    /// READ CONTRACT: as a DELTA around a single dispatch — snapshot before, compare after,
-    /// `!=` means that dispatch failed. Never absolutely. It is monotonic and deliberately
-    /// never reset (unlike `hook_failure_notified`, which is per-run), so a `> 0` test would
-    /// read as "failed" forever after any earlier failure and would suppress the
-    /// queue-drained watermark permanently. `hooks::fire_queue_drained` is the reader.
-    pub(crate) hook_failure_count: std::sync::atomic::AtomicUsize,
 }
 
 impl ConverterState {
@@ -245,7 +237,6 @@ impl ConverterState {
             installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
             hook_failure_notified: Mutex::new(false),
-            hook_failure_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -6045,5 +6036,89 @@ HandBrake has exited.";
             "2026-01-01T00:00:00.000000+00:00",
             "and the watermark still advances, so the loop terminates"
         );
+    }
+
+    /// Books three completed rows and a watermark that leaves two of them reportable, so
+    /// "the watermark did not move" is a real observation against a real value rather than the
+    /// empty default an absent watermark would also read as. Shared by the shutdown pair below.
+    fn drain_backlog_behind_a_watermark(ctx: &Arc<Ctx>) -> String {
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_history(&ctx.clone(), 3, |i| format!("2026-01-01T00:00:0{i}+00:00"));
+        let watermark = "2026-01-01T00:00:00+00:00".to_string();
+        set_setting(&ctx.db, "last_queue_drained_at", &watermark);
+        watermark
+    }
+
+    #[test]
+    fn a_drain_during_shutdown_sends_nothing_and_leaves_the_watermark_alone() {
+        // The bug this pins: `dispatch` bails on is_shutting_down WITHOUT reporting a failure,
+        // and the old "did the failure counter move?" signal read that as a success. The
+        // watermark then advanced past jobs nothing was ever sent for — no log, no hook-failed,
+        // no notification — and because the next drain selects `completed_at > watermark`, they
+        // could never be reported again. In a backlog the loop keeps going while more remain,
+        // so an entire History can be watermarked away in one pass. Reachable from `docker
+        // stop`, an app quit, and an auto-update install.
+        let (ctx, sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        let watermark = drain_backlog_behind_a_watermark(&ctx);
+
+        kill_active_child(&ctx.converter); // this is how the shutdown flag is armed
+        crate::hooks::fire_queue_drained(&ctx);
+
+        assert!(
+            hooks.webhooks.lock().unwrap().is_empty(),
+            "a shutdown must send nothing: {:?}",
+            hooks.webhooks.lock().unwrap()
+        );
+        assert!(hooks.commands.lock().unwrap().is_empty());
+        assert!(
+            sink.payloads("hook-failed").is_empty(),
+            "a deliberate skip is not a failure — it must not be reported as one"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at"),
+            watermark,
+            "the watermark must not move past jobs nothing was sent for"
+        );
+    }
+
+    #[test]
+    fn the_same_drain_arrangement_advances_the_watermark_when_not_shutting_down() {
+        // Guards the guard: identical fixture, no shutdown. Proves the test above observes the
+        // skip rather than an arrangement that could never have fired or advanced at all.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        let watermark = drain_backlog_behind_a_watermark(&ctx);
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+        assert_ne!(setting_value(&ctx.db, "last_queue_drained_at"), watermark);
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at"),
+            completed_at_of(&ctx.db, "h0002"),
+            "a delivered drain advances to the newest reported row"
+        );
+    }
+
+    #[test]
+    fn a_refused_drain_leaves_a_pre_existing_watermark_where_it_was() {
+        // The `Failed` arm of the same decision, against a NON-EMPTY starting watermark:
+        // `a_failed_drain_hook_does_not_advance_the_watermark` asserts against "", which a
+        // never-written watermark also satisfies. This one can only pass if the value survived.
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        let watermark = drain_backlog_behind_a_watermark(&ctx);
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let failed = sink.payloads("hook-failed");
+        assert_eq!(failed.len(), 1, "the drain hook must have been attempted");
+        assert_eq!(failed[0]["event"], "queue-drained");
+        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at"), watermark);
     }
 }
