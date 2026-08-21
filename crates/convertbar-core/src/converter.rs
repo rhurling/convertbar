@@ -837,11 +837,34 @@ fn final_run_status(had_errors: bool) -> &'static str {
 /// so a crash in `process_queue` can't wedge the queue by leaving the flag stuck true (which
 /// makes every future `run_queue` early-return, permanently). Poison-tolerant so a poisoned
 /// `is_running` still gets cleared.
-struct RunningGuard<'a>(&'a ConverterState);
+struct RunningGuard<'a> {
+    state: &'a ConverterState,
+    armed: bool,
+}
+
+impl<'a> RunningGuard<'a> {
+    fn new(state: &'a ConverterState) -> Self {
+        Self { state, armed: true }
+    }
+
+    /// The slot has already been released, atomically against `claim_queue_slot`. Stand down:
+    /// once released, another thread may have claimed it, and clearing `is_running` under a
+    /// queue thread that is genuinely running would let a THIRD claim succeed and run two queues
+    /// at once.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for RunningGuard<'_> {
     fn drop(&mut self) {
-        *self.0.is_running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        if self.armed {
+            *self
+                .state
+                .is_running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+        }
     }
 }
 
@@ -866,20 +889,36 @@ enum PassOutcome {
 /// tray already showing idle. Anything the refusal missed is picked up here instead of being
 /// stranded.
 fn process_queue(ctx: &Ctx) {
-    // Clears is_running on every exit path (normal, early return, or panic). Held across ALL
-    // passes: releasing it between them would reopen exactly the window this loop closes.
-    let _running = RunningGuard(&ctx.converter);
+    // Clears is_running on every exit path (early return, or panic). Held across ALL passes:
+    // releasing it between them would reopen exactly the window this loop closes. On the normal
+    // exit the slot is released by `release_queue_slot_unless_work_arrived` instead and the
+    // guard is disarmed — see there for why that release cannot be a plain drop.
+    let mut running = RunningGuard::new(&ctx.converter);
 
     loop {
         if process_queue_pass(ctx) != PassOutcome::Drained {
             return;
         }
-        if !work_arrived_while_busy(ctx) {
+        if work_arrived_while_busy(ctx) {
+            eprintln!(
+                "convertbar: work was queued while the queue was busy — running another pass \
+                 instead of leaving it stranded"
+            );
+            continue;
+        }
+        // Nothing recorded, or nothing left in the DB. Release the slot atomically against
+        // `claim_queue_slot` so a refusal landing in this instant cannot be lost between the
+        // check above and the release.
+        if release_queue_slot_unless_work_arrived(&ctx.converter) {
+            running.disarm();
             return;
         }
+        // A start was refused in that instant. We still hold the slot, so the refusal is ours to
+        // honour: loop, and let the next pass be authoritative about whether there is work. At
+        // worst that is one no-op pass — the flag was consumed, so it cannot repeat.
         eprintln!(
-            "convertbar: work was queued while the queue was busy — running another pass \
-             instead of leaving it stranded"
+            "convertbar: a queue start was refused as this run was releasing its slot — running \
+             another pass rather than stranding whatever it was for"
         );
     }
 }
@@ -1701,13 +1740,48 @@ pub fn claim_queue_slot(converter: &ConverterState) -> bool {
     true
 }
 
+/// Releases the queue slot, but only if no start was refused while we were deciding to.
+///
+/// This is the same critical section `claim_queue_slot` uses, and that is the whole point: the
+/// consume-then-release pair must be ATOMIC against a refusal. A refusal landing between an
+/// ordinary flag read and `RunningGuard`'s drop would set a flag nobody will ever read for this
+/// run and be refused into a run that is already over — restoring, in miniature, exactly the
+/// stranding this machinery exists to prevent.
+///
+/// Returns true when the slot was released (the caller must stop and MUST disarm its
+/// `RunningGuard`), false when a refusal was seen, in which case `is_running` stays claimed and
+/// the caller keeps going. Takes no other lock — in particular not `ctx.db` — so it adds no lock
+/// ordering edge to the one CLAUDE.md warns about.
+fn release_queue_slot_unless_work_arrived(converter: &ConverterState) -> bool {
+    let mut running = converter
+        .is_running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if converter.take_work_arrived_while_busy() {
+        return false; // keep the slot; the caller runs another pass
+    }
+    *running = false;
+    true
+}
+
 /// Starts queue processing in a new background thread.
 /// Sets `is_running` to true atomically before spawning.
 pub fn run_queue(ctx: Arc<Ctx>) {
     if !claim_queue_slot(&ctx.converter) {
         return;
     }
+    spawn_queue_thread(ctx);
+}
 
+/// Spawns the queue thread for a slot the CALLER has already claimed. Split out of `run_queue`
+/// for `control::start_queue`, which must claim before it touches the persisted pause and would
+/// otherwise have to re-implement the claim (and, historically, got the refusal semantics
+/// subtly different — see BUG 1). `claim_queue_slot` stays the one place that decides what a
+/// refusal means.
+///
+/// The caller must hold the slot: `process_queue`'s `RunningGuard` releases it, so calling this
+/// without a claim clears an `is_running` that belongs to somebody else.
+pub fn spawn_queue_thread(ctx: Arc<Ctx>) {
     std::thread::spawn(move || {
         process_queue(&ctx);
     });
@@ -3481,7 +3555,7 @@ HandBrake has exited.";
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _running = RunningGuard(&converter);
+            let _running = RunningGuard::new(&converter);
             assert!(
                 *converter.is_running.lock().unwrap(),
                 "is_running stays true while the guard is alive"
@@ -6246,7 +6320,22 @@ HandBrake has exited.";
         ctx: Mutex<Option<Arc<Ctx>>>,
         dir: Mutex<Option<std::path::PathBuf>>,
         fired: Mutex<bool>,
+        /// Which of the two ways into the queue this run models. Both must record the refusal;
+        /// only one of them did when this was first fixed.
+        via: StartPath,
     }
+
+    /// How the mid-hook arrival asks for the queue. `RunQueue` is the watcher's ingest path
+    /// (`watcher.rs`); `StartQueue` is `control::start_queue`, which is what BOTH heads call
+    /// after an add — `useFileIntake.ts` for the desktop UI, `routes/converter.rs` for the
+    /// server — because `queue_ops::add_files` does not start the queue itself.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    enum StartPath {
+        #[default]
+        RunQueue,
+        StartQueue,
+    }
+
     impl crate::hooks::HookRunner for EnqueueDuringHookRunner {
         fn run_webhook(&self, _r: &crate::hooks::WebhookRequest) -> Result<(), String> {
             // Once only: the second pass drains too and fires this hook again, and an
@@ -6265,13 +6354,24 @@ HandBrake has exited.";
                 out.to_str().unwrap(),
                 1000,
             );
-            // The refusal under test. It must be REFUSED — otherwise this test would be
-            // measuring a second queue thread instead of the re-check.
-            assert!(
-                !claim_queue_slot(&ctx.converter),
-                "the queue must still hold is_running while its own drain hook runs"
-            );
-            run_queue(ctx.clone());
+            match self.via {
+                StartPath::RunQueue => {
+                    // The refusal under test. It must be REFUSED — otherwise this test would be
+                    // measuring a second queue thread instead of the re-check.
+                    assert!(
+                        !claim_queue_slot(&ctx.converter),
+                        "the queue must still hold is_running while its own drain hook runs"
+                    );
+                    run_queue(ctx.clone());
+                }
+                StartPath::StartQueue => {
+                    crate::control::start_queue(&ctx).unwrap();
+                    assert!(
+                        *ctx.converter.is_running.lock().unwrap(),
+                        "start_queue must not have released the slot this run holds"
+                    );
+                }
+            }
             Ok(())
         }
         fn run_command(&self, _r: &crate::hooks::CommandRequest) -> Result<(), String> {
@@ -6279,14 +6379,13 @@ HandBrake has exited.";
         }
     }
 
-    #[test]
-    fn a_job_queued_while_the_drain_hook_runs_is_still_converted() {
-        // The stranding this fix exists for. `claim_queue_slot` refuses for as long as the queue
-        // holds is_running, and the drain hook can hold that open for minutes (batches ×
-        // mechanisms × a timeout that goes to 300s). `run_queue` returns silently on the
-        // refusal, the tray already says idle, and before this fix nothing ever looked again:
-        // the file sat 'queued' until some unrelated later event.
-        let runner = Arc::new(EnqueueDuringHookRunner::default());
+    /// Runs one job to a true drain with a hook that, mid-drain, enqueues a second job and asks
+    /// for the queue through `via`. Asserts the late job is converted anyway.
+    fn assert_a_mid_hook_arrival_is_converted(via: StartPath) {
+        let runner = Arc::new(EnqueueDuringHookRunner {
+            via,
+            ..Default::default()
+        });
         let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), runner.clone());
         *runner.ctx.lock().unwrap() = Some(ctx.clone());
         set_setting(
@@ -6299,9 +6398,9 @@ HandBrake has exited.";
         *runner.dir.lock().unwrap() = Some(dir.path().to_path_buf());
         queue_real_job(&ctx, &dir, "j1", 0);
 
-        // Claim the slot the way `run_queue` would, so the hook's `claim_queue_slot` really is
-        // refused. process_queue then runs inline on this thread: no sleeps, no polling, and a
-        // regression fails rather than flakes.
+        // Claim the slot the way `run_queue` would, so the hook's start really is refused.
+        // process_queue then runs inline on this thread: no sleeps, no polling, and a regression
+        // fails rather than flakes.
         *ctx.converter.is_running.lock().unwrap() = true;
         process_queue(&ctx);
 
@@ -6309,7 +6408,7 @@ HandBrake has exited.";
         assert_eq!(
             job_row(&ctx.db, "late").0,
             "done",
-            "the job that arrived during the drain hook was stranded"
+            "the job that arrived during the drain hook was stranded ({via:?})"
         );
         assert!(
             !ctx.converter.take_work_arrived_while_busy(),
@@ -6317,8 +6416,29 @@ HandBrake has exited.";
         );
         assert!(
             !*ctx.converter.is_running.lock().unwrap(),
-            "RunningGuard still releases the slot after the extra pass"
+            "the slot must be released after the extra pass"
         );
+    }
+
+    #[test]
+    fn a_job_queued_while_the_drain_hook_runs_is_still_converted() {
+        // The stranding this fix exists for, on the watcher's ingest path. `claim_queue_slot`
+        // refuses for as long as the queue holds is_running, and the drain hook can hold that
+        // open for minutes (batches × mechanisms × a timeout that goes to 300s). `run_queue`
+        // returns silently on the refusal, the tray already says idle, and before this fix
+        // nothing ever looked again: the file sat 'queued' until some unrelated later event.
+        assert_a_mid_hook_arrival_is_converted(StartPath::RunQueue);
+    }
+
+    #[test]
+    fn a_job_added_through_start_queue_while_the_drain_hook_runs_is_still_converted() {
+        // The SAME stranding on the path a user actually takes. Every user-initiated add goes
+        // through `control::start_queue` — `useFileIntake.ts` calls `startQueue()` after
+        // `addFiles`, the server head's `routes/converter.rs` does the same, and
+        // `queue_ops::add_files` does not start the queue itself. `start_queue` used to
+        // short-circuit on its own `is_running` read and never reach `claim_queue_slot`, so it
+        // recorded nothing and this file stayed stranded even after the watcher path was fixed.
+        assert_a_mid_hook_arrival_is_converted(StartPath::StartQueue);
     }
 
     #[test]
@@ -6365,6 +6485,53 @@ HandBrake has exited.";
         assert!(
             !converter.take_work_arrived_while_busy(),
             "and the flag is consumed by the read"
+        );
+    }
+
+    #[test]
+    fn releasing_the_slot_honours_a_refusal_that_lands_in_the_same_instant() {
+        // The consume/release race. Reading the flag and then letting `RunningGuard` drop are
+        // two steps, and a refusal landing between them sets a flag nobody will read for this
+        // run — the millisecond window restored rather than eliminated. Consuming the flag and
+        // releasing `is_running` inside ONE critical section — the same one `claim_queue_slot`
+        // takes — is what makes a refusal either seen by this run or refused into the next.
+        let converter = ConverterState::new();
+        assert!(claim_queue_slot(&converter));
+        assert!(!claim_queue_slot(&converter), "a start refused right now");
+
+        assert!(
+            !release_queue_slot_unless_work_arrived(&converter),
+            "an outstanding refusal must block the release"
+        );
+        assert!(
+            *converter.is_running.lock().unwrap(),
+            "and the slot must stay claimed, so no second queue thread can start underneath"
+        );
+
+        assert!(
+            release_queue_slot_unless_work_arrived(&converter),
+            "with the refusal consumed, the release goes through"
+        );
+        assert!(!*converter.is_running.lock().unwrap());
+    }
+
+    #[test]
+    fn a_disarmed_running_guard_does_not_clear_a_slot_someone_else_claimed() {
+        // Why `disarm` exists. Once the slot is released, another thread may claim it before
+        // this one returns; a guard that still cleared `is_running` on drop would free a slot a
+        // live queue thread is holding, and a THIRD claim would then succeed — two queues at
+        // once, which is exactly what the claim is for.
+        let converter = ConverterState::new();
+        assert!(claim_queue_slot(&converter));
+        {
+            let mut guard = RunningGuard::new(&converter);
+            assert!(release_queue_slot_unless_work_arrived(&converter));
+            guard.disarm();
+            assert!(claim_queue_slot(&converter), "another run takes the slot");
+        }
+        assert!(
+            *converter.is_running.lock().unwrap(),
+            "the disarmed guard must leave the new owner's claim alone"
         );
     }
 

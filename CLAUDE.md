@@ -134,12 +134,18 @@ change is most likely to break:
   command is fixed. Both keys are absent from `ALLOWED_KEYS`/`Settings` like the key they
   replaced; `db::init_db` seeds them from the pre-split `last_queue_drained_at` (`INSERT OR
   IGNORE`, and the legacy row is kept so a rollback still has a watermark).
-- **A drain hook can block for minutes**, and `claim_queue_slot` refuses every `run_queue` for
-  that whole time — silently. `process_queue` therefore runs another pass when
-  `work_arrived_while_busy` was set *and* the DB really holds a `queued` job; the flag alone
-  must never drive the loop (a refusal can race a `clear_queue`), and only a `PassOutcome::
-  Drained` may be followed by another pass, since `get_next_job` does not consult `queue_paused`.
-  The update interlock's refusal must not set the flag.
+- **A drain hook can block for minutes**, and every start is refused for that whole time —
+  silently. `claim_queue_slot` must stay the ONE place that decides what a refusal means:
+  `control::start_queue` (the path both heads use after an add) claims through it too, rather
+  than short-circuiting on its own `is_running` read, which is how that path stayed broken after
+  the watcher path was fixed. `process_queue` runs another pass when `work_arrived_while_busy`
+  was set *and* the DB really holds a `queued` job; the flag alone must never drive the loop (a
+  refusal can race a `clear_queue`), and only a `PassOutcome::Drained` may be followed by another
+  pass, since `get_next_job` does not consult `queue_paused`. The update interlock's refusal must
+  not set the flag. The final release goes through `release_queue_slot_unless_work_arrived`, which
+  consumes the flag and clears `is_running` in ONE critical section — a plain read followed by
+  `RunningGuard`'s drop loses any refusal landing between the two — and the guard is disarmed
+  afterwards so its drop cannot free a slot another run has since claimed.
 
 ## Cross-Platform
 

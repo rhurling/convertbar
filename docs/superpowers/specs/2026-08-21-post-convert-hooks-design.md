@@ -673,9 +673,15 @@ for it, but it means a CRUD table, routes, and list UI instead of two flat confi
 single mounted script fans out — including to the Unraid host, since `bash` can open
 `/dev/tcp/host/port` without `curl`. The receiver multiplexes; ConvertBar does not.
 
-**Command hook editable in the web UI.** It would make the server's auth token the only thing
-between the network and remote code execution as the container user. Environment-variable
-configuration costs a container restart to change and removes the escalation entirely.
+**Command hook editable in the web UI.** It would hand any authenticated caller a general,
+one-request way to run arbitrary code as the container user. Environment-variable configuration
+costs a container restart to change and keeps *these keys* off the API entirely.
+
+It does not remove every escalation from the API, and must not be described as if it did:
+`handbrake_path` IS in `ALLOWED_KEYS`, so the same authenticated caller can point it at another
+executable in the container and let the queue spawn it. That is pre-existing, is the same trust
+class as the auth token, and is out of scope here — but it means the honest claim is "the command
+hook keys are not remotely reachable", not "the escalation is removed".
 
 **Fire-and-forget hooks.** Never slows encoding, but hooks for different files overlap and land
 out of order, and failures are only discoverable in the log. Ordering and visible failure were
