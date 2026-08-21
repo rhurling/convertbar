@@ -659,7 +659,115 @@ pub enum DispatchOutcome {
     NotConfigured,
 }
 
-/// Runs a trigger's configured hooks. MUST be called with no `ctx.db` guard held.
+/// One of the two ways a trigger can deliver. They are addressed separately because
+/// `queue-drained` runs each configured one against its OWN watermark — see
+/// `Mechanism::watermark_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mechanism {
+    Webhook,
+    Command,
+}
+
+impl Mechanism {
+    /// Both, in dispatch order. A `for` over this rather than two hand-written call sites, so a
+    /// third mechanism cannot be added to one loop and forgotten in the other.
+    pub(crate) const ALL: [Mechanism; 2] = [Mechanism::Webhook, Mechanism::Command];
+
+    fn is_configured(self, cfg: &HookConfig) -> bool {
+        match self {
+            Mechanism::Webhook => !cfg.url.trim().is_empty(),
+            Mechanism::Command => !cfg.command.trim().is_empty(),
+        }
+    }
+
+    /// Prefix on a `hook-failed` reason, so an operator can tell which half broke.
+    fn label(self) -> &'static str {
+        match self {
+            Mechanism::Webhook => "webhook",
+            Mechanism::Command => "command",
+        }
+    }
+
+    /// Where THIS mechanism's queue-drained reporting stopped.
+    ///
+    /// One watermark per mechanism, not one shared: with both configured, a shared watermark
+    /// advances only when BOTH deliver, so a webhook that works is pinned behind a command that
+    /// fails — it re-receives the identical oldest batch on every drain forever, and once the
+    /// unreported backlog passes `QUEUE_DRAINED_BATCH` the jobs behind that batch are never
+    /// delivered to it at all. At-least-once delivery covers a retry, not an infinite replay.
+    /// The trigger is the misconfiguration the README calls the most common one (a hook script
+    /// left non-executable), in the exact pairing this feature was built for (a Stash rescan
+    /// webhook plus a `stashdupe` command).
+    ///
+    /// Both keys are deliberately absent from `settings_ops::ALLOWED_KEYS` and from the
+    /// `Settings` struct, exactly like the single key they replace: that absence is the security
+    /// boundary, and `settings_ops` tests it. Seeded from the pre-split
+    /// `last_queue_drained_at` by the migration in `db::init_db`.
+    pub(crate) fn watermark_key(self) -> &'static str {
+        match self {
+            Mechanism::Webhook => "last_queue_drained_at_webhook",
+            Mechanism::Command => "last_queue_drained_at_command",
+        }
+    }
+}
+
+/// Runs ONE mechanism. MUST be called with no `ctx.db` guard held.
+fn dispatch_mechanism(
+    ctx: &crate::ctx::Ctx,
+    trigger: Trigger,
+    cfg: &HookConfig,
+    payload: &Value,
+    mechanism: Mechanism,
+) -> DispatchOutcome {
+    if !mechanism.is_configured(cfg) {
+        return DispatchOutcome::NotConfigured;
+    }
+    // Checked here, not only at the queue loop head: a quit during a hook would otherwise
+    // block the queue thread for up to the timeout and could orphan a command child.
+    if ctx.converter.is_shutting_down() {
+        return DispatchOutcome::Skipped;
+    }
+
+    let result = match mechanism {
+        Mechanism::Webhook => {
+            // Path mapping is a webhook concern only — a script rewrites paths itself.
+            let mut mapped = payload.clone();
+            map_payload_paths(&mut mapped, &cfg.path_map);
+            parse_headers(&cfg.headers).and_then(|headers| {
+                let body = if cfg.body.trim().is_empty() {
+                    mapped.to_string()
+                } else {
+                    render_body(&cfg.body, &mapped)
+                };
+                ctx.hooks.runner.run_webhook(&WebhookRequest {
+                    url: cfg.url.trim().to_string(),
+                    headers,
+                    body,
+                    timeout: cfg.timeout,
+                })
+            })
+        }
+        Mechanism::Command => ctx.hooks.runner.run_command(&CommandRequest {
+            command: cfg.command.trim().to_string(),
+            env: command_env(payload), // raw, unmapped
+            timeout: cfg.timeout,
+        }),
+    };
+
+    match result {
+        Ok(()) => DispatchOutcome::Delivered,
+        Err(e) => {
+            report_failure(ctx, trigger, &format!("{}: {e}", mechanism.label()));
+            DispatchOutcome::Failed
+        }
+    }
+}
+
+/// Runs a trigger's configured hooks, both mechanisms, and collapses the two outcomes into one.
+/// MUST be called with no `ctx.db` guard held.
+///
+/// The per-file fire point uses this. `fire_queue_drained` does NOT — it drives each mechanism
+/// separately so their watermarks stay independent.
 pub fn dispatch(
     ctx: &crate::ctx::Ctx,
     trigger: Trigger,
@@ -669,50 +777,19 @@ pub fn dispatch(
     if cfg.is_off() {
         return DispatchOutcome::NotConfigured;
     }
-    // Checked here, not only at the queue loop head: a quit during a hook would otherwise
-    // block the queue thread for up to the timeout and could orphan a command child.
     if ctx.converter.is_shutting_down() {
         return DispatchOutcome::Skipped;
     }
 
-    let mut failed = false;
-    if !cfg.url.trim().is_empty() {
-        // Path mapping is a webhook concern only — a script rewrites paths itself.
-        let mut mapped = payload.clone();
-        map_payload_paths(&mut mapped, &cfg.path_map);
-        let result = parse_headers(&cfg.headers).and_then(|headers| {
-            let body = if cfg.body.trim().is_empty() {
-                mapped.to_string()
-            } else {
-                render_body(&cfg.body, &mapped)
-            };
-            ctx.hooks.runner.run_webhook(&WebhookRequest {
-                url: cfg.url.trim().to_string(),
-                headers,
-                body,
-                timeout: cfg.timeout,
-            })
-        });
-        if let Err(e) = result {
-            report_failure(ctx, trigger, &format!("webhook: {e}"));
-            failed = true;
-        }
-    }
+    let outcomes = Mechanism::ALL.map(|m| dispatch_mechanism(ctx, trigger, cfg, &payload, m));
 
-    if !cfg.command.trim().is_empty() {
-        let result = ctx.hooks.runner.run_command(&CommandRequest {
-            command: cfg.command.trim().to_string(),
-            env: command_env(&payload), // raw, unmapped
-            timeout: cfg.timeout,
-        });
-        if let Err(e) = result {
-            report_failure(ctx, trigger, &format!("command: {e}"));
-            failed = true;
-        }
-    }
-
-    if failed {
+    // Worst outcome wins, and a partial delivery is never reported as a full one: `Failed` if
+    // either half failed, then `Skipped` if a shutdown landed between the two. At least one is
+    // configured (`is_off` was false), so `Delivered` here really means something was sent.
+    if outcomes.contains(&DispatchOutcome::Failed) {
         DispatchOutcome::Failed
+    } else if outcomes.contains(&DispatchOutcome::Skipped) {
+        DispatchOutcome::Skipped
     } else {
         DispatchOutcome::Delivered
     }
@@ -854,9 +931,13 @@ pub fn fire_post_convert(ctx: &crate::ctx::Ctx, job_id: &str) {
     let _ = dispatch(ctx, Trigger::PostConvert, &cfg, post_convert_payload(&job));
 }
 
-/// Where the last successful queue-drained report stopped. Persisted, not run-local: a pause,
-/// a low-disk stop, or a restart must not lose the jobs completed before it.
-const WATERMARK_KEY: &str = "last_queue_drained_at";
+/// The pre-split watermark key. NOT read by the fire path any more — `Mechanism::watermark_key`
+/// replaced it with one key per mechanism — but named here so the migration in `db::init_db`
+/// that seeds those two from it has something to point at, and so a search for it lands on the
+/// explanation rather than on nothing. Deliberately not deleted from existing databases: a
+/// rollback to an earlier build must still find its watermark, or that build replays the whole
+/// of History on its first drain. It costs one stale settings row.
+pub(crate) const LEGACY_WATERMARK_KEY: &str = "last_queue_drained_at";
 
 /// Jobs per drain payload.
 ///
@@ -916,10 +997,13 @@ pub fn load_jobs_since(
     }
 }
 
-/// Fires on a TRUE drain, in batches of `QUEUE_DRAINED_BATCH`. Advances the watermark only
-/// after a batch dispatches cleanly, so a failed hook re-reports the same jobs next time
-/// rather than losing them — and the batch bound keeps that retry from growing without limit.
-/// A whole backlog drains inside this one call, not one batch per queue run.
+/// Fires on a TRUE drain: each CONFIGURED mechanism drains its own backlog, in batches of
+/// `QUEUE_DRAINED_BATCH`, against its own watermark.
+///
+/// The loops are independent on purpose. Sharing one watermark means it advances only when
+/// every mechanism delivers, so one broken half pins the other at the oldest unreported batch
+/// forever — see `Mechanism::watermark_key`. A mechanism that is not configured has no
+/// watermark to advance and is not a failure; it is simply skipped.
 pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
     let cfg = {
         let db = match ctx.db.lock() {
@@ -933,6 +1017,20 @@ pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
         cfg
     };
 
+    for mechanism in Mechanism::ALL {
+        if mechanism.is_configured(&cfg) {
+            drain_mechanism(ctx, &cfg, mechanism);
+        }
+    }
+}
+
+/// One mechanism's batch loop. Advances that mechanism's watermark only after a batch
+/// dispatches cleanly to it, so a refusal re-reports the same jobs next time rather than losing
+/// them — and the batch bound keeps that retry from growing without limit. A whole backlog
+/// drains inside this one call, not one batch per queue run.
+fn drain_mechanism(ctx: &crate::ctx::Ctx, cfg: &HookConfig, mechanism: Mechanism) {
+    let watermark_key = mechanism.watermark_key();
+
     loop {
         let (watermark, jobs) = {
             let db = match ctx.db.lock() {
@@ -943,7 +1041,9 @@ pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
             // every completed job in History. That one-time burst is preferred over seeding the
             // watermark at migration time, which would make a fresh install and an upgrade
             // behave differently for no visible reason. It arrives batched, not as one payload.
-            let watermark = setting(&db, WATERMARK_KEY);
+            // (An UPGRADE from the single-watermark build is not a first run: `db::init_db`
+            // seeds both keys from `LEGACY_WATERMARK_KEY`, so nobody gets that burst twice.)
+            let watermark = setting(&db, watermark_key);
             let jobs = load_jobs_since(&db, &watermark, QUEUE_DRAINED_BATCH);
             (watermark, jobs)
         }; // guard dropped BEFORE dispatch — a hook can block for the full timeout.
@@ -983,15 +1083,17 @@ pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
         // AFTER the truncation, so the watermark names the last row actually reported.
         let newest = jobs.iter().filter_map(|j| j.completed_at.clone()).max();
 
-        // ONLY `Delivered` may advance the watermark. `Failed` is the receiver refusing;
-        // `Skipped` is a shutdown that deliberately sent nothing; `NotConfigured` cannot occur
-        // here (`cfg.is_off()` was checked above) but is not a delivery either. All three stop
-        // the loop, so the same batch is re-reported on the next drain instead of being lost.
-        match dispatch(
+        // ONLY `Delivered` may advance this mechanism's watermark. `Failed` is the receiver
+        // refusing; `Skipped` is a shutdown that deliberately sent nothing; `NotConfigured`
+        // cannot occur here (the caller only calls a configured mechanism) but is not a delivery
+        // either. All three stop THIS loop — and only this one: the other mechanism's loop has
+        // already run or is still to run, against its own watermark, unaffected.
+        match dispatch_mechanism(
             ctx,
             Trigger::QueueDrained,
-            &cfg,
-            queue_drained_payload(&jobs),
+            cfg,
+            &queue_drained_payload(&jobs),
+            mechanism,
         ) {
             DispatchOutcome::Delivered => {}
             DispatchOutcome::Failed | DispatchOutcome::Skipped | DispatchOutcome::NotConfigured => {
@@ -1026,7 +1128,7 @@ pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
             };
             db.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
-                rusqlite::params![WATERMARK_KEY, &newest],
+                rusqlite::params![watermark_key, &newest],
             )
         };
         // A failed write is the other way the watermark stays put; same rule applies.

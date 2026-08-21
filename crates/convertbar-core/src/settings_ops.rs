@@ -853,8 +853,22 @@ mod tests {
 
     #[test]
     fn internal_hook_keys_are_not_writable_over_the_api() {
-        // Engine-written, like the three updater keys.
-        assert!(!ALLOWED_KEYS.contains(&"last_queue_drained_at"));
+        // Engine-written, like the three updater keys. Both per-mechanism drain watermarks are
+        // covered, not just the pre-split key they replaced: a watermark that could be written
+        // over the API is a watermark an authenticated user can rewind to replay every job in
+        // History at the receiver, or push forward to silence it.
+        let (ctx, _sink, _disp) = test_ctx(test_conn());
+        for key in [
+            "last_queue_drained_at",
+            "last_queue_drained_at_webhook",
+            "last_queue_drained_at_command",
+        ] {
+            assert!(
+                !ALLOWED_KEYS.contains(&key),
+                "{key} must NOT be remotely writable"
+            );
+            assert!(update_setting(&ctx, key, "2026-01-01T00:00:00+00:00").is_err());
+        }
     }
 
     #[test]
@@ -866,6 +880,8 @@ mod tests {
             "post_convert_command",
             "queue_drained_command",
             "last_queue_drained_at",
+            "last_queue_drained_at_webhook",
+            "last_queue_drained_at_command",
         ] {
             conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, 'SENTINEL')",

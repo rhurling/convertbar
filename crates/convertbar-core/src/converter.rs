@@ -5671,7 +5671,7 @@ HandBrake has exited.";
             .unwrap()
             .to_string();
         assert_eq!(
-            setting_value(&ctx.db, "last_queue_drained_at"),
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
             completed_at_of(&ctx.db, &last_reported),
             "the watermark is computed from the reported set, never from the clock"
         );
@@ -5797,7 +5797,7 @@ HandBrake has exited.";
         assert_eq!(failed.len(), 1, "the drain hook must have been attempted");
         assert_eq!(failed[0]["event"], "queue-drained");
 
-        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at"), "");
+        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at_webhook"), "");
     }
 
     #[test]
@@ -5871,7 +5871,7 @@ HandBrake has exited.";
         // written — which is what proves the post-dispatch re-acquire really ran rather than
         // the whole tail being skipped.
         assert_eq!(
-            setting_value(&ctx.db, "last_queue_drained_at"),
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
             completed_at_of(&ctx.db, "j1")
         );
     }
@@ -5959,7 +5959,7 @@ HandBrake has exited.";
             "batching must not drop or duplicate a job"
         );
         assert_eq!(
-            setting_value(&ctx.db, "last_queue_drained_at"),
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
             completed_at_of(&ctx.db, &format!("h{:04}", total - 1))
         );
     }
@@ -6005,15 +6005,26 @@ HandBrake has exited.";
         let failed = sink.payloads("hook-failed");
         assert_eq!(failed.len(), 1, "exactly the first batch, then it stopped");
         assert_eq!(failed[0]["event"], "queue-drained");
-        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at"), "");
+        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at_webhook"), "");
     }
 
     /// Books `count` completed history rows whose `completed_at` is `stamp(i)`. Direct row
     /// writes: the batching behaviour under test is about the SQL window, and running hundreds
     /// of real encodes would take minutes while proving nothing extra.
     fn book_history(ctx: &Arc<Ctx>, count: usize, stamp: impl Fn(usize) -> String) {
+        book_history_prefixed(ctx, "h", count, stamp)
+    }
+
+    /// `book_history` with a caller-chosen id prefix, so a test can book a SECOND wave of
+    /// completions without colliding with the first wave's ids.
+    fn book_history_prefixed(
+        ctx: &Arc<Ctx>,
+        prefix: &str,
+        count: usize,
+        stamp: impl Fn(usize) -> String,
+    ) {
         for i in 0..count {
-            let id = format!("h{i:04}");
+            let id = format!("{prefix}{i:04}");
             queue_job(
                 &ctx.db,
                 &id,
@@ -6123,7 +6134,7 @@ HandBrake has exited.";
         let reported = reported_job_ids(&hooks);
         assert_eq!(reported.len(), 100, "the unsplittable group is sent whole");
         assert_eq!(
-            setting_value(&ctx.db, "last_queue_drained_at"),
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
             "2026-01-01T00:00:00.000000+00:00",
             "and the watermark still advances, so the loop terminates"
         );
@@ -6140,7 +6151,7 @@ HandBrake has exited.";
         );
         book_history(&ctx.clone(), 3, |i| format!("2026-01-01T00:00:0{i}+00:00"));
         let watermark = "2026-01-01T00:00:00+00:00".to_string();
-        set_setting(&ctx.db, "last_queue_drained_at", &watermark);
+        set_setting(&ctx.db, "last_queue_drained_at_webhook", &watermark);
         watermark
     }
 
@@ -6170,7 +6181,7 @@ HandBrake has exited.";
             "a deliberate skip is not a failure — it must not be reported as one"
         );
         assert_eq!(
-            setting_value(&ctx.db, "last_queue_drained_at"),
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
             watermark,
             "the watermark must not move past jobs nothing was sent for"
         );
@@ -6186,9 +6197,12 @@ HandBrake has exited.";
         crate::hooks::fire_queue_drained(&ctx);
 
         assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
-        assert_ne!(setting_value(&ctx.db, "last_queue_drained_at"), watermark);
+        assert_ne!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            watermark
+        );
         assert_eq!(
-            setting_value(&ctx.db, "last_queue_drained_at"),
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
             completed_at_of(&ctx.db, "h0002"),
             "a delivered drain advances to the newest reported row"
         );
@@ -6210,7 +6224,10 @@ HandBrake has exited.";
         let failed = sink.payloads("hook-failed");
         assert_eq!(failed.len(), 1, "the drain hook must have been attempted");
         assert_eq!(failed[0]["event"], "queue-drained");
-        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at"), watermark);
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            watermark
+        );
     }
 
     // --- Work that arrives while the queue is busy -------------------------------------------
@@ -6365,6 +6382,234 @@ HandBrake has exited.";
         assert!(
             !converter.take_work_arrived_while_busy(),
             "an install holding the interlock must not set the flag"
+        );
+    }
+
+    // --- Per-mechanism drain watermarks -------------------------------------------------------
+
+    /// A webhook that works alongside a command that does not. This is not an exotic pairing:
+    /// it is the deployment the feature was built for (a Stash rescan webhook plus a
+    /// `stashdupe` command) meeting the misconfiguration the README calls the most common one
+    /// (a hook script left non-executable).
+    #[derive(Default)]
+    struct WorkingWebhookFailingCommandRunner {
+        webhooks: Mutex<Vec<crate::hooks::WebhookRequest>>,
+        commands: Mutex<Vec<crate::hooks::CommandRequest>>,
+    }
+    impl crate::hooks::HookRunner for WorkingWebhookFailingCommandRunner {
+        fn run_webhook(&self, r: &crate::hooks::WebhookRequest) -> Result<(), String> {
+            self.webhooks.lock().unwrap().push(r.clone());
+            Ok(())
+        }
+        fn run_command(&self, r: &crate::hooks::CommandRequest) -> Result<(), String> {
+            self.commands.lock().unwrap().push(r.clone());
+            Err("Permission denied (os error 13)".into())
+        }
+    }
+
+    /// The job ids in one webhook body, in payload order.
+    fn body_job_ids(body: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["job_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_failing_command_does_not_pin_the_working_webhook() {
+        // With ONE watermark shared by both mechanisms, a webhook that delivers plus a command
+        // that fails collapses to "failed", the watermark never moves, and the working receiver
+        // gets the identical oldest batch on every drain forever — never the new jobs. Past
+        // QUEUE_DRAINED_BATCH unreported jobs it would never see them at all until the command
+        // is fixed. Each mechanism therefore carries its own watermark.
+        let runner = Arc::new(WorkingWebhookFailingCommandRunner::default());
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(test_conn(), runner.clone());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        // Written directly: queue_drained_command is deliberately absent from ALLOWED_KEYS.
+        set_setting(&ctx.db, "queue_drained_command", "/config/hooks/drained.sh");
+
+        book_history(&ctx, 3, |i| format!("2026-01-01T00:00:0{i}+00:00"));
+        crate::hooks::fire_queue_drained(&ctx);
+
+        // Positive control: the command really was attempted and really was refused, so an
+        // un-advanced command watermark cannot pass by way of nothing having fired.
+        assert_eq!(runner.commands.lock().unwrap().len(), 1);
+        let failed = sink.payloads("hook-failed");
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("command:"),
+            "the failure must name the mechanism: {:?}",
+            failed[0]["reason"]
+        );
+
+        assert_eq!(runner.webhooks.lock().unwrap().len(), 1);
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            completed_at_of(&ctx.db, "h0002"),
+            "the webhook delivered, so ITS watermark advances"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            "",
+            "the command failed, so its own watermark stays put and it will retry"
+        );
+
+        // A later drain, with new work behind it. The webhook must receive the NEW jobs — not
+        // the batch it has already been given.
+        book_history_prefixed(&ctx, "n", 2, |i| format!("2026-01-02T00:00:0{i}+00:00"));
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let sent = runner.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 2, "the webhook fired again");
+        assert_eq!(
+            body_job_ids(&sent[1].body),
+            ["n0000", "n0001"],
+            "the working webhook moves on; at-least-once covers a retry, not an infinite replay"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            "",
+            "and the broken command is still pinned where it was"
+        );
+        // The command's own loop keeps retrying from ITS watermark, so it re-offers the OLDEST
+        // batch — which now includes the new rows, since nothing has ever been delivered to it.
+        let commands = runner.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        let payload: serde_json::Value = serde_json::from_str(
+            &commands[1]
+                .env
+                .iter()
+                .find(|(k, _)| k == "CONVERTBAR_PAYLOAD")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert_eq!(
+            payload["jobs"].as_array().unwrap().len(),
+            5,
+            "the command retries its whole unreported backlog, oldest first"
+        );
+    }
+
+    #[test]
+    fn a_mechanism_that_is_not_configured_advances_no_watermark_and_is_not_a_failure() {
+        // "Not configured" must not read as "failed" — otherwise a webhook-only install would
+        // be held back by the command watermark it never had, which is the same starvation
+        // from the other direction.
+        let (ctx, sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        book_history(&ctx, 2, |i| format!("2026-01-01T00:00:0{i}+00:00"));
+        crate::hooks::fire_queue_drained(&ctx);
+
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+        assert!(hooks.commands.lock().unwrap().is_empty());
+        assert!(
+            sink.payloads("hook-failed").is_empty(),
+            "an unconfigured mechanism is not a failure"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            completed_at_of(&ctx.db, "h0001")
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            "",
+            "an unconfigured mechanism has no watermark to advance"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_seeds_both_watermarks_from_the_pre_split_key() {
+        // Without the migration, upgrading to per-mechanism watermarks makes both keys absent,
+        // an absent watermark sorts before every timestamp, and the user's receiver is handed
+        // their entire History again. The legacy row is left in place on purpose so a rollback
+        // still finds it.
+        let conn = test_conn();
+        let watermark = "2026-01-01T00:00:05+00:00";
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_queue_drained_at', ?1)",
+            params![watermark],
+        )
+        .unwrap();
+        // Re-running init_db is what an upgrade does on its next boot.
+        crate::db::init_db(&conn).unwrap();
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(conn);
+
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            watermark
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            watermark
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at"),
+            watermark,
+            "the legacy row survives, so a rollback does not replay History"
+        );
+
+        // And it is a seed, not a burst: a job that completed BEFORE the old watermark is not
+        // re-reported, while one after it is.
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_history(&ctx, 1, |_| "2026-01-01T00:00:01+00:00".to_string());
+        book_history_prefixed(&ctx, "n", 1, |_| "2026-01-01T00:00:09+00:00".to_string());
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let sent = hooks.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(body_job_ids(&sent[0].body), ["n0000"]);
+    }
+
+    #[test]
+    fn the_migration_never_drags_an_advanced_watermark_backwards() {
+        // init_db runs on EVERY boot, not just the upgrade one. INSERT OR IGNORE is what keeps
+        // a key that has since advanced from being reset to the stale legacy value — which
+        // would re-report every job in between, on every restart.
+        let conn = test_conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) \
+             VALUES ('last_queue_drained_at', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) \
+             VALUES ('last_queue_drained_at_webhook', '2026-06-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+
+        crate::db::init_db(&conn).unwrap();
+
+        let (ctx, _sink, _disp, _hooks) = test_ctx_hooks(conn);
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            "2026-06-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            "2026-01-01T00:00:00+00:00",
+            "the key that had not advanced is still seeded"
         );
     }
 }
