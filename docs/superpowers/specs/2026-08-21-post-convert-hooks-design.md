@@ -107,7 +107,12 @@ reported by the drain that eventually follows it. It also means **a drain with n
 nothing at all** — an idle queue does not emit empty `queue-drained` payloads.
 
 The watermark advances only after a successful fire, so a failed hook re-reports the same jobs on
-the next drain rather than losing them. A receiver must therefore tolerate a repeat; for a library
+the next drain rather than losing them. "Successful" is `dispatch` returning
+`DispatchOutcome::Delivered` — an explicit outcome, deliberately not a failure counter's delta.
+The counter could not represent the third case: a shutdown return is neither a success nor a
+failure, and read as "no failure seen" it advanced the watermark past jobs nothing was ever sent
+for, silently and irrecoverably (`completed_at > watermark` means they never come back). Only
+`Delivered` advances; `Failed`, `Skipped` and `NotConfigured` all stop the loop. A receiver must therefore tolerate a repeat; for a library
 rescan that is harmless, and it is the right trade against silent loss. Clearing History drops
 rows that were never reported.
 
@@ -477,7 +482,10 @@ guaranteed and a hung receiver cannot wedge the app.
 - **Shutdown skips hooks.** `ConverterState::is_shutting_down` is checked immediately before
   firing, not only at the loop head. Without this, quitting the app blocks the queue thread for up
   to the timeout — up to 300s at the maximum setting — and a command hook's child could outlive
-  the app. A hook already in flight at shutdown is abandoned; a command child is killed.
+  the app. A hook already in flight at shutdown is abandoned, and a command child already
+  spawned is NOT killed — `run_command` kills only when its own timeout expires, so on quit the
+  child is simply orphaned. The `is_shutting_down` check prevents starting new ones; it does not
+  reach the one already running.
 - **Worst case is a multiple of the timeout.** With both a webhook and a command configured on
   `post-convert`, a dead receiver costs `2 ×` the timeout per job. The 30s default is the
   per-hook bound, not the per-job bound; the UI help text says so next to the field.
@@ -628,6 +636,13 @@ Through `process_queue`, with an injected runner:
 - A drain with nothing new since the watermark fires nothing.
 - A failed `queue-drained` hook does not advance the watermark, so the next drain re-reports the
   same jobs rather than losing them.
+- **A drain during shutdown sends nothing and does not advance the watermark either** — the
+  `Skipped` outcome. Paired with a positive control on the identical fixture without shutdown, so
+  "the watermark stayed put" cannot pass by way of an arrangement that could never have advanced.
+- The command-hook environment variables (`CONVERTBAR_POST_CONVERT_COMMAND`,
+  `CONVERTBAR_QUEUE_DRAINED_COMMAND`) are honoured and beat a stored settings row. In its own
+  integration-test binary (`tests/hook_command_env.rs`) because `set_var` is process-global and
+  would otherwise hand a command hook to every lib test running concurrently.
 - `run_status` is `"idle"` when the job set has no errors even though a cancelled job set
   `had_errors`.
 - `FailingHookRunner`: job status stays `done`, `had_errors` stays false, `hook-failed` is

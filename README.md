@@ -140,7 +140,7 @@ same silicon if run in parallel, so two at once is usually slower overall.
 ## Post-convert hooks
 
 ConvertBar can notify an external system after each conversion, and once when a queue run
-finishes. Configure both under Settings → Hooks, in the desktop app or the web UI.
+finishes. Configure both under **Settings → Hooks**, in the desktop app or the web UI.
 
 **Two trigger points:**
 
@@ -177,6 +177,41 @@ plus `CONVERTBAR_PAYLOAD`, the whole JSON payload. Each individual environment v
 from the OS — use the webhook instead if a payload might get that large. Path mapping (below)
 does **not** apply to the command hook: it gets raw paths, and a script can rewrite them itself.
 
+> **The script must be executable.** ConvertBar runs it directly, without a shell, so a script
+> that is merely readable (mode `0644` — what a fresh file or a copied-in Docker volume usually
+> is) fails with `Permission denied` on *every* conversion. Run `chmod +x /path/to/script.sh`,
+> and start it with a shebang (`#!/bin/sh`). This is the most common reason a command hook
+> "does nothing".
+
+**Timeout** — `hook_timeout_seconds`, default `30`, clamped to 1–300. It bounds each hook
+individually: with both a webhook and a command configured on the same trigger, a dead receiver
+costs up to twice this per job, and the queue waits. Settable in the UI only — there is no
+environment variable for it, on either head.
+
+### What each trigger sends
+
+Both payloads are JSON objects. The webhook body template can reference any field below as
+`{{field}}` (or `{{field_json}}`); a placeholder that is not in *that* trigger's payload is left
+in the body **verbatim**, producing an invalid request that ConvertBar still reports as a success
+— so `{{output_dirs_json}}` in a post-convert body is a silent misconfiguration, not an error.
+
+| Field | `post-convert` | `queue-drained` | Notes |
+|---|:---:|:---:|---|
+| `event` | yes | yes | `"post-convert"` / `"queue-drained"` |
+| `job_id`, `status`, `preset` | yes | — | per-job; inside `jobs[]` on a drain |
+| `source_path`, `output_path`, `result_path`, `output_dir` | yes | — | ditto. Act on `result_path`: on a skipped job the converted file was discarded, so `output_path` names a file that no longer exists |
+| `in_place`, `kept_file` | yes | — | ditto |
+| `original_size`, `converted_size`, `space_saved`, `duration_seconds` | yes | — | ditto |
+| `error_message`, `failure_class`, `started_at`, `completed_at` | yes | — | ditto |
+| `run_status` | — | yes | `"idle"` or `"error"` |
+| `completed`, `errors`, `space_saved` | — | yes | totals across the batch |
+| `output_dirs` | — | yes | deduped directories to rescan; **`{{output_dirs_json}}` exists only here** |
+| `jobs` | — | yes | array of the per-job objects above, without their own `event` key |
+
+`{{payload_json}}` is the whole payload and works on both. For a command hook the same fields
+arrive as `CONVERTBAR_<FIELD>` (uppercased), except `jobs`, which is reachable only through
+`CONVERTBAR_PAYLOAD`.
+
 **Path mapping** rewrites path fields in the webhook payload only, one `from => to` rule per
 line. The longest matching prefix wins regardless of line order, and a trailing slash on either
 side is tolerated (`/media/ => /data/` and `/media => /data` are equivalent).
@@ -200,7 +235,17 @@ break the request. Keep it as a variable rather than "simplifying" it back into 
 
 **Command hooks on the server head** are configured only by environment variable —
 `CONVERTBAR_POST_CONVERT_COMMAND` and `CONVERTBAR_QUEUE_DRAINED_COMMAND` — never through the web
-UI or the HTTP API. See [Environment variables](#environment-variables) below.
+UI or the HTTP API. See [Environment variables](#environment-variables) below. Put the scripts
+under `./config/hooks` on the host, which the `./config:/config` mount already covers — a second
+mount for them would sit inside the directory the entrypoint `chown -R`s when `PUID`/`PGID` are
+set, rewriting the ownership of your own files. And `chmod +x` them: the executable-bit rule
+above bites hardest here, where a script arrives through a volume mount.
+
+The image ships **bash but no `curl`, `wget` or `nc`.** A script can reach a plain-HTTP endpoint
+through bash's `/dev/tcp` (`exec 3<>/dev/tcp/host/port`), but `/dev/tcp` **cannot do TLS**, so an
+`https://` receiver is unreachable from a stock container. Either build a custom image on top of
+this one with `curl` installed, or use ConvertBar's own webhook — it speaks HTTPS, including
+against a private CA, and needs nothing installed in the image.
 
 Webhook headers are stored in plaintext in `convertbar.db` and are readable by any authenticated
 web-UI user, and an authenticated user can point the webhook at any address the container can
