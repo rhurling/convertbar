@@ -435,6 +435,10 @@ impl HookRunner for HttpHookRunner {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".into())
             )),
+            // Known accepted edge case: a try_wait() I/O error returns here without killing
+            // the child, leaving it unmanaged. This path is the waiter thread failing to poll
+            // the OS, not the command itself failing, and is rare enough not to warrant a kill
+            // attempt against a process handle we may not trust anymore.
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 let _ = child.lock().unwrap().kill();
@@ -959,20 +963,36 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn http_runner_kills_a_command_that_outruns_the_timeout() {
-        // A hung receiver must not wedge the queue thread forever.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let script = dir.path().join("slow.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\ntouch \"$MARKER\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let r = HttpHookRunner;
         let req = CommandRequest {
-            command: "/bin/sleep 30".into(),
-            env: vec![],
+            command: script.to_string_lossy().to_string(),
+            env: vec![("MARKER".into(), marker.to_string_lossy().to_string())],
             timeout: Duration::from_secs(1),
         };
+
         let started = std::time::Instant::now();
         let err = r.run_command(&req).unwrap_err();
         assert!(err.to_lowercase().contains("timed out"), "got: {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "should have been killed at the timeout, took {:?}",
+            started.elapsed() < Duration::from_secs(4),
+            "should have returned at the timeout, took {:?}",
             started.elapsed()
+        );
+
+        // The kill is what this test is NAMED for, and the assertions above pass with kill()
+        // deleted. Wait well past the script's own sleep and prove it never reached its final
+        // line: if the child survived the timeout, the marker exists.
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(
+            !marker.exists(),
+            "child survived the timeout — kill() did not run"
         );
     }
 }
