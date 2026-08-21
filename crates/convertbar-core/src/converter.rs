@@ -222,6 +222,17 @@ pub struct ConverterState {
     /// hoisting the fire out to the nine call sites — recreates exactly the drift the
     /// single-entry-point design prevents. Cleared at the top of every run.
     pub(crate) hook_failure_notified: Mutex<bool>,
+    /// Set by `claim_queue_slot` whenever it refuses a start because the queue is ALREADY
+    /// RUNNING — i.e. somebody wanted work done and was turned away — and consumed by
+    /// `process_queue` after its drain hook returns. Without it, work that arrives while the
+    /// queue is busy is stranded: `run_queue` returns silently on the refusal and nothing
+    /// re-checks. The window used to be milliseconds; the `queue-drained` hook can hold it open
+    /// for minutes (batches × mechanisms × a timeout that goes to 300s), and the hook's own side
+    /// effects are exactly what drops new files into a watched folder.
+    ///
+    /// NOT set by the update interlock's refusal: an install holding the slot is not "work
+    /// arrived", and `resume_queue_after_install` re-triggers the queue itself.
+    pub(crate) work_arrived_while_busy: std::sync::atomic::AtomicBool,
 }
 
 impl ConverterState {
@@ -237,7 +248,15 @@ impl ConverterState {
             installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
             hook_failure_notified: Mutex::new(false),
+            work_arrived_while_busy: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Reads and clears the "work arrived while we were busy" flag in one step, so a single
+    /// refusal can trigger at most one re-check and cannot loop the queue thread forever.
+    pub(crate) fn take_work_arrived_while_busy(&self) -> bool {
+        self.work_arrived_while_busy
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -826,11 +845,64 @@ impl Drop for RunningGuard<'_> {
     }
 }
 
+/// How a single pass of the queue ended. Only a TRUE drain may be followed by another pass:
+/// every other ending is a deliberate stop (shutdown, low disk, pause-after-current) and looping
+/// would override the user's or the platform's decision — `get_next_job` does not consult
+/// `queue_paused`, so a loop-back after a pause would silently un-pause the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassOutcome {
+    Drained,
+    Stopped,
+}
+
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
+///
+/// Runs `process_queue_pass` until a pass ends without new work waiting behind it. The second
+/// and later passes exist because `claim_queue_slot` refuses every `run_queue` for as long as
+/// this thread holds `is_running`, and a refused `run_queue` returns SILENTLY — so a file that
+/// a watched folder ingests while the pass's `queue-drained` hook is blocking (up to 300s per
+/// batch, per mechanism) would otherwise sit `queued` until some unrelated later event, with the
+/// tray already showing idle. Anything the refusal missed is picked up here instead of being
+/// stranded.
 fn process_queue(ctx: &Ctx) {
-    // Clears is_running on every exit path (normal, early return, or panic).
+    // Clears is_running on every exit path (normal, early return, or panic). Held across ALL
+    // passes: releasing it between them would reopen exactly the window this loop closes.
     let _running = RunningGuard(&ctx.converter);
+
+    loop {
+        if process_queue_pass(ctx) != PassOutcome::Drained {
+            return;
+        }
+        if !work_arrived_while_busy(ctx) {
+            return;
+        }
+        eprintln!(
+            "convertbar: work was queued while the queue was busy — running another pass \
+             instead of leaving it stranded"
+        );
+    }
+}
+
+/// Whether a refused `run_queue` left real work behind. The flag alone is not enough: a refusal
+/// can race a `clear_queue`/`remove_job` that then deletes the very row it was about, and looping
+/// on the flag alone would spin. The flag is consumed unconditionally (so one refusal can cause
+/// at most one re-check) and the DB is the authority on whether there is anything to do.
+fn work_arrived_while_busy(ctx: &Ctx) -> bool {
+    if !ctx.converter.take_work_arrived_while_busy() {
+        return false;
+    }
+    let db = match ctx.db.lock() {
+        Ok(db) => db,
+        Err(_) => return false,
+    };
+    get_next_job(&db).is_some()
+}
+
+/// One pass: drain the queue, then report. Split out of `process_queue` so the re-check loop
+/// above has something to call; the per-run state it resets below is per-PASS on purpose — a
+/// pass is exactly the run the refused `run_queue` would have started.
+fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
     // Every run/resume starts fresh: a stale reason from a prior pause must not linger once
     // the queue is running again (and be gone entirely if this run never hits the gate).
     *ctx.converter.low_disk_pause.lock().unwrap() = None;
@@ -847,9 +919,10 @@ fn process_queue(ctx: &Ctx) {
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
         // job — teardown would otherwise race a fresh HandBrakeCLI spawn and orphan it.
-        // Return (not break) so no "Queue complete" notification fires mid-quit.
+        // Return (not break) so no "Queue complete" notification fires mid-quit, and `Stopped`
+        // so the caller does not start another pass into a teardown.
         if ctx.converter.is_shutting_down() {
-            return;
+            return PassOutcome::Stopped;
         }
         let job;
         let handbrake_path_opt;
@@ -932,7 +1005,9 @@ fn process_queue(ctx: &Ctx) {
                             fps: None,
                         },
                     );
-                    return;
+                    // `Stopped`: the job is still queued, so a re-check would find work and
+                    // loop straight back into the same shortfall.
+                    return PassOutcome::Stopped;
                 }
             }
         }
@@ -1587,7 +1662,14 @@ fn process_queue(ctx: &Ctx) {
         crate::hooks::fire_queue_drained(ctx);
     }
 
-    // is_running is reset by RunningGuard on return (and on an unwinding panic).
+    // is_running is NOT reset here: RunningGuard lives in `process_queue`, which decides whether
+    // to run another pass. Anything queued while this pass held the slot — including everything
+    // that arrived during the hook above — is picked up there.
+    if drained {
+        PassOutcome::Drained
+    } else {
+        PassOutcome::Stopped
+    }
 }
 
 /// Atomically claims the right to run the queue. Returns false when the queue is already
@@ -1599,10 +1681,19 @@ pub fn claim_queue_slot(converter: &ConverterState) -> bool {
         .is_running
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if *running
-        || converter
-            .installing
-            .load(std::sync::atomic::Ordering::SeqCst)
+    // Checked before the interlock, and separately from it: a refusal because the queue is
+    // already running means somebody wanted work done and was turned away, so the running queue
+    // has to re-check before it exits (see `work_arrived_while_busy`). A refusal because an
+    // install holds the interlock is NOT that — it must not set the flag.
+    if *running {
+        converter
+            .work_arrived_while_busy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        return false;
+    }
+    if converter
+        .installing
+        .load(std::sync::atomic::Ordering::SeqCst)
     {
         return false;
     }
@@ -6120,5 +6211,160 @@ HandBrake has exited.";
         assert_eq!(failed.len(), 1, "the drain hook must have been attempted");
         assert_eq!(failed[0]["event"], "queue-drained");
         assert_eq!(setting_value(&ctx.db, "last_queue_drained_at"), watermark);
+    }
+
+    // --- Work that arrives while the queue is busy -------------------------------------------
+
+    /// A drain hook that does, from inside itself, exactly what a watched folder does when a
+    /// file lands mid-hook: enqueue a job and ask the queue to run. `run_queue` is refused —
+    /// this thread IS the queue — and that refusal returns silently, which is the whole bug.
+    ///
+    /// Doing the enqueue INSIDE the hook rather than from a second thread that races a sleeping
+    /// hook is deliberate: it puts the arrival unambiguously inside the hook's window with no
+    /// timing to lose, and a sleep long enough to be safe would be a sleep long enough to be
+    /// slow. It also models the real case — the hook's own side effects (a library rescan that
+    /// moves files) are what produce the new file.
+    #[derive(Default)]
+    struct EnqueueDuringHookRunner {
+        ctx: Mutex<Option<Arc<Ctx>>>,
+        dir: Mutex<Option<std::path::PathBuf>>,
+        fired: Mutex<bool>,
+    }
+    impl crate::hooks::HookRunner for EnqueueDuringHookRunner {
+        fn run_webhook(&self, _r: &crate::hooks::WebhookRequest) -> Result<(), String> {
+            // Once only: the second pass drains too and fires this hook again, and an
+            // unconditional enqueue would keep the queue running forever.
+            if std::mem::replace(&mut *self.fired.lock().unwrap(), true) {
+                return Ok(());
+            }
+            let ctx = self.ctx.lock().unwrap().clone().expect("ctx handle set");
+            let dir = self.dir.lock().unwrap().clone().expect("dir handle set");
+            let src = real_source(&dir, "late.mkv");
+            let out = dir.join("late.mp4");
+            queue_job(
+                &ctx.db,
+                "late",
+                src.to_str().unwrap(),
+                out.to_str().unwrap(),
+                1000,
+            );
+            // The refusal under test. It must be REFUSED — otherwise this test would be
+            // measuring a second queue thread instead of the re-check.
+            assert!(
+                !claim_queue_slot(&ctx.converter),
+                "the queue must still hold is_running while its own drain hook runs"
+            );
+            run_queue(ctx.clone());
+            Ok(())
+        }
+        fn run_command(&self, _r: &crate::hooks::CommandRequest) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_job_queued_while_the_drain_hook_runs_is_still_converted() {
+        // The stranding this fix exists for. `claim_queue_slot` refuses for as long as the queue
+        // holds is_running, and the drain hook can hold that open for minutes (batches ×
+        // mechanisms × a timeout that goes to 300s). `run_queue` returns silently on the
+        // refusal, the tray already says idle, and before this fix nothing ever looked again:
+        // the file sat 'queued' until some unrelated later event.
+        let runner = Arc::new(EnqueueDuringHookRunner::default());
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), runner.clone());
+        *runner.ctx.lock().unwrap() = Some(ctx.clone());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        *runner.dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        queue_real_job(&ctx, &dir, "j1", 0);
+
+        // Claim the slot the way `run_queue` would, so the hook's `claim_queue_slot` really is
+        // refused. process_queue then runs inline on this thread: no sleeps, no polling, and a
+        // regression fails rather than flakes.
+        *ctx.converter.is_running.lock().unwrap() = true;
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(
+            job_row(&ctx.db, "late").0,
+            "done",
+            "the job that arrived during the drain hook was stranded"
+        );
+        assert!(
+            !ctx.converter.take_work_arrived_while_busy(),
+            "the flag must be consumed, or the next drain loops for nothing"
+        );
+        assert!(
+            !*ctx.converter.is_running.lock().unwrap(),
+            "RunningGuard still releases the slot after the extra pass"
+        );
+    }
+
+    #[test]
+    fn a_set_flag_with_an_empty_queue_does_not_start_another_pass() {
+        // The spin guard. The flag is advisory — a refusal can race a clear_queue/remove_job
+        // that deletes the very row it was about — so the DB, not the flag, decides. A test that
+        // regressed this would hang rather than fail, which is why the flag is consumed
+        // unconditionally and the re-check is authoritative.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        ctx.converter
+            .work_arrived_while_busy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(
+            hooks.webhooks.lock().unwrap().len(),
+            1,
+            "one pass, one drain payload — the flag alone must not buy a second pass"
+        );
+    }
+
+    #[test]
+    fn a_refusal_because_the_queue_is_running_records_that_work_arrived() {
+        let converter = ConverterState::new();
+        assert!(claim_queue_slot(&converter));
+        assert!(
+            !claim_queue_slot(&converter),
+            "the second claim must be refused"
+        );
+        assert!(
+            converter.take_work_arrived_while_busy(),
+            "somebody wanted work done and was turned away"
+        );
+        assert!(
+            !converter.take_work_arrived_while_busy(),
+            "and the flag is consumed by the read"
+        );
+    }
+
+    #[test]
+    fn an_install_refusal_does_not_record_that_work_arrived() {
+        // The update interlock is not "work arrived": nothing was queued, and
+        // `resume_queue_after_install` re-triggers the queue itself. Recording it here would
+        // make the pass that follows an install do a pointless extra lap — and, worse, teach
+        // the flag to mean something other than "a start was refused with work behind it".
+        let converter = ConverterState::new();
+        converter
+            .installing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!claim_queue_slot(&converter));
+        assert!(
+            !converter.take_work_arrived_while_busy(),
+            "an install holding the interlock must not set the flag"
+        );
     }
 }
