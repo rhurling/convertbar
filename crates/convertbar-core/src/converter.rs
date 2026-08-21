@@ -222,8 +222,13 @@ pub struct ConverterState {
     /// hoisting the fire out to the nine call sites — recreates exactly the drift the
     /// single-entry-point design prevents. Cleared at the top of every run.
     pub(crate) hook_failure_notified: Mutex<bool>,
-    /// How many hook dispatches have failed. Task 6's queue-drained fire reads it to tell
-    /// whether ITS dispatch failed and therefore whether the watermark may advance.
+    /// How many hook dispatches have failed, for the lifetime of this `ConverterState`.
+    ///
+    /// READ CONTRACT: as a DELTA around a single dispatch — snapshot before, compare after,
+    /// `!=` means that dispatch failed. Never absolutely. It is monotonic and deliberately
+    /// never reset (unlike `hook_failure_notified`, which is per-run), so a `> 0` test would
+    /// read as "failed" forever after any earlier failure and would suppress the
+    /// queue-drained watermark permanently. `hooks::fire_queue_drained` is the reader.
     pub(crate) hook_failure_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -842,6 +847,12 @@ fn process_queue(ctx: &Ctx) {
     // notification, and the next run must be able to notify again.
     *ctx.converter.hook_failure_notified.lock().unwrap() = false;
     let mut had_errors = false;
+    // A TRUE drain: get_next_job found nothing left. Deliberately NOT set by the
+    // pause-after-current break below, which is also every pause on Windows
+    // (`control::pause_conversion` falls back to it when the process cannot be frozen), and
+    // never reached at all by the low-disk and shutdown returns. Only this flag gates the
+    // queue-drained hook.
+    let mut drained = false;
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
         // job — teardown would otherwise race a fresh HandBrakeCLI spawn and orphan it.
@@ -857,7 +868,10 @@ fn process_queue(ctx: &Ctx) {
             let db = ctx.db.lock().unwrap();
             job = match get_next_job(&db) {
                 Some(j) => j,
-                None => break,
+                None => {
+                    drained = true;
+                    break;
+                }
             };
             handbrake_path_opt = get_handbrake_path(&db, &*ctx.handbrake);
             low_disk_min_gb = get_low_disk_min_gb(&db);
@@ -1560,6 +1574,10 @@ fn process_queue(ctx: &Ctx) {
         if notify_queue_done {
             ctx.events.notify("ConvertBar", "Queue complete");
         }
+    } // the ctx.db guard above is scoped inside this block and is gone by here
+
+    if drained {
+        crate::hooks::fire_queue_drained(ctx);
     }
 
     let final_status = final_run_status(had_errors);
@@ -1721,7 +1739,6 @@ mod tests {
 
     /// Like `test_ctx`, but also hands back the recording hook runner so a test can assert on
     /// what was sent. Use this for any test that configures a hook.
-    #[allow(dead_code)]
     fn test_ctx_hooks(
         conn: Connection,
     ) -> (
@@ -1735,7 +1752,6 @@ mod tests {
 
     /// `allow_stored_command` false reproduces the server head's policy, where the
     /// post_convert_command settings ROW must be ignored entirely.
-    #[allow(dead_code)]
     fn test_ctx_hooks_with_policy(
         conn: Connection,
         allow_stored_command: bool,
@@ -1762,7 +1778,6 @@ mod tests {
     }
 
     /// For tests that need a FailingHookRunner or a bespoke probe instead of the recorder.
-    #[allow(dead_code)]
     fn test_ctx_with_hook_runner(
         conn: Connection,
         runner: Arc<dyn crate::hooks::HookRunner>,
@@ -1782,8 +1797,7 @@ mod tests {
         (ctx, sink, disposer)
     }
 
-    /// Reads a settings row back — Task 6 asserts on the watermark with this.
-    #[allow(dead_code)]
+    /// Reads a settings row back — the queue-drained watermark assertions use this.
     fn setting_value(db: &Arc<Mutex<Connection>>, key: &str) -> String {
         db.lock()
             .unwrap()
@@ -5477,5 +5491,238 @@ HandBrake has exited.";
             "the webhook still fires"
         );
         assert!(hooks.commands.lock().unwrap().is_empty());
+    }
+
+    // --- Task 6: the once-per-drain queue-drained hook --------------------------------------
+    //
+    // Same arrangement as the Task 5 tests above: a REAL queue against
+    // `successful_fake_handbrake_script` installed as `handbrake_path`, which is what lets an
+    // `AbsentLocator` fixture run an encode.
+
+    /// Installs the fake HandBrake and hands back the tempdir every source and output lives in.
+    fn drain_fixture(ctx: &Arc<Ctx>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        dir
+    }
+
+    /// Queues one job whose source really exists, sized (1000 declared bytes against the fake's
+    /// few-byte output) so the re-encode wins and the job books 'done'. `order` is explicit
+    /// because `queue_job` writes queue_order 0 for everything, and these tests assert on which
+    /// job ran before a pause.
+    fn queue_real_job(ctx: &Arc<Ctx>, dir: &tempfile::TempDir, id: &str, order: i64) {
+        let src = real_source(dir.path(), &format!("{id}.mkv"));
+        let out = dir.path().join(format!("{id}.mp4"));
+        queue_job(
+            &ctx.db,
+            id,
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+        set_queue_order(ctx, id, order);
+    }
+
+    fn set_queue_order(ctx: &Arc<Ctx>, id: &str, order: i64) {
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET queue_order = ?2 WHERE id = ?1",
+                params![id, order],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_true_drain_fires_queue_drained_and_advances_the_watermark() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        queue_real_job(&ctx, &dir, "j2", 1);
+
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(job_row(&ctx.db, "j2").0, "done");
+
+        let sent = hooks.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly one drain payload per run");
+        let body: serde_json::Value = serde_json::from_str(&sent[0].body).unwrap();
+        assert_eq!(body["event"], "queue-drained");
+        assert_eq!(body["completed"], 2);
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+        assert!(!setting_value(&ctx.db, "last_queue_drained_at").is_empty());
+    }
+
+    #[test]
+    fn pause_after_current_fires_no_queue_drained() {
+        // This is the Windows pause path (control.rs:46-53), so without the drained gate every
+        // pause on Windows would emit a spurious drain mid-run. Drive the flag, not the platform.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        queue_real_job(&ctx, &dir, "j2", 1);
+        crate::control::pause_after_current(&ctx).unwrap();
+
+        process_queue(&ctx);
+
+        // The arrangement really ran and really stopped short: one job finished, one is still
+        // waiting. That is what makes the silence below the gate rather than an inert queue.
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(job_row(&ctx.db, "j2").0, "queued");
+        assert!(
+            hooks.webhooks.lock().unwrap().is_empty(),
+            "a pause is not a drain — a job is still queued"
+        );
+
+        // Positive control: same ctx, same hook config, run on to a true drain. The hook fires,
+        // so the silence above was the `drained` gate and not a hook that could never have fired.
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j2").0, "done");
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn jobs_completed_before_a_pause_appear_in_the_drain_that_follows() {
+        // The regression test for the in-memory accumulator this design rejects: a run-local
+        // Vec would lose everything completed before the pause.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        crate::control::pause_after_current(&ctx).unwrap();
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert!(
+            hooks.webhooks.lock().unwrap().is_empty(),
+            "run 1 ended on the pause break, not a drain"
+        );
+
+        queue_real_job(&ctx, &dir, "j2", 1);
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j2").0, "done");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&hooks.webhooks.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2, "both runs' jobs");
+        let ids: Vec<&str> = body["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["job_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["j1", "j2"],
+            "the job from before the pause is still reported, oldest first"
+        );
+    }
+
+    #[test]
+    fn a_drain_with_nothing_new_fires_nothing() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        process_queue(&ctx);
+        // Positive control: the first drain DID fire against this exact config, so the silence
+        // below is "nothing completed since the watermark" and not a hook that never worked.
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+        hooks.webhooks.lock().unwrap().clear();
+
+        process_queue(&ctx); // a true drain again, but nothing has completed since
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_drain_hook_does_not_advance_the_watermark() {
+        // Re-reporting is harmless for a rescan; silent loss is not.
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        process_queue(&ctx);
+
+        // Positive control: the dispatch really happened and really failed. Without it, a
+        // watermark left empty because the hook never fired at all would read as a pass.
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        let failed = sink.payloads("hook-failed");
+        assert_eq!(failed.len(), 1, "the drain hook must have been attempted");
+        assert_eq!(failed[0]["event"], "queue-drained");
+
+        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at"), "");
+    }
+
+    #[test]
+    fn drain_output_dirs_exclude_error_jobs_and_dedupe() {
+        // Two successes in ONE directory plus a failure in the same directory. The successes
+        // collapse to a single entry, and the error contributes none: it has no kept_file, so
+        // no result_path and no output_dir. Rescanning a directory for a file that was never
+        // produced is at best wasted work.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        queue_real_job(&ctx, &dir, "j2", 1);
+        // Same directory, but this source is deliberately never created, so the vanished-source
+        // gate books status='error' with kept_file left NULL.
+        let gone = dir.path().join("gone.mkv");
+        let gone_out = dir.path().join("gone.mp4");
+        queue_job(
+            &ctx.db,
+            "j3",
+            gone.to_str().unwrap(),
+            gone_out.to_str().unwrap(),
+            1000,
+        );
+        set_queue_order(&ctx, "j3", 2);
+
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(job_row(&ctx.db, "j2").0, "done");
+        assert_eq!(job_row(&ctx.db, "j3").0, "error");
+
+        let body = only_webhook_body(&hooks);
+        assert_eq!(body["completed"], 2);
+        assert_eq!(body["output_dirs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["output_dirs"][0], dir.path().to_str().unwrap());
+        assert_eq!(body["errors"], 1);
     }
 }

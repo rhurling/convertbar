@@ -14,8 +14,10 @@ pub struct JobPayload {
     pub source_path: String,
     pub output_path: String,
     /// The file that EXISTS now: output_path when kept_file is "converted", source_path when
-    /// it is "original" (the skipped and cleanup-failure cases). None on error. Receivers act
-    /// on this, never on output_path — see the spec.
+    /// it is "original" (the skipped case). None for every other value of kept_file, including
+    /// NULL — which is what an error row carries, cleanup failures included, because those arms
+    /// call `record_job_error` and never set kept_file. Receivers act on this, never on
+    /// output_path — see the spec.
     pub result_path: Option<String>,
     pub output_dir: Option<String>,
     pub in_place: bool,
@@ -717,8 +719,11 @@ fn row_to_payload(
     started_at: Option<String>,
     completed_at: Option<String>,
 ) -> JobPayload {
-    // The file that EXISTS now. "original" covers the skipped case and the cleanup-failure
-    // case, where the converted file was discarded. Never blindly output_path.
+    // The file that EXISTS now, keyed on kept_file: "converted" is the re-encode, "original"
+    // is the skipped case, where the converted file was discarded. Everything else — NULL
+    // included, which is what every error row carries (the cleanup-failure arms call
+    // `record_job_error`, which leaves kept_file NULL) — has no surviving result to name.
+    // Never blindly output_path.
     let result_path = match kept_file.as_deref() {
         Some("converted") => Some(output_path.clone()),
         Some("original") => Some(source_path.clone()),
@@ -781,6 +786,101 @@ pub fn fire_post_convert(ctx: &crate::ctx::Ctx, job_id: &str) {
 
     let Some(job) = job else { return };
     dispatch(ctx, Trigger::PostConvert, &cfg, post_convert_payload(&job));
+}
+
+/// Where the last successful queue-drained report stopped. Persisted, not run-local: a pause,
+/// a low-disk stop, or a restart must not lose the jobs completed before it.
+const WATERMARK_KEY: &str = "last_queue_drained_at";
+
+/// Jobs completed since the watermark, oldest first. Reading from the table rather than an
+/// in-memory accumulator is what lets the payload survive a pause, a low-disk stop, or a
+/// restart — a run-local Vec would silently drop everything completed before the interruption.
+pub fn load_jobs_since(db: &rusqlite::Connection, watermark: &str) -> Vec<JobPayload> {
+    let mut stmt = match db.prepare(
+        "SELECT id, status, source_path, output_path, preset, kept_file, original_size, \
+         converted_size, space_saved, error_message, failure_class, started_at, completed_at \
+         FROM jobs WHERE completed_at IS NOT NULL AND completed_at > ?1 \
+         ORDER BY completed_at ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![watermark], |r| {
+        Ok(row_to_payload(
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+            r.get(7)?,
+            r.get(8)?,
+            r.get(9)?,
+            r.get(10)?,
+            r.get(11)?,
+            r.get(12)?,
+        ))
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Read as a DELTA around a single dispatch, never absolutely — see the field's own doc on
+/// `ConverterState::hook_failure_count`.
+fn hook_failures_seen(ctx: &crate::ctx::Ctx) -> usize {
+    ctx.converter
+        .hook_failure_count
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Fires once per TRUE drain. Advances the watermark only on success, so a failed hook
+/// re-reports the same jobs next time rather than losing them.
+pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
+    let (cfg, jobs) = {
+        let db = match ctx.db.lock() {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let cfg = read_hook_config(&db, Trigger::QueueDrained, ctx.hooks.allow_stored_command);
+        if cfg.is_off() {
+            return;
+        }
+        // An absent watermark sorts before every RFC3339 timestamp, so a first run reports
+        // every completed job in History. That one-time burst is preferred over seeding the
+        // watermark at migration time, which would make a fresh install and an upgrade behave
+        // differently for no visible reason.
+        let watermark = setting(&db, WATERMARK_KEY);
+        let jobs = load_jobs_since(&db, &watermark);
+        (cfg, jobs)
+    }; // guard dropped BEFORE dispatch — a hook can block for the full timeout.
+
+    if jobs.is_empty() {
+        return; // nothing new — an idle queue emits no empty payloads
+    }
+    let newest = jobs.iter().filter_map(|j| j.completed_at.clone()).max();
+
+    let failures_before = hook_failures_seen(ctx);
+    dispatch(
+        ctx,
+        Trigger::QueueDrained,
+        &cfg,
+        queue_drained_payload(&jobs),
+    );
+    if hook_failures_seen(ctx) != failures_before {
+        return; // do not advance past jobs the receiver never heard about
+    }
+
+    // Only now is ctx.db re-locked: dispatch has fully returned, so no guard was ever held
+    // across a hook.
+    if let (Some(newest), Ok(db)) = (newest, ctx.db.lock()) {
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![WATERMARK_KEY, newest],
+        );
+    }
 }
 
 #[cfg(test)]
