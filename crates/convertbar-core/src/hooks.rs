@@ -101,7 +101,17 @@ impl PathMap {
             .filter_map(|line| {
                 let (from, to) = line.split_once("=>")?;
                 let (from, to) = (from.trim(), to.trim());
+                // Strip a trailing separator from both sides so the rule is stored in the same
+                // form `apply`'s segment-boundary check expects: a trailing slash consumed into
+                // `from` would leave `apply` no separator to match on for any real subpath, so
+                // `/media/ => ...` would silently never rewrite; a trailing slash left on `to`
+                // would double up into `/data//...`.
+                let from = from.trim_end_matches(['/', '\\']);
+                let to = to.trim_end_matches(['/', '\\']);
                 if from.is_empty() {
+                    // Also covers a degenerate `/ => ...` root rule, once trimmed — there is no
+                    // sensible meaning to invent for rewriting the filesystem root, so it is
+                    // skipped like any other empty `from`.
                     return None;
                 }
                 Some((from.to_string(), to.to_string()))
@@ -456,6 +466,29 @@ mod tests {
     #[test]
     fn empty_path_map_is_identity() {
         assert_eq!(PathMap::parse("").apply("/media/x.mkv"), "/media/x.mkv");
+    }
+
+    #[test]
+    fn path_map_tolerates_trailing_slashes_on_either_side() {
+        // "/media/ => /data/" is a rule a user would reasonably write. Before normalization
+        // the trailing slash was consumed into `from`, so the remainder could never start
+        // with a separator and the segment-boundary check rejected every real subpath —
+        // the rule silently did nothing.
+        let m = PathMap::parse("/media/ => /data/");
+        assert_eq!(m.apply("/media/movies/x.mkv"), "/data/movies/x.mkv");
+    }
+
+    #[test]
+    fn path_map_does_not_double_separators() {
+        let m = PathMap::parse("/media => /data/");
+        assert_eq!(m.apply("/media/movies/x.mkv"), "/data/movies/x.mkv");
+    }
+
+    #[test]
+    fn path_map_still_honours_longest_prefix_after_normalization() {
+        // Normalization must not disturb the longest-first sort.
+        let m = PathMap::parse("/media/ => /a\n/media/movies/ => /b");
+        assert_eq!(m.apply("/media/movies/x.mkv"), "/b/x.mkv");
     }
 
     #[test]
