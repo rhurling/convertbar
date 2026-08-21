@@ -918,4 +918,70 @@ describe("SettingsPage", () => {
       command: "/new.sh",
     });
   });
+
+  it("retries a command-hook write on the next blur after a rejected set_command_hook, instead of believing it saved", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    let failNext = true;
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.resolve({ postConvert: "/original.sh", queueDrained: "" });
+        case "set_command_hook":
+          if (failNext) {
+            failNext = false;
+            return Promise.reject(new Error("boom"));
+          }
+          return Promise.resolve(undefined);
+        case "update_setting":
+        case "set_preset_suffix":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run after each conversion/i);
+    await waitFor(() => expect(input).toHaveValue("/original.sh"));
+
+    fireEvent.change(input, { target: { value: "/new.sh" } });
+    fireEvent.blur(input);
+
+    await waitFor(() => expect(consoleError).toHaveBeenCalled());
+    const callsAfterFailure = invokeMock.mock.calls.filter(
+      (c) => c[0] === "set_command_hook",
+    );
+    expect(callsAfterFailure).toHaveLength(1);
+
+    // Draft is unchanged, but the committed value must NOT have advanced past the failed write —
+    // a second blur (e.g. the user tabbing away again) must retry, not no-op.
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook"),
+      ).toHaveLength(2),
+    );
+    expect(invokeMock).toHaveBeenLastCalledWith("set_command_hook", {
+      trigger: "post_convert",
+      command: "/new.sh",
+    });
+
+    consoleError.mockRestore();
+  });
 });

@@ -242,18 +242,21 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   // rejected write from vanishing silently.
   const commitPcCommand = () => {
     if (pcCommandHook !== null && pcCommandDraft !== pcCommandHook) {
-      invoke("set_command_hook", { trigger: "post_convert", command: pcCommandDraft }).catch(
-        (e) => console.error("Couldn't save post-convert command hook:", e),
-      );
-      setPcCommandHook(pcCommandDraft);
+      const command = pcCommandDraft;
+      invoke("set_command_hook", { trigger: "post_convert", command })
+        // Only advance the committed value on success — a rejected write must leave the old
+        // "last known committed" value in place, so the guard above still sees a diff and the
+        // next blur retries instead of silently believing the write already landed.
+        .then(() => setPcCommandHook(command))
+        .catch((e) => console.error("Couldn't save post-convert command hook:", e));
     }
   };
   const commitQdCommand = () => {
     if (qdCommandHook !== null && qdCommandDraft !== qdCommandHook) {
-      invoke("set_command_hook", { trigger: "queue_drained", command: qdCommandDraft }).catch(
-        (e) => console.error("Couldn't save queue-drained command hook:", e),
-      );
-      setQdCommandHook(qdCommandDraft);
+      const command = qdCommandDraft;
+      invoke("set_command_hook", { trigger: "queue_drained", command })
+        .then(() => setQdCommandHook(command))
+        .catch((e) => console.error("Couldn't save queue-drained command hook:", e));
     }
   };
 
