@@ -6,6 +6,7 @@ mod error;
 pub mod converter;
 pub mod files;
 pub mod handbrake;
+pub mod hooks;
 pub mod queue;
 pub mod settings;
 pub mod updater;

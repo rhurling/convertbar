@@ -54,6 +54,8 @@ pub fn run() {
             commands::settings::update_setting,
             commands::settings::get_preset_suffix,
             commands::settings::set_preset_suffix,
+            commands::hooks::get_command_hooks,
+            commands::hooks::set_command_hook,
             commands::handbrake::detect_handbrake,
             commands::handbrake::list_handbrake_presets,
             commands::handbrake::generate_preset_suffix,
