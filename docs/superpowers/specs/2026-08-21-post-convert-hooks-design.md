@@ -47,7 +47,7 @@ Two, both on the queue thread in `converter::process_queue`:
 | Hook | Fires | Site |
 |---|---|---|
 | `post-convert` | after each job reaches a terminal state (`done`, `skipped`, or `error`) | two sites, see below |
-| `queue-drained` | once when the queue empties after a run | `converter.rs:1524`, the existing "queue done" block |
+| `queue-drained` | once when the queue genuinely drains | `converter.rs:1524`, guarded — see below |
 
 Both fire on **every** terminal outcome. There is no configurable outcome filter.
 
@@ -61,12 +61,48 @@ through entirely separate code paths:
   :1309, :1341, and :1512. Firing at the wrapper instead would silently miss the :869 path.
 
 To keep the two sites from drifting, **neither builds the payload**. Both call one
-`hooks::fire_post_convert(ctx, &job_id, &mut run_state)` which re-reads the freshly booked
-`jobs` row and constructs the payload from it. The hook therefore always reports exactly what
+`hooks::fire_post_convert(ctx, &job_id)` which re-reads the freshly booked `jobs` row and
+constructs the payload from it. It takes only `&Ctx`, which is what lets the error fire point sit
+inside a free function without any signature churn. The hook therefore always reports exactly what
 History shows, and a future status field is picked up by both paths at once.
 
 Each trigger point supports two independent mechanisms — a webhook and a command — which may be
 configured together, separately, or not at all. An unset URL or command means that half is off.
+
+### `queue-drained` is not simply "the queue-done block was reached"
+
+The existing queue-done block at `converter.rs:1524` is **not** a drain signal. Two `break`s
+reach it:
+
+- `get_next_job` returns `None` — a true drain.
+- `take_pause_after_current` fires (`converter.rs:1457`, breaking at :1470) — "pause after this
+  job", **and every pause on Windows**, since `pause_conversion` falls back to
+  `pause_after_current` when `can_pause_process()` is false (`control.rs:46-53`).
+
+And two paths never reach it at all: the low-disk pause and the shutdown path both `return`
+early. So the naive placement would fire mid-run on every Windows pause, fire again after
+resume, and silently drop every job completed before a low-disk stop.
+
+Two changes fix this:
+
+1. **Fire only on a true drain.** `process_queue` tracks a `drained` flag set only on the
+   `get_next_job` → `None` break. The pause break leaves it false and fires nothing.
+2. **Derive the job list from a persisted watermark, not an in-memory `Vec`.** A run-local
+   accumulator cannot survive a pause, a low-disk stop, a quit, or a crash — exactly the
+   interruptions a long Unraid queue actually hits. Instead a `last_queue_drained_at` row in
+   `settings` holds the `completed_at` of the newest job already reported. On a true drain the
+   hook selects `jobs` rows with `completed_at > last_queue_drained_at`, ordered by
+   `completed_at`, fires, and only then advances the watermark to the newest `completed_at` in
+   that set.
+
+This makes the payload correct across every interruption path: work completed before a pause is
+reported by the drain that eventually follows it. It also means **a drain with nothing new fires
+nothing at all** — an idle queue does not emit empty `queue-drained` payloads.
+
+The watermark advances only after a successful fire, so a failed hook re-reports the same jobs on
+the next drain rather than losing them. A receiver must therefore tolerate a repeat; for a library
+rescan that is harmless, and it is the right trade against silent loss. Clearing History drops
+rows that were never reported.
 
 ### Lock discipline
 
@@ -135,19 +171,26 @@ to report. This is deliberate and gets a test.
 
 ### Cancellation
 
+**A cancelled job fires no `post-convert` hook, in any state.**
+
 `control::cancel_conversion` books `status = 'error', error_message = 'Cancelled by user'`
-directly (`control.rs:260`) and then kills the child. It does **not** call
-`record_job_error_quiet`, so it does not itself fire a hook. What follows differs by state:
+directly (`control.rs:260`) and *then* kills the child. It does not call
+`record_job_error_quiet`. When the killed child makes `wait_for_active_child` return non-success,
+`process_queue`'s failure arm reads the row back and guards on it —
+`if current_status.as_deref() != Some("error")` at `converter.rs:1501` — so `record_job_error` is
+skipped precisely because cancel already wrote the row. Neither fire point is reached.
 
-- **Cancelled while encoding:** the killed child makes `wait_for_active_child` return a
-  non-success status, `process_queue` takes a failure arm, and the hook fires once from
-  `record_job_error_quiet` with `status: "error"`. Correct: the job did terminate inside the
-  engine, and a receiver watching for terminal outcomes should hear about it.
-- **Cancelled while queued or paused:** no encode was ever running, `process_queue` never sees
-  the row, and no hook fires. Also correct: nothing was converted.
+This is the correct outcome and is left as-is: a cancellation is a user action, not a conversion
+result, and a receiver asked to rescan a file the user just abandoned is being told a lie. Do not
+"fix" this by adding a third fire point inside the already-error branch.
 
-The asymmetry is a consequence of where the row is booked, not a policy choice, and is spelled
-out here so it is not later "fixed" into firing twice for an encoding cancel.
+One consequence must be handled rather than inherited: `had_errors = true` is set at
+`converter.rs:1493` *before* that guard, so a cancelled job makes
+`converter::final_run_status` report `"error"` while contributing no row to the `queue-drained`
+job set. `run_status` in the payload is therefore derived from the payload's **own** job set
+(`errors > 0`), not from `had_errors`, so `{"run_status": "error", "errors": 0}` is unrepresentable.
+This can differ from the tray's status after a cancel; that is intended, and the tray is not a
+hook consumer.
 
 ### `queue-drained`
 
@@ -163,7 +206,9 @@ out here so it is not later "fixed" into firing twice for an encoding cancel.
 }
 ```
 
-`run_status` is `converter::final_run_status(had_errors)` — `"idle"` or `"error"`.
+`run_status` is `"error"` when the reported job set contains an `error` row and `"idle"`
+otherwise. It is deliberately **not** `converter::final_run_status(had_errors)` — see
+"Cancellation" for why that would report `"error"` alongside `"errors": 0`.
 `output_dirs` is the deduplicated, path-mapped list of directories touched by the run, in
 first-seen order, derived from each job's `result_path` and therefore naming only directories
 that contain a file that exists. Jobs with `status: "error"` contribute nothing to it, since
@@ -173,7 +218,8 @@ argument, and a rescan of a path that was deleted is at best wasted work.
 `completed` counts `done` and `skipped` jobs; `errors` counts `error` jobs. `space_saved` is the
 sum over all jobs and, like the per-job field, can be negative.
 
-Jobs are accumulated in a `Vec` local to `process_queue` for the duration of the run.
+The job set comes from the `last_queue_drained_at` watermark query described under "Trigger
+points", not from an in-memory accumulator, so it survives pauses, low-disk stops, and restarts.
 
 ## Mechanism: webhook
 
@@ -195,8 +241,12 @@ A non-empty body is a template. `{{placeholder}}` is substituted from the payloa
 - **`_json` placeholders** (`{{output_dirs_json}}`, `{{jobs_json}}`, `{{payload_json}}`) render
   pre-formed valid JSON and are inserted **raw**.
 
-An unknown placeholder is left untouched rather than replaced with empty — a silent empty string
-would send a malformed request that looks well-formed to the receiver.
+A **`null`** field substitutes as the empty string, so `"path": "{{result_path}}"` on an error
+job yields `"path": ""` — valid JSON that the receiver can test. It does not render the bare token
+`null`, which would produce `"null"` inside quotes and read as a real path.
+
+An **unknown** placeholder is left untouched rather than replaced with empty — a silent empty
+string would send a malformed request that looks well-formed to the receiver.
 
 Worked example, the driving case, on `queue-drained`:
 
@@ -216,8 +266,11 @@ bad line silently dropped. Validation happens at fire time (read side), matching
 existing convention that `update_setting` validates the key and nothing else.
 
 Headers are stored in plaintext in `convertbar.db` and are readable by any authenticated web-UI
-user, since the UI must display them for editing. This is the same posture as the server's auth
-token and is called out in the README rather than engineered around.
+user, since the UI must display them for editing. Relatedly, an authenticated user can aim the
+webhook — arbitrary URL, headers, and body — at any address the container can reach, including
+internal ones, which is a request-forgery primitive. Both are the same trust class as the auth
+token itself: holding it already implies control of what ConvertBar converts and where output
+lands. Called out in the README rather than engineered around, but called out.
 
 ## Mechanism: command
 
@@ -227,6 +280,11 @@ The payload is passed as environment variables, screaming-snake-cased with a `CO
 prefix: `CONVERTBAR_EVENT`, `CONVERTBAR_STATUS`, `CONVERTBAR_SOURCE_PATH`,
 `CONVERTBAR_OUTPUT_PATH`, `CONVERTBAR_OUTPUT_DIR`, `CONVERTBAR_SPACE_SAVED`, and so on. A `null`
 field is passed as an empty string.
+
+Non-scalar fields get no variable of their own: `queue-drained` exposes no
+`CONVERTBAR_JOBS`, and `CONVERTBAR_OUTPUT_DIRS` carries the directory list as a **JSON array**,
+not a shell-ambiguous space- or newline-joined string — a path containing a space would otherwise
+be unrecoverable.
 
 `CONVERTBAR_PAYLOAD` always carries the entire JSON payload, which is how a `queue-drained`
 command reads the `jobs` array and how any consumer reads a field this list forgot.
@@ -254,7 +312,11 @@ Whitespace around `=>` is trimmed. Rules apply longest-`from`-first, so a more s
 wins regardless of line order. The first matching rule applies; rewriting is not chained. A rule
 matches only on a path-segment boundary, so `/media` does not match `/mediafoo`.
 
-Mapping applies to `source_path`, `output_path`, `output_dir`, and `output_dirs`.
+Mapping applies to **every path-valued field**: `source_path`, `output_path`, `result_path`,
+`output_dir`, and `output_dirs` — and recursively to the same fields inside each element of
+`queue-drained`'s `jobs` array. `result_path` in particular must be mapped: the spec tells
+receivers to act on it, and shipping it unmapped beside a mapped `output_path` would be the
+worst of both.
 
 **Mapping applies to webhook payloads only.** A command hook receives raw container paths,
 because a shell script can rewrite them itself in one parameter expansion, and a second mapping
@@ -284,6 +346,17 @@ Added to `settings_ops::ALLOWED_KEYS` and to the `Settings` struct, seeded in `d
 `hook_timeout_seconds` is parsed on read and clamped to `1..=300`; an unparseable value reads as
 the default 30.
 
+### Internal state, not user-editable
+
+`last_queue_drained_at` holds the watermark. It is written by the engine, never by a user, so it
+is **absent from `ALLOWED_KEYS` and from the `Settings` struct** — the same treatment the three
+updater keys already get (`update_skipped_version`, `update_notified_version`,
+`update_installed`), and the existing test that pins those exclusions is the model. An absent or
+unparseable value reads as "no watermark", meaning the first drain reports every completed job in
+History. That is a one-time burst on upgrade; the alternative — seeding it at migration time to
+`now` — is a silent behaviour difference between a fresh install and an upgrade, so the burst is
+accepted and noted in the release notes.
+
 ### Command settings — deliberately not remotely configurable
 
 `post_convert_command` and `queue_drained_command` are arbitrary code execution. On the server
@@ -296,8 +369,18 @@ of which is a filter someone can forget to apply:
   `match` with a `_ => {}` arm. A key with no field in `Settings` is dropped on read. Adding no
   field is what keeps it off `GET /api/settings`.
 
-Resolution order at fire time: the environment variable wins; otherwise the stored settings row;
-otherwise the hook is off.
+Resolution at fire time depends on the head, and the server head **never reads the settings
+row at all**:
+
+- **Server head:** environment variable only. If it is unset, the command hook is off.
+- **Desktop head:** environment variable if set, otherwise the settings row.
+
+"Environment wins, then fall back to the row" applied uniformly would be a live hazard, not a
+convenience: a `convertbar.db` copied or migrated from a desktop install carries a
+`post_convert_command` row, and the container would execute it. (Copying a live database into a
+head has already caused one incident in this project.) The head therefore supplies the resolution
+policy — `Ctx` carries whether the settings row is an accepted source — rather than core guessing.
+A test asserts the server policy ignores a populated row.
 
 | Trigger | Environment variable | Settings key (desktop only) |
 |---|---|---|
@@ -325,6 +408,15 @@ guaranteed and a hung receiver cannot wedge the app.
   `Child::kill()` when it expires — `std::process` has no native wait-with-timeout.
 - **No retries.** A retry multiplies the worst-case stall and risks duplicating a side effect the
   receiver already performed before timing out.
+- **Shutdown skips hooks.** `ConverterState::is_shutting_down` is checked immediately before
+  firing, not only at the loop head. Without this, quitting the app blocks the queue thread for up
+  to the timeout — up to 300s at the maximum setting — and a command hook's child could outlive
+  the app. A hook already in flight at shutdown is abandoned; a command child is killed.
+- **Worst case is a multiple of the timeout.** With both a webhook and a command configured on
+  `post-convert`, a dead receiver costs `2 ×` the timeout per job. The 30s default is the
+  per-hook bound, not the per-job bound; the UI help text says so next to the field.
+- **Cancelling during a hook does nothing.** `current_job_id` is already cleared by then
+  (`converter.rs:1135`), so cancel has no target. The hook runs to completion or timeout.
 - A hook failure — non-2xx, transport error, timeout, malformed header line, non-zero exit
   status, command not found — **never** changes the job's status and never sets `had_errors`.
 
@@ -334,10 +426,23 @@ Failures surface three ways:
 - `ctx.events.emit_t("hook-failed", { "event": …, "reason": … })` so the web UI can toast
 - a line on stderr
 
+Ordering note for the error fire point: `record_job_error` calls `record_job_error_quiet` first
+and *then* re-locks the db to send its "X failed" notification (`converter.rs:768-784`). A hook
+firing inside `quiet` therefore delays that notification by up to the hook timeout, and a
+hook-failure notification arrives before the job-failure one. Accepted: moving the fire after the
+notification would miss the direct `record_job_error_quiet` call at `converter.rs:869`.
+
 **Notification is suppressed after the first failure of a queue run.** A broken receiver on a
-200-file queue would otherwise produce 200 notifications. A `bool` local to `process_queue`,
-alongside the existing `had_errors`, carries this; subsequent failures still log and still emit.
-The `queue-drained` hook fires once and so is unaffected.
+200-file queue would otherwise produce 200 notifications. Subsequent failures still log and still
+emit `hook-failed`.
+
+This flag must **not** be a `process_queue` local. One of the two fire points is inside
+`record_job_error_quiet`, a free function called from nine places via a wrapper; threading
+`&mut` state into it would mean changing both function signatures and all nine call sites, and
+the obvious shortcut — hoisting the hook call out to the nine sites instead — recreates exactly
+the drift the two-fire-point design exists to prevent. Instead the flag is a field on
+`ConverterState` (already an `Arc` reachable as `ctx.converter` from both fire points), cleared
+when `process_queue` starts a run.
 
 Hook-failure notifications ignore `notifications_per_file` and `notifications_errors_only`. Those
 settings describe conversion outcomes; a misconfigured hook is a different condition and
@@ -356,7 +461,8 @@ pub trait HookRunner: Send + Sync {
 ```
 
 `Ctx` gains `pub hooks: Arc<dyn HookRunner>` and `Ctx::new` gains a fifth parameter. There are
-17 `Ctx::new` call sites; the compiler forces each to declare its runner. This is the same reason
+16 `Ctx::new` call sites (a 17th `grep` hit is a doc comment at `settings_ops.rs:266`); the
+compiler forces each to declare its runner. This is the same reason
 `handbrake` is injected rather than defaulted — a test that reaches the hook layer without
 declaring its world should fail to compile rather than make a real network call.
 
@@ -374,9 +480,24 @@ Payload construction, templating, header parsing, and path mapping are **pure fu
 
 ### HTTP client
 
-`ureq`. Blocking, small, native timeout support, no async runtime. `reqwest` would pull tokio
-into the desktop app for the sake of a handful of requests per queue run. `ca-certificates` is
-already present in the runtime image, so TLS to an external receiver works unchanged.
+**`ureq` 3**, pinned to the major version. Blocking, small, no async runtime. `reqwest` would
+pull tokio into the desktop app for the sake of a handful of requests per queue run.
+
+Two details that are easy to get wrong:
+
+- **TLS roots.** ureq 3's default features use rustls with **bundled webpki-roots**, which do
+  *not* consult the container's `ca-certificates` store. Public-CA receivers would work, but a
+  receiver behind a private CA or a self-signed homelab reverse proxy — a likely deployment for
+  this feature — would fail with no obvious cause. The `platform-verifier` feature is therefore
+  selected explicitly so the OS trust store is used.
+- **Timeouts** in ureq 3 are configured on the agent (`Agent::config_builder()`), not per
+  request. One agent is built with the configured timeout and reused.
+
+`convertbar-core` currently has **zero** network dependencies. The `HookRunner` trait and all
+pure logic live in `hooks.rs` in core; `HttpHookRunner` lives there too and core takes the ureq
+dependency. Both heads need it, and duplicating the implementation per head to keep core
+network-free would be worse. Flagged because it grows every consumer's build and the shared
+`rust-tests` CI cache key (CLAUDE.md, cache topology).
 
 ## UI
 
@@ -418,12 +539,26 @@ Through `process_queue`, with an injected runner:
 - An `error` job fires once — driven through a real failure arm, not by calling
   `record_job_error_quiet` directly, so the test would catch the hook being attached to the
   `record_job_error` wrapper and thereby missing the :869 path.
-- A job cancelled while encoding fires once with `status: "error"`; a job cancelled while
-  queued fires nothing.
+- A cancelled job fires nothing, cancelled while encoding **and** while queued. The
+  encoding case must drive a real cancel through `control::cancel_conversion` so it exercises
+  the `!= Some("error")` guard at `converter.rs:1501`, not a hand-written error row.
 - No path fires `post-convert` twice for one job.
+- The hook-failure notification fires once per run and not once per file, and the flag resets on
+  the next run — it lives on `ConverterState`, so a stale flag would silence a later run.
 - The in-place + `keep` case fires nothing.
 - An empty URL and empty command fire nothing.
-- A run fires exactly one `queue-drained` carrying every job of the run.
+- A true drain fires exactly one `queue-drained` carrying every job since the watermark, and
+  advances the watermark.
+- **`pause_after_current` fires no `queue-drained`.** This is the Windows-pause path
+  (`control.rs:46-53`), so on Windows every pause would otherwise emit a spurious drain. The
+  test drives the pause flag, not the platform.
+- Jobs completed before a pause appear in the `queue-drained` that follows the eventual true
+  drain — the regression test for the in-memory accumulator this design rejects.
+- A drain with nothing new since the watermark fires nothing.
+- A failed `queue-drained` hook does not advance the watermark, so the next drain re-reports the
+  same jobs rather than losing them.
+- `run_status` is `"idle"` when the job set has no errors even though a cancelled job set
+  `had_errors`.
 - `FailingHookRunner`: job status stays `done`, `had_errors` stays false, `hook-failed` is
   emitted, and the second failure of a run does not notify again.
 - `SlowHookRunner`: the hook is abandoned at the timeout and the queue proceeds.
@@ -454,6 +589,8 @@ express what the payload already carries.
 ## Open items for the implementation plan
 
 - Migration is additive only: new `settings` rows via the existing `INSERT OR IGNORE` defaults
-  block. No schema change to `jobs`, so nothing to review for backward compatibility.
+  block, plus the engine-written `last_queue_drained_at`. No schema change to `jobs`, so nothing
+  to review for backward compatibility.
+- Release notes must mention the first-drain burst described under "Internal state".
 - README and `docker-compose.example.yml` gain the hook environment variables and a worked Stash
   example. `unraid-template.xml` gains the two command variables.
