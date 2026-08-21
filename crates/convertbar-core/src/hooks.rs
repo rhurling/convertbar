@@ -365,6 +365,17 @@ pub trait HookRunner: Send + Sync {
     fn run_command(&self, req: &CommandRequest) -> Result<(), String>;
 }
 
+/// Conservative cap on any SINGLE environment value handed to a command hook.
+///
+/// Linux rejects an env string longer than `MAX_ARG_STRLEN` (128 KiB) with `E2BIG`; macOS caps
+/// args+env together at 256 KiB. 96 KiB sits under both with room for the rest of the
+/// environment, and exists to turn an unreadable `E2BIG` from `spawn()` into a sentence naming
+/// the variable and its size. `QUEUE_DRAINED_BATCH` is the primary defence — this is the
+/// backstop for when a batch's per-job size estimate is wrong (very long paths, say).
+///
+/// The WEBHOOK path has no such limit: it is the escape hatch for very large payloads.
+pub const MAX_COMMAND_ENV_VALUE_BYTES: usize = 96 * 1024;
+
 /// Production runner: real HTTP, real process spawn.
 pub struct HttpHookRunner;
 
@@ -401,6 +412,19 @@ impl HookRunner for HttpHookRunner {
         let (program, args) = parts
             .split_first()
             .ok_or_else(|| "command is empty".to_string())?;
+
+        // Sits next to the spawn() it protects: past this point an oversized variable comes
+        // back as a bare `E2BIG` from the OS, which tells an operator nothing.
+        for (k, v) in &req.env {
+            if v.len() > MAX_COMMAND_ENV_VALUE_BYTES {
+                return Err(format!(
+                    "{k} is {}k, over the {}k limit a command hook can receive; \
+                     reduce the batch or use a webhook",
+                    v.len() / 1024,
+                    MAX_COMMAND_ENV_VALUE_BYTES / 1024
+                ));
+            }
+        }
 
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
@@ -897,6 +921,35 @@ pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
             return; // nothing new — an idle queue emits no empty payloads
         }
         let more_may_remain = jobs.len() >= QUEUE_DRAINED_BATCH;
+
+        // A full batch may have cut a group of rows sharing one `completed_at` in half. The
+        // next pass asks for `> watermark`, so the rows on the far side of that cut would be
+        // silently SKIPPED — not re-sent. Drop the trailing tied rows here and let them come
+        // back whole, together with their siblings, in the next iteration.
+        let mut jobs = jobs;
+        if more_may_remain {
+            if let Some(boundary) = jobs.last().and_then(|j| j.completed_at.clone()) {
+                let first_tied = jobs
+                    .iter()
+                    .position(|j| j.completed_at.as_deref() == Some(boundary.as_str()))
+                    .unwrap_or(0);
+                if first_tied == 0 {
+                    // Every row in a full batch shares one timestamp: the tie group is larger
+                    // than a batch and cannot be split, so send it whole. Rows beyond it that
+                    // share the timestamp WILL be skipped. That residual is acceptable; a
+                    // SILENT one is not, hence the log.
+                    eprintln!(
+                        "convertbar: queue-drained tie group at {boundary} fills an entire \
+                         {QUEUE_DRAINED_BATCH}-job batch — any further jobs sharing that exact \
+                         completed_at will be skipped"
+                    );
+                } else {
+                    jobs.truncate(first_tied);
+                }
+            }
+        }
+
+        // AFTER the truncation, so the watermark names the last row actually reported.
         let newest = jobs.iter().filter_map(|j| j.completed_at.clone()).max();
 
         let failures_before = hook_failures_seen(ctx);
@@ -1388,6 +1441,50 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert!(r.run_command(&c).is_err());
+    }
+
+    #[test]
+    fn http_runner_refuses_an_oversized_env_value_with_a_readable_message() {
+        // An operator must read a sentence, not decode `E2BIG` from spawn(). The command is
+        // /usr/bin/true — present on macOS and Linux, unlike /bin/true, which does not exist on
+        // macOS — so a green result cannot be the program failing to resolve instead.
+        let r = HttpHookRunner;
+        let req = CommandRequest {
+            command: "/usr/bin/true".into(),
+            env: vec![(
+                "CONVERTBAR_PAYLOAD".into(),
+                "x".repeat(MAX_COMMAND_ENV_VALUE_BYTES + 1),
+            )],
+            timeout: Duration::from_secs(10),
+        };
+        let err = r.run_command(&req).unwrap_err();
+        assert!(
+            err.contains("CONVERTBAR_PAYLOAD"),
+            "the error must name the variable: {err}"
+        );
+        assert!(err.contains("96k"), "the error must name the limit: {err}");
+        assert!(
+            err.contains("webhook"),
+            "the error must name the way out: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_runner_accepts_an_env_value_just_under_the_cap() {
+        // Guards the guard: proves the cap is a boundary, not a blanket refusal that would
+        // make the test above pass for the wrong reason. Unix-gated like every other test here
+        // that spawns a real program.
+        let r = HttpHookRunner;
+        let req = CommandRequest {
+            command: "/usr/bin/true".into(),
+            env: vec![(
+                "CONVERTBAR_PAYLOAD".into(),
+                "x".repeat(MAX_COMMAND_ENV_VALUE_BYTES),
+            )],
+            timeout: Duration::from_secs(10),
+        };
+        assert!(r.run_command(&req).is_ok());
     }
 
     #[cfg(unix)]

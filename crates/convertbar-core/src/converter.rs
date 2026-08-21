@@ -5837,7 +5837,11 @@ HandBrake has exited.";
         crate::hooks::fire_queue_drained(&ctx);
 
         let sent = hooks.webhooks.lock().unwrap();
-        assert_eq!(sent.len(), 3, "250 jobs at 100 per batch is 100 + 100 + 50");
+        assert_eq!(
+            sent.len(),
+            3,
+            "250 jobs at ~100 per batch is three payloads"
+        );
         let sizes: Vec<usize> = sent
             .iter()
             .map(|w| {
@@ -5847,10 +5851,14 @@ HandBrake has exited.";
                     .len()
             })
             .collect();
-        assert_eq!(
-            sizes,
-            [100, 100, 50],
-            "no payload may exceed the batch bound"
+        // 99, not 100: a FULL batch is cut back to the last completed_at boundary so a tie
+        // group can never straddle it (see `a_tie_group_straddling_a_batch_boundary_loses_no_job`).
+        // Here every timestamp is distinct, so that trailing "group" is a single row and costs
+        // one slot per full batch. The final batch is short, so it goes out intact.
+        assert_eq!(sizes, [99, 99, 52], "the batch boundary rule is applied");
+        assert!(
+            sizes.iter().all(|n| *n <= 100),
+            "the bound is what keeps CONVERTBAR_PAYLOAD under the exec limits"
         );
 
         // Every job reported exactly once, and the watermark ends on the newest of them.
@@ -5916,5 +5924,126 @@ HandBrake has exited.";
         assert_eq!(failed.len(), 1, "exactly the first batch, then it stopped");
         assert_eq!(failed[0]["event"], "queue-drained");
         assert_eq!(setting_value(&ctx.db, "last_queue_drained_at"), "");
+    }
+
+    /// Books `count` completed history rows whose `completed_at` is `stamp(i)`. Direct row
+    /// writes: the batching behaviour under test is about the SQL window, and running hundreds
+    /// of real encodes would take minutes while proving nothing extra.
+    fn book_history(ctx: &Arc<Ctx>, count: usize, stamp: impl Fn(usize) -> String) {
+        for i in 0..count {
+            let id = format!("h{i:04}");
+            queue_job(
+                &ctx.db,
+                &id,
+                &format!("/media/{id}.mkv"),
+                &format!("/media/{id}.mp4"),
+                1000,
+            );
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET status='done', kept_file='converted', converted_size=500, \
+                     space_saved=500, completed_at=?2 WHERE id=?1",
+                    params![id, stamp(i)],
+                )
+                .unwrap();
+        }
+    }
+
+    /// Every job_id across every sent webhook, in send order.
+    fn reported_job_ids(hooks: &crate::hooks::RecordingHookRunner) -> Vec<String> {
+        hooks
+            .webhooks
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|w| {
+                let body: serde_json::Value = serde_json::from_str(&w.body).unwrap();
+                body["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|j| j["job_id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tie_group_straddling_a_batch_boundary_loses_no_job() {
+        // The hazard the batch bound introduced: rows sharing one completed_at get cut in half
+        // by the LIMIT, the watermark advances to that shared value, and the next pass's strict
+        // `>` SKIPS the far half — silently, forever. A full batch is therefore truncated back
+        // to the last timestamp boundary so the tie group comes back whole next iteration.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        // Rows 99, 100 and 101 share one completed_at, so the 100-job batch boundary falls
+        // INSIDE the tie group (row 99 is the batch's last row; 100 and 101 are outside it).
+        let total = 150;
+        book_history(&ctx, total, |i| {
+            let effective = if (99..=101).contains(&i) { 99 } else { i };
+            format!("2026-01-01T00:00:00.{effective:06}+00:00")
+        });
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let reported = reported_job_ids(&hooks);
+        let mut unique = reported.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            total,
+            "every job must be reported — the tie group was cut and its far half skipped"
+        );
+        assert_eq!(
+            reported.len(),
+            total,
+            "and none re-sent: truncation must not replay the rows it kept"
+        );
+
+        // The truncation really happened: the first batch stopped SHORT of the bound rather
+        // than ending mid-tie. Without it the first payload would hold exactly 100.
+        let first_batch = hooks.webhooks.lock().unwrap()[0].body.clone();
+        let first: serde_json::Value = serde_json::from_str(&first_batch).unwrap();
+        assert_eq!(
+            first["jobs"].as_array().unwrap().len(),
+            99,
+            "the batch is cut back to the last timestamp boundary"
+        );
+    }
+
+    #[test]
+    fn a_tie_group_larger_than_a_whole_batch_is_still_sent() {
+        // The arm where truncation would empty the batch: every row shares one timestamp, so
+        // the group cannot be split. It must go out whole rather than deadlock the loop or
+        // send nothing — the residual (rows past the batch sharing that stamp) is logged, not
+        // silent.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        book_history(&ctx, 100, |_| {
+            "2026-01-01T00:00:00.000000+00:00".to_string()
+        });
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let reported = reported_job_ids(&hooks);
+        assert_eq!(reported.len(), 100, "the unsplittable group is sent whole");
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at"),
+            "2026-01-01T00:00:00.000000+00:00",
+            "and the watermark still advances, so the loop terminates"
+        );
     }
 }
