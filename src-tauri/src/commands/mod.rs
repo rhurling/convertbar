@@ -170,7 +170,7 @@ mod tests {
         // canonicalize a user-chosen path before registering an OS watch, and `cancel_conversion`
         // removes a partial output — both block the main thread on a dead mount, and both are
         // recorded under item 16 in docs/RECOMMENDATIONS.md rather than fixed here.
-        const MUST_BLOCK: [&str; 13] = [
+        const MUST_BLOCK: [&str; 14] = [
             "add_files",
             "scan_folder",
             "confirm_folder_add",
@@ -181,6 +181,7 @@ mod tests {
             "generate_preset_suffix",
             "validate_handbrake",
             "pick_folder",
+            "pick_file",
             "check_paths_exist",
             "open_path",
             "reveal_in_dir",

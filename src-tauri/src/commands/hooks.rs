@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use convertbar_core::ctx::Ctx;
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 
-use super::CommandError;
+use super::{blocking, CommandError};
 
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +79,32 @@ pub fn set_command_hook(
         .lock()
         .map_err(|e| CommandError::from(e.to_string()))?;
     write_command_hook(&conn, &trigger, &command)
+}
+
+/// Opens the native file picker so the UI can populate a command-hook field with a script path.
+/// Invoked from Rust, so no frontend `dialog` ACL permission is required. Mirrors
+/// `watch::pick_folder` exactly — same threading contract, same reasoning, because it is the
+/// same class of hazard:
+///
+/// MUST NOT run on the main thread: `blocking_pick_file` dispatches the panel to the main thread
+/// and then blocks the calling thread, so calling it there deadlocks the event loop — which is
+/// what a sync command would do, since Tauri runs those on the main thread.
+///
+/// It goes through `blocking` rather than merely being `async`, because the call blocks for as
+/// long as the panel is open — a user who walks away holds the thread for minutes. `async` alone
+/// parked that on a core runtime worker; the blocking pool exists for exactly this, is equally
+/// not-the-main-thread, and hands the command the same panic taxonomy as every other.
+#[tauri::command]
+pub async fn pick_file(app: AppHandle) -> Result<Option<String>, CommandError> {
+    blocking(move || {
+        Ok(app
+            .dialog()
+            .file()
+            .blocking_pick_file()
+            .and_then(|file_path| file_path.into_path().ok())
+            .map(|path| path.to_string_lossy().to_string()))
+    })
+    .await
 }
 
 #[cfg(test)]

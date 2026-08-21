@@ -240,6 +240,23 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   // `useSettings.updateSetting` surfaces failed setting writes via its `error` state (that
   // banner is wired to useSettings's own writes only) — console.error at minimum keeps a
   // rejected write from vanishing silently.
+  // Populates the draft only, same as the coordinator asked: commit-on-blur (or the unmount
+  // flush) still owns persistence, so a picked path behaves exactly like a typed one.
+  const pickPcCommand = async () => {
+    const path = await invoke<string | null>("pick_file").catch((e) => {
+      console.error("Couldn't open the file picker:", e);
+      return null;
+    });
+    if (path !== null) setPcCommandDraft(path);
+  };
+  const pickQdCommand = async () => {
+    const path = await invoke<string | null>("pick_file").catch((e) => {
+      console.error("Couldn't open the file picker:", e);
+      return null;
+    });
+    if (path !== null) setQdCommandDraft(path);
+  };
+
   const commitPcCommand = () => {
     if (pcCommandHook !== null && pcCommandDraft !== pcCommandHook) {
       const command = pcCommandDraft;
@@ -661,18 +678,27 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
             <label className="setting-label" htmlFor="post-convert-command">
               Command to run after each conversion
             </label>
-            <input
-              id="post-convert-command"
-              className="setting-input"
-              type="text"
-              value={pcCommandDraft}
-              onChange={(e) => setPcCommandDraft(e.target.value)}
-              onBlur={commitPcCommand}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") e.currentTarget.blur();
-              }}
-              placeholder="/path/to/script.sh"
-            />
+            <div className="setting-row">
+              <input
+                id="post-convert-command"
+                className="setting-input flex-1"
+                type="text"
+                value={pcCommandDraft}
+                onChange={(e) => setPcCommandDraft(e.target.value)}
+                onBlur={commitPcCommand}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+                placeholder="/path/to/script.sh"
+              />
+              <button
+                className="btn btn-small"
+                onClick={pickPcCommand}
+                aria-label="Choose a script to run after each conversion"
+              >
+                Browse
+              </button>
+            </div>
           </>
         )}
         <p className="setting-hint">
@@ -726,18 +752,27 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
             <label className="setting-label" htmlFor="queue-drained-command">
               Command to run when the queue finishes
             </label>
-            <input
-              id="queue-drained-command"
-              className="setting-input"
-              type="text"
-              value={qdCommandDraft}
-              onChange={(e) => setQdCommandDraft(e.target.value)}
-              onBlur={commitQdCommand}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") e.currentTarget.blur();
-              }}
-              placeholder="/path/to/script.sh"
-            />
+            <div className="setting-row">
+              <input
+                id="queue-drained-command"
+                className="setting-input flex-1"
+                type="text"
+                value={qdCommandDraft}
+                onChange={(e) => setQdCommandDraft(e.target.value)}
+                onBlur={commitQdCommand}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+                placeholder="/path/to/script.sh"
+              />
+              <button
+                className="btn btn-small"
+                onClick={pickQdCommand}
+                aria-label="Choose a script to run when the queue finishes"
+              >
+                Browse
+              </button>
+            </div>
           </>
         )}
         <p className="setting-hint">

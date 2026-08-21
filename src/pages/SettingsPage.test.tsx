@@ -984,4 +984,105 @@ describe("SettingsPage", () => {
 
     consoleError.mockRestore();
   });
+
+  it("populates the correct command field from the file picker, not the other one", async () => {
+    // Same copy-paste shape as the write tests above: two buttons, two triggers — a swapped
+    // handler would still compile and still "work" for whichever field happens to be tested
+    // alone, so both are asserted together against distinct picked paths.
+    let pickedPath: string | null = "/picked/post-convert.sh";
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.resolve({ postConvert: "", queueDrained: "" });
+        case "pick_file":
+          return Promise.resolve(pickedPath);
+        case "update_setting":
+        case "set_preset_suffix":
+        case "set_command_hook":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const pcInput = await screen.findByLabelText(/command to run after each conversion/i);
+    const qdInput = await screen.findByLabelText(/command to run when the queue finishes/i);
+    await waitFor(() => expect(pcInput).toHaveValue(""));
+
+    fireEvent.click(
+      screen.getByLabelText("Choose a script to run after each conversion"),
+    );
+    await waitFor(() => expect(pcInput).toHaveValue("/picked/post-convert.sh"));
+    expect(qdInput).toHaveValue(""); // the other field must not have moved
+
+    pickedPath = "/picked/queue-drained.sh";
+    fireEvent.click(
+      screen.getByLabelText("Choose a script to run when the queue finishes"),
+    );
+    await waitFor(() => expect(qdInput).toHaveValue("/picked/queue-drained.sh"));
+    expect(pcInput).toHaveValue("/picked/post-convert.sh"); // unaffected by the second pick
+  });
+
+  it("leaves the command field untouched when the file picker is cancelled", async () => {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.resolve({ postConvert: "/original.sh", queueDrained: "" });
+        case "pick_file":
+          return Promise.resolve(null); // cancelled dialog
+        case "update_setting":
+        case "set_preset_suffix":
+        case "set_command_hook":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run after each conversion/i);
+    await waitFor(() => expect(input).toHaveValue("/original.sh"));
+
+    fireEvent.click(
+      screen.getByLabelText("Choose a script to run after each conversion"),
+    );
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.filter((c) => c[0] === "pick_file"),
+      ).toHaveLength(1),
+    );
+    expect(input).toHaveValue("/original.sh");
+  });
 });
