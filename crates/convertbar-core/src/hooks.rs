@@ -14,10 +14,12 @@ pub struct JobPayload {
     pub source_path: String,
     pub output_path: String,
     /// The file that EXISTS now: output_path when kept_file is "converted", source_path when
-    /// it is "original" (the skipped case). None for every other value of kept_file, including
-    /// NULL — which is what an error row carries, cleanup failures included, because those arms
-    /// call `record_job_error` and never set kept_file. Receivers act on this, never on
-    /// output_path — see the spec.
+    /// it is "original". Note that "original" is NOT only the `skipped` status: `KeptFile::
+    /// Neither` (no usable output) also books kept_file = "original" while the job stays
+    /// `done`, so a `done` job can legitimately carry the source path here. None for every
+    /// other value of kept_file, including NULL — which is what an error row carries, cleanup
+    /// failures included, because those arms call `record_job_error` and never set kept_file.
+    /// Receivers act on this, never on output_path — see the spec.
     pub result_path: Option<String>,
     pub output_dir: Option<String>,
     pub in_place: bool,
@@ -719,11 +721,12 @@ fn row_to_payload(
     started_at: Option<String>,
     completed_at: Option<String>,
 ) -> JobPayload {
-    // The file that EXISTS now, keyed on kept_file: "converted" is the re-encode, "original"
-    // is the skipped case, where the converted file was discarded. Everything else — NULL
-    // included, which is what every error row carries (the cleanup-failure arms call
-    // `record_job_error`, which leaves kept_file NULL) — has no surviving result to name.
-    // Never blindly output_path.
+    // The file that EXISTS now, keyed on kept_file: "converted" is the re-encode; "original"
+    // is the skipped case, where the converted file was discarded, AND `KeptFile::Neither`,
+    // where there was no usable output at all — that one stays status='done', so "original"
+    // does not imply "skipped". Everything else — NULL included, which is what every error row
+    // carries (the cleanup-failure arms call `record_job_error`, which leaves kept_file NULL)
+    // — has no surviving result to name. Never blindly output_path.
     let result_path = match kept_file.as_deref() {
         Some("converted") => Some(output_path.clone()),
         Some("original") => Some(source_path.clone()),
@@ -792,20 +795,39 @@ pub fn fire_post_convert(ctx: &crate::ctx::Ctx, job_id: &str) {
 /// a low-disk stop, or a restart must not lose the jobs completed before it.
 const WATERMARK_KEY: &str = "last_queue_drained_at";
 
-/// Jobs completed since the watermark, oldest first. Reading from the table rather than an
-/// in-memory accumulator is what lets the payload survive a pause, a low-disk stop, or a
-/// restart — a run-local Vec would silently drop everything completed before the interruption.
-pub fn load_jobs_since(db: &rusqlite::Connection, watermark: &str) -> Vec<JobPayload> {
+/// Jobs per drain payload.
+///
+/// This is a HARD safety bound, not a tuning knob. `command_env` puts the whole payload into
+/// `CONVERTBAR_PAYLOAD`, and `run_command` sets that with `Command::env` before `spawn()`.
+/// Linux caps a single env string at `MAX_ARG_STRLEN` (128 KiB); macOS caps args+env together
+/// at 256 KiB. An unbounded payload therefore fails `spawn()` with `E2BIG` — and because that
+/// failure correctly refuses to advance the watermark, the NEXT drain would build an even
+/// larger payload. A wedge that never self-heals. At roughly 500 bytes per job object a full
+/// batch is ~50 KB, comfortably under both caps with room for long paths.
+const QUEUE_DRAINED_BATCH: usize = 100;
+
+/// One batch of jobs completed since the watermark, oldest first. Reading from the table
+/// rather than an in-memory accumulator is what lets the payload survive a pause, a low-disk
+/// stop, or a restart — a run-local Vec would silently drop everything completed before the
+/// interruption. Errors are logged, never silently returned as "nothing new".
+pub fn load_jobs_since(
+    db: &rusqlite::Connection,
+    watermark: &str,
+    limit: usize,
+) -> Vec<JobPayload> {
     let mut stmt = match db.prepare(
         "SELECT id, status, source_path, output_path, preset, kept_file, original_size, \
          converted_size, space_saved, error_message, failure_class, started_at, completed_at \
          FROM jobs WHERE completed_at IS NOT NULL AND completed_at > ?1 \
-         ORDER BY completed_at ASC",
+         ORDER BY completed_at ASC LIMIT ?2",
     ) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            eprintln!("convertbar: queue-drained hook could not prepare its job query — {e}");
+            return Vec::new();
+        }
     };
-    let rows = stmt.query_map(rusqlite::params![watermark], |r| {
+    let rows = stmt.query_map(rusqlite::params![watermark, limit as i64], |r| {
         Ok(row_to_payload(
             r.get(0)?,
             r.get(1)?,
@@ -824,7 +846,10 @@ pub fn load_jobs_since(db: &rusqlite::Connection, watermark: &str) -> Vec<JobPay
     });
     match rows {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            eprintln!("convertbar: queue-drained hook could not read completed jobs — {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -836,10 +861,12 @@ fn hook_failures_seen(ctx: &crate::ctx::Ctx) -> usize {
         .load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Fires once per TRUE drain. Advances the watermark only on success, so a failed hook
-/// re-reports the same jobs next time rather than losing them.
+/// Fires on a TRUE drain, in batches of `QUEUE_DRAINED_BATCH`. Advances the watermark only
+/// after a batch dispatches cleanly, so a failed hook re-reports the same jobs next time
+/// rather than losing them — and the batch bound keeps that retry from growing without limit.
+/// A whole backlog drains inside this one call, not one batch per queue run.
 pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
-    let (cfg, jobs) = {
+    let cfg = {
         let db = match ctx.db.lock() {
             Ok(db) => db,
             Err(_) => return,
@@ -848,37 +875,83 @@ pub fn fire_queue_drained(ctx: &crate::ctx::Ctx) {
         if cfg.is_off() {
             return;
         }
-        // An absent watermark sorts before every RFC3339 timestamp, so a first run reports
-        // every completed job in History. That one-time burst is preferred over seeding the
-        // watermark at migration time, which would make a fresh install and an upgrade behave
-        // differently for no visible reason.
-        let watermark = setting(&db, WATERMARK_KEY);
-        let jobs = load_jobs_since(&db, &watermark);
-        (cfg, jobs)
-    }; // guard dropped BEFORE dispatch — a hook can block for the full timeout.
+        cfg
+    };
 
-    if jobs.is_empty() {
-        return; // nothing new — an idle queue emits no empty payloads
-    }
-    let newest = jobs.iter().filter_map(|j| j.completed_at.clone()).max();
+    loop {
+        let (watermark, jobs) = {
+            let db = match ctx.db.lock() {
+                Ok(db) => db,
+                Err(_) => return,
+            };
+            // An absent watermark sorts before every RFC3339 timestamp, so a first run reports
+            // every completed job in History. That one-time burst is preferred over seeding the
+            // watermark at migration time, which would make a fresh install and an upgrade
+            // behave differently for no visible reason. It arrives batched, not as one payload.
+            let watermark = setting(&db, WATERMARK_KEY);
+            let jobs = load_jobs_since(&db, &watermark, QUEUE_DRAINED_BATCH);
+            (watermark, jobs)
+        }; // guard dropped BEFORE dispatch — a hook can block for the full timeout.
 
-    let failures_before = hook_failures_seen(ctx);
-    dispatch(
-        ctx,
-        Trigger::QueueDrained,
-        &cfg,
-        queue_drained_payload(&jobs),
-    );
-    if hook_failures_seen(ctx) != failures_before {
-        return; // do not advance past jobs the receiver never heard about
-    }
+        if jobs.is_empty() {
+            return; // nothing new — an idle queue emits no empty payloads
+        }
+        let more_may_remain = jobs.len() >= QUEUE_DRAINED_BATCH;
+        let newest = jobs.iter().filter_map(|j| j.completed_at.clone()).max();
 
-    // Only now is ctx.db re-locked: dispatch has fully returned, so no guard was ever held
-    // across a hook.
-    if let (Some(newest), Ok(db)) = (newest, ctx.db.lock()) {
-        let _ = db.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
-            rusqlite::params![WATERMARK_KEY, newest],
+        let failures_before = hook_failures_seen(ctx);
+        dispatch(
+            ctx,
+            Trigger::QueueDrained,
+            &cfg,
+            queue_drained_payload(&jobs),
+        );
+        if hook_failures_seen(ctx) != failures_before {
+            return; // do not advance past jobs the receiver never heard about
+        }
+
+        // TERMINATION GUARD. Everything past here must either advance the watermark or stop:
+        // this loop re-selects from the same table on the next pass, so a watermark that does
+        // not move re-sends the identical batch forever on the queue thread.
+        let Some(newest) = newest else {
+            eprintln!(
+                "convertbar: queue-drained batch carried no usable completed_at — stopping \
+                 rather than re-sending the same rows"
+            );
+            return;
+        };
+        if newest == watermark {
+            eprintln!(
+                "convertbar: queue-drained watermark did not advance past {newest} — stopping \
+                 rather than re-sending the same rows"
+            );
+            return;
+        }
+
+        // Only now is ctx.db re-locked: dispatch has fully returned, so no guard was ever held
+        // across a hook.
+        let advanced = {
+            let db = match ctx.db.lock() {
+                Ok(db) => db,
+                Err(_) => return,
+            };
+            db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                rusqlite::params![WATERMARK_KEY, &newest],
+            )
+        };
+        // A failed write is the other way the watermark stays put; same rule applies.
+        if let Err(e) = advanced {
+            eprintln!("convertbar: queue-drained watermark could not be stored — {e}");
+            return;
+        }
+
+        if !more_may_remain {
+            return;
+        }
+        eprintln!(
+            "convertbar: queue-drained batch was full ({QUEUE_DRAINED_BATCH} jobs) — more \
+             remain, sending the next batch"
         );
     }
 }

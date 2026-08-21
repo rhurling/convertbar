@@ -1576,10 +1576,6 @@ fn process_queue(ctx: &Ctx) {
         }
     } // the ctx.db guard above is scoped inside this block and is gone by here
 
-    if drained {
-        crate::hooks::fire_queue_drained(ctx);
-    }
-
     let final_status = final_run_status(had_errors);
     ctx.events.emit_t(
         "menu-bar-update",
@@ -1592,6 +1588,13 @@ fn process_queue(ctx: &Ctx) {
             fps: None,
         },
     );
+
+    // Deliberately AFTER the final menu-bar-update: a hook may block for the full timeout (up
+    // to 300s), and the tray must not keep showing a stale "converting" status for five
+    // minutes after the queue is actually empty. No ctx.db guard is held here.
+    if drained {
+        crate::hooks::fire_queue_drained(ctx);
+    }
 
     // is_running is reset by RunningGuard on return (and on an unwinding panic).
 }
@@ -5245,38 +5248,42 @@ HandBrake has exited.";
         assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
     }
 
+    /// Asserts, from inside a hook, that `ctx.db` is free. `try_lock`, never `lock`: a real
+    /// regression must FAIL the test, not hang it forever. Shared by the per-file and the
+    /// queue-drained lock-discipline tests below — CLAUDE.md names this invariant as the one
+    /// behind two shipped deadlocks, and the drain path re-acquires the lock after dispatch,
+    /// which is a second chance to get it wrong.
+    #[derive(Default)]
+    struct LockProbeRunner {
+        db: Mutex<Option<Arc<Mutex<Connection>>>>,
+        was_free: Mutex<bool>,
+    }
+    impl LockProbeRunner {
+        fn probe(&self) -> Result<(), String> {
+            let db = self.db.lock().unwrap().clone().expect("db handle set");
+            let verdict = match db.try_lock() {
+                Ok(_) => {
+                    *self.was_free.lock().unwrap() = true;
+                    Ok(())
+                }
+                Err(_) => Err("ctx.db was held across the hook".into()),
+            };
+            verdict
+        }
+    }
+    impl crate::hooks::HookRunner for LockProbeRunner {
+        fn run_webhook(&self, _r: &crate::hooks::WebhookRequest) -> Result<(), String> {
+            self.probe()
+        }
+        fn run_command(&self, _r: &crate::hooks::CommandRequest) -> Result<(), String> {
+            self.probe()
+        }
+    }
+
     #[test]
     fn the_db_lock_is_not_held_while_a_hook_runs() {
         // The invariant most likely to regress, and the one that has already caused two
         // shipped deadlocks. A hook is slower than an emit, so the window is wider here.
-        // try_lock, never lock: a real regression must fail this test, not hang it forever.
-        #[derive(Default)]
-        struct LockProbeRunner {
-            db: Mutex<Option<Arc<Mutex<Connection>>>>,
-            was_free: Mutex<bool>,
-        }
-        impl LockProbeRunner {
-            fn probe(&self) -> Result<(), String> {
-                let db = self.db.lock().unwrap().clone().expect("db handle set");
-                let verdict = match db.try_lock() {
-                    Ok(_) => {
-                        *self.was_free.lock().unwrap() = true;
-                        Ok(())
-                    }
-                    Err(_) => Err("ctx.db was held across the hook".into()),
-                };
-                verdict
-            }
-        }
-        impl crate::hooks::HookRunner for LockProbeRunner {
-            fn run_webhook(&self, _r: &crate::hooks::WebhookRequest) -> Result<(), String> {
-                self.probe()
-            }
-            fn run_command(&self, _r: &crate::hooks::CommandRequest) -> Result<(), String> {
-                self.probe()
-            }
-        }
-
         let probe = Arc::new(LockProbeRunner::default());
         let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), probe.clone());
         *probe.db.lock().unwrap() = Some(ctx.db.clone());
@@ -5524,6 +5531,20 @@ HandBrake has exited.";
         set_queue_order(ctx, id, order);
     }
 
+    /// A job row's `completed_at` verbatim, for asserting the watermark against the value the
+    /// payload actually reported rather than against "something non-empty".
+    fn completed_at_of(db: &Arc<Mutex<Connection>>, id: &str) -> String {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT completed_at FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .expect("a reported job has a completed_at")
+    }
+
     fn set_queue_order(ctx: &Arc<Ctx>, id: &str, order: i64) {
         ctx.db
             .lock()
@@ -5558,7 +5579,20 @@ HandBrake has exited.";
         assert_eq!(body["event"], "queue-drained");
         assert_eq!(body["completed"], 2);
         assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
-        assert!(!setting_value(&ctx.db, "last_queue_drained_at").is_empty());
+
+        // The watermark's VALUE, not merely that it is non-empty: it must be the newest
+        // completed_at IN THE REPORTED SET. Stamping the clock instead would look identical to
+        // a non-empty assertion while silently skipping any job that completed between the
+        // last reported one and the write — exactly the loss this design exists to prevent.
+        let last_reported = body["jobs"].as_array().unwrap().last().unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at"),
+            completed_at_of(&ctx.db, &last_reported),
+            "the watermark is computed from the reported set, never from the clock"
+        );
     }
 
     #[test]
@@ -5724,5 +5758,163 @@ HandBrake has exited.";
         assert_eq!(body["output_dirs"].as_array().unwrap().len(), 1);
         assert_eq!(body["output_dirs"][0], dir.path().to_str().unwrap());
         assert_eq!(body["errors"], 1);
+    }
+
+    #[test]
+    fn the_db_lock_is_not_held_while_the_drain_hook_runs() {
+        // `the_db_lock_is_not_held_while_a_hook_runs` covers fire_post_convert only. The drain
+        // path is the riskier one: it releases ctx.db, dispatches, and then RE-ACQUIRES the
+        // lock to write the watermark. Nothing else in the suite would catch a refactor that
+        // hoists that write back inside the first guarded block, or wraps dispatch in the
+        // guard — RecordingHookRunner and TestSink never touch ctx.db.
+        let probe = Arc::new(LockProbeRunner::default());
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), probe.clone());
+        *probe.db.lock().unwrap() = Some(ctx.db.clone());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert!(
+            *probe.was_free.lock().unwrap(),
+            "ctx.db must be released before the drain hook runs"
+        );
+        // The probe returns Ok, so the dispatch succeeded and the watermark MUST have been
+        // written — which is what proves the post-dispatch re-acquire really ran rather than
+        // the whole tail being skipped.
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at"),
+            completed_at_of(&ctx.db, "j1")
+        );
+    }
+
+    #[test]
+    fn a_backlog_larger_than_one_batch_drains_in_batches_within_a_single_call() {
+        // The E2BIG wedge this bound exists for: command_env puts the whole payload into
+        // CONVERTBAR_PAYLOAD, Linux caps one env string at 128 KiB, and an over-cap spawn
+        // fails -> watermark correctly refuses to advance -> the next payload is BIGGER. It
+        // never self-heals. Batching bounds each payload, and the loop drains the whole
+        // backlog in one call rather than one batch per queue run.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        // 250 history rows with strictly increasing completed_at, written directly: running
+        // 250 real encodes would take minutes and prove nothing extra about the batching.
+        let total = 250;
+        for i in 0..total {
+            let id = format!("h{i:04}");
+            queue_job(
+                &ctx.db,
+                &id,
+                &format!("/media/{id}.mkv"),
+                &format!("/media/{id}.mp4"),
+                1000,
+            );
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET status='done', kept_file='converted', converted_size=500, \
+                     space_saved=500, completed_at=?2 WHERE id=?1",
+                    params![
+                        id,
+                        format!("2026-01-01T00:00:{:02}.{:06}+00:00", i / 1000, i)
+                    ],
+                )
+                .unwrap();
+        }
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let sent = hooks.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 3, "250 jobs at 100 per batch is 100 + 100 + 50");
+        let sizes: Vec<usize> = sent
+            .iter()
+            .map(|w| {
+                serde_json::from_str::<serde_json::Value>(&w.body).unwrap()["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .collect();
+        assert_eq!(
+            sizes,
+            [100, 100, 50],
+            "no payload may exceed the batch bound"
+        );
+
+        // Every job reported exactly once, and the watermark ends on the newest of them.
+        let mut seen: Vec<String> = Vec::new();
+        for w in sent.iter() {
+            let body: serde_json::Value = serde_json::from_str(&w.body).unwrap();
+            for j in body["jobs"].as_array().unwrap() {
+                seen.push(j["job_id"].as_str().unwrap().to_string());
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            total,
+            "batching must not drop or duplicate a job"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at"),
+            completed_at_of(&ctx.db, &format!("h{:04}", total - 1))
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_stops_the_drain_without_advancing_the_watermark() {
+        // The batch loop must keep the all-or-nothing rule per batch: a refusal mid-backlog
+        // stops immediately rather than marching the watermark past jobs the receiver never
+        // heard about.
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        for i in 0..150 {
+            let id = format!("h{i:04}");
+            queue_job(
+                &ctx.db,
+                &id,
+                &format!("/media/{id}.mkv"),
+                &format!("/media/{id}.mp4"),
+                1000,
+            );
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET status='done', kept_file='converted', converted_size=500, \
+                     space_saved=500, completed_at=?2 WHERE id=?1",
+                    params![id, format!("2026-01-01T00:00:00.{:06}+00:00", i)],
+                )
+                .unwrap();
+        }
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        // Positive control: the first batch really was attempted and really was refused, so an
+        // empty watermark cannot pass by way of nothing having fired at all.
+        let failed = sink.payloads("hook-failed");
+        assert_eq!(failed.len(), 1, "exactly the first batch, then it stopped");
+        assert_eq!(failed[0]["event"], "queue-drained");
+        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at"), "");
     }
 }
