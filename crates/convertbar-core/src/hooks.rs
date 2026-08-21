@@ -333,6 +333,155 @@ pub fn command_env(payload: &Value) -> Vec<(String, String)> {
     env
 }
 
+use std::sync::Mutex;
+use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebhookRequest {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandRequest {
+    pub command: String,
+    pub env: Vec<(String, String)>,
+    pub timeout: Duration,
+}
+
+/// The hook I/O edge, injected per head so tests never touch the network or spawn processes
+/// they did not ask for. Same pattern as `FileDisposer` and `HandbrakeLocator`.
+pub trait HookRunner: Send + Sync {
+    fn run_webhook(&self, req: &WebhookRequest) -> Result<(), String>;
+    fn run_command(&self, req: &CommandRequest) -> Result<(), String>;
+}
+
+/// Production runner: real HTTP, real process spawn.
+pub struct HttpHookRunner;
+
+impl HookRunner for HttpHookRunner {
+    fn run_webhook(&self, req: &WebhookRequest) -> Result<(), String> {
+        // RootCerts::PlatformVerifier is REQUIRED, not merely the cargo feature: enabling
+        // the feature only makes the verifier available, and the default stays webpki's
+        // bundled Mozilla roots. Without this line a receiver behind a private CA or a
+        // self-signed homelab proxy fails, and no test can catch it because every test uses
+        // a recording runner.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(req.timeout))
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                    .build(),
+            )
+            .build()
+            .into();
+
+        let mut request = agent.post(&req.url);
+        for (name, value) in &req.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        match request.send(req.body.as_bytes()) {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::StatusCode(code)) => Err(format!("receiver returned HTTP {code}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn run_command(&self, req: &CommandRequest) -> Result<(), String> {
+        let parts = split_command(&req.command)?;
+        let (program, args) = parts
+            .split_first()
+            .ok_or_else(|| "command is empty".to_string())?;
+
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        for (k, v) in &req.env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().map_err(|e| format!("{program}: {e}"))?;
+
+        // std::process has no wait-with-timeout. Share the child with a waiter thread so the
+        // timeout arm can still kill it. The waiter POLLS with try_wait rather than calling
+        // wait(): wait() would hold the mutex for the child's entire lifetime and the timeout
+        // arm could never lock it to kill. No libc and no per-platform code needed.
+        let child = std::sync::Arc::new(Mutex::new(child));
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let child = std::sync::Arc::clone(&child);
+            std::thread::spawn(move || loop {
+                let polled = { child.lock().unwrap().try_wait() };
+                match polled {
+                    Ok(Some(status)) => {
+                        let _ = tx.send(Ok(status));
+                        return;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(e) => {
+                        let _ = tx.send(Err(e.to_string()));
+                        return;
+                    }
+                }
+            });
+        }
+
+        match rx.recv_timeout(req.timeout) {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => Err(format!(
+                "command exited with status {}",
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into())
+            )),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                let _ = child.lock().unwrap().kill();
+                Err(format!("command timed out after {:?}", req.timeout))
+            }
+        }
+    }
+}
+
+/// Test-harness default: records what was asked for, performs no I/O, always succeeds.
+/// Unlike `PanickingLocator`, this does NOT fail loud — every `process_queue` test reaches a
+/// fire point, and with no hook configured the fire is a no-op anyway.
+#[derive(Default)]
+pub struct RecordingHookRunner {
+    pub webhooks: Mutex<Vec<WebhookRequest>>,
+    pub commands: Mutex<Vec<CommandRequest>>,
+}
+
+impl HookRunner for RecordingHookRunner {
+    fn run_webhook(&self, req: &WebhookRequest) -> Result<(), String> {
+        self.webhooks.lock().unwrap().push(req.clone());
+        Ok(())
+    }
+    fn run_command(&self, req: &CommandRequest) -> Result<(), String> {
+        self.commands.lock().unwrap().push(req.clone());
+        Ok(())
+    }
+}
+
+/// Drives the failure-surfacing paths.
+pub struct FailingHookRunner;
+
+impl HookRunner for FailingHookRunner {
+    fn run_webhook(&self, _req: &WebhookRequest) -> Result<(), String> {
+        Err("receiver refused".into())
+    }
+    fn run_command(&self, _req: &CommandRequest) -> Result<(), String> {
+        Err("receiver refused".into())
+    }
+}
+
+// Deliberately NO SlowHookRunner. Timeout enforcement lives inside `HttpHookRunner` — the
+// ureq agent config for webhooks, `recv_timeout` for commands — so a slow *double* would only
+// block `dispatch` for its full sleep and prove nothing about the timeout. Real timeout
+// behaviour is covered by `http_runner_kills_a_command_that_outruns_the_timeout` above,
+// against a real child process.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,5 +864,115 @@ mod tests {
             r#"["/media/movies"]"#
         );
         assert!(env.iter().all(|(n, _)| n != "CONVERTBAR_JOBS"));
+    }
+
+    // ---- HookRunner ----
+
+    use std::time::Duration;
+
+    #[test]
+    fn recording_runner_captures_requests_and_succeeds() {
+        let r = RecordingHookRunner::default();
+        let req = WebhookRequest {
+            url: "http://example.invalid/x".into(),
+            headers: vec![("A".into(), "b".into())],
+            body: "{}".into(),
+            timeout: Duration::from_secs(1),
+        };
+        assert!(r.run_webhook(&req).is_ok());
+        assert_eq!(r.webhooks.lock().unwrap().len(), 1);
+        assert_eq!(
+            r.webhooks.lock().unwrap()[0].url,
+            "http://example.invalid/x"
+        );
+    }
+
+    #[test]
+    fn failing_runner_reports_an_error_for_both_mechanisms() {
+        let r = FailingHookRunner;
+        let w = WebhookRequest {
+            url: "http://x.invalid".into(),
+            headers: vec![],
+            body: String::new(),
+            timeout: Duration::from_secs(1),
+        };
+        let c = CommandRequest {
+            command: "/bin/true".into(),
+            env: vec![],
+            timeout: Duration::from_secs(1),
+        };
+        assert!(r.run_webhook(&w).is_err());
+        assert!(r.run_command(&c).is_err());
+    }
+
+    #[test]
+    fn http_runner_rejects_an_empty_command() {
+        let r = HttpHookRunner;
+        let c = CommandRequest {
+            command: "   ".into(),
+            env: vec![],
+            timeout: Duration::from_secs(1),
+        };
+        assert!(r.run_command(&c).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_runner_runs_a_real_command_and_passes_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        let script = dir.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' \"$CONVERTBAR_STATUS\" > \"$CONVERTBAR_OUT\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let r = HttpHookRunner;
+        let req = CommandRequest {
+            command: script.to_string_lossy().to_string(),
+            env: vec![
+                ("CONVERTBAR_STATUS".into(), "done".into()),
+                ("CONVERTBAR_OUT".into(), out.to_string_lossy().to_string()),
+            ],
+            timeout: Duration::from_secs(10),
+        };
+        r.run_command(&req).expect("hook script should succeed");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "done");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_runner_reports_a_non_zero_exit() {
+        let r = HttpHookRunner;
+        let req = CommandRequest {
+            command: "/bin/sh -c 'exit 3'".into(),
+            env: vec![],
+            timeout: Duration::from_secs(10),
+        };
+        let err = r.run_command(&req).unwrap_err();
+        assert!(err.contains('3'), "error should name the exit code: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_runner_kills_a_command_that_outruns_the_timeout() {
+        // A hung receiver must not wedge the queue thread forever.
+        let r = HttpHookRunner;
+        let req = CommandRequest {
+            command: "/bin/sleep 30".into(),
+            env: vec![],
+            timeout: Duration::from_secs(1),
+        };
+        let started = std::time::Instant::now();
+        let err = r.run_command(&req).unwrap_err();
+        assert!(err.to_lowercase().contains("timed out"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "should have been killed at the timeout, took {:?}",
+            started.elapsed()
+        );
     }
 }
