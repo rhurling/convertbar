@@ -36,6 +36,14 @@ function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings {
     update_mode: "automatic",
     history_show_duration: true,
     encode_priority: "normal",
+    post_convert_webhook_url: "",
+    post_convert_webhook_headers: "",
+    post_convert_webhook_body: "",
+    queue_drained_webhook_url: "",
+    queue_drained_webhook_headers: "",
+    queue_drained_webhook_body: "",
+    hook_path_map: "",
+    hook_timeout_seconds: "30",
     ...overrides,
   };
 }
@@ -68,6 +76,48 @@ async function waitForSettingsToSettle() {
   );
 }
 
+/**
+ * The `fetch` stub a server-head render needs: `isServerHead` swaps `commands` to the HTTP
+ * transport, so every load goes through fetch rather than `invoke`. Introduced for the command
+ * hook test below rather than retrofitted onto the four older server-head tests, which inline
+ * their own variants with test-specific responses.
+ */
+function serverHeadFetch() {
+  return vi.fn((path: string) => {
+    if (path === "/api/settings") {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(makeSettings()) });
+    }
+    if (path === "/api/handbrake/presets") {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(["Fast 1080p30"]) });
+    }
+    if (path === "/api/info") {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            version: "1.2.3",
+            head: "server",
+            can_pause_process: true,
+            auth_required: false,
+            browse_roots: [],
+          }),
+      });
+    }
+    if (path.includes("/suffix/generate")) {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(META) });
+    }
+    if (path.includes("/suffix")) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(".{resolution}-{codec}"),
+      });
+    }
+    return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({ error: "not mocked" }) });
+  });
+}
+
 afterEach(() => {
   // Only ever armed by the server-head version test below (stubEnv/stubGlobal/resetModules) —
   // a no-op otherwise, so it is safe to run unconditionally after every test in this file.
@@ -92,12 +142,15 @@ beforeEach(() => {
         return Promise.resolve(".RESOLVED"); // sentinel proving the preview is backend-computed
       case "update_setting":
       case "set_preset_suffix":
+      case "set_command_hook":
         return Promise.resolve(undefined);
       case "get_platform_capabilities":
         return Promise.resolve({
           can_pause_process: true,
           priority_is_group_scoped: groupScopedFlag,
         });
+      case "get_command_hooks":
+        return Promise.resolve({ postConvert: "", queueDrained: "" });
       default:
         return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
     }
@@ -128,6 +181,38 @@ function withMode(cleanup_mode: string, suffix: string) {
         return Promise.resolve(null);
     }
   }) as typeof invoke);
+}
+
+/** Points `invokeMock` at `settings` (same shape as `beforeEach`) and renders `<SettingsPage />`. */
+function renderWithSettings(settings: AppSettings) {
+  invokeMock.mockImplementation(((cmd: string) => {
+    switch (cmd) {
+      case "get_settings":
+        return Promise.resolve(settings);
+      case "list_handbrake_presets":
+        return Promise.resolve(["Fast 1080p30"]);
+      case "get_preset_suffix":
+        return Promise.resolve(".{resolution}-{codec}");
+      case "generate_preset_suffix":
+        return Promise.resolve(META);
+      case "resolve_suffix_template":
+        return Promise.resolve(".RESOLVED");
+      case "update_setting":
+      case "set_preset_suffix":
+      case "set_command_hook":
+        return Promise.resolve(undefined);
+      case "get_platform_capabilities":
+        return Promise.resolve({
+          can_pause_process: true,
+          priority_is_group_scoped: groupScopedFlag,
+        });
+      case "get_command_hooks":
+        return Promise.resolve({ postConvert: "", queueDrained: "" });
+      default:
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    }
+  }) as typeof invoke);
+  render(<SettingsPage />);
 }
 
 describe("SettingsPage", () => {
@@ -233,7 +318,10 @@ describe("SettingsPage", () => {
 
   it("does not write the low-disk threshold per keystroke; commits on blur", async () => {
     render(<SettingsPage />);
-    const input = await screen.findByRole("spinbutton"); // the only number input on the page
+    // Disambiguated by label, not role: the Hooks section added its own number input (timeout).
+    const input = await screen.findByLabelText(
+      /pause when destination free space is low/i,
+    );
     await waitForSettingsToSettle();
     fireEvent.change(input, { target: { value: "2" } });
     fireEvent.change(input, { target: { value: "2.5" } });
@@ -286,7 +374,10 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByPlaceholderText(".downloading"), {
       target: { value: ".part" },
     });
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2.5" } });
+    fireEvent.change(
+      screen.getByLabelText(/pause when destination free space is low/i),
+      { target: { value: "2.5" } },
+    );
     fireEvent.change(screen.getByPlaceholderText(".{resolution}-{codec}"), {
       target: { value: ".hevc" },
     });
@@ -705,5 +796,441 @@ describe("SettingsPage", () => {
     // rendered yet — the failure mode a bare queryBy would hide.
     await screen.findByLabelText(/run only with cpu nothing else wants/i);
     expect(screen.queryByText(/--cpu-shares/)).not.toBeInTheDocument();
+  });
+
+  it("renders the webhook url for both trigger points", async () => {
+    renderWithSettings(
+      makeSettings({
+        post_convert_webhook_url: "http://a/",
+        queue_drained_webhook_url: "http://b/",
+      }),
+    );
+    // Waits out the same late-arriving-draft-sync race waitForSettingsToSettle documents above:
+    // adding the command-hook fetch effect gave this field one more render cycle to land in.
+    await waitForSettingsToSettle();
+    expect(await screen.findByLabelText(/after each conversion.*url/i)).toHaveValue("http://a/");
+    expect(screen.getByLabelText(/when the queue finishes.*url/i)).toHaveValue("http://b/");
+  });
+
+  it("shows both command hook fields on the desktop head", async () => {
+    // queue_drained is the more important of the two triggers (a library rescan once per
+    // batch, the driving use case), so both must be individually configurable, not just
+    // post_convert.
+    renderWithSettings(makeSettings());
+    expect(
+      await screen.findByLabelText(/command to run after each conversion/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(/command to run when the queue finishes/i),
+    ).toBeInTheDocument();
+  });
+
+  it("does not render either command hook field on the server head", async () => {
+    // Absent, not disabled and not read-only: the server head cannot serve the value, so a
+    // field that always renders empty would read as a bug.
+    //
+    // stubEnv + a fetch stub, the same mechanism as this file's other four server-head tests,
+    // NOT vi.doMock("../lib/head"): doMock has no teardown here (afterEach only calls
+    // vi.unstubAllEnvs/Globals), so it would leave the module registry pointing at a
+    // permanently server-head `../lib/head` for anything added after it.
+    vi.stubEnv("VITE_HEAD", "server");
+    vi.stubGlobal("fetch", serverHeadFetch());
+    vi.resetModules();
+    const { default: ServerSettingsPage } = await import("./SettingsPage");
+    render(<ServerSettingsPage />);
+    const note = await screen.findByText(/set by environment variable/i);
+    expect(note.textContent).toMatch(/CONVERTBAR_POST_CONVERT_COMMAND/);
+    expect(note.textContent).toMatch(/CONVERTBAR_QUEUE_DRAINED_COMMAND/);
+    expect(screen.queryByLabelText(/command to run/i)).not.toBeInTheDocument();
+  });
+
+  it("warns that path mapping does not apply to the command hook", async () => {
+    renderWithSettings(makeSettings());
+    expect(await screen.findByText(/applies to webhooks only/i)).toBeInTheDocument();
+  });
+
+  it("writes the timeout setting on blur", async () => {
+    renderWithSettings(makeSettings());
+    const input = await screen.findByLabelText(/timeout/i);
+    fireEvent.change(input, { target: { value: "60" } });
+    fireEvent.blur(input);
+    await waitFor(() => expect(updateCallsFor("hook_timeout_seconds")).toHaveLength(1));
+    expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+      key: "hook_timeout_seconds",
+      value: "60",
+    });
+  });
+
+  it("does not write a webhook field per edit; commits on blur", async () => {
+    // Same commit-on-blur guarantee as watch_skip_marker, extended to the new hook fields — a
+    // URL typed character by character must not fire one write per keystroke.
+    renderWithSettings(makeSettings());
+    const input = await screen.findByLabelText(/after each conversion.*url/i);
+
+    fireEvent.change(input, { target: { value: "http://a" } });
+    fireEvent.change(input, { target: { value: "http://a.example/" } });
+    expect(updateCallsFor("post_convert_webhook_url")).toHaveLength(0);
+
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+        key: "post_convert_webhook_url",
+        value: "http://a.example/",
+      }),
+    );
+  });
+
+  function withCommandHooks(postConvert: string, queueDrained: string) {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.resolve({ postConvert, queueDrained });
+        case "update_setting":
+        case "set_preset_suffix":
+        case "set_command_hook":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+  }
+
+  it("writes the post-convert command via set_command_hook on blur, not per keystroke", async () => {
+    // Distinct initial values for the two triggers so a swapped binding would also show up as
+    // the wrong field displaying the wrong starting value, not just the wrong trigger on write.
+    withCommandHooks("/post-convert-original.sh", "/queue-drained-original.sh");
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run after each conversion/i);
+    await waitFor(() => expect(input).toHaveValue("/post-convert-original.sh"));
+
+    fireEvent.change(input, { target: { value: "/new.sh" } });
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook"),
+    ).toHaveLength(0);
+
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_command_hook", {
+        trigger: "post_convert",
+        command: "/new.sh",
+      }),
+    );
+    // Guards the obvious copy-paste bug: both fields wired to the same trigger.
+    expect(invokeMock).not.toHaveBeenCalledWith("set_command_hook", {
+      trigger: "queue_drained",
+      command: "/new.sh",
+    });
+  });
+
+  it("writes the queue-drained command via set_command_hook on blur, not per keystroke", async () => {
+    withCommandHooks("/post-convert-original.sh", "/queue-drained-original.sh");
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run when the queue finishes/i);
+    await waitFor(() => expect(input).toHaveValue("/queue-drained-original.sh"));
+
+    fireEvent.change(input, { target: { value: "/new.sh" } });
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook"),
+    ).toHaveLength(0);
+
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_command_hook", {
+        trigger: "queue_drained",
+        command: "/new.sh",
+      }),
+    );
+    // Guards the obvious copy-paste bug: both fields wired to the same trigger.
+    expect(invokeMock).not.toHaveBeenCalledWith("set_command_hook", {
+      trigger: "post_convert",
+      command: "/new.sh",
+    });
+  });
+
+  it("retries a command-hook write on the next blur after a rejected set_command_hook, instead of believing it saved", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    let failNext = true;
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.resolve({ postConvert: "/original.sh", queueDrained: "" });
+        case "set_command_hook":
+          if (failNext) {
+            failNext = false;
+            return Promise.reject(new Error("boom"));
+          }
+          return Promise.resolve(undefined);
+        case "update_setting":
+        case "set_preset_suffix":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run after each conversion/i);
+    await waitFor(() => expect(input).toHaveValue("/original.sh"));
+
+    fireEvent.change(input, { target: { value: "/new.sh" } });
+    fireEvent.blur(input);
+
+    await waitFor(() => expect(consoleError).toHaveBeenCalled());
+    const callsAfterFailure = invokeMock.mock.calls.filter(
+      (c) => c[0] === "set_command_hook",
+    );
+    expect(callsAfterFailure).toHaveLength(1);
+
+    // Draft is unchanged, but the committed value must NOT have advanced past the failed write —
+    // a second blur (e.g. the user tabbing away again) must retry, not no-op.
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook"),
+      ).toHaveLength(2),
+    );
+    expect(invokeMock).toHaveBeenLastCalledWith("set_command_hook", {
+      trigger: "post_convert",
+      command: "/new.sh",
+    });
+
+    consoleError.mockRestore();
+  });
+
+  it("populates the correct command field from the file picker, not the other one", async () => {
+    // Same copy-paste shape as the write tests above: two buttons, two triggers — a swapped
+    // handler would still compile and still "work" for whichever field happens to be tested
+    // alone, so both are asserted together against distinct picked paths.
+    let pickedPath: string | null = "/picked/post-convert.sh";
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.resolve({ postConvert: "", queueDrained: "" });
+        case "pick_file":
+          return Promise.resolve(pickedPath);
+        case "update_setting":
+        case "set_preset_suffix":
+        case "set_command_hook":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const pcInput = await screen.findByLabelText(/command to run after each conversion/i);
+    const qdInput = await screen.findByLabelText(/command to run when the queue finishes/i);
+    await waitFor(() => expect(pcInput).toHaveValue(""));
+
+    fireEvent.click(
+      screen.getByLabelText("Choose a script to run after each conversion"),
+    );
+    await waitFor(() => expect(pcInput).toHaveValue("/picked/post-convert.sh"));
+    expect(qdInput).toHaveValue(""); // the other field must not have moved
+
+    // The value must be SAVED, not merely displayed. Persistence cannot ride on the input's
+    // onBlur: clicking Browse focuses the button, so the input never blurs — the user sees the
+    // path, quits from the Settings tab, and nothing was ever written. Asserting only on the
+    // input's value cannot tell "picked and saved" from "picked and lost".
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_command_hook", {
+        trigger: "post_convert",
+        command: "/picked/post-convert.sh",
+      }),
+    );
+
+    pickedPath = "/picked/queue-drained.sh";
+    fireEvent.click(
+      screen.getByLabelText("Choose a script to run when the queue finishes"),
+    );
+    await waitFor(() => expect(qdInput).toHaveValue("/picked/queue-drained.sh"));
+    expect(pcInput).toHaveValue("/picked/post-convert.sh"); // unaffected by the second pick
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_command_hook", {
+        trigger: "queue_drained",
+        command: "/picked/queue-drained.sh",
+      }),
+    );
+    // Exactly two writes, one per pick — and neither trigger got the other's path, which a
+    // swapped save handler would produce while both inputs still displayed correctly.
+    const writes = invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook");
+    expect(writes.map((c) => c[1])).toEqual([
+      { trigger: "post_convert", command: "/picked/post-convert.sh" },
+      { trigger: "queue_drained", command: "/picked/queue-drained.sh" },
+    ]);
+  });
+
+  it("leaves the command field untouched when the file picker is cancelled", async () => {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.resolve({ postConvert: "/original.sh", queueDrained: "" });
+        case "pick_file":
+          return Promise.resolve(null); // cancelled dialog
+        case "update_setting":
+        case "set_preset_suffix":
+        case "set_command_hook":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run after each conversion/i);
+    await waitFor(() => expect(input).toHaveValue("/original.sh"));
+
+    fireEvent.click(
+      screen.getByLabelText("Choose a script to run after each conversion"),
+    );
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.filter((c) => c[0] === "pick_file"),
+      ).toHaveLength(1),
+    );
+    expect(input).toHaveValue("/original.sh");
+    // Cancel is a no-op on BOTH halves: nothing displayed, and — now that a pick persists
+    // immediately — nothing written either.
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook"),
+    ).toHaveLength(0);
+  });
+
+  it("still lets the command fields be written after get_command_hooks fails, instead of disabling them forever", async () => {
+    // A rejected read used to leave both hooks `null`: the field renders "" (indistinguishable
+    // from "no hook configured") AND the `!== null` write guard blocks every save, with nothing
+    // to retry it. Silent and permanent for the session.
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.reject(new Error("boom"));
+        case "update_setting":
+        case "set_preset_suffix":
+        case "set_command_hook":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run after each conversion/i);
+    // The MESSAGE, not merely "console.error ran": React logs its own warnings through
+    // console.error, and a bare toHaveBeenCalled() resolved on one of those — before the
+    // rejection had been handled at all — which made this test pass or fail on timing.
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        "Couldn't read the command hooks:",
+        expect.any(Error),
+      ),
+    );
+
+    // Typed and blurred inside the retry: the catch's fallback re-syncs the draft one render
+    // later, and an edit made before that lands is overwritten by it, so the blur would see no
+    // diff and write nothing. Retrying is what makes this deterministic; once the fallback has
+    // landed the write is issued synchronously, so exactly one write happens.
+    await waitFor(() => {
+      fireEvent.change(input, { target: { value: "/new.sh" } });
+      fireEvent.blur(input);
+      expect(invokeMock).toHaveBeenCalledWith("set_command_hook", {
+        trigger: "post_convert",
+        command: "/new.sh",
+      });
+    });
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook"),
+    ).toHaveLength(1);
+    consoleError.mockRestore();
+  });
+
+  it("labels the hook settings with the heading the README sends users to", async () => {
+    // README: "Configure both under Settings -> Hooks". There was no such heading in the UI.
+    renderWithSettings(makeSettings());
+    expect(
+      await screen.findByRole("heading", { name: "Hooks" }),
+    ).toBeInTheDocument();
   });
 });

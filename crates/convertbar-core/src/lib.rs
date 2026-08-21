@@ -7,6 +7,7 @@ pub mod dispose;
 pub mod events;
 pub mod failure_class;
 pub mod handbrake;
+pub mod hooks;
 pub mod media_skip;
 pub mod priority;
 pub mod probe;

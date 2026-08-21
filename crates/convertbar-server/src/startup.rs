@@ -152,6 +152,10 @@ mod tests {
             Arc::new(TestSink::default()),
             Arc::new(RecordingDisposer::default()),
             Arc::new(convertbar_core::handbrake::PanickingLocator),
+            convertbar_core::hooks::HookSetup {
+                runner: Arc::new(convertbar_core::hooks::RecordingHookRunner::default()),
+                allow_stored_command: false,
+            },
         )
     }
 

@@ -46,6 +46,14 @@ pub struct Settings {
     pub history_show_duration: bool,
     /// Always normalized on read — `"normal"`, `"low"`, or `"idle"`, never a raw column value.
     pub encode_priority: String,
+    pub post_convert_webhook_url: String,
+    pub post_convert_webhook_headers: String,
+    pub post_convert_webhook_body: String,
+    pub queue_drained_webhook_url: String,
+    pub queue_drained_webhook_headers: String,
+    pub queue_drained_webhook_body: String,
+    pub hook_path_map: String,
+    pub hook_timeout_seconds: String,
 }
 
 /// Existence of a history entry's two paths, checked when its context menu opens.

@@ -137,6 +137,123 @@ Four things to know about Keep:
 Encoding is deliberately sequential: hardware encoders would just contend for the
 same silicon if run in parallel, so two at once is usually slower overall.
 
+## Post-convert hooks
+
+ConvertBar can notify an external system after each conversion, and once when a queue run
+finishes. Configure both under **Settings → Hooks**, in the desktop app or the web UI.
+
+**Two trigger points:**
+
+- **After each conversion** — fires once a file reaches a terminal state (`done`, `skipped`, or
+  `error`), even on failure. A cancelled job fires nothing — it's a user action, not a conversion
+  result.
+- **When the queue finishes** — fires once per true drain (the queue genuinely ran out of work),
+  not on every pause. Jobs are reported in batches of up to 100; a backlog larger than that sends
+  several payloads in a row from one drain rather than one giant one. **The first drain after you
+  configure the hook reports every job already in History**, since there is no prior watermark to
+  start from — expect a burst the first time, or right after an upgrade. A failed hook does not
+  advance past the jobs it tried to report, so **receivers must be idempotent**: the same batch is
+  resent on the next drain rather than lost.
+
+Each trigger point supports two independent mechanisms, which can be combined:
+
+**Webhook** — URL, headers (one `Name: value` per line), and an optional body template. Leave the
+body empty to send the full JSON payload with `Content-Type: application/json`. A non-empty body
+is a template:
+
+- `{{field}}` (e.g. `{{status}}`, `{{result_path}}`) substitutes a JSON-escaped scalar, safe to
+  drop inside a string literal: `"path": "{{result_path}}"`.
+- `{{field_json}}` (note the `_json` suffix — e.g. `{{output_dirs_json}}`, `{{payload_json}}`)
+  substitutes raw, already-valid JSON. It belongs at a JSON *value* position, never inside a
+  string literal — putting it inside quotes would splice unescaped quotes into that string and
+  produce an invalid body. This is why the Stash example below passes paths as a GraphQL
+  **variable** instead of interpolating them into the query text.
+
+**Command** (desktop UI only, with a Browse button to pick the script — see below for the server
+head) — a path to a script or executable, run with no shell. It receives the payload as
+`CONVERTBAR_<FIELD>` environment variables (e.g. `CONVERTBAR_STATUS`, `CONVERTBAR_RESULT_PATH`)
+plus `CONVERTBAR_PAYLOAD`, the whole JSON payload. Each individual environment value is capped at
+96 KiB; a value over that fails with a message naming the variable rather than an opaque `E2BIG`
+from the OS — use the webhook instead if a payload might get that large. Path mapping (below)
+does **not** apply to the command hook: it gets raw paths, and a script can rewrite them itself.
+
+> **The script must be executable.** ConvertBar runs it directly, without a shell, so a script
+> that is merely readable (mode `0644` — what a fresh file or a copied-in Docker volume usually
+> is) fails with `Permission denied` on *every* conversion. Run `chmod +x /path/to/script.sh`,
+> and start it with a shebang (`#!/bin/sh`). This is the most common reason a command hook
+> "does nothing".
+
+**Timeout** — `hook_timeout_seconds`, default `30`, clamped to 1–300. It bounds each hook
+individually: with both a webhook and a command configured on the same trigger, a dead receiver
+costs up to twice this per job, and the queue waits. Settable in the UI only — there is no
+environment variable for it, on either head.
+
+### What each trigger sends
+
+Both payloads are JSON objects. The webhook body template can reference any field below as
+`{{field}}` (or `{{field_json}}`); a placeholder that is not in *that* trigger's payload is left
+in the body **verbatim**, producing an invalid request that ConvertBar still reports as a success
+— so `{{output_dirs_json}}` in a post-convert body is a silent misconfiguration, not an error.
+
+| Field | `post-convert` | `queue-drained` | Notes |
+|---|:---:|:---:|---|
+| `event` | yes | yes | `"post-convert"` / `"queue-drained"` |
+| `job_id`, `status`, `preset` | yes | — | per-job; inside `jobs[]` on a drain |
+| `source_path`, `output_path`, `result_path`, `output_dir` | yes | — | ditto. Act on `result_path`: on a skipped job the converted file was discarded, so `output_path` names a file that no longer exists |
+| `in_place`, `kept_file` | yes | — | ditto |
+| `original_size`, `converted_size`, `space_saved`, `duration_seconds` | yes | — | ditto |
+| `error_message`, `failure_class`, `started_at`, `completed_at` | yes | — | ditto |
+| `run_status` | — | yes | `"idle"` or `"error"` |
+| `completed`, `errors`, `space_saved` | — | yes | totals across the batch |
+| `output_dirs` | — | yes | deduped directories to rescan; **`{{output_dirs_json}}` exists only here** |
+| `jobs` | — | yes | array of the per-job objects above, without their own `event` key |
+
+`{{payload_json}}` is the whole payload and works on both. For a command hook the same fields
+arrive as `CONVERTBAR_<FIELD>` (uppercased), except `jobs`, which is reachable only through
+`CONVERTBAR_PAYLOAD`.
+
+**Path mapping** rewrites path fields in the webhook payload only, one `from => to` rule per
+line. The longest matching prefix wins regardless of line order, and a trailing slash on either
+side is tolerated (`/media/ => /data/` and `/media => /data` are equivalent).
+
+### Example: make Stash rescan after a batch
+
+Set the **queue-drained** webhook to:
+
+| Field | Value |
+|---|---|
+| URL | `http://stash:9999/graphql` |
+| Headers | `ApiKey: your-stash-api-key` |
+| Body | `{"query":"mutation($input: ScanMetadataInput!) { metadataScan(input: $input) }","variables":{"input":{"paths":{{output_dirs_json}}}}}` |
+
+If Stash mounts the same media at a different path, add a path-map rule — `/media => /data`.
+
+The paths are passed as a GraphQL **variable**, not interpolated into the query string, precisely
+because `{{output_dirs_json}}` inserts raw JSON: at the `variables` value position that's exactly
+right, but splicing it into the quoted `query` string would inject unescaped `"` characters and
+break the request. Keep it as a variable rather than "simplifying" it back into the query text.
+
+**Command hooks on the server head** are configured only by environment variable —
+`CONVERTBAR_POST_CONVERT_COMMAND` and `CONVERTBAR_QUEUE_DRAINED_COMMAND` — never through the web
+UI or the HTTP API. See [Environment variables](#environment-variables) below. Put the scripts
+under `./config/hooks` on the host, which the `./config:/config` mount already covers — a second
+mount for them would sit inside the directory the entrypoint `chown -R`s when `PUID`/`PGID` are
+set, rewriting the ownership of your own files. And `chmod +x` them: the executable-bit rule
+above bites hardest here, where a script arrives through a volume mount.
+
+The image ships **bash but no `curl`, `wget` or `nc`.** A script can reach a plain-HTTP endpoint
+through bash's `/dev/tcp` (`exec 3<>/dev/tcp/host/port`), but `/dev/tcp` **cannot do TLS**, so an
+`https://` receiver is unreachable from a stock container. Either build a custom image on top of
+this one with `curl` installed, or use ConvertBar's own webhook — it speaks HTTPS, including
+against a private CA, and needs nothing installed in the image.
+
+Webhook headers are stored in plaintext in `convertbar.db` and are readable by any authenticated
+web-UI user, and an authenticated user can point the webhook at any address the container can
+reach. Both are the same trust class as the auth token itself. Keeping the command keys out of
+the API means *those keys* are not reachable from the network — it is not a blanket
+no-code-execution guarantee: `handbrake_path` is API-writable and the queue spawns whatever it
+names, which is the same trust class again.
+
 ## Server (Docker)
 
 ConvertBar also ships as a headless server image with a browser UI, for running
@@ -181,6 +298,8 @@ caveats it also documents inline:
 | `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; needed if you browse by hostname instead of IP (e.g. `nas.local`) or use a reverse proxy. |
 | `CONVERTBAR_BROWSE_ROOTS` | `/` | Colon-separated paths the web file browser may navigate. Restrict it to your media mount(s), e.g. `/media`. |
 | `CONVERTBAR_TRUSTED_PROXIES` | *(none)* | Comma-separated IPs or CIDR ranges whose `X-Forwarded-For` header is believed, so login throttling counts real client addresses instead of the proxy's. **Set this as narrowly as possible** — see [Auth](#auth). |
+| `CONVERTBAR_POST_CONVERT_COMMAND` | *(none)* | Script or executable to run after each conversion — see [Post-convert hooks](#post-convert-hooks). Not configurable through the web UI or the HTTP API; environment-variable-only by design. |
+| `CONVERTBAR_QUEUE_DRAINED_COMMAND` | *(none)* | Script or executable to run when the queue finishes a true drain. Same restriction as above. |
 | `PUID` | `0` | UID to drop to after start. `0` keeps the container's starting user (root, unless you pass `--user`). See [Volumes and permissions](#volumes-and-permissions). |
 | `PGID` | `0` | GID to drop to after start. |
 

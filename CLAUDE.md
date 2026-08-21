@@ -106,6 +106,51 @@ When adding a new frontend Tauri API call or plugin, add the corresponding permi
 
 Window position is persisted across restarts via `tauri-plugin-window-state`. Screen confinement runs on every show (tray click) to handle monitor layout changes — ensures at least half the window is visible.
 
+## Post-Convert Hooks
+
+`crates/convertbar-core/src/hooks.rs` fires a webhook and/or a command on two events —
+`post-convert` (per file) and `queue-drained` (once per true drain) — through an injected
+`HookRunner` seam, same pattern as `FileDisposer`/`HandbrakeLocator`. Six invariants a future
+change is most likely to break:
+
+- `post-convert` has two fire points; the error one must stay on `record_job_error_quiet`, not
+  the `record_job_error` wrapper, or the direct `record_job_error_quiet` call in the
+  vanished-source gate (the one that bypasses the `record_job_error` wrapper) is missed.
+- `queue-drained` fires only on a true drain. The queue-done block is also reached by
+  `pause_after_current`, which is every pause on Windows.
+- `post_convert_command` / `queue_drained_command` are absent from `ALLOWED_KEYS` and from the
+  `Settings` struct on purpose. That pair of absences is the entire boundary keeping the server
+  head's HTTP API from being a remote shell.
+- `drain_mechanism` takes two **disjoint** `ctx.db` guards per iteration — one to read the
+  batch, one to write the watermark after dispatching. A mutation that kept the first guard
+  alive past the second deadlocked the function against *itself*. No `LockProbeRunner` can catch
+  that: `try_lock` only helps once the hook is reached, and this hangs before that. The
+  disjoint-statement structure is the only thing preventing it.
+- **Each mechanism has its own watermark** (`Mechanism::watermark_key`:
+  `last_queue_drained_at_webhook` / `last_queue_drained_at_command`) and its own batch loop.
+  Do not re-merge them. A shared watermark advances only when every configured mechanism
+  delivers, so a working webhook is pinned behind a failing command — replaying the same oldest
+  batch forever, and never delivering anything past the first `QUEUE_DRAINED_BATCH` until the
+  command is fixed. Both keys are absent from `ALLOWED_KEYS`/`Settings` like the key they
+  replaced; `db::init_db` seeds them from the pre-split `last_queue_drained_at` (`INSERT OR
+  IGNORE`, and the legacy row is kept so a rollback still has a watermark).
+- **A drain hook can block for minutes**, and every start is refused for that whole time —
+  silently. `claim_queue_slot` must stay the ONE place that decides what a refusal means:
+  `control::start_queue` (the path both heads use after an add) claims through it too, rather
+  than short-circuiting on its own `is_running` read, which is how that path stayed broken after
+  the watcher path was fixed. `process_queue` runs another pass when `work_arrived_while_busy`
+  was set *and* the DB really holds a `queued` job; **no branch may loop on the flag alone** (a
+  refusal can race a `clear_queue`, and an empty pass re-enters `fire_queue_drained`, which
+  re-dispatches a pinned mechanism's whole backlog at up to 300s a batch — a hook whose side
+  effect starts the queue would livelock). Only a `PassOutcome::Drained` may be followed by
+  another pass, since `get_next_job` does not consult `queue_paused`. The update interlock's
+  refusal must not set the flag. The final release goes through
+  `release_queue_slot_unless_work_arrived`, which reads the flag and clears `is_running` in ONE
+  critical section — a read followed by `RunningGuard`'s drop loses any refusal landing between
+  the two — and deliberately LEAVES the flag set when it refuses to release, so that refusal is
+  settled by the same DB-backed check as every other. The guard is disarmed after a successful
+  release so its drop cannot free a slot another run has since claimed.
+
 ## Cross-Platform
 
 - `libc` (SIGSTOP/SIGCONT) is a `[target.'cfg(unix)'.dependencies]` entry in `crates/convertbar-core/Cargo.toml`, and the signal call sites are gated with `#[cfg(unix)]` attributes — never the `cfg!()` macro, which only skips code at runtime and would still require linking libc on every platform. Mid-encode pause works on macOS and Linux; Windows falls back to queue-level pause.

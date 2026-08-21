@@ -119,6 +119,26 @@
     Mask="false"/>
 
   <Config
+    Name="Post-Convert Command"
+    Target="CONVERTBAR_POST_CONVERT_COMMAND"
+    Default=""
+    Description="Script or executable to run after each conversion, e.g. /config/hooks/post-convert.sh. Runs with no shell, so the script must be executable (chmod +x) or every conversion fails with Permission denied; it receives the job as CONVERTBAR_* environment variables plus CONVERTBAR_PAYLOAD (the full JSON). The image has bash but no curl, and bash's /dev/tcp cannot do HTTPS. Not configurable through the web UI or the HTTP API &#8212; environment-variable-only by design, so this key specifically is not reachable from the network. That is not a blanket no-code-execution guarantee for the API: the HandBrake binary path IS writable over the API, and an authenticated user can point it at another executable in the container. Treat the auth token as the boundary."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false"/>
+
+  <Config
+    Name="Queue-Drained Command"
+    Target="CONVERTBAR_QUEUE_DRAINED_COMMAND"
+    Default=""
+    Description="Script or executable to run once the queue finishes a true drain (batched, up to 100 jobs per run), e.g. /config/hooks/queue-drained.sh. Same restrictions as Post-Convert Command above."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false"/>
+
+  <Config
     Name="Disable Auth"
     Target="CONVERTBAR_NO_AUTH"
     Default=""

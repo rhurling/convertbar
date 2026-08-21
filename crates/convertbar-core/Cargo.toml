@@ -21,6 +21,10 @@ chrono = { version = "0.4", features = ["serde"] }
 dunce = "1.0.5"
 notify = "8"
 fs4 = { version = "1.1", features = ["sync"] }
+# Blocking HTTP for post-convert webhooks. `platform-verifier` is REQUIRED: ureq 3's default
+# rustls setup bundles webpki-roots and ignores the OS trust store, so a receiver behind a
+# private CA or a self-signed homelab proxy would fail with no obvious cause.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
 
 [target.'cfg(unix)'.dependencies]
 # SIGSTOP/SIGCONT (control::pause_conversion/resume_conversion/cancel_conversion,

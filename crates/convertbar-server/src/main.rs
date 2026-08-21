@@ -58,6 +58,10 @@ async fn main() {
         Arc::new(ServerSink(events_tx.clone())),
         Arc::new(DeleteDisposer),
         Arc::new(convertbar_core::handbrake::PathLocator),
+        convertbar_core::hooks::HookSetup {
+            runner: Arc::new(convertbar_core::hooks::HttpHookRunner),
+            allow_stored_command: false,
+        },
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

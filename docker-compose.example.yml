@@ -13,9 +13,21 @@ services:
       # PGID: "1000"                         # its output files run/land as this uid:gid
       # CONVERTBAR_BROWSE_ROOTS: "/media"    # optional: restrict the file browser
       # CONVERTBAR_ALLOWED_HOSTS: "nas.local"   # needed if you browse by hostname instead of IP
+      # Hook scripts live under ./config/hooks on the host — already covered by the ./config
+      # mount below. Do NOT add a second mount for them: the entrypoint chown -R's /config when
+      # PUID/PGID are set, so a separately mounted host directory would have its ownership
+      # rewritten. Every script must be executable (chmod +x) — it is run directly, with no
+      # shell, so a 0644 script fails with "Permission denied" on every conversion.
+      # CONVERTBAR_POST_CONVERT_COMMAND: "/config/hooks/post-convert.sh"
+      # CONVERTBAR_QUEUE_DRAINED_COMMAND: "/config/hooks/queue-drained.sh"
     volumes:
-      - ./config:/config                     # SQLite db + probe cache
+      - ./config:/config                     # SQLite db + probe cache + ./config/hooks scripts
       - /path/to/media:/media                # bind-mount LOCAL disks for watched folders:
                                              # inotify is event-blind on NFS/SMB mounts —
                                              # watched dirs on network filesystems only ingest
                                              # on container restart.
+      #
+      # The image ships bash, but no curl, wget or nc. A hook script can reach a PLAIN-HTTP
+      # endpoint over bash's raw TCP, e.g. `exec 3<>/dev/tcp/host/port`. /dev/tcp cannot do TLS,
+      # so an https:// receiver is out of reach: build a custom image on top of this one with
+      # curl installed, or use ConvertBar's own webhook hook instead of a command hook.

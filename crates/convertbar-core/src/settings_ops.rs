@@ -57,6 +57,14 @@ pub const ALLOWED_KEYS: &[&str] = &[
     "update_mode",
     "history_show_duration",
     "encode_priority",
+    "post_convert_webhook_url",
+    "post_convert_webhook_headers",
+    "post_convert_webhook_body",
+    "queue_drained_webhook_url",
+    "queue_drained_webhook_headers",
+    "queue_drained_webhook_body",
+    "hook_path_map",
+    "hook_timeout_seconds",
 ];
 
 /// Coerce a stored `bad_source_action` to a known value. Anything other than an exact
@@ -142,6 +150,14 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
     let mut update_mode = String::from("automatic");
     let mut history_show_duration = true;
     let mut encode_priority = String::from("normal");
+    let mut post_convert_webhook_url = String::new();
+    let mut post_convert_webhook_headers = String::new();
+    let mut post_convert_webhook_body = String::new();
+    let mut queue_drained_webhook_url = String::new();
+    let mut queue_drained_webhook_headers = String::new();
+    let mut queue_drained_webhook_body = String::new();
+    let mut hook_path_map = String::new();
+    let mut hook_timeout_seconds = String::from("30");
 
     let rows = stmt
         .query_map([], |row| {
@@ -180,6 +196,14 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
                     .as_str()
                     .to_string()
             }
+            "post_convert_webhook_url" => post_convert_webhook_url = value,
+            "post_convert_webhook_headers" => post_convert_webhook_headers = value,
+            "post_convert_webhook_body" => post_convert_webhook_body = value,
+            "queue_drained_webhook_url" => queue_drained_webhook_url = value,
+            "queue_drained_webhook_headers" => queue_drained_webhook_headers = value,
+            "queue_drained_webhook_body" => queue_drained_webhook_body = value,
+            "hook_path_map" => hook_path_map = value,
+            "hook_timeout_seconds" => hook_timeout_seconds = value,
             _ => {}
         }
     }
@@ -205,6 +229,14 @@ pub fn get_settings(ctx: &Ctx) -> Result<Settings, String> {
         update_mode,
         history_show_duration,
         encode_priority,
+        post_convert_webhook_url,
+        post_convert_webhook_headers,
+        post_convert_webhook_body,
+        queue_drained_webhook_url,
+        queue_drained_webhook_headers,
+        queue_drained_webhook_body,
+        hook_path_map,
+        hook_timeout_seconds,
     })
 }
 
@@ -272,6 +304,10 @@ mod tests {
             sink.clone(),
             disposer.clone(),
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         (ctx, sink, disposer)
     }
@@ -774,5 +810,101 @@ mod tests {
             settings.cleanup_mode, "trash",
             "get_settings must normalize corrupted cleanup_mode to trash"
         );
+    }
+
+    #[test]
+    fn hook_webhook_keys_are_writable_by_the_settings_ui() {
+        let (ctx, _sink, _disp) = test_ctx(test_conn());
+        for key in [
+            "post_convert_webhook_url",
+            "post_convert_webhook_headers",
+            "post_convert_webhook_body",
+            "queue_drained_webhook_url",
+            "queue_drained_webhook_headers",
+            "queue_drained_webhook_body",
+            "hook_path_map",
+            "hook_timeout_seconds",
+        ] {
+            assert!(
+                ALLOWED_KEYS.contains(&key),
+                "{key} is written by the Settings UI via update_setting"
+            );
+            assert!(
+                update_setting(&ctx, key, "x").is_ok(),
+                "{key} should be writable"
+            );
+        }
+    }
+
+    #[test]
+    fn command_hook_keys_are_not_writable_over_the_api() {
+        // This absence IS the security boundary: update_setting is the only write path behind
+        // PUT /api/settings/{key}, so a command key in ALLOWED_KEYS would make the server's
+        // auth token the only thing between the network and arbitrary code execution.
+        let (ctx, _sink, _disp) = test_ctx(test_conn());
+        for key in ["post_convert_command", "queue_drained_command"] {
+            assert!(
+                !ALLOWED_KEYS.contains(&key),
+                "{key} must NOT be remotely writable"
+            );
+            assert!(update_setting(&ctx, key, "/bin/sh").is_err());
+        }
+    }
+
+    #[test]
+    fn internal_hook_keys_are_not_writable_over_the_api() {
+        // Engine-written, like the three updater keys. Both per-mechanism drain watermarks are
+        // covered, not just the pre-split key they replaced: a watermark that could be written
+        // over the API is a watermark an authenticated user can rewind to replay every job in
+        // History at the receiver, or push forward to silence it.
+        let (ctx, _sink, _disp) = test_ctx(test_conn());
+        for key in [
+            "last_queue_drained_at",
+            "last_queue_drained_at_webhook",
+            "last_queue_drained_at_command",
+        ] {
+            assert!(
+                !ALLOWED_KEYS.contains(&key),
+                "{key} must NOT be remotely writable"
+            );
+            assert!(update_setting(&ctx, key, "2026-01-01T00:00:00+00:00").is_err());
+        }
+    }
+
+    #[test]
+    fn command_hook_keys_do_not_leak_through_get_settings() {
+        // The other half of the boundary: get_settings drops keys with no Settings field, so
+        // GET /api/settings cannot read the command back out.
+        let conn = test_conn();
+        for key in [
+            "post_convert_command",
+            "queue_drained_command",
+            "last_queue_drained_at",
+            "last_queue_drained_at_webhook",
+            "last_queue_drained_at_command",
+        ] {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, 'SENTINEL')",
+                rusqlite::params![key],
+            )
+            .unwrap();
+        }
+        let (ctx, _sink, _disp) = test_ctx(conn);
+        let settings = get_settings(&ctx).unwrap();
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            !json.contains("SENTINEL"),
+            "a command key leaked into the settings snapshot: {json}"
+        );
+    }
+
+    #[test]
+    fn hook_settings_have_defaults() {
+        let (ctx, _sink, _disp) = test_ctx(test_conn());
+        let s = get_settings(&ctx).unwrap();
+        assert_eq!(s.post_convert_webhook_url, "");
+        assert_eq!(s.queue_drained_webhook_url, "");
+        assert_eq!(s.hook_path_map, "");
+        assert_eq!(s.hook_timeout_seconds, "30");
     }
 }

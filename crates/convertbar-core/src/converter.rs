@@ -215,6 +215,24 @@ pub struct ConverterState {
     /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
     /// backend state on mount, not just the live `queue-paused-low-disk` event.
     pub(crate) low_disk_pause: Mutex<Option<LowDiskPause>>,
+    /// Whether this queue run has already notified about a hook failure. Lives on the state
+    /// rather than as a `process_queue` local because one fire point is inside
+    /// `record_job_error_quiet`, a free function reached from nine places: threading `&mut`
+    /// state into it would force a signature change at every one, and the obvious shortcut —
+    /// hoisting the fire out to the nine call sites — recreates exactly the drift the
+    /// single-entry-point design prevents. Cleared at the top of every run.
+    pub(crate) hook_failure_notified: Mutex<bool>,
+    /// Set by `claim_queue_slot` whenever it refuses a start because the queue is ALREADY
+    /// RUNNING — i.e. somebody wanted work done and was turned away — and consumed by
+    /// `process_queue` after its drain hook returns. Without it, work that arrives while the
+    /// queue is busy is stranded: `run_queue` returns silently on the refusal and nothing
+    /// re-checks. The window used to be milliseconds; the `queue-drained` hook can hold it open
+    /// for minutes (batches × mechanisms × a timeout that goes to 300s), and the hook's own side
+    /// effects are exactly what drops new files into a watched folder.
+    ///
+    /// NOT set by the update interlock's refusal: an install holding the slot is not "work
+    /// arrived", and `resume_queue_after_install` re-triggers the queue itself.
+    pub(crate) work_arrived_while_busy: std::sync::atomic::AtomicBool,
 }
 
 impl ConverterState {
@@ -229,7 +247,16 @@ impl ConverterState {
             shutdown: std::sync::atomic::AtomicBool::new(false),
             installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
+            hook_failure_notified: Mutex::new(false),
+            work_arrived_while_busy: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Reads and clears the "work arrived while we were busy" flag in one step, so a single
+    /// refusal can trigger at most one re-check and cannot loop the queue thread forever.
+    pub(crate) fn take_work_arrived_while_busy(&self) -> bool {
+        self.work_arrived_while_busy
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -754,6 +781,11 @@ fn record_job_error_quiet(
         "job-status-changed",
         serde_json::json!({ "job_id": job_id, "status": "error" }),
     );
+
+    // The error fire point, and deliberately HERE rather than in the `record_job_error`
+    // wrapper: this is the single choke point for all nine error bookings, and the wrapper
+    // misses the direct call from process_queue's vanished-source gate.
+    crate::hooks::fire_post_convert(ctx, job_id);
 }
 
 /// Record a failed job: everything `record_job_error_quiet` does, plus the per-file
@@ -805,29 +837,133 @@ fn final_run_status(had_errors: bool) -> &'static str {
 /// so a crash in `process_queue` can't wedge the queue by leaving the flag stuck true (which
 /// makes every future `run_queue` early-return, permanently). Poison-tolerant so a poisoned
 /// `is_running` still gets cleared.
-struct RunningGuard<'a>(&'a ConverterState);
+struct RunningGuard<'a> {
+    state: &'a ConverterState,
+    armed: bool,
+}
+
+impl<'a> RunningGuard<'a> {
+    fn new(state: &'a ConverterState) -> Self {
+        Self { state, armed: true }
+    }
+
+    /// The slot has already been released, atomically against `claim_queue_slot`. Stand down:
+    /// once released, another thread may have claimed it, and clearing `is_running` under a
+    /// queue thread that is genuinely running would let a THIRD claim succeed and run two queues
+    /// at once.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for RunningGuard<'_> {
     fn drop(&mut self) {
-        *self.0.is_running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        if self.armed {
+            *self
+                .state
+                .is_running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+        }
     }
+}
+
+/// How a single pass of the queue ended. Only a TRUE drain may be followed by another pass:
+/// every other ending is a deliberate stop (shutdown, low disk, pause-after-current) and looping
+/// would override the user's or the platform's decision — `get_next_job` does not consult
+/// `queue_paused`, so a loop-back after a pause would silently un-pause the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassOutcome {
+    Drained,
+    Stopped,
 }
 
 /// Core queue processing logic. Call from a background thread.
 /// The `is_running` flag must be set to true before calling this.
+///
+/// Runs `process_queue_pass` until a pass ends without new work waiting behind it. The second
+/// and later passes exist because `claim_queue_slot` refuses every `run_queue` for as long as
+/// this thread holds `is_running`, and a refused `run_queue` returns SILENTLY — so a file that
+/// a watched folder ingests while the pass's `queue-drained` hook is blocking (up to 300s per
+/// batch, per mechanism) would otherwise sit `queued` until some unrelated later event, with the
+/// tray already showing idle. Anything the refusal missed is picked up here instead of being
+/// stranded.
 fn process_queue(ctx: &Ctx) {
-    // Clears is_running on every exit path (normal, early return, or panic).
-    let _running = RunningGuard(&ctx.converter);
+    // Clears is_running on every exit path (early return, or panic). Held across ALL passes:
+    // releasing it between them would reopen exactly the window this loop closes. On the normal
+    // exit the slot is released by `release_queue_slot_unless_work_arrived` instead and the
+    // guard is disarmed — see there for why that release cannot be a plain drop.
+    let mut running = RunningGuard::new(&ctx.converter);
+
+    'passes: loop {
+        if process_queue_pass(ctx) != PassOutcome::Drained {
+            return;
+        }
+        // Settle "is there more work?" and release the slot only when the answer is still no at
+        // the instant of the release. `work_arrived_while_busy` is the SINGLE decision point:
+        // every loop-back goes through it, so no branch can loop on the flag alone.
+        loop {
+            if work_arrived_while_busy(ctx) {
+                eprintln!(
+                    "convertbar: work was queued while the queue was busy — running another \
+                     pass instead of leaving it stranded"
+                );
+                continue 'passes;
+            }
+            if release_queue_slot_unless_work_arrived(&ctx.converter) {
+                running.disarm();
+                return;
+            }
+            // A start was refused in the release instant. The slot is still ours and the flag is
+            // still set, so this loop's head consumes it and lets the DB decide — another pass
+            // if there is really something queued, another release attempt if there is not.
+            eprintln!(
+                "convertbar: a queue start was refused as this run was releasing its slot — \
+                 re-checking rather than stranding whatever it was for"
+            );
+        }
+    }
+}
+
+/// Whether a refused `run_queue` left real work behind. The flag alone is not enough: a refusal
+/// can race a `clear_queue`/`remove_job` that then deletes the very row it was about, and looping
+/// on the flag alone would spin. The flag is consumed unconditionally (so one refusal can cause
+/// at most one re-check) and the DB is the authority on whether there is anything to do.
+fn work_arrived_while_busy(ctx: &Ctx) -> bool {
+    if !ctx.converter.take_work_arrived_while_busy() {
+        return false;
+    }
+    let db = match ctx.db.lock() {
+        Ok(db) => db,
+        Err(_) => return false,
+    };
+    get_next_job(&db).is_some()
+}
+
+/// One pass: drain the queue, then report. Split out of `process_queue` so the re-check loop
+/// above has something to call; the per-run state it resets below is per-PASS on purpose — a
+/// pass is exactly the run the refused `run_queue` would have started.
+fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
     // Every run/resume starts fresh: a stale reason from a prior pause must not linger once
     // the queue is running again (and be gone entirely if this run never hits the gate).
     *ctx.converter.low_disk_pause.lock().unwrap() = None;
+    // Once per run, not once per file: a broken receiver on a 200-file queue must produce one
+    // notification, and the next run must be able to notify again.
+    *ctx.converter.hook_failure_notified.lock().unwrap() = false;
     let mut had_errors = false;
+    // A TRUE drain: get_next_job found nothing left. Deliberately NOT set by the
+    // pause-after-current break below, which is also every pause on Windows
+    // (`control::pause_conversion` falls back to it when the process cannot be frozen), and
+    // never reached at all by the low-disk and shutdown returns. Only this flag gates the
+    // queue-drained hook.
+    let mut drained = false;
     loop {
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
         // job — teardown would otherwise race a fresh HandBrakeCLI spawn and orphan it.
-        // Return (not break) so no "Queue complete" notification fires mid-quit.
+        // Return (not break) so no "Queue complete" notification fires mid-quit, and `Stopped`
+        // so the caller does not start another pass into a teardown.
         if ctx.converter.is_shutting_down() {
-            return;
+            return PassOutcome::Stopped;
         }
         let job;
         let handbrake_path_opt;
@@ -837,7 +973,10 @@ fn process_queue(ctx: &Ctx) {
             let db = ctx.db.lock().unwrap();
             job = match get_next_job(&db) {
                 Some(j) => j,
-                None => break,
+                None => {
+                    drained = true;
+                    break;
+                }
             };
             handbrake_path_opt = get_handbrake_path(&db, &*ctx.handbrake);
             low_disk_min_gb = get_low_disk_min_gb(&db);
@@ -907,7 +1046,9 @@ fn process_queue(ctx: &Ctx) {
                             fps: None,
                         },
                     );
-                    return;
+                    // `Stopped`: the job is still queued, so a re-check would find work and
+                    // loop straight back into the same shortfall.
+                    return PassOutcome::Stopped;
                 }
             }
         }
@@ -1412,6 +1553,10 @@ fn process_queue(ctx: &Ctx) {
                     }),
                 );
 
+                // The completion fire point (done/skipped). Outside the db block above — never
+                // hold ctx.db across a hook, which is slower than an emit.
+                crate::hooks::fire_post_convert(ctx, &job.id);
+
                 // Notification logic for successful/skipped jobs
                 {
                     let (notify_per_file, errors_only) = {
@@ -1536,7 +1681,7 @@ fn process_queue(ctx: &Ctx) {
         if notify_queue_done {
             ctx.events.notify("ConvertBar", "Queue complete");
         }
-    }
+    } // the ctx.db guard above is scoped inside this block and is gone by here
 
     let final_status = final_run_status(had_errors);
     ctx.events.emit_t(
@@ -1551,26 +1696,92 @@ fn process_queue(ctx: &Ctx) {
         },
     );
 
-    // is_running is reset by RunningGuard on return (and on an unwinding panic).
+    // Deliberately AFTER the final menu-bar-update: a hook may block for the full timeout (up
+    // to 300s), and the tray must not keep showing a stale "converting" status for five
+    // minutes after the queue is actually empty. No ctx.db guard is held here.
+    if drained {
+        crate::hooks::fire_queue_drained(ctx);
+    }
+
+    // is_running is NOT reset here: RunningGuard lives in `process_queue`, which decides whether
+    // to run another pass. Anything queued while this pass held the slot — including everything
+    // that arrived during the hook above — is picked up there.
+    if drained {
+        PassOutcome::Drained
+    } else {
+        PassOutcome::Stopped
+    }
 }
 
 /// Atomically claims the right to run the queue. Returns false when the queue is already
-/// running or an update install holds the interlock. Poison-tolerant: if a prior queue thread
+/// running or an update install holds the interlock.
+///
+/// `#[must_use]`: a discarded `true` is a CLAIMED, leaked slot — `is_running` stays set with no
+/// queue thread behind it and every future start is refused for the life of the process. Poison-tolerant: if a prior queue thread
 /// panicked while briefly holding this lock, recover the flag rather than propagating the
 /// poison and permanently wedging starts.
+#[must_use]
 pub fn claim_queue_slot(converter: &ConverterState) -> bool {
     let mut running = converter
         .is_running
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if *running
-        || converter
-            .installing
-            .load(std::sync::atomic::Ordering::SeqCst)
+    // Checked before the interlock, and separately from it: a refusal because the queue is
+    // already running means somebody wanted work done and was turned away, so the running queue
+    // has to re-check before it exits (see `work_arrived_while_busy`). A refusal because an
+    // install holds the interlock is NOT that — it must not set the flag.
+    if *running {
+        converter
+            .work_arrived_while_busy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        return false;
+    }
+    if converter
+        .installing
+        .load(std::sync::atomic::Ordering::SeqCst)
     {
         return false;
     }
     *running = true;
+    true
+}
+
+/// Releases the queue slot, but only if no start was refused while we were deciding to.
+///
+/// This is the same critical section `claim_queue_slot` uses, and that is the whole point: the
+/// consume-then-release pair must be ATOMIC against a refusal. A refusal landing between an
+/// ordinary flag read and `RunningGuard`'s drop would set a flag nobody will ever read for this
+/// run and be refused into a run that is already over — restoring, in miniature, exactly the
+/// stranding this machinery exists to prevent.
+///
+/// Returns true when the slot was released (the caller must stop and MUST disarm its
+/// `RunningGuard`), false when a refusal was seen, in which case `is_running` stays claimed and
+/// the caller decides again. Takes no other lock — in particular not `ctx.db` — so it adds no
+/// lock ordering edge to the one CLAUDE.md warns about.
+///
+/// A blocked release READS the flag and deliberately leaves it SET, rather than consuming it.
+/// Consuming here would force the caller to loop on the flag alone — the one thing
+/// `work_arrived_while_busy` exists to forbid — and an empty pass is not free: it re-enters
+/// `fire_queue_drained`, which re-dispatches a pinned mechanism's whole backlog at up to 300s a
+/// batch. A hook whose side effect starts the queue would then refuse itself into a livelock.
+/// Left set, the refusal is settled by the caller's ordinary DB-backed check.
+///
+/// The plain `load` is as atomic as a swap here: `claim_queue_slot` sets the flag while holding
+/// this same mutex, so a refusal either happened before we took the lock (we see the flag) or
+/// happens after we drop it (by which point `is_running` is false, so it is not a refusal at all
+/// — the claim succeeds and starts a fresh queue thread).
+fn release_queue_slot_unless_work_arrived(converter: &ConverterState) -> bool {
+    let mut running = converter
+        .is_running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if converter
+        .work_arrived_while_busy
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return false; // keep the slot; the caller settles the refusal against the DB
+    }
+    *running = false;
     true
 }
 
@@ -1580,7 +1791,21 @@ pub fn run_queue(ctx: Arc<Ctx>) {
     if !claim_queue_slot(&ctx.converter) {
         return;
     }
+    spawn_queue_thread(ctx);
+}
 
+/// Spawns the queue thread for a slot the CALLER has already claimed. Split out of `run_queue`
+/// for `control::start_queue`, which must claim before it touches the persisted pause and would
+/// otherwise have to re-implement the claim (and, historically, got the refusal semantics
+/// subtly different — see BUG 1). `claim_queue_slot` stays the one place that decides what a
+/// refusal means.
+///
+/// The caller must hold the slot: `process_queue`'s `RunningGuard` releases it, so calling this
+/// without a claim clears an `is_running` that belongs to somebody else. `pub(crate)` for exactly
+/// that reason — the obligation stays inside this crate, where `control` is the only other
+/// caller, instead of being exported to the heads, where a well-meaning "just start the queue"
+/// call would silently run two queue threads.
+pub(crate) fn spawn_queue_thread(ctx: Arc<Ctx>) {
     std::thread::spawn(move || {
         process_queue(&ctx);
     });
@@ -1662,7 +1887,16 @@ mod tests {
     ) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
         let sink = Arc::new(TestSink::default());
         let disposer = Arc::new(RecordingDisposer::default());
-        let ctx = Ctx::new(conn, sink.clone(), disposer.clone(), locator);
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer.clone(),
+            locator,
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
+        );
         (ctx, sink, disposer)
     }
 
@@ -1678,8 +1912,84 @@ mod tests {
             sink.clone(),
             disposer,
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         (ctx, sink)
+    }
+
+    /// Like `test_ctx`, but also hands back the recording hook runner so a test can assert on
+    /// what was sent. Use this for any test that configures a hook.
+    fn test_ctx_hooks(
+        conn: Connection,
+    ) -> (
+        Arc<Ctx>,
+        Arc<TestSink>,
+        Arc<RecordingDisposer>,
+        Arc<crate::hooks::RecordingHookRunner>,
+    ) {
+        test_ctx_hooks_with_policy(conn, true)
+    }
+
+    /// `allow_stored_command` false reproduces the server head's policy, where the
+    /// post_convert_command settings ROW must be ignored entirely.
+    fn test_ctx_hooks_with_policy(
+        conn: Connection,
+        allow_stored_command: bool,
+    ) -> (
+        Arc<Ctx>,
+        Arc<TestSink>,
+        Arc<RecordingDisposer>,
+        Arc<crate::hooks::RecordingHookRunner>,
+    ) {
+        let sink = Arc::new(TestSink::default());
+        let disposer = Arc::new(RecordingDisposer::default());
+        let runner = Arc::new(crate::hooks::RecordingHookRunner::default());
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer.clone(),
+            Arc::new(crate::handbrake::AbsentLocator),
+            crate::hooks::HookSetup {
+                runner: runner.clone(),
+                allow_stored_command,
+            },
+        );
+        (ctx, sink, disposer, runner)
+    }
+
+    /// For tests that need a FailingHookRunner or a bespoke probe instead of the recorder.
+    fn test_ctx_with_hook_runner(
+        conn: Connection,
+        runner: Arc<dyn crate::hooks::HookRunner>,
+    ) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
+        let sink = Arc::new(TestSink::default());
+        let disposer = Arc::new(RecordingDisposer::default());
+        let ctx = Ctx::new(
+            conn,
+            sink.clone(),
+            disposer.clone(),
+            Arc::new(crate::handbrake::AbsentLocator),
+            crate::hooks::HookSetup {
+                runner,
+                allow_stored_command: true,
+            },
+        );
+        (ctx, sink, disposer)
+    }
+
+    /// Reads a settings row back — the queue-drained watermark assertions use this.
+    fn setting_value(db: &Arc<Mutex<Connection>>, key: &str) -> String {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_default()
     }
 
     fn saved_of(db: &Arc<Mutex<Connection>>, id: &str) -> Option<i64> {
@@ -3269,7 +3579,7 @@ HandBrake has exited.";
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _running = RunningGuard(&converter);
+            let _running = RunningGuard::new(&converter);
             assert!(
                 *converter.is_running.lock().unwrap(),
                 "is_running stays true while the guard is alive"
@@ -4784,6 +5094,1757 @@ HandBrake has exited.";
         assert_eq!(
             recorded, "BelowNormal",
             "the encode must run at the configured priority class, not the parent's"
+        );
+    }
+    // --- Task 5: per-file hook fire points -------------------------------------------------
+    //
+    // Every test below that names a hook runs a REAL queue against `successful_fake_handbrake_
+    // script` with `handbrake_path` configured, which is what makes an `AbsentLocator` fixture
+    // work: a configured path short-circuits HandBrake discovery.
+
+    /// A hooks fixture wired for a real encode: the fake HandBrake installed as the configured
+    /// path, and a tempdir to keep sources/outputs in.
+    fn hook_encode_fixture(ctx: &Arc<Ctx>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let source = real_source(dir.path(), "movie.mkv");
+        (dir, source)
+    }
+
+    /// The single sent webhook body, parsed. Fails loud when the count is not exactly one, so a
+    /// test can never assert against a body it did not actually cause.
+    fn only_webhook_body(hooks: &crate::hooks::RecordingHookRunner) -> serde_json::Value {
+        let sent = hooks.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 1, "expected exactly one webhook");
+        serde_json::from_str(&sent[0].body).unwrap()
+    }
+
+    #[test]
+    fn done_job_fires_post_convert_once_with_the_result_path() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        // 1000 declared bytes against the fake's few-byte output: the re-encode wins, so the
+        // job books 'done' with kept_file = 'converted'.
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+
+        let body = only_webhook_body(&hooks);
+        assert_eq!(body["event"], "post-convert");
+        assert_eq!(body["status"], "done");
+        assert_eq!(body["result_path"], body["output_path"]);
+        assert_eq!(body["job_id"], "j1");
+    }
+
+    #[test]
+    fn skipped_job_fires_with_result_path_equal_to_the_source() {
+        // Converted came out larger, so the original was kept and the encode discarded.
+        // A receiver told to scan output_path would scan a file that no longer exists.
+        let (ctx, _sink, disposer, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        // 3 declared bytes is smaller than the fake encode's output (5-6 bytes), so the
+        // re-encode loses: status 'skipped', kept_file 'original', output disposed.
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            3,
+        );
+
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "skipped");
+        assert_eq!(
+            disposer.0.lock().unwrap().as_slice(),
+            [out.to_str().unwrap().to_string()],
+            "the losing re-encode really was discarded — result_path must not name it"
+        );
+        assert!(!out.exists());
+
+        let body = only_webhook_body(&hooks);
+        assert_eq!(body["status"], "skipped");
+        assert_eq!(body["result_path"], body["source_path"]);
+        assert_ne!(
+            body["result_path"], body["output_path"],
+            "output_path names a file that was just deleted"
+        );
+    }
+
+    #[test]
+    fn error_job_fires_through_a_real_failure_arm() {
+        // Driven through an actual failing encode, NOT by calling record_job_error_quiet
+        // directly: that is what makes this catch the hook being attached to the
+        // record_job_error wrapper and thereby missing the direct call at the vanished-source
+        // gate, which is the one error booking that bypasses the wrapper.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        // A fake that DOES write its output: if the gate let the spawn through the job would
+        // end 'done', so the assertions below can only pass on the vanished-source arm.
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let gone = dir.path().join("gone.mkv"); // deliberately never created
+        let out = dir.path().join("gone.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            gone.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        let (status, msg) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "error");
+        assert!(
+            msg.unwrap().contains("Source file no longer exists"),
+            "this must be the record_job_error_quiet arm, not a wrapper arm"
+        );
+
+        let body = only_webhook_body(&hooks);
+        assert_eq!(body["status"], "error");
+        assert!(body["result_path"].is_null());
+    }
+
+    #[test]
+    fn no_hook_fires_when_nothing_is_configured() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        // Guards the guard: the conversion really happened, so "nothing sent" is the hook
+        // config being off rather than the queue never running.
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+        assert!(hooks.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_place_keep_deletes_the_row_and_fires_nothing() {
+        // The row is deleted rather than booked, so there is no conversion to report.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        set_setting(&ctx.db, "cleanup_mode", "keep");
+
+        let (_dir, source) = hook_encode_fixture(&ctx);
+        let p = source.to_str().unwrap();
+        // in-place: output_path == source_path, and the job reaches 'encoding' before the
+        // fresh cleanup_mode read sees "keep".
+        queue_job(&ctx.db, "j1", p, p, 10);
+
+        process_queue(&ctx);
+
+        assert!(
+            !job_exists(&ctx.db, "j1"),
+            "the arrangement must actually reach the row-deleting branch"
+        );
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+        assert!(hooks.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failing_hook_does_not_fail_the_job() {
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            job_row(&ctx.db, "j1").0,
+            "done",
+            "a broken receiver is not a failed encode"
+        );
+    }
+
+    #[test]
+    fn hook_failure_notifies_once_per_run_not_once_per_file() {
+        // A broken receiver on a 200-file queue must not produce 200 notifications.
+        // The flag lives on ConverterState, so this also pins that it resets between runs.
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+
+        let queue_three = |run: &str| {
+            for i in 0..3 {
+                let src = real_source(dir.path(), &format!("{run}-{i}.mkv"));
+                let out = dir.path().join(format!("{run}-{i}.mp4"));
+                queue_job(
+                    &ctx.db,
+                    &format!("{run}-{i}"),
+                    src.to_str().unwrap(),
+                    out.to_str().unwrap(),
+                    1000,
+                );
+            }
+        };
+        let hook_notes = || {
+            sink.notifications
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, body)| body.contains("hook"))
+                .count()
+        };
+
+        queue_three("a");
+        process_queue(&ctx);
+
+        assert_eq!(
+            sink.payloads("hook-failed").len(),
+            3,
+            "all three failures must still be surfaced as events — only the toast is deduped"
+        );
+        assert_eq!(
+            hook_notes(),
+            1,
+            "expected exactly one hook-failure notification per run"
+        );
+
+        // Second run: the flag is per-run, so a later run may notify again.
+        queue_three("b");
+        process_queue(&ctx);
+        assert_eq!(
+            hook_notes(),
+            2,
+            "the once-per-run flag must reset at the top of every run, not latch forever"
+        );
+    }
+
+    /// Books a completed job row directly, for the tests below that call
+    /// `fire_post_convert` without running a queue.
+    fn book_done_job(db: &Arc<Mutex<Connection>>, id: &str) {
+        queue_job(db, id, "/media/s.mkv", "/media/o.mkv", 100);
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status='done', kept_file='converted', converted_size=50, \
+                 space_saved=50, completed_at='2026-01-01T00:00:00+00:00' WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn shutdown_skips_the_hook_entirely() {
+        // is_shutting_down is otherwise only checked at the loop head, so a quit would block
+        // the queue thread for up to the timeout and could orphan a command child.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        // The row MUST exist: fire_post_convert returns early when load_job_payload finds
+        // nothing, so without it this test passes even with the shutdown guard deleted.
+        book_done_job(&ctx.db, "j1");
+
+        kill_active_child(&ctx.converter); // this is how the shutdown flag is armed
+        crate::hooks::fire_post_convert(&ctx, "j1");
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_shutdown_arrangement_does_fire_when_not_shutting_down() {
+        // Guards the guard: proves the arrangement above is capable of firing, so a green
+        // shutdown test means the guard worked rather than that nothing happened at all.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_done_job(&ctx.db, "j1");
+        crate::hooks::fire_post_convert(&ctx, "j1");
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+    }
+
+    /// Asserts, from inside a hook, that `ctx.db` is free. `try_lock`, never `lock`: a real
+    /// regression must FAIL the test, not hang it forever. Shared by the per-file and the
+    /// queue-drained lock-discipline tests below — CLAUDE.md names this invariant as the one
+    /// behind two shipped deadlocks, and the drain path re-acquires the lock after dispatch,
+    /// which is a second chance to get it wrong.
+    #[derive(Default)]
+    struct LockProbeRunner {
+        db: Mutex<Option<Arc<Mutex<Connection>>>>,
+        was_free: Mutex<bool>,
+    }
+    impl LockProbeRunner {
+        fn probe(&self) -> Result<(), String> {
+            let db = self.db.lock().unwrap().clone().expect("db handle set");
+            let verdict = match db.try_lock() {
+                Ok(_) => {
+                    *self.was_free.lock().unwrap() = true;
+                    Ok(())
+                }
+                Err(_) => Err("ctx.db was held across the hook".into()),
+            };
+            verdict
+        }
+    }
+    impl crate::hooks::HookRunner for LockProbeRunner {
+        fn run_webhook(&self, _r: &crate::hooks::WebhookRequest) -> Result<(), String> {
+            self.probe()
+        }
+        fn run_command(&self, _r: &crate::hooks::CommandRequest) -> Result<(), String> {
+            self.probe()
+        }
+    }
+
+    #[test]
+    fn the_db_lock_is_not_held_while_a_hook_runs() {
+        // The invariant most likely to regress, and the one that has already caused two
+        // shipped deadlocks. A hook is slower than an emit, so the window is wider here.
+        let probe = Arc::new(LockProbeRunner::default());
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), probe.clone());
+        *probe.db.lock().unwrap() = Some(ctx.db.clone());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_done_job(&ctx.db, "j1");
+
+        crate::hooks::fire_post_convert(&ctx, "j1");
+        assert!(
+            *probe.was_free.lock().unwrap(),
+            "ctx.db must be released before the hook runs"
+        );
+    }
+
+    #[test]
+    fn a_hook_failure_emits_hook_failed() {
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_done_job(&ctx.db, "j1");
+        crate::hooks::fire_post_convert(&ctx, "j1");
+
+        let events = sink.payloads("hook-failed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "post-convert");
+    }
+
+    #[test]
+    fn a_job_cancelled_while_encoding_fires_nothing() {
+        // cancel_conversion books status='error' itself and THEN kills the child, so the
+        // failure arm's `current_status != Some("error")` guard skips record_job_error and
+        // neither fire point is reached. Driven through a real control::cancel_conversion —
+        // a hand-written error row would not exercise that guard.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = slow_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        let source = real_source(dir.path(), "movie.mkv");
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        run_queue(ctx.clone());
+        wait_until("the fake encode to be running", || {
+            job_row(&ctx.db, "j1").0 == "encoding"
+                && ctx.converter.current_child.lock().unwrap().is_some()
+        });
+
+        crate::control::cancel_conversion(&ctx).unwrap();
+        wait_until("the queue thread to exit", || {
+            !*ctx.converter.is_running.lock().unwrap()
+        });
+
+        let (status, msg) = job_row(&ctx.db, "j1");
+        assert_eq!(status, "error");
+        assert_eq!(
+            msg.as_deref(),
+            Some("Cancelled by user"),
+            "the arrangement must be a real cancel, not some other failure"
+        );
+        assert!(
+            hooks.webhooks.lock().unwrap().is_empty(),
+            "a user cancel is not a conversion result: {:?}",
+            hooks.webhooks.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_job_cancelled_while_queued_fires_nothing() {
+        // No encode ever ran, so process_queue never sees the row. `remove_job` is what the
+        // UI's cancel does to a still-queued job.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        for id in ["j1", "j2"] {
+            let src = real_source(dir.path(), &format!("{id}.mkv"));
+            let out = dir.path().join(format!("{id}.mp4"));
+            queue_job(
+                &ctx.db,
+                id,
+                src.to_str().unwrap(),
+                out.to_str().unwrap(),
+                1000,
+            );
+        }
+
+        crate::queue_ops::remove_job(&ctx, "j1").unwrap();
+        process_queue(&ctx);
+
+        // The surviving job DID fire, so "j1 fired nothing" is a real observation rather
+        // than a queue that never ran.
+        let body = only_webhook_body(&hooks);
+        assert_eq!(
+            body["job_id"], "j2",
+            "a job cancelled while queued must never reach a fire point"
+        );
+    }
+
+    #[test]
+    fn command_hook_receives_unmapped_paths_while_the_webhook_is_mapped() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        set_setting(&ctx.db, "post_convert_command", "/bin/true");
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        // The spec's example is `/media => /data`; a test cannot write under /media, so the
+        // rule is anchored at the tempdir the real files actually live in. The behaviour under
+        // test — webhook paths rewritten, command paths raw — is identical.
+        set_setting(
+            &ctx.db,
+            "hook_path_map",
+            &format!("{} => /data", dir.path().to_str().unwrap()),
+        );
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+
+        let webhook_body = only_webhook_body(&hooks);
+        // `/data` not `/data/`: on Windows the untouched remainder keeps its `\` separator.
+        assert!(
+            webhook_body["result_path"]
+                .as_str()
+                .unwrap()
+                .starts_with("/data"),
+            "webhook paths are rewritten: {webhook_body}"
+        );
+
+        let commands = hooks.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        let raw = commands[0]
+            .env
+            .iter()
+            .find(|(k, _)| k == "CONVERTBAR_RESULT_PATH")
+            .unwrap();
+        assert_eq!(
+            raw.1,
+            out.to_str().unwrap(),
+            "commands get raw paths; scripts rewrite them"
+        );
+    }
+
+    #[test]
+    fn server_policy_ignores_a_stored_command_row() {
+        // A convertbar.db copied from a desktop install must not make the container execute
+        // the desktop user's command.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks_with_policy(test_conn(), false);
+        // post_convert_command is deliberately absent from settings_ops::ALLOWED_KEYS, so it
+        // can only get into the DB the way a copied database would: written directly.
+        set_setting(&ctx.db, "post_convert_command", "/bin/true");
+        // The webhook stays allowed, so a green result means the COMMAND was refused rather
+        // than the whole hook config reading as off.
+        set_setting(
+            &ctx.db,
+            "post_convert_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let (dir, source) = hook_encode_fixture(&ctx);
+        let out = dir.path().join("movie.mp4");
+        queue_job(
+            &ctx.db,
+            "j1",
+            source.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            hooks.webhooks.lock().unwrap().len(),
+            1,
+            "the webhook still fires"
+        );
+        assert!(hooks.commands.lock().unwrap().is_empty());
+    }
+
+    // --- Task 6: the once-per-drain queue-drained hook --------------------------------------
+    //
+    // Same arrangement as the Task 5 tests above: a REAL queue against
+    // `successful_fake_handbrake_script` installed as `handbrake_path`, which is what lets an
+    // `AbsentLocator` fixture run an encode.
+
+    /// Installs the fake HandBrake and hands back the tempdir every source and output lives in.
+    fn drain_fixture(ctx: &Arc<Ctx>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script = successful_fake_handbrake_script(dir.path());
+        set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+        dir
+    }
+
+    /// Queues one job whose source really exists, sized (1000 declared bytes against the fake's
+    /// few-byte output) so the re-encode wins and the job books 'done'. `order` is explicit
+    /// because `queue_job` writes queue_order 0 for everything, and these tests assert on which
+    /// job ran before a pause.
+    fn queue_real_job(ctx: &Arc<Ctx>, dir: &tempfile::TempDir, id: &str, order: i64) {
+        let src = real_source(dir.path(), &format!("{id}.mkv"));
+        let out = dir.path().join(format!("{id}.mp4"));
+        queue_job(
+            &ctx.db,
+            id,
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            1000,
+        );
+        set_queue_order(ctx, id, order);
+    }
+
+    /// A job row's `completed_at` verbatim, for asserting the watermark against the value the
+    /// payload actually reported rather than against "something non-empty".
+    fn completed_at_of(db: &Arc<Mutex<Connection>>, id: &str) -> String {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT completed_at FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .expect("a reported job has a completed_at")
+    }
+
+    fn set_queue_order(ctx: &Arc<Ctx>, id: &str, order: i64) {
+        ctx.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET queue_order = ?2 WHERE id = ?1",
+                params![id, order],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_true_drain_fires_queue_drained_and_advances_the_watermark() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        queue_real_job(&ctx, &dir, "j2", 1);
+
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(job_row(&ctx.db, "j2").0, "done");
+
+        let sent = hooks.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly one drain payload per run");
+        let body: serde_json::Value = serde_json::from_str(&sent[0].body).unwrap();
+        assert_eq!(body["event"], "queue-drained");
+        assert_eq!(body["completed"], 2);
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        // The watermark's VALUE, not merely that it is non-empty: it must be the newest
+        // completed_at IN THE REPORTED SET. Stamping the clock instead would look identical to
+        // a non-empty assertion while silently skipping any job that completed between the
+        // last reported one and the write — exactly the loss this design exists to prevent.
+        let last_reported = body["jobs"].as_array().unwrap().last().unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            completed_at_of(&ctx.db, &last_reported),
+            "the watermark is computed from the reported set, never from the clock"
+        );
+    }
+
+    #[test]
+    fn pause_after_current_fires_no_queue_drained() {
+        // This is the Windows pause path (control.rs:46-53), so without the drained gate every
+        // pause on Windows would emit a spurious drain mid-run. Drive the flag, not the platform.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        queue_real_job(&ctx, &dir, "j2", 1);
+        crate::control::pause_after_current(&ctx).unwrap();
+
+        process_queue(&ctx);
+
+        // The arrangement really ran and really stopped short: one job finished, one is still
+        // waiting. That is what makes the silence below the gate rather than an inert queue.
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(job_row(&ctx.db, "j2").0, "queued");
+        assert!(
+            hooks.webhooks.lock().unwrap().is_empty(),
+            "a pause is not a drain — a job is still queued"
+        );
+
+        // Positive control: same ctx, same hook config, run on to a true drain. The hook fires,
+        // so the silence above was the `drained` gate and not a hook that could never have fired.
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j2").0, "done");
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn jobs_completed_before_a_pause_appear_in_the_drain_that_follows() {
+        // The regression test for the in-memory accumulator this design rejects: a run-local
+        // Vec would lose everything completed before the pause.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        crate::control::pause_after_current(&ctx).unwrap();
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert!(
+            hooks.webhooks.lock().unwrap().is_empty(),
+            "run 1 ended on the pause break, not a drain"
+        );
+
+        queue_real_job(&ctx, &dir, "j2", 1);
+        process_queue(&ctx);
+        assert_eq!(job_row(&ctx.db, "j2").0, "done");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&hooks.webhooks.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2, "both runs' jobs");
+        let ids: Vec<&str> = body["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["job_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["j1", "j2"],
+            "the job from before the pause is still reported, oldest first"
+        );
+    }
+
+    #[test]
+    fn a_drain_with_nothing_new_fires_nothing() {
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        process_queue(&ctx);
+        // Positive control: the first drain DID fire against this exact config, so the silence
+        // below is "nothing completed since the watermark" and not a hook that never worked.
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+        hooks.webhooks.lock().unwrap().clear();
+
+        process_queue(&ctx); // a true drain again, but nothing has completed since
+        assert!(hooks.webhooks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_drain_hook_does_not_advance_the_watermark() {
+        // Re-reporting is harmless for a rescan; silent loss is not.
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        process_queue(&ctx);
+
+        // Positive control: the dispatch really happened and really failed. Without it, a
+        // watermark left empty because the hook never fired at all would read as a pass.
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        let failed = sink.payloads("hook-failed");
+        assert_eq!(failed.len(), 1, "the drain hook must have been attempted");
+        assert_eq!(failed[0]["event"], "queue-drained");
+
+        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at_webhook"), "");
+    }
+
+    #[test]
+    fn drain_output_dirs_exclude_error_jobs_and_dedupe() {
+        // Two successes in ONE directory plus a failure in the same directory. The successes
+        // collapse to a single entry, and the error contributes none: it has no kept_file, so
+        // no result_path and no output_dir. Rescanning a directory for a file that was never
+        // produced is at best wasted work.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        queue_real_job(&ctx, &dir, "j2", 1);
+        // Same directory, but this source is deliberately never created, so the vanished-source
+        // gate books status='error' with kept_file left NULL.
+        let gone = dir.path().join("gone.mkv");
+        let gone_out = dir.path().join("gone.mp4");
+        queue_job(
+            &ctx.db,
+            "j3",
+            gone.to_str().unwrap(),
+            gone_out.to_str().unwrap(),
+            1000,
+        );
+        set_queue_order(&ctx, "j3", 2);
+
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(job_row(&ctx.db, "j2").0, "done");
+        assert_eq!(job_row(&ctx.db, "j3").0, "error");
+
+        let body = only_webhook_body(&hooks);
+        assert_eq!(body["completed"], 2);
+        assert_eq!(body["output_dirs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["output_dirs"][0], dir.path().to_str().unwrap());
+        assert_eq!(body["errors"], 1);
+    }
+
+    #[test]
+    fn the_db_lock_is_not_held_while_the_drain_hook_runs() {
+        // `the_db_lock_is_not_held_while_a_hook_runs` covers fire_post_convert only. The drain
+        // path is the riskier one: it releases ctx.db, dispatches, and then RE-ACQUIRES the
+        // lock to write the watermark. Nothing else in the suite would catch a refactor that
+        // hoists that write back inside the first guarded block, or wraps dispatch in the
+        // guard — RecordingHookRunner and TestSink never touch ctx.db.
+        let probe = Arc::new(LockProbeRunner::default());
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), probe.clone());
+        *probe.db.lock().unwrap() = Some(ctx.db.clone());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert!(
+            *probe.was_free.lock().unwrap(),
+            "ctx.db must be released before the drain hook runs"
+        );
+        // The probe returns Ok, so the dispatch succeeded and the watermark MUST have been
+        // written — which is what proves the post-dispatch re-acquire really ran rather than
+        // the whole tail being skipped.
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            completed_at_of(&ctx.db, "j1")
+        );
+    }
+
+    #[test]
+    fn a_backlog_larger_than_one_batch_drains_in_batches_within_a_single_call() {
+        // The E2BIG wedge this bound exists for: command_env puts the whole payload into
+        // CONVERTBAR_PAYLOAD, Linux caps one env string at 128 KiB, and an over-cap spawn
+        // fails -> watermark correctly refuses to advance -> the next payload is BIGGER. It
+        // never self-heals. Batching bounds each payload, and the loop drains the whole
+        // backlog in one call rather than one batch per queue run.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        // 250 history rows with strictly increasing completed_at, written directly: running
+        // 250 real encodes would take minutes and prove nothing extra about the batching.
+        let total = 250;
+        for i in 0..total {
+            let id = format!("h{i:04}");
+            queue_job(
+                &ctx.db,
+                &id,
+                &format!("/media/{id}.mkv"),
+                &format!("/media/{id}.mp4"),
+                1000,
+            );
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET status='done', kept_file='converted', converted_size=500, \
+                     space_saved=500, completed_at=?2 WHERE id=?1",
+                    params![
+                        id,
+                        format!("2026-01-01T00:00:{:02}.{:06}+00:00", i / 1000, i)
+                    ],
+                )
+                .unwrap();
+        }
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let sent = hooks.webhooks.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            3,
+            "250 jobs at ~100 per batch is three payloads"
+        );
+        let sizes: Vec<usize> = sent
+            .iter()
+            .map(|w| {
+                serde_json::from_str::<serde_json::Value>(&w.body).unwrap()["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .collect();
+        // 99, not 100: a FULL batch is cut back to the last completed_at boundary so a tie
+        // group can never straddle it (see `a_tie_group_straddling_a_batch_boundary_loses_no_job`).
+        // Here every timestamp is distinct, so that trailing "group" is a single row and costs
+        // one slot per full batch. The final batch is short, so it goes out intact.
+        assert_eq!(sizes, [99, 99, 52], "the batch boundary rule is applied");
+        assert!(
+            sizes.iter().all(|n| *n <= 100),
+            "the bound is what keeps CONVERTBAR_PAYLOAD under the exec limits"
+        );
+
+        // Every job reported exactly once, and the watermark ends on the newest of them.
+        let mut seen: Vec<String> = Vec::new();
+        for w in sent.iter() {
+            let body: serde_json::Value = serde_json::from_str(&w.body).unwrap();
+            for j in body["jobs"].as_array().unwrap() {
+                seen.push(j["job_id"].as_str().unwrap().to_string());
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            total,
+            "batching must not drop or duplicate a job"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            completed_at_of(&ctx.db, &format!("h{:04}", total - 1))
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_stops_the_drain_without_advancing_the_watermark() {
+        // The batch loop must keep the all-or-nothing rule per batch: a refusal mid-backlog
+        // stops immediately rather than marching the watermark past jobs the receiver never
+        // heard about.
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        for i in 0..150 {
+            let id = format!("h{i:04}");
+            queue_job(
+                &ctx.db,
+                &id,
+                &format!("/media/{id}.mkv"),
+                &format!("/media/{id}.mp4"),
+                1000,
+            );
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET status='done', kept_file='converted', converted_size=500, \
+                     space_saved=500, completed_at=?2 WHERE id=?1",
+                    params![id, format!("2026-01-01T00:00:00.{:06}+00:00", i)],
+                )
+                .unwrap();
+        }
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        // Positive control: the first batch really was attempted and really was refused, so an
+        // empty watermark cannot pass by way of nothing having fired at all.
+        let failed = sink.payloads("hook-failed");
+        assert_eq!(failed.len(), 1, "exactly the first batch, then it stopped");
+        assert_eq!(failed[0]["event"], "queue-drained");
+        assert_eq!(setting_value(&ctx.db, "last_queue_drained_at_webhook"), "");
+    }
+
+    /// Books `count` completed history rows whose `completed_at` is `stamp(i)`. Direct row
+    /// writes: the batching behaviour under test is about the SQL window, and running hundreds
+    /// of real encodes would take minutes while proving nothing extra.
+    fn book_history(ctx: &Arc<Ctx>, count: usize, stamp: impl Fn(usize) -> String) {
+        book_history_prefixed(ctx, "h", count, stamp)
+    }
+
+    /// `book_history` with a caller-chosen id prefix, so a test can book a SECOND wave of
+    /// completions without colliding with the first wave's ids.
+    fn book_history_prefixed(
+        ctx: &Arc<Ctx>,
+        prefix: &str,
+        count: usize,
+        stamp: impl Fn(usize) -> String,
+    ) {
+        for i in 0..count {
+            let id = format!("{prefix}{i:04}");
+            queue_job(
+                &ctx.db,
+                &id,
+                &format!("/media/{id}.mkv"),
+                &format!("/media/{id}.mp4"),
+                1000,
+            );
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET status='done', kept_file='converted', converted_size=500, \
+                     space_saved=500, completed_at=?2 WHERE id=?1",
+                    params![id, stamp(i)],
+                )
+                .unwrap();
+        }
+    }
+
+    /// Every job_id across every sent webhook, in send order.
+    fn reported_job_ids(hooks: &crate::hooks::RecordingHookRunner) -> Vec<String> {
+        hooks
+            .webhooks
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|w| {
+                let body: serde_json::Value = serde_json::from_str(&w.body).unwrap();
+                body["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|j| j["job_id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tie_group_straddling_a_batch_boundary_loses_no_job() {
+        // The hazard the batch bound introduced: rows sharing one completed_at get cut in half
+        // by the LIMIT, the watermark advances to that shared value, and the next pass's strict
+        // `>` SKIPS the far half — silently, forever. A full batch is therefore truncated back
+        // to the last timestamp boundary so the tie group comes back whole next iteration.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        // Rows 99, 100 and 101 share one completed_at, so the 100-job batch boundary falls
+        // INSIDE the tie group (row 99 is the batch's last row; 100 and 101 are outside it).
+        let total = 150;
+        book_history(&ctx, total, |i| {
+            let effective = if (99..=101).contains(&i) { 99 } else { i };
+            format!("2026-01-01T00:00:00.{effective:06}+00:00")
+        });
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let reported = reported_job_ids(&hooks);
+        let mut unique = reported.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            total,
+            "every job must be reported — the tie group was cut and its far half skipped"
+        );
+        assert_eq!(
+            reported.len(),
+            total,
+            "and none re-sent: truncation must not replay the rows it kept"
+        );
+
+        // The truncation really happened: the first batch stopped SHORT of the bound rather
+        // than ending mid-tie. Without it the first payload would hold exactly 100.
+        let first_batch = hooks.webhooks.lock().unwrap()[0].body.clone();
+        let first: serde_json::Value = serde_json::from_str(&first_batch).unwrap();
+        assert_eq!(
+            first["jobs"].as_array().unwrap().len(),
+            99,
+            "the batch is cut back to the last timestamp boundary"
+        );
+    }
+
+    #[test]
+    fn a_tie_group_larger_than_a_whole_batch_is_still_sent() {
+        // The arm where truncation would empty the batch: every row shares one timestamp, so
+        // the group cannot be split. It must go out whole rather than deadlock the loop or
+        // send nothing — the residual (rows past the batch sharing that stamp) is logged, not
+        // silent.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        book_history(&ctx, 100, |_| {
+            "2026-01-01T00:00:00.000000+00:00".to_string()
+        });
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let reported = reported_job_ids(&hooks);
+        assert_eq!(reported.len(), 100, "the unsplittable group is sent whole");
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            "2026-01-01T00:00:00.000000+00:00",
+            "and the watermark still advances, so the loop terminates"
+        );
+    }
+
+    /// Books three completed rows and a watermark that leaves two of them reportable, so
+    /// "the watermark did not move" is a real observation against a real value rather than the
+    /// empty default an absent watermark would also read as. Shared by the shutdown pair below.
+    fn drain_backlog_behind_a_watermark(ctx: &Arc<Ctx>) -> String {
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_history(&ctx.clone(), 3, |i| format!("2026-01-01T00:00:0{i}+00:00"));
+        let watermark = "2026-01-01T00:00:00+00:00".to_string();
+        set_setting(&ctx.db, "last_queue_drained_at_webhook", &watermark);
+        watermark
+    }
+
+    #[test]
+    fn a_drain_during_shutdown_sends_nothing_and_leaves_the_watermark_alone() {
+        // The bug this pins: `dispatch` bails on is_shutting_down WITHOUT reporting a failure,
+        // and the old "did the failure counter move?" signal read that as a success. The
+        // watermark then advanced past jobs nothing was ever sent for — no log, no hook-failed,
+        // no notification — and because the next drain selects `completed_at > watermark`, they
+        // could never be reported again. In a backlog the loop keeps going while more remain,
+        // so an entire History can be watermarked away in one pass. Reachable from `docker
+        // stop`, an app quit, and an auto-update install.
+        let (ctx, sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        let watermark = drain_backlog_behind_a_watermark(&ctx);
+
+        kill_active_child(&ctx.converter); // this is how the shutdown flag is armed
+        crate::hooks::fire_queue_drained(&ctx);
+
+        assert!(
+            hooks.webhooks.lock().unwrap().is_empty(),
+            "a shutdown must send nothing: {:?}",
+            hooks.webhooks.lock().unwrap()
+        );
+        assert!(hooks.commands.lock().unwrap().is_empty());
+        assert!(
+            sink.payloads("hook-failed").is_empty(),
+            "a deliberate skip is not a failure — it must not be reported as one"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            watermark,
+            "the watermark must not move past jobs nothing was sent for"
+        );
+    }
+
+    #[test]
+    fn the_same_drain_arrangement_advances_the_watermark_when_not_shutting_down() {
+        // Guards the guard: identical fixture, no shutdown. Proves the test above observes the
+        // skip rather than an arrangement that could never have fired or advanced at all.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        let watermark = drain_backlog_behind_a_watermark(&ctx);
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+        assert_ne!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            watermark
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            completed_at_of(&ctx.db, "h0002"),
+            "a delivered drain advances to the newest reported row"
+        );
+    }
+
+    #[test]
+    fn a_refused_drain_leaves_a_pre_existing_watermark_where_it_was() {
+        // The `Failed` arm of the same decision, against a NON-EMPTY starting watermark:
+        // `a_failed_drain_hook_does_not_advance_the_watermark` asserts against "", which a
+        // never-written watermark also satisfies. This one can only pass if the value survived.
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(
+            test_conn(),
+            std::sync::Arc::new(crate::hooks::FailingHookRunner),
+        );
+        let watermark = drain_backlog_behind_a_watermark(&ctx);
+
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let failed = sink.payloads("hook-failed");
+        assert_eq!(failed.len(), 1, "the drain hook must have been attempted");
+        assert_eq!(failed[0]["event"], "queue-drained");
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            watermark
+        );
+    }
+
+    // --- Work that arrives while the queue is busy -------------------------------------------
+
+    /// A drain hook that does, from inside itself, exactly what a watched folder does when a
+    /// file lands mid-hook: enqueue a job and ask the queue to run. `run_queue` is refused —
+    /// this thread IS the queue — and that refusal returns silently, which is the whole bug.
+    ///
+    /// Doing the enqueue INSIDE the hook rather than from a second thread that races a sleeping
+    /// hook is deliberate: it puts the arrival unambiguously inside the hook's window with no
+    /// timing to lose, and a sleep long enough to be safe would be a sleep long enough to be
+    /// slow. It also models the real case — the hook's own side effects (a library rescan that
+    /// moves files) are what produce the new file.
+    #[derive(Default)]
+    struct EnqueueDuringHookRunner {
+        ctx: Mutex<Option<Arc<Ctx>>>,
+        dir: Mutex<Option<std::path::PathBuf>>,
+        fired: Mutex<bool>,
+        /// Which of the two ways into the queue this run models. Both must record the refusal;
+        /// only one of them did when this was first fixed.
+        via: StartPath,
+    }
+
+    /// How the mid-hook arrival asks for the queue. `RunQueue` is the watcher's ingest path
+    /// (`watcher.rs`); `StartQueue` is `control::start_queue`, which is what BOTH heads call
+    /// after an add — `useFileIntake.ts` for the desktop UI, `routes/converter.rs` for the
+    /// server — because `queue_ops::add_files` does not start the queue itself.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    enum StartPath {
+        #[default]
+        RunQueue,
+        StartQueue,
+    }
+
+    impl crate::hooks::HookRunner for EnqueueDuringHookRunner {
+        fn run_webhook(&self, _r: &crate::hooks::WebhookRequest) -> Result<(), String> {
+            // Once only: the second pass drains too and fires this hook again, and an
+            // unconditional enqueue would keep the queue running forever.
+            if std::mem::replace(&mut *self.fired.lock().unwrap(), true) {
+                return Ok(());
+            }
+            let ctx = self.ctx.lock().unwrap().clone().expect("ctx handle set");
+            let dir = self.dir.lock().unwrap().clone().expect("dir handle set");
+            let src = real_source(&dir, "late.mkv");
+            let out = dir.join("late.mp4");
+            queue_job(
+                &ctx.db,
+                "late",
+                src.to_str().unwrap(),
+                out.to_str().unwrap(),
+                1000,
+            );
+            match self.via {
+                StartPath::RunQueue => {
+                    // The refusal under test. It must be REFUSED — otherwise this test would be
+                    // measuring a second queue thread instead of the re-check.
+                    assert!(
+                        !claim_queue_slot(&ctx.converter),
+                        "the queue must still hold is_running while its own drain hook runs"
+                    );
+                    run_queue(ctx.clone());
+                }
+                StartPath::StartQueue => {
+                    crate::control::start_queue(&ctx).unwrap();
+                    assert!(
+                        *ctx.converter.is_running.lock().unwrap(),
+                        "start_queue must not have released the slot this run holds"
+                    );
+                }
+            }
+            Ok(())
+        }
+        fn run_command(&self, _r: &crate::hooks::CommandRequest) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Runs one job to a true drain with a hook that, mid-drain, enqueues a second job and asks
+    /// for the queue through `via`. Asserts the late job is converted anyway.
+    fn assert_a_mid_hook_arrival_is_converted(via: StartPath) {
+        let runner = Arc::new(EnqueueDuringHookRunner {
+            via,
+            ..Default::default()
+        });
+        let (ctx, _sink, _disp) = test_ctx_with_hook_runner(test_conn(), runner.clone());
+        *runner.ctx.lock().unwrap() = Some(ctx.clone());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        *runner.dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        queue_real_job(&ctx, &dir, "j1", 0);
+
+        // Claim the slot the way `run_queue` would, so the hook's start really is refused.
+        // process_queue then runs inline on this thread: no sleeps, no polling, and a regression
+        // fails rather than flakes.
+        *ctx.converter.is_running.lock().unwrap() = true;
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(
+            job_row(&ctx.db, "late").0,
+            "done",
+            "the job that arrived during the drain hook was stranded ({via:?})"
+        );
+        assert!(
+            !ctx.converter.take_work_arrived_while_busy(),
+            "the flag must be consumed, or the next drain loops for nothing"
+        );
+        assert!(
+            !*ctx.converter.is_running.lock().unwrap(),
+            "the slot must be released after the extra pass"
+        );
+    }
+
+    #[test]
+    fn a_job_queued_while_the_drain_hook_runs_is_still_converted() {
+        // The stranding this fix exists for, on the watcher's ingest path. `claim_queue_slot`
+        // refuses for as long as the queue holds is_running, and the drain hook can hold that
+        // open for minutes (batches × mechanisms × a timeout that goes to 300s). `run_queue`
+        // returns silently on the refusal, the tray already says idle, and before this fix
+        // nothing ever looked again: the file sat 'queued' until some unrelated later event.
+        assert_a_mid_hook_arrival_is_converted(StartPath::RunQueue);
+    }
+
+    #[test]
+    fn a_job_added_through_start_queue_while_the_drain_hook_runs_is_still_converted() {
+        // The SAME stranding on the path a user actually takes. Every user-initiated add goes
+        // through `control::start_queue` — `useFileIntake.ts` calls `startQueue()` after
+        // `addFiles`, the server head's `routes/converter.rs` does the same, and
+        // `queue_ops::add_files` does not start the queue itself. `start_queue` used to
+        // short-circuit on its own `is_running` read and never reach `claim_queue_slot`, so it
+        // recorded nothing and this file stayed stranded even after the watcher path was fixed.
+        assert_a_mid_hook_arrival_is_converted(StartPath::StartQueue);
+    }
+
+    #[test]
+    fn a_set_flag_with_an_empty_queue_does_not_start_another_pass() {
+        // The spin guard. The flag is advisory — a refusal can race a clear_queue/remove_job
+        // that deletes the very row it was about — so the DB, not the flag, decides. A test that
+        // regressed this would hang rather than fail, which is why the flag is consumed
+        // unconditionally and the re-check is authoritative.
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        let dir = drain_fixture(&ctx);
+        queue_real_job(&ctx, &dir, "j1", 0);
+        ctx.converter
+            .work_arrived_while_busy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        process_queue(&ctx);
+
+        assert_eq!(job_row(&ctx.db, "j1").0, "done");
+        assert_eq!(
+            hooks.webhooks.lock().unwrap().len(),
+            1,
+            "one pass, one drain payload — the flag alone must not buy a second pass"
+        );
+    }
+
+    #[test]
+    fn a_refusal_because_the_queue_is_running_records_that_work_arrived() {
+        let converter = ConverterState::new();
+        assert!(claim_queue_slot(&converter));
+        assert!(
+            !claim_queue_slot(&converter),
+            "the second claim must be refused"
+        );
+        assert!(
+            converter.take_work_arrived_while_busy(),
+            "somebody wanted work done and was turned away"
+        );
+        assert!(
+            !converter.take_work_arrived_while_busy(),
+            "and the flag is consumed by the read"
+        );
+    }
+
+    #[test]
+    fn an_outstanding_refusal_with_an_empty_queue_does_not_produce_another_pass() {
+        // The DB, never the flag, decides — and this is the case where it matters most. A
+        // blocked release leaves the refusal set and hands it to this same check, so the
+        // false-release arm is not an exception to the rule: with nothing queued it buys another
+        // release attempt, not another pass. An empty pass is not free — it re-enters
+        // `fire_queue_drained`, which re-dispatches a pinned mechanism's whole backlog at up to
+        // 300s a batch — so a hook whose side effect starts the queue could otherwise refuse
+        // itself into a livelock, each refusal buying a pass that produces the next refusal.
+        //
+        // An empty queue never reaches HandBrake resolution, hence the PanickingLocator fixture:
+        // one `menu-bar-update` is emitted per pass, which makes the emit count the pass count.
+        let (ctx, sink, _disp) = test_ctx(test_conn());
+        *ctx.converter.is_running.lock().unwrap() = true;
+        ctx.converter
+            .work_arrived_while_busy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        process_queue(&ctx);
+
+        assert_eq!(
+            sink.payloads("menu-bar-update").len(),
+            1,
+            "exactly one pass: the refusal referred to no queued job"
+        );
+        assert!(
+            !ctx.converter.take_work_arrived_while_busy(),
+            "and the refusal was consumed, not left to trigger a later run"
+        );
+        assert!(
+            !*ctx.converter.is_running.lock().unwrap(),
+            "the slot is released"
+        );
+    }
+
+    #[test]
+    fn releasing_the_slot_honours_a_refusal_that_lands_in_the_same_instant() {
+        // The consume/release race. Reading the flag and then letting `RunningGuard` drop are
+        // two steps, and a refusal landing between them sets a flag nobody will read for this
+        // run — the millisecond window restored rather than eliminated. Consuming the flag and
+        // releasing `is_running` inside ONE critical section — the same one `claim_queue_slot`
+        // takes — is what makes a refusal either seen by this run or refused into the next.
+        let converter = ConverterState::new();
+        assert!(claim_queue_slot(&converter));
+        assert!(!claim_queue_slot(&converter), "a start refused right now");
+
+        assert!(
+            !release_queue_slot_unless_work_arrived(&converter),
+            "an outstanding refusal must block the release"
+        );
+        assert!(
+            *converter.is_running.lock().unwrap(),
+            "and the slot must stay claimed, so no second queue thread can start underneath"
+        );
+        assert!(
+            converter
+                .work_arrived_while_busy
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a blocked release must LEAVE the refusal for the DB-backed decision point — \
+             consuming it here is what would force a branch that loops on the flag alone"
+        );
+
+        // Which is what the caller then does: consume it, decide against the DB, come back.
+        assert!(converter.take_work_arrived_while_busy());
+        assert!(
+            release_queue_slot_unless_work_arrived(&converter),
+            "with the refusal settled, the release goes through"
+        );
+        assert!(!*converter.is_running.lock().unwrap());
+    }
+
+    #[test]
+    fn a_disarmed_running_guard_does_not_clear_a_slot_someone_else_claimed() {
+        // Why `disarm` exists. Once the slot is released, another thread may claim it before
+        // this one returns; a guard that still cleared `is_running` on drop would free a slot a
+        // live queue thread is holding, and a THIRD claim would then succeed — two queues at
+        // once, which is exactly what the claim is for.
+        let converter = ConverterState::new();
+        assert!(claim_queue_slot(&converter));
+        {
+            let mut guard = RunningGuard::new(&converter);
+            assert!(release_queue_slot_unless_work_arrived(&converter));
+            guard.disarm();
+            assert!(claim_queue_slot(&converter), "another run takes the slot");
+        }
+        assert!(
+            *converter.is_running.lock().unwrap(),
+            "the disarmed guard must leave the new owner's claim alone"
+        );
+    }
+
+    #[test]
+    fn an_install_refusal_does_not_record_that_work_arrived() {
+        // The update interlock is not "work arrived": nothing was queued, and
+        // `resume_queue_after_install` re-triggers the queue itself. Recording it here would
+        // make the pass that follows an install do a pointless extra lap — and, worse, teach
+        // the flag to mean something other than "a start was refused with work behind it".
+        let converter = ConverterState::new();
+        converter
+            .installing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!claim_queue_slot(&converter));
+        assert!(
+            !converter.take_work_arrived_while_busy(),
+            "an install holding the interlock must not set the flag"
+        );
+    }
+
+    // --- Per-mechanism drain watermarks -------------------------------------------------------
+
+    /// A webhook that works alongside a command that does not. This is not an exotic pairing:
+    /// it is the deployment the feature was built for (a Stash rescan webhook plus a
+    /// `stashdupe` command) meeting the misconfiguration the README calls the most common one
+    /// (a hook script left non-executable).
+    #[derive(Default)]
+    struct WorkingWebhookFailingCommandRunner {
+        webhooks: Mutex<Vec<crate::hooks::WebhookRequest>>,
+        commands: Mutex<Vec<crate::hooks::CommandRequest>>,
+    }
+    impl crate::hooks::HookRunner for WorkingWebhookFailingCommandRunner {
+        fn run_webhook(&self, r: &crate::hooks::WebhookRequest) -> Result<(), String> {
+            self.webhooks.lock().unwrap().push(r.clone());
+            Ok(())
+        }
+        fn run_command(&self, r: &crate::hooks::CommandRequest) -> Result<(), String> {
+            self.commands.lock().unwrap().push(r.clone());
+            Err("Permission denied (os error 13)".into())
+        }
+    }
+
+    /// The job ids in one webhook body, in payload order.
+    fn body_job_ids(body: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["job_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_failing_command_does_not_pin_the_working_webhook() {
+        // With ONE watermark shared by both mechanisms, a webhook that delivers plus a command
+        // that fails collapses to "failed", the watermark never moves, and the working receiver
+        // gets the identical oldest batch on every drain forever — never the new jobs. Past
+        // QUEUE_DRAINED_BATCH unreported jobs it would never see them at all until the command
+        // is fixed. Each mechanism therefore carries its own watermark.
+        let runner = Arc::new(WorkingWebhookFailingCommandRunner::default());
+        let (ctx, sink, _disp) = test_ctx_with_hook_runner(test_conn(), runner.clone());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        // Written directly: queue_drained_command is deliberately absent from ALLOWED_KEYS.
+        set_setting(&ctx.db, "queue_drained_command", "/config/hooks/drained.sh");
+
+        book_history(&ctx, 3, |i| format!("2026-01-01T00:00:0{i}+00:00"));
+        crate::hooks::fire_queue_drained(&ctx);
+
+        // Positive control: the command really was attempted and really was refused, so an
+        // un-advanced command watermark cannot pass by way of nothing having fired.
+        assert_eq!(runner.commands.lock().unwrap().len(), 1);
+        let failed = sink.payloads("hook-failed");
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("command:"),
+            "the failure must name the mechanism: {:?}",
+            failed[0]["reason"]
+        );
+
+        assert_eq!(runner.webhooks.lock().unwrap().len(), 1);
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            completed_at_of(&ctx.db, "h0002"),
+            "the webhook delivered, so ITS watermark advances"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            "",
+            "the command failed, so its own watermark stays put and it will retry"
+        );
+
+        // A later drain, with new work behind it. The webhook must receive the NEW jobs — not
+        // the batch it has already been given.
+        book_history_prefixed(&ctx, "n", 2, |i| format!("2026-01-02T00:00:0{i}+00:00"));
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let sent = runner.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 2, "the webhook fired again");
+        assert_eq!(
+            body_job_ids(&sent[1].body),
+            ["n0000", "n0001"],
+            "the working webhook moves on; at-least-once covers a retry, not an infinite replay"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            "",
+            "and the broken command is still pinned where it was"
+        );
+        // The command's own loop keeps retrying from ITS watermark, so it re-offers the OLDEST
+        // batch — which now includes the new rows, since nothing has ever been delivered to it.
+        let commands = runner.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        let payload: serde_json::Value = serde_json::from_str(
+            &commands[1]
+                .env
+                .iter()
+                .find(|(k, _)| k == "CONVERTBAR_PAYLOAD")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert_eq!(
+            payload["jobs"].as_array().unwrap().len(),
+            5,
+            "the command retries its whole unreported backlog, oldest first"
+        );
+    }
+
+    #[test]
+    fn a_mechanism_that_is_not_configured_advances_no_watermark_and_is_not_a_failure() {
+        // "Not configured" must not read as "failed" — otherwise a webhook-only install would
+        // be held back by the command watermark it never had, which is the same starvation
+        // from the other direction.
+        let (ctx, sink, _disp, hooks) = test_ctx_hooks(test_conn());
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+
+        book_history(&ctx, 2, |i| format!("2026-01-01T00:00:0{i}+00:00"));
+        crate::hooks::fire_queue_drained(&ctx);
+
+        assert_eq!(hooks.webhooks.lock().unwrap().len(), 1);
+        assert!(hooks.commands.lock().unwrap().is_empty());
+        assert!(
+            sink.payloads("hook-failed").is_empty(),
+            "an unconfigured mechanism is not a failure"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            completed_at_of(&ctx.db, "h0001")
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            "",
+            "an unconfigured mechanism has no watermark to advance"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_seeds_both_watermarks_from_the_pre_split_key() {
+        // Without the migration, upgrading to per-mechanism watermarks makes both keys absent,
+        // an absent watermark sorts before every timestamp, and the user's receiver is handed
+        // their entire History again. The legacy row is left in place on purpose so a rollback
+        // still finds it.
+        let conn = test_conn();
+        let watermark = "2026-01-01T00:00:05+00:00";
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_queue_drained_at', ?1)",
+            params![watermark],
+        )
+        .unwrap();
+        // Re-running init_db is what an upgrade does on its next boot.
+        crate::db::init_db(&conn).unwrap();
+        let (ctx, _sink, _disp, hooks) = test_ctx_hooks(conn);
+
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            watermark
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            watermark
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at"),
+            watermark,
+            "the legacy row survives, so a rollback does not replay History"
+        );
+
+        // And it is a seed, not a burst: a job that completed BEFORE the old watermark is not
+        // re-reported, while one after it is.
+        set_setting(
+            &ctx.db,
+            "queue_drained_webhook_url",
+            "http://receiver.invalid/hook",
+        );
+        book_history(&ctx, 1, |_| "2026-01-01T00:00:01+00:00".to_string());
+        book_history_prefixed(&ctx, "n", 1, |_| "2026-01-01T00:00:09+00:00".to_string());
+        crate::hooks::fire_queue_drained(&ctx);
+
+        let sent = hooks.webhooks.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(body_job_ids(&sent[0].body), ["n0000"]);
+    }
+
+    #[test]
+    fn the_migration_never_drags_an_advanced_watermark_backwards() {
+        // init_db runs on EVERY boot, not just the upgrade one. INSERT OR IGNORE is what keeps
+        // a key that has since advanced from being reset to the stale legacy value — which
+        // would re-report every job in between, on every restart.
+        let conn = test_conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) \
+             VALUES ('last_queue_drained_at', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) \
+             VALUES ('last_queue_drained_at_webhook', '2026-06-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+
+        crate::db::init_db(&conn).unwrap();
+
+        let (ctx, _sink, _disp, _hooks) = test_ctx_hooks(conn);
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_webhook"),
+            "2026-06-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            setting_value(&ctx.db, "last_queue_drained_at_command"),
+            "2026-01-01T00:00:00+00:00",
+            "the key that had not advanced is still seeded"
         );
     }
 }

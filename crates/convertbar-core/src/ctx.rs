@@ -17,6 +17,7 @@ pub struct Ctx {
     /// HandBrakeCLI at most once per process lifetime.
     pub preset_cache: Mutex<HashMap<String, crate::handbrake::PresetMetadata>>,
     pub watcher: crate::watcher::WatcherState,
+    pub hooks: crate::hooks::HookSetup,
 }
 
 impl Ctx {
@@ -25,6 +26,7 @@ impl Ctx {
         events: Arc<dyn crate::events::EventSink>,
         disposer: Arc<dyn crate::dispose::FileDisposer>,
         handbrake: Arc<dyn crate::handbrake::HandbrakeLocator>,
+        hooks: crate::hooks::HookSetup,
     ) -> Arc<Self> {
         Arc::new(Self {
             db: Arc::new(Mutex::new(conn)),
@@ -34,6 +36,27 @@ impl Ctx {
             handbrake,
             preset_cache: Mutex::new(HashMap::new()),
             watcher: crate::watcher::WatcherState::new(),
+            hooks,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctx_carries_the_hook_setup_it_was_given() {
+        let ctx = Ctx::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            std::sync::Arc::new(crate::events::TestSink::default()),
+            std::sync::Arc::new(crate::dispose::RecordingDisposer::default()),
+            std::sync::Arc::new(crate::handbrake::AbsentLocator),
+            crate::hooks::HookSetup {
+                runner: std::sync::Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: false,
+            },
+        );
+        assert!(!ctx.hooks.allow_stored_command);
     }
 }

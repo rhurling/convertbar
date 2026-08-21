@@ -54,6 +54,9 @@ pub fn run() {
             commands::settings::update_setting,
             commands::settings::get_preset_suffix,
             commands::settings::set_preset_suffix,
+            commands::hooks::get_command_hooks,
+            commands::hooks::set_command_hook,
+            commands::hooks::pick_file,
             commands::handbrake::detect_handbrake,
             commands::handbrake::list_handbrake_presets,
             commands::handbrake::generate_preset_suffix,
@@ -110,6 +113,10 @@ pub fn run() {
                 events,
                 Arc::new(sink::TrashDisposer),
                 Arc::new(convertbar_core::handbrake::PathLocator),
+                convertbar_core::hooks::HookSetup {
+                    runner: Arc::new(convertbar_core::hooks::HttpHookRunner),
+                    allow_stored_command: true,
+                },
             );
             app.manage(ctx.clone());
 

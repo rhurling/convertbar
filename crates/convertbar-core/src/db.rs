@@ -225,6 +225,26 @@ pub fn init_db(conn: &Connection) -> Result<DbInit> {
 
     backfill_canonical_watch_paths(conn)?;
 
+    // The single `last_queue_drained_at` watermark became one per delivery mechanism (see
+    // hooks.rs, `Mechanism::watermark_key`). Seed each new key from the old value so an
+    // upgrading user is not handed a second full-History burst.
+    //
+    // INSERT OR IGNORE, so a key that has already advanced on its own is never dragged back to
+    // the legacy value — this runs on every boot, not just the first. The SELECT yields no row
+    // when the legacy key was never written, so a fresh install stays unseeded: an ABSENT
+    // watermark is what makes the first drain report everything, and that is by design.
+    //
+    // The legacy row is deliberately left in place rather than deleted. It is one stale settings
+    // row, and keeping it means a rollback to an earlier build still finds its watermark instead
+    // of replaying the whole of History into the user's receiver on its first drain.
+    for key in crate::hooks::Mechanism::ALL.map(|m| m.watermark_key()) {
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value)
+             SELECT ?1, value FROM settings WHERE key = ?2",
+            rusqlite::params![key, crate::hooks::LEGACY_WATERMARK_KEY],
+        )?;
+    }
+
     let defaults: &[(&str, &str)] = &[
         ("preset", preset),
         ("cleanup_mode", "trash"),
@@ -245,6 +265,14 @@ pub fn init_db(conn: &Connection) -> Result<DbInit> {
         ("bad_source_action", "trash"),
         ("update_mode", "automatic"),
         ("history_show_duration", "true"),
+        ("post_convert_webhook_url", ""),
+        ("post_convert_webhook_headers", ""),
+        ("post_convert_webhook_body", ""),
+        ("queue_drained_webhook_url", ""),
+        ("queue_drained_webhook_headers", ""),
+        ("queue_drained_webhook_body", ""),
+        ("hook_path_map", ""),
+        ("hook_timeout_seconds", "30"),
     ];
 
     for (key, value) in defaults {
@@ -307,7 +335,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 19);
+        assert_eq!(count, 27);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -395,7 +423,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 19);
+        assert_eq!(count, 27);
     }
 
     #[test]

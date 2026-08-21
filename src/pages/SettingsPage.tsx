@@ -1,10 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
 import UpdatePanel from "../components/UpdatePanel";
 import { isServerHead } from "../lib/head";
 import { RELEASES_URL } from "../lib/releases";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
+
+// get_command_hooks / set_command_hook are desktop-only #[tauri::command]s that bypass the
+// `commands` transport abstraction on purpose (CLAUDE.md, "Permissions (ACL)" background in
+// task 7): they are absent from ALLOWED_KEYS so the server head's HTTP API can't reach them, so
+// there is no httpCommands twin to unify them behind. Called only when !isServerHead.
+interface CommandHooksResponse {
+  postConvert: string;
+  queueDrained: string;
+}
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
 
@@ -51,6 +61,27 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [suffixDraft, setSuffixDraft] = useState(presetSuffix);
   const [resolvedSuffix, setResolvedSuffix] = useState("");
 
+  // Same commit-on-blur draft pattern as above, for the eight hook settings (task 3) plus the
+  // desktop-only command hook (task 7, fetched separately below).
+  const [pcUrlDraft, setPcUrlDraft] = useState(settings?.post_convert_webhook_url ?? "");
+  const [pcHeadersDraft, setPcHeadersDraft] = useState(settings?.post_convert_webhook_headers ?? "");
+  const [pcBodyDraft, setPcBodyDraft] = useState(settings?.post_convert_webhook_body ?? "");
+  const [qdUrlDraft, setQdUrlDraft] = useState(settings?.queue_drained_webhook_url ?? "");
+  const [qdHeadersDraft, setQdHeadersDraft] = useState(settings?.queue_drained_webhook_headers ?? "");
+  const [qdBodyDraft, setQdBodyDraft] = useState(settings?.queue_drained_webhook_body ?? "");
+  const [pathMapDraft, setPathMapDraft] = useState(settings?.hook_path_map ?? "");
+  const [timeoutDraft, setTimeoutDraft] = useState(settings?.hook_timeout_seconds ?? "30");
+
+  // Command hooks: fetched via get_command_hooks (not part of `settings`), so `null` here means
+  // "not yet loaded" — distinct from "" (loaded, empty) — the same guard shape `commitDrafts`
+  // uses for `settings` itself, so an unmount before the fetch lands writes nothing. Two
+  // independent pairs, one per trigger — queue_drained is the primary use case (a library
+  // rescan once per batch), so it gets full parity with post_convert, not a lesser field.
+  const [pcCommandHook, setPcCommandHook] = useState<string | null>(null);
+  const [pcCommandDraft, setPcCommandDraft] = useState("");
+  const [qdCommandHook, setQdCommandHook] = useState<string | null>(null);
+  const [qdCommandDraft, setQdCommandDraft] = useState("");
+
   // getAppInfo() works on both heads (desktop composes it from getVersion() internally, server
   // hits /api/info). The version is only rendered on the server head, but the priority caveat is
   // per-OS and so is needed on both.
@@ -75,6 +106,59 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   useEffect(() => {
     setSuffixDraft(presetSuffix);
   }, [presetSuffix]);
+  useEffect(() => {
+    if (settings) setPcUrlDraft(settings.post_convert_webhook_url);
+  }, [settings?.post_convert_webhook_url]);
+  useEffect(() => {
+    if (settings) setPcHeadersDraft(settings.post_convert_webhook_headers);
+  }, [settings?.post_convert_webhook_headers]);
+  useEffect(() => {
+    if (settings) setPcBodyDraft(settings.post_convert_webhook_body);
+  }, [settings?.post_convert_webhook_body]);
+  useEffect(() => {
+    if (settings) setQdUrlDraft(settings.queue_drained_webhook_url);
+  }, [settings?.queue_drained_webhook_url]);
+  useEffect(() => {
+    if (settings) setQdHeadersDraft(settings.queue_drained_webhook_headers);
+  }, [settings?.queue_drained_webhook_headers]);
+  useEffect(() => {
+    if (settings) setQdBodyDraft(settings.queue_drained_webhook_body);
+  }, [settings?.queue_drained_webhook_body]);
+  useEffect(() => {
+    if (settings) setPathMapDraft(settings.hook_path_map);
+  }, [settings?.hook_path_map]);
+  useEffect(() => {
+    if (settings) setTimeoutDraft(settings.hook_timeout_seconds);
+  }, [settings?.hook_timeout_seconds]);
+
+  // The server head can't serve this value (get_command_hooks is desktop-only), so it must never
+  // be called there — not even to read. Fires once, when `settings` first finishes loading
+  // (mirrors the rest of the page's gate on rendering at all), not on every settings change.
+  useEffect(() => {
+    if (isServerHead || !settings) return;
+    invoke<CommandHooksResponse>("get_command_hooks")
+      .then((hooks) => {
+        setPcCommandHook(hooks.postConvert);
+        setQdCommandHook(hooks.queueDrained);
+      })
+      .catch((e) => {
+        // Swallowing this used to disable the fields permanently and invisibly: both hooks stay
+        // `null`, which renders as "" (indistinguishable from "no hook configured") AND blocks
+        // every write through the `!== null` guard in the commits below, with nothing to retry
+        // it. Log it (the page's convention for a bespoke invoke that has no error banner), and
+        // fall back to "" so the guard opens — a user who then edits the field writes a real
+        // value rather than being silently ignored forever.
+        console.error("Couldn't read the command hooks:", e);
+        setPcCommandHook("");
+        setQdCommandHook("");
+      });
+  }, [!!settings]);
+  useEffect(() => {
+    if (pcCommandHook !== null) setPcCommandDraft(pcCommandHook);
+  }, [pcCommandHook]);
+  useEffect(() => {
+    if (qdCommandHook !== null) setQdCommandDraft(qdCommandHook);
+  }, [qdCommandHook]);
 
   // Preview resolves the *draft* (so it updates as you type) via the backend resolver —
   // never a JS reimplementation, which diverged from the real output-name algorithm.
@@ -126,6 +210,95 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     if (suffixDraft !== presetSuffix) updatePresetSuffix(suffixDraft);
   };
 
+  const commitPcUrl = () => {
+    if (pcUrlDraft !== settings?.post_convert_webhook_url)
+      updateSetting("post_convert_webhook_url", pcUrlDraft);
+  };
+  const commitPcHeaders = () => {
+    if (pcHeadersDraft !== settings?.post_convert_webhook_headers)
+      updateSetting("post_convert_webhook_headers", pcHeadersDraft);
+  };
+  const commitPcBody = () => {
+    if (pcBodyDraft !== settings?.post_convert_webhook_body)
+      updateSetting("post_convert_webhook_body", pcBodyDraft);
+  };
+  const commitQdUrl = () => {
+    if (qdUrlDraft !== settings?.queue_drained_webhook_url)
+      updateSetting("queue_drained_webhook_url", qdUrlDraft);
+  };
+  const commitQdHeaders = () => {
+    if (qdHeadersDraft !== settings?.queue_drained_webhook_headers)
+      updateSetting("queue_drained_webhook_headers", qdHeadersDraft);
+  };
+  const commitQdBody = () => {
+    if (qdBodyDraft !== settings?.queue_drained_webhook_body)
+      updateSetting("queue_drained_webhook_body", qdBodyDraft);
+  };
+  const commitPathMap = () => {
+    if (pathMapDraft !== settings?.hook_path_map)
+      updateSetting("hook_path_map", pathMapDraft);
+  };
+  const commitTimeout = () => {
+    if (timeoutDraft !== settings?.hook_timeout_seconds)
+      updateSetting("hook_timeout_seconds", timeoutDraft);
+  };
+
+  // Not routed through useSettings/updateSetting: set_command_hook is the bespoke desktop-only
+  // command (see the CommandHooksResponse comment above), so this manages its own "last known
+  // committed value" instead of relying on the settings object's optimistic-merge machinery.
+  // The page has no general mechanism to surface a failed bespoke `invoke()` the way
+  // `useSettings.updateSetting` surfaces failed setting writes via its `error` state (that
+  // banner is wired to useSettings's own writes only) — console.error at minimum keeps a
+  // rejected write from vanishing silently.
+  // Takes the value explicitly rather than reading the draft, so `pick*Command` can persist the
+  // path it just received: `setPcCommandDraft` does not update the state this closure captured.
+  const savePcCommand = (command: string) => {
+    if (pcCommandHook !== null && command !== pcCommandHook) {
+      invoke("set_command_hook", { trigger: "post_convert", command })
+        // Only advance the committed value on success — a rejected write must leave the old
+        // "last known committed" value in place, so the guard above still sees a diff and the
+        // next blur retries instead of silently believing the write already landed.
+        .then(() => setPcCommandHook(command))
+        .catch((e) => console.error("Couldn't save post-convert command hook:", e));
+    }
+  };
+  const saveQdCommand = (command: string) => {
+    if (qdCommandHook !== null && command !== qdCommandHook) {
+      invoke("set_command_hook", { trigger: "queue_drained", command })
+        .then(() => setQdCommandHook(command))
+        .catch((e) => console.error("Couldn't save queue-drained command hook:", e));
+    }
+  };
+
+  const commitPcCommand = () => savePcCommand(pcCommandDraft);
+  const commitQdCommand = () => saveQdCommand(qdCommandDraft);
+
+  // Commits on pick, NOT draft-only. Persistence cannot ride on the input's `onBlur` here:
+  // clicking Browse focuses the button (and on macOS WKWebView may take no focus at all), so
+  // the input never blurs — the user saw the path appear, quit from the Settings tab, and the
+  // hook was never saved. Worse, when the input *was* focused, the blur committed the
+  // PRE-pick draft and then stranded the picked value. Cancel stays a no-op.
+  const pickPcCommand = async () => {
+    const path = await invoke<string | null>("pick_file").catch((e) => {
+      console.error("Couldn't open the file picker:", e);
+      return null;
+    });
+    if (path !== null) {
+      setPcCommandDraft(path);
+      savePcCommand(path);
+    }
+  };
+  const pickQdCommand = async () => {
+    const path = await invoke<string | null>("pick_file").catch((e) => {
+      console.error("Couldn't open the file picker:", e);
+      return null;
+    });
+    if (path !== null) {
+      setQdCommandDraft(path);
+      saveQdCommand(path);
+    }
+  };
+
   // Commit-on-blur alone loses data: crossing the 1300px layout breakpoint swaps App's two JSX
   // trees and remounts this page (browser zoom crosses it without touching the window), and an
   // unmount fires no `blur` — so a typed-but-unblurred draft was silently discarded. Flushing the
@@ -136,11 +309,22 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     // those would persist them over the user's stored values, so a pre-load unmount writes
     // nothing; each commit's own equality guard covers the loaded case. This is also what keeps
     // StrictMode's dev-only mount/unmount/mount cycle from writing anything.
+    // Both independently guarded by their own `*CommandHook !== null`, not by `settings`.
+    commitPcCommand();
+    commitQdCommand();
     if (!settings) return;
     commitHbPath();
     commitMarker();
     commitDisk();
     commitSuffix();
+    commitPcUrl();
+    commitPcHeaders();
+    commitPcBody();
+    commitQdUrl();
+    commitQdHeaders();
+    commitQdBody();
+    commitPathMap();
+    commitTimeout();
   };
   const commitDraftsRef = useRef(commitDrafts);
   useEffect(() => {
@@ -425,9 +609,12 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       </div>
 
       <div className="setting-group">
-        <label className="setting-label">Pause when destination free space is low</label>
+        <label className="setting-label" htmlFor="low-disk-min-gb">
+          Pause when destination free space is low
+        </label>
         <div className="setting-row">
           <input
+            id="low-disk-min-gb"
             className="setting-input"
             type="number"
             min="0"
@@ -467,6 +654,208 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           your downloader creates while downloading. Leave empty to disable.
         </p>
       </div>
+
+      <h2 className="setting-section-heading">Hooks</h2>
+
+      <div className="setting-group">
+        <label className="setting-label" htmlFor="post-convert-url">
+          After each conversion — URL
+        </label>
+        <input
+          id="post-convert-url"
+          className="setting-input"
+          type="text"
+          value={pcUrlDraft}
+          onChange={(e) => setPcUrlDraft(e.target.value)}
+          onBlur={commitPcUrl}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+          placeholder="https://example.com/webhook"
+        />
+        <label className="setting-label" htmlFor="post-convert-headers">
+          After each conversion — Headers
+        </label>
+        <textarea
+          id="post-convert-headers"
+          className="setting-input"
+          rows={2}
+          value={pcHeadersDraft}
+          onChange={(e) => setPcHeadersDraft(e.target.value)}
+          onBlur={commitPcHeaders}
+          placeholder="ApiKey: your-key"
+        />
+        <label className="setting-label" htmlFor="post-convert-body">
+          After each conversion — Body
+        </label>
+        <textarea
+          id="post-convert-body"
+          className="setting-input"
+          rows={3}
+          value={pcBodyDraft}
+          onChange={(e) => setPcBodyDraft(e.target.value)}
+          onBlur={commitPcBody}
+          placeholder="Leave empty to send the raw JSON payload"
+        />
+        {!isServerHead && (
+          <>
+            <label className="setting-label" htmlFor="post-convert-command">
+              Command to run after each conversion
+            </label>
+            <div className="setting-row">
+              <input
+                id="post-convert-command"
+                className="setting-input flex-1"
+                type="text"
+                value={pcCommandDraft}
+                onChange={(e) => setPcCommandDraft(e.target.value)}
+                onBlur={commitPcCommand}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+                placeholder="/path/to/script.sh"
+              />
+              <button
+                className="btn btn-small"
+                onClick={pickPcCommand}
+                aria-label="Choose a script to run after each conversion"
+              >
+                Browse
+              </button>
+            </div>
+          </>
+        )}
+        <p className="setting-hint">
+          Fires after every file finishes converting, whether it succeeded or failed. Leave the
+          URL and command empty to disable.
+        </p>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label" htmlFor="queue-drained-url">
+          When the queue finishes — URL
+        </label>
+        <input
+          id="queue-drained-url"
+          className="setting-input"
+          type="text"
+          value={qdUrlDraft}
+          onChange={(e) => setQdUrlDraft(e.target.value)}
+          onBlur={commitQdUrl}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+          placeholder="https://example.com/webhook"
+        />
+        <label className="setting-label" htmlFor="queue-drained-headers">
+          When the queue finishes — Headers
+        </label>
+        <textarea
+          id="queue-drained-headers"
+          className="setting-input"
+          rows={2}
+          value={qdHeadersDraft}
+          onChange={(e) => setQdHeadersDraft(e.target.value)}
+          onBlur={commitQdHeaders}
+          placeholder="ApiKey: your-key"
+        />
+        <label className="setting-label" htmlFor="queue-drained-body">
+          When the queue finishes — Body
+        </label>
+        <textarea
+          id="queue-drained-body"
+          className="setting-input"
+          rows={3}
+          value={qdBodyDraft}
+          onChange={(e) => setQdBodyDraft(e.target.value)}
+          onBlur={commitQdBody}
+          placeholder="Leave empty to send the raw JSON payload"
+        />
+        {!isServerHead && (
+          <>
+            <label className="setting-label" htmlFor="queue-drained-command">
+              Command to run when the queue finishes
+            </label>
+            <div className="setting-row">
+              <input
+                id="queue-drained-command"
+                className="setting-input flex-1"
+                type="text"
+                value={qdCommandDraft}
+                onChange={(e) => setQdCommandDraft(e.target.value)}
+                onBlur={commitQdCommand}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+                placeholder="/path/to/script.sh"
+              />
+              <button
+                className="btn btn-small"
+                onClick={pickQdCommand}
+                aria-label="Choose a script to run when the queue finishes"
+              >
+                Browse
+              </button>
+            </div>
+          </>
+        )}
+        <p className="setting-hint">
+          Fires once the queue empties — not on every pause, only a true drain. Leave the URL
+          and command empty to disable.
+        </p>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label" htmlFor="hook-path-map">
+          Path mapping
+        </label>
+        <textarea
+          id="hook-path-map"
+          className="setting-input"
+          rows={3}
+          value={pathMapDraft}
+          onChange={(e) => setPathMapDraft(e.target.value)}
+          onBlur={commitPathMap}
+          placeholder="/media => /data"
+        />
+        <p className="setting-hint">
+          One rule per line. Applies to webhooks only — a command hook receives raw paths.
+        </p>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label" htmlFor="hook-timeout">
+          Timeout (seconds)
+        </label>
+        <input
+          id="hook-timeout"
+          className="setting-input"
+          type="number"
+          min="1"
+          step="1"
+          value={timeoutDraft}
+          onChange={(e) => setTimeoutDraft(e.target.value)}
+          onBlur={commitTimeout}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+        />
+        <p className="setting-hint">
+          Per hook. With both a webhook and a command configured, a dead receiver costs twice
+          this per job.
+        </p>
+      </div>
+
+      {isServerHead && (
+        <div className="setting-group">
+          <span className="setting-label">Command hooks</span>
+          <p className="setting-hint">
+            Set by environment variable on the server head (
+            <code>CONVERTBAR_POST_CONVERT_COMMAND</code> and{" "}
+            <code>CONVERTBAR_QUEUE_DRAINED_COMMAND</code>).
+          </p>
+        </div>
+      )}
 
       <div className="setting-group">
         <label className="setting-label">History</label>

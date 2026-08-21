@@ -17,21 +17,26 @@ use crate::events::EventSinkExt;
 /// (Re)starts the queue if it isn't already running, clearing any remembered pause first — a
 /// user (re)starting the queue (Resume button, or a drag-drop add which routes through this).
 pub fn start_queue(ctx: &Arc<Ctx>) -> Result<(), String> {
-    let is_running = *ctx.converter.is_running.lock().map_err(|e| e.to_string())?;
-    if is_running {
+    // Claim FIRST, then clear the pause, then spawn — rather than the historical
+    // check-`is_running`, clear, `run_queue` — for two reasons:
+    //
+    // 1. `claim_queue_slot` is the single place that decides what a refusal MEANS. A hand-rolled
+    //    `is_running` short-circuit here returned Ok silently and recorded nothing, so a file
+    //    added through the UI or the HTTP API while the queue was busy — every user-initiated
+    //    add goes through this function, `queue_ops::add_files` does not start the queue itself —
+    //    was stranded for as long as the run lasted. With a `queue-drained` hook that is minutes,
+    //    not milliseconds. Routing through the claim records the refusal, and `process_queue`
+    //    picks the work up before it exits.
+    // 2. It subsumes the separate install-interlock check this function used to need. That check
+    //    existed only because `run_queue`'s claim refused AFTER the paused flag had already been
+    //    cleared, leaving the queue neither running nor paused. Claiming before touching the
+    //    pause removes the ordering hazard structurally instead of guarding against it — and the
+    //    interlock refusal deliberately does NOT record work arriving.
+    if !converter::claim_queue_slot(&ctx.converter) {
         return Ok(());
     }
 
-    // An update install holds the queue interlock, so `run_queue`'s claim would refuse below —
-    // after the paused flag had already been cleared, leaving the queue neither running nor
-    // paused. Bail before touching it; the user can start again once the install is done.
-    if ctx
-        .converter
-        .installing
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        return Ok(());
-    }
+    // The slot is ours from here: `process_queue`'s `RunningGuard` releases it.
 
     // A user (re)starting the queue — Resume button, or a drag-drop add which routes through
     // startQueue — clears any remembered pause.
@@ -39,7 +44,7 @@ pub fn start_queue(ctx: &Arc<Ctx>) -> Result<(), String> {
         converter::set_queue_paused(&conn, false);
     }
 
-    converter::run_queue(ctx.clone());
+    converter::spawn_queue_thread(ctx.clone());
     Ok(())
 }
 
@@ -401,6 +406,10 @@ mod tests {
             Arc::new(crate::events::TestSink::default()),
             Arc::new(crate::dispose::DeleteDisposer),
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         )
     }
 
@@ -630,6 +639,10 @@ mod tests {
             sink.clone(),
             Arc::new(crate::dispose::DeleteDisposer),
             Arc::new(crate::handbrake::PanickingLocator),
+            crate::hooks::HookSetup {
+                runner: Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         );
         sink.db.set(ctx.db.clone()).unwrap();
 

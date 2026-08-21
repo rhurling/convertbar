@@ -538,6 +538,10 @@ mod tests {
             std::sync::Arc::new(crate::events::TestSink::default()),
             std::sync::Arc::new(crate::dispose::DeleteDisposer),
             locator,
+            crate::hooks::HookSetup {
+                runner: std::sync::Arc::new(crate::hooks::RecordingHookRunner::default()),
+                allow_stored_command: true,
+            },
         )
     }
 
