@@ -36,6 +36,14 @@ function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings {
     update_mode: "automatic",
     history_show_duration: true,
     encode_priority: "normal",
+    post_convert_webhook_url: "",
+    post_convert_webhook_headers: "",
+    post_convert_webhook_body: "",
+    queue_drained_webhook_url: "",
+    queue_drained_webhook_headers: "",
+    queue_drained_webhook_body: "",
+    hook_path_map: "",
+    hook_timeout_seconds: "30",
     ...overrides,
   };
 }

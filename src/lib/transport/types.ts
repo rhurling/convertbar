@@ -101,6 +101,14 @@ export interface AppSettings {
   // Narrowed like bad_source_action: get_settings normalizes the raw stored string before
   // returning it, so only these three ever reach the frontend.
   encode_priority: "normal" | "low" | "idle";
+  post_convert_webhook_url: string;
+  post_convert_webhook_headers: string;
+  post_convert_webhook_body: string;
+  queue_drained_webhook_url: string;
+  queue_drained_webhook_headers: string;
+  queue_drained_webhook_body: string;
+  hook_path_map: string;
+  hook_timeout_seconds: string;
 }
 
 export interface PathsExist {

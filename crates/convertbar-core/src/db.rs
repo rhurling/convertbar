@@ -245,6 +245,14 @@ pub fn init_db(conn: &Connection) -> Result<DbInit> {
         ("bad_source_action", "trash"),
         ("update_mode", "automatic"),
         ("history_show_duration", "true"),
+        ("post_convert_webhook_url", ""),
+        ("post_convert_webhook_headers", ""),
+        ("post_convert_webhook_body", ""),
+        ("queue_drained_webhook_url", ""),
+        ("queue_drained_webhook_headers", ""),
+        ("queue_drained_webhook_body", ""),
+        ("hook_path_map", ""),
+        ("hook_timeout_seconds", "30"),
     ];
 
     for (key, value) in defaults {
@@ -307,7 +315,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 19);
+        assert_eq!(count, 27);
 
         // Platform-neutral fixed defaults.
         assert_eq!(setting(&conn, "cleanup_mode").as_deref(), Some("trash"));
@@ -395,7 +403,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 19);
+        assert_eq!(count, 27);
     }
 
     #[test]
