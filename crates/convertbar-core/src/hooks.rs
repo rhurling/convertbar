@@ -85,8 +85,14 @@ pub fn queue_drained_payload(jobs: &[JobPayload]) -> Value {
 
     json!({
         "event": "queue-drained",
-        // From the reported set, NOT from had_errors: a cancelled job sets had_errors but
-        // contributes no row, and {"run_status":"error","errors":0} must be impossible.
+        // From the reported set, NOT from had_errors: `had_errors` can be true for a run whose
+        // error rows fall OUTSIDE this window — the low-disk and shutdown paths set it without
+        // booking anything reportable, and a cancellation sets it for a row that may already sit
+        // behind the watermark — and {"run_status":"error","errors":0} must be impossible.
+        // A cancelled job itself is NOT excluded: `control::cancel_conversion` writes
+        // status='error' WITH completed_at, so `load_jobs_since` selects it and it appears here
+        // as an error row. The spec intends that (see its "Cancellation" section) — the drain
+        // payload is a ledger of what the queue did, and a cancellation belongs in the ledger.
         "run_status": if errors > 0 { "error" } else { "idle" },
         "completed": completed,
         "errors": errors,
@@ -1134,10 +1140,11 @@ mod tests {
     }
 
     #[test]
-    fn queue_drained_run_status_ignores_cancelled_jobs() {
-        // run_status comes from the reported set, never from had_errors — a cancelled job
-        // sets had_errors but contributes no row, and {"run_status":"error","errors":0}
-        // must be unrepresentable.
+    fn queue_drained_run_status_comes_from_the_reported_set() {
+        // Never from had_errors, which can be true for a run whose error rows fall outside
+        // this window (low-disk, shutdown, or a cancellation already behind the watermark):
+        // {"run_status":"error","errors":0} must be unrepresentable. A cancelled job whose row
+        // IS in the window is reported like any other error row — it carries completed_at.
         assert_eq!(queue_drained_payload(&[sample()])["run_status"], "idle");
         assert_eq!(queue_drained_payload(&[errored()])["run_status"], "error");
     }
