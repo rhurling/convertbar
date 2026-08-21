@@ -96,18 +96,26 @@ Two changes fix this:
    `get_next_job` → `None` break. The pause break leaves it false and fires nothing.
 2. **Derive the job list from a persisted watermark, not an in-memory `Vec`.** A run-local
    accumulator cannot survive a pause, a low-disk stop, a quit, or a crash — exactly the
-   interruptions a long Unraid queue actually hits. Instead a `last_queue_drained_at` row in
-   `settings` holds the `completed_at` of the newest job already reported. On a true drain the
-   hook selects `jobs` rows with `completed_at > last_queue_drained_at`, ordered by
-   `completed_at`, fires, and only then advances the watermark to the newest `completed_at` in
-   that set.
+   interruptions a long Unraid queue actually hits. Instead a `settings` row holds the
+   `completed_at` of the newest job already reported. On a true drain the hook selects `jobs`
+   rows with `completed_at > watermark`, ordered by `completed_at`, fires, and only then
+   advances the watermark to the newest `completed_at` in that set.
+3. **One watermark per delivery mechanism**, `last_queue_drained_at_webhook` and
+   `last_queue_drained_at_command`, each with its own batch loop. A single shared watermark
+   advances only when *every* configured mechanism delivers, so with both configured a webhook
+   that works is pinned behind a command that fails: it re-receives the identical oldest batch
+   on every drain forever, and once the unreported backlog exceeds `QUEUE_DRAINED_BATCH` it
+   never sees the jobs behind that batch at all. At-least-once delivery covers a retry, not an
+   infinite replay. A mechanism that is not configured has no watermark to advance and is not
+   treated as a failure.
 
 This makes the payload correct across every interruption path: work completed before a pause is
 reported by the drain that eventually follows it. It also means **a drain with nothing new fires
 nothing at all** — an idle queue does not emit empty `queue-drained` payloads.
 
-The watermark advances only after a successful fire, so a failed hook re-reports the same jobs on
-the next drain rather than losing them. "Successful" is `dispatch` returning
+A mechanism's watermark advances only after a successful fire **to that mechanism**, so a failed
+hook re-reports the same jobs to it on the next drain rather than losing them — and leaves the
+other mechanism's watermark alone. "Successful" is `dispatch_mechanism` returning
 `DispatchOutcome::Delivered` — an explicit outcome, deliberately not a failure counter's delta.
 The counter could not represent the third case: a shutdown return is neither a success nor a
 failure, and read as "no failure seen" it advanced the watermark past jobs nothing was ever sent
@@ -262,8 +270,9 @@ argument, and a rescan of a path that was deleted is at best wasted work.
 `completed` counts `done` and `skipped` jobs; `errors` counts `error` jobs. `space_saved` is the
 sum over all jobs and, like the per-job field, can be negative.
 
-The job set comes from the `last_queue_drained_at` watermark query described under "Trigger
-points", not from an in-memory accumulator, so it survives pauses, low-disk stops, and restarts.
+The job set comes from the watermark query described under "Trigger points" — the *receiving
+mechanism's* watermark, so the two can be at different points in History — not from an in-memory
+accumulator, so it survives pauses, low-disk stops, and restarts.
 It arrives in batches of up to `QUEUE_DRAINED_BATCH` (100) jobs, not as one payload per drain —
 see the batching rule under "Trigger points". **The first drain after a hook is configured
 reports the entire completed History**, batched, because there is no watermark yet.
@@ -419,8 +428,9 @@ the default 30.
 
 ### Internal state, not user-editable
 
-`last_queue_drained_at` holds the watermark. It is written by the engine, never by a user, so it
-is **absent from `ALLOWED_KEYS` and from the `Settings` struct** — the same treatment the three
+`last_queue_drained_at_webhook` and `last_queue_drained_at_command` hold the watermarks (one per
+mechanism, see "Trigger points"). They are written by the engine, never by a user, so both are
+**absent from `ALLOWED_KEYS` and from the `Settings` struct** — the same treatment the three
 updater keys already get (`update_skipped_version`, `update_notified_version`,
 `update_installed`), and the existing test that pins those exclusions is the model. An absent or
 unparseable value reads as "no watermark", meaning the first drain reports every completed job in
@@ -678,8 +688,11 @@ express what the payload already carries.
 ## Open items for the implementation plan
 
 - Migration is additive only: new `settings` rows via the existing `INSERT OR IGNORE` defaults
-  block, plus the engine-written `last_queue_drained_at`. No schema change to `jobs`, so nothing
-  to review for backward compatibility.
+  block, plus the engine-written watermarks. No schema change to `jobs`, so nothing to review for
+  backward compatibility. `db::init_db` also seeds both per-mechanism watermarks from the
+  pre-split `last_queue_drained_at` where that row exists, with `INSERT OR IGNORE` so a boot
+  after one has advanced cannot drag it back; the pre-split row is left in place so a rollback
+  still finds its watermark instead of replaying History.
 - Release notes must mention the first-drain burst described under "Internal state".
 - README and `docker-compose.example.yml` gain the hook environment variables and a worked Stash
   example. `unraid-template.xml` gains the two command variables.

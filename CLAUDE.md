@@ -110,7 +110,7 @@ Window position is persisted across restarts via `tauri-plugin-window-state`. Sc
 
 `crates/convertbar-core/src/hooks.rs` fires a webhook and/or a command on two events —
 `post-convert` (per file) and `queue-drained` (once per true drain) — through an injected
-`HookRunner` seam, same pattern as `FileDisposer`/`HandbrakeLocator`. Four invariants a future
+`HookRunner` seam, same pattern as `FileDisposer`/`HandbrakeLocator`. Six invariants a future
 change is most likely to break:
 
 - `post-convert` has two fire points; the error one must stay on `record_job_error_quiet`, not
@@ -121,11 +121,25 @@ change is most likely to break:
 - `post_convert_command` / `queue_drained_command` are absent from `ALLOWED_KEYS` and from the
   `Settings` struct on purpose. That pair of absences is the entire boundary keeping the server
   head's HTTP API from being a remote shell.
-- `fire_queue_drained` takes two **disjoint** `ctx.db` guards in one function — one to read the
+- `drain_mechanism` takes two **disjoint** `ctx.db` guards per iteration — one to read the
   batch, one to write the watermark after dispatching. A mutation that kept the first guard
   alive past the second deadlocked the function against *itself*. No `LockProbeRunner` can catch
   that: `try_lock` only helps once the hook is reached, and this hangs before that. The
   disjoint-statement structure is the only thing preventing it.
+- **Each mechanism has its own watermark** (`Mechanism::watermark_key`:
+  `last_queue_drained_at_webhook` / `last_queue_drained_at_command`) and its own batch loop.
+  Do not re-merge them. A shared watermark advances only when every configured mechanism
+  delivers, so a working webhook is pinned behind a failing command — replaying the same oldest
+  batch forever, and never delivering anything past the first `QUEUE_DRAINED_BATCH` until the
+  command is fixed. Both keys are absent from `ALLOWED_KEYS`/`Settings` like the key they
+  replaced; `db::init_db` seeds them from the pre-split `last_queue_drained_at` (`INSERT OR
+  IGNORE`, and the legacy row is kept so a rollback still has a watermark).
+- **A drain hook can block for minutes**, and `claim_queue_slot` refuses every `run_queue` for
+  that whole time — silently. `process_queue` therefore runs another pass when
+  `work_arrived_while_busy` was set *and* the DB really holds a `queued` job; the flag alone
+  must never drive the loop (a refusal can race a `clear_queue`), and only a `PassOutcome::
+  Drained` may be followed by another pass, since `get_next_job` does not consult `queue_paused`.
+  The update interlock's refusal must not set the flag.
 
 ## Cross-Platform
 
