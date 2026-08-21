@@ -104,6 +104,32 @@ the next drain rather than losing them. A receiver must therefore tolerate a rep
 rescan that is harmless, and it is the right trade against silent loss. Clearing History drops
 rows that were never reported.
 
+**The payload is batched, `QUEUE_DRAINED_BATCH = 100` jobs per payload.** `fire_queue_drained`
+loops: each pass selects up to 100 rows since the watermark, dispatches one payload, and — only
+after that dispatch succeeds — advances the watermark to the newest `completed_at` actually sent,
+then loops again if the batch was full. A whole backlog therefore drains inside one call to
+`fire_queue_drained`, not one batch per queue run; a 250-job backlog sends three payloads
+(`[100, 100, 50]` job counts before the boundary rule below trims full batches). This exists
+because `CONVERTBAR_PAYLOAD` puts the entire payload into a single command-hook environment
+variable, and an unbounded payload would eventually fail `spawn()` with `E2BIG` — a failure that
+correctly refuses to advance the watermark, so the *next* drain would build an even larger
+payload: a wedge that never self-heals. At roughly 500 bytes per job object a full batch is
+~50 KB, comfortably under both the Linux `MAX_ARG_STRLEN` (128 KiB) and macOS's combined
+args+env cap (256 KiB).
+
+**A full batch is cut at a `completed_at` timestamp boundary**, so a tie group (several jobs
+sharing one `completed_at`) that straddles the cut is never split silently: the next pass asks for
+`completed_at > watermark`, so any tied rows left on the far side of a mid-tie cut would be
+silently *skipped*, not merely delayed. `fire_queue_drained` instead drops the trailing tied rows
+from a full batch before dispatching, so they come back whole together with their siblings on the
+next pass — a 250-job backlog with no ties therefore sends `[99, 99, 52]`, not `[100, 100, 50]`,
+because the row that would have split a tie group is deferred to the following batch. **When a
+single tie group is larger than one whole batch it cannot be split this way**, so it is sent
+whole (a batch larger than `QUEUE_DRAINED_BATCH` by exactly the excess), and any further jobs
+sharing that exact `completed_at` beyond the batch are skipped — logged loudly to stderr rather
+than silently dropped, since silent loss here is the one outcome the watermark design exists to
+prevent.
+
 ### Lock discipline
 
 The hook runs **after** the `ctx.db` guard is dropped, exactly like `emit_t`. Holding `ctx.db`
@@ -225,6 +251,9 @@ sum over all jobs and, like the per-job field, can be negative.
 
 The job set comes from the `last_queue_drained_at` watermark query described under "Trigger
 points", not from an in-memory accumulator, so it survives pauses, low-disk stops, and restarts.
+It arrives in batches of up to `QUEUE_DRAINED_BATCH` (100) jobs, not as one payload per drain —
+see the batching rule under "Trigger points". **The first drain after a hook is configured
+reports the entire completed History**, batched, because there is no watermark yet.
 
 ## Mechanism: webhook
 
@@ -303,6 +332,15 @@ be unrecoverable.
 `CONVERTBAR_PAYLOAD` always carries the entire JSON payload, which is how a `queue-drained`
 command reads the `jobs` array and how any consumer reads a field this list forgot.
 
+**Each individual environment value is capped at `MAX_COMMAND_ENV_VALUE_BYTES` (96 KiB)**,
+checked immediately before `spawn()`. 96 KiB sits under both the Linux `MAX_ARG_STRLEN` (128 KiB)
+and macOS's combined args+env cap (256 KiB), with room for the rest of the process environment.
+An oversized value fails with a message naming the variable and its size rather than a bare
+`E2BIG` from the OS. `QUEUE_DRAINED_BATCH` is the primary defence against this ever being hit;
+the cap is the backstop for when a batch's per-job size estimate is wrong (very long paths, for
+instance). **The webhook path carries no such cap** — it is the escape hatch for a payload too
+large for a command hook's environment.
+
 The command line is split into a program and arguments on whitespace, with single- or
 double-quoted segments kept intact as one argument. There are no escape sequences, no variable
 expansion, and no globbing — a literal `$HOME` or `*` reaches the program unchanged. It is
@@ -325,6 +363,12 @@ One setting, `hook_path_map`, one rule per line:
 Whitespace around `=>` is trimmed. Rules apply longest-`from`-first, so a more specific prefix
 wins regardless of line order. The first matching rule applies; rewriting is not chained. A rule
 matches only on a path-segment boundary, so `/media` does not match `/mediafoo`.
+
+A trailing separator is stripped from **both** sides before storage, so `/media/ => /data/` and
+`/media => /data` are equivalent. Without this, a trailing slash consumed into `from` would leave
+`apply`'s segment-boundary check no separator to match on for any real subpath, so a rule written
+with a trailing slash on `from` would silently never rewrite anything; a trailing slash left on
+`to` would double up into `/data//...` instead.
 
 Mapping applies to **every path-valued field**: `source_path`, `output_path`, `result_path`,
 `output_dir`, and `output_dirs` — and recursively to the same fields inside each element of
@@ -436,7 +480,8 @@ guaranteed and a hung receiver cannot wedge the app.
 
 Failures surface three ways:
 
-- `ctx.events.notify("ConvertBar", "Post-convert hook failed: <reason>")`
+- `ctx.events.notify("ConvertBar", "<event> hook failed — <reason>")`, e.g.
+  `post-convert hook failed — webhook: ...`
 - `ctx.events.emit_t("hook-failed", { "event": …, "reason": … })`, so a head can surface it.
   No UI consumer ships in this change — the event exists so one can be added without touching
   the engine, and a test asserts it is emitted.

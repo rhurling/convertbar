@@ -106,6 +106,26 @@ When adding a new frontend Tauri API call or plugin, add the corresponding permi
 
 Window position is persisted across restarts via `tauri-plugin-window-state`. Screen confinement runs on every show (tray click) to handle monitor layout changes — ensures at least half the window is visible.
 
+## Post-Convert Hooks
+
+`crates/convertbar-core/src/hooks.rs` fires a webhook and/or a command on two events —
+`post-convert` (per file) and `queue-drained` (once per true drain) — through an injected
+`HookRunner` seam, same pattern as `FileDisposer`/`HandbrakeLocator`. Four invariants a future
+change is most likely to break:
+
+- `post-convert` has two fire points; the error one must stay on `record_job_error_quiet`, not
+  the `record_job_error` wrapper, or the direct call at `converter.rs:869` is missed.
+- `queue-drained` fires only on a true drain. The queue-done block is also reached by
+  `pause_after_current`, which is every pause on Windows.
+- `post_convert_command` / `queue_drained_command` are absent from `ALLOWED_KEYS` and from the
+  `Settings` struct on purpose. That pair of absences is the entire boundary keeping the server
+  head's HTTP API from being a remote shell.
+- `fire_queue_drained` takes two **disjoint** `ctx.db` guards in one function — one to read the
+  batch, one to write the watermark after dispatching. A mutation that kept the first guard
+  alive past the second deadlocked the function against *itself*. No `LockProbeRunner` can catch
+  that: `try_lock` only helps once the hook is reached, and this hangs before that. The
+  disjoint-statement structure is the only thing preventing it.
+
 ## Cross-Platform
 
 - `libc` (SIGSTOP/SIGCONT) is a `[target.'cfg(unix)'.dependencies]` entry in `crates/convertbar-core/Cargo.toml`, and the signal call sites are gated with `#[cfg(unix)]` attributes — never the `cfg!()` macro, which only skips code at runtime and would still require linking libc on every platform. Mid-encode pause works on macOS and Linux; Windows falls back to queue-level pause.

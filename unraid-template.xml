@@ -119,6 +119,28 @@
     Mask="false"/>
 
   <Config
+    Name="Post-Convert Command"
+    Target="CONVERTBAR_POST_CONVERT_COMMAND"
+    Default=""
+    Description="Script or executable to run after each conversion, e.g. /config/hooks/post-convert.sh. Runs with no shell; receives the job as CONVERTBAR_* environment variables plus CONVERTBAR_PAYLOAD (the full JSON). Not configurable through the web UI or the HTTP API &#8212; environment-variable-only by design, so an authenticated web-UI user can't turn this into remote code execution."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mode=""
+    Mask="false"/>
+
+  <Config
+    Name="Queue-Drained Command"
+    Target="CONVERTBAR_QUEUE_DRAINED_COMMAND"
+    Default=""
+    Description="Script or executable to run once the queue finishes a true drain (batched, up to 100 jobs per run), e.g. /config/hooks/queue-drained.sh. Same restrictions as Post-Convert Command above."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mode=""
+    Mask="false"/>
+
+  <Config
     Name="Disable Auth"
     Target="CONVERTBAR_NO_AUTH"
     Default=""
