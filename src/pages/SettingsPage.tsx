@@ -141,7 +141,17 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         setPcCommandHook(hooks.postConvert);
         setQdCommandHook(hooks.queueDrained);
       })
-      .catch(() => {});
+      .catch((e) => {
+        // Swallowing this used to disable the fields permanently and invisibly: both hooks stay
+        // `null`, which renders as "" (indistinguishable from "no hook configured") AND blocks
+        // every write through the `!== null` guard in the commits below, with nothing to retry
+        // it. Log it (the page's convention for a bespoke invoke that has no error banner), and
+        // fall back to "" so the guard opens — a user who then edits the field writes a real
+        // value rather than being silently ignored forever.
+        console.error("Couldn't read the command hooks:", e);
+        setPcCommandHook("");
+        setQdCommandHook("");
+      });
   }, [!!settings]);
   useEffect(() => {
     if (pcCommandHook !== null) setPcCommandDraft(pcCommandHook);
@@ -240,26 +250,10 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   // `useSettings.updateSetting` surfaces failed setting writes via its `error` state (that
   // banner is wired to useSettings's own writes only) — console.error at minimum keeps a
   // rejected write from vanishing silently.
-  // Populates the draft only, same as the coordinator asked: commit-on-blur (or the unmount
-  // flush) still owns persistence, so a picked path behaves exactly like a typed one.
-  const pickPcCommand = async () => {
-    const path = await invoke<string | null>("pick_file").catch((e) => {
-      console.error("Couldn't open the file picker:", e);
-      return null;
-    });
-    if (path !== null) setPcCommandDraft(path);
-  };
-  const pickQdCommand = async () => {
-    const path = await invoke<string | null>("pick_file").catch((e) => {
-      console.error("Couldn't open the file picker:", e);
-      return null;
-    });
-    if (path !== null) setQdCommandDraft(path);
-  };
-
-  const commitPcCommand = () => {
-    if (pcCommandHook !== null && pcCommandDraft !== pcCommandHook) {
-      const command = pcCommandDraft;
+  // Takes the value explicitly rather than reading the draft, so `pick*Command` can persist the
+  // path it just received: `setPcCommandDraft` does not update the state this closure captured.
+  const savePcCommand = (command: string) => {
+    if (pcCommandHook !== null && command !== pcCommandHook) {
       invoke("set_command_hook", { trigger: "post_convert", command })
         // Only advance the committed value on success — a rejected write must leave the old
         // "last known committed" value in place, so the guard above still sees a diff and the
@@ -268,12 +262,40 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
         .catch((e) => console.error("Couldn't save post-convert command hook:", e));
     }
   };
-  const commitQdCommand = () => {
-    if (qdCommandHook !== null && qdCommandDraft !== qdCommandHook) {
-      const command = qdCommandDraft;
+  const saveQdCommand = (command: string) => {
+    if (qdCommandHook !== null && command !== qdCommandHook) {
       invoke("set_command_hook", { trigger: "queue_drained", command })
         .then(() => setQdCommandHook(command))
         .catch((e) => console.error("Couldn't save queue-drained command hook:", e));
+    }
+  };
+
+  const commitPcCommand = () => savePcCommand(pcCommandDraft);
+  const commitQdCommand = () => saveQdCommand(qdCommandDraft);
+
+  // Commits on pick, NOT draft-only. Persistence cannot ride on the input's `onBlur` here:
+  // clicking Browse focuses the button (and on macOS WKWebView may take no focus at all), so
+  // the input never blurs — the user saw the path appear, quit from the Settings tab, and the
+  // hook was never saved. Worse, when the input *was* focused, the blur committed the
+  // PRE-pick draft and then stranded the picked value. Cancel stays a no-op.
+  const pickPcCommand = async () => {
+    const path = await invoke<string | null>("pick_file").catch((e) => {
+      console.error("Couldn't open the file picker:", e);
+      return null;
+    });
+    if (path !== null) {
+      setPcCommandDraft(path);
+      savePcCommand(path);
+    }
+  };
+  const pickQdCommand = async () => {
+    const path = await invoke<string | null>("pick_file").catch((e) => {
+      console.error("Couldn't open the file picker:", e);
+      return null;
+    });
+    if (path !== null) {
+      setQdCommandDraft(path);
+      saveQdCommand(path);
     }
   };
 
@@ -632,6 +654,8 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           your downloader creates while downloading. Leave empty to disable.
         </p>
       </div>
+
+      <h2 className="setting-section-heading">Hooks</h2>
 
       <div className="setting-group">
         <label className="setting-label" htmlFor="post-convert-url">
