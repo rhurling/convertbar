@@ -100,12 +100,15 @@ beforeEach(() => {
         return Promise.resolve(".RESOLVED"); // sentinel proving the preview is backend-computed
       case "update_setting":
       case "set_preset_suffix":
+      case "set_command_hook":
         return Promise.resolve(undefined);
       case "get_platform_capabilities":
         return Promise.resolve({
           can_pause_process: true,
           priority_is_group_scoped: groupScopedFlag,
         });
+      case "get_command_hooks":
+        return Promise.resolve({ postConvert: "", queueDrained: "" });
       default:
         return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
     }
@@ -136,6 +139,38 @@ function withMode(cleanup_mode: string, suffix: string) {
         return Promise.resolve(null);
     }
   }) as typeof invoke);
+}
+
+/** Points `invokeMock` at `settings` (same shape as `beforeEach`) and renders `<SettingsPage />`. */
+function renderWithSettings(settings: AppSettings) {
+  invokeMock.mockImplementation(((cmd: string) => {
+    switch (cmd) {
+      case "get_settings":
+        return Promise.resolve(settings);
+      case "list_handbrake_presets":
+        return Promise.resolve(["Fast 1080p30"]);
+      case "get_preset_suffix":
+        return Promise.resolve(".{resolution}-{codec}");
+      case "generate_preset_suffix":
+        return Promise.resolve(META);
+      case "resolve_suffix_template":
+        return Promise.resolve(".RESOLVED");
+      case "update_setting":
+      case "set_preset_suffix":
+      case "set_command_hook":
+        return Promise.resolve(undefined);
+      case "get_platform_capabilities":
+        return Promise.resolve({
+          can_pause_process: true,
+          priority_is_group_scoped: groupScopedFlag,
+        });
+      case "get_command_hooks":
+        return Promise.resolve({ postConvert: "", queueDrained: "" });
+      default:
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    }
+  }) as typeof invoke);
+  render(<SettingsPage />);
 }
 
 describe("SettingsPage", () => {
@@ -241,7 +276,10 @@ describe("SettingsPage", () => {
 
   it("does not write the low-disk threshold per keystroke; commits on blur", async () => {
     render(<SettingsPage />);
-    const input = await screen.findByRole("spinbutton"); // the only number input on the page
+    // Disambiguated by label, not role: the Hooks section added its own number input (timeout).
+    const input = await screen.findByLabelText(
+      /pause when destination free space is low/i,
+    );
     await waitForSettingsToSettle();
     fireEvent.change(input, { target: { value: "2" } });
     fireEvent.change(input, { target: { value: "2.5" } });
@@ -294,7 +332,10 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByPlaceholderText(".downloading"), {
       target: { value: ".part" },
     });
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2.5" } });
+    fireEvent.change(
+      screen.getByLabelText(/pause when destination free space is low/i),
+      { target: { value: "2.5" } },
+    );
     fireEvent.change(screen.getByPlaceholderText(".{resolution}-{codec}"), {
       target: { value: ".hevc" },
     });
@@ -713,5 +754,117 @@ describe("SettingsPage", () => {
     // rendered yet — the failure mode a bare queryBy would hide.
     await screen.findByLabelText(/run only with cpu nothing else wants/i);
     expect(screen.queryByText(/--cpu-shares/)).not.toBeInTheDocument();
+  });
+
+  it("renders the webhook url for both trigger points", async () => {
+    renderWithSettings(
+      makeSettings({
+        post_convert_webhook_url: "http://a/",
+        queue_drained_webhook_url: "http://b/",
+      }),
+    );
+    expect(await screen.findByLabelText(/after each conversion.*url/i)).toHaveValue("http://a/");
+    expect(screen.getByLabelText(/when the queue finishes.*url/i)).toHaveValue("http://b/");
+  });
+
+  it("shows the command hook field on the desktop head", async () => {
+    renderWithSettings(makeSettings());
+    expect(await screen.findByLabelText(/command to run/i)).toBeInTheDocument();
+  });
+
+  it("does not render the command hook field on the server head", async () => {
+    // Absent, not disabled and not read-only: the server head cannot serve the value, so a
+    // field that always renders empty would read as a bug.
+    vi.doMock("../lib/head", () => ({ isServerHead: true }));
+    vi.resetModules();
+    const { default: ServerSettingsPage } = await import("./SettingsPage");
+    render(<ServerSettingsPage />);
+    expect(await screen.findByText(/set by environment variable/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/command to run/i)).not.toBeInTheDocument();
+  });
+
+  it("warns that path mapping does not apply to the command hook", async () => {
+    renderWithSettings(makeSettings());
+    expect(await screen.findByText(/applies to webhooks only/i)).toBeInTheDocument();
+  });
+
+  it("writes the timeout setting on blur", async () => {
+    renderWithSettings(makeSettings());
+    const input = await screen.findByLabelText(/timeout/i);
+    fireEvent.change(input, { target: { value: "60" } });
+    fireEvent.blur(input);
+    await waitFor(() => expect(updateCallsFor("hook_timeout_seconds")).toHaveLength(1));
+    expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+      key: "hook_timeout_seconds",
+      value: "60",
+    });
+  });
+
+  it("does not write a webhook field per edit; commits on blur", async () => {
+    // Same commit-on-blur guarantee as watch_skip_marker, extended to the new hook fields — a
+    // URL typed character by character must not fire one write per keystroke.
+    renderWithSettings(makeSettings());
+    const input = await screen.findByLabelText(/after each conversion.*url/i);
+
+    fireEvent.change(input, { target: { value: "http://a" } });
+    fireEvent.change(input, { target: { value: "http://a.example/" } });
+    expect(updateCallsFor("post_convert_webhook_url")).toHaveLength(0);
+
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("update_setting", {
+        key: "post_convert_webhook_url",
+        value: "http://a.example/",
+      }),
+    );
+  });
+
+  it("writes the command hook via set_command_hook on blur, not per keystroke", async () => {
+    invokeMock.mockImplementation(((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(makeSettings());
+        case "list_handbrake_presets":
+          return Promise.resolve(["Fast 1080p30"]);
+        case "get_preset_suffix":
+          return Promise.resolve(".{resolution}-{codec}");
+        case "generate_preset_suffix":
+          return Promise.resolve(META);
+        case "resolve_suffix_template":
+          return Promise.resolve(".RESOLVED");
+        case "get_command_hooks":
+          return Promise.resolve({ postConvert: "/original.sh", queueDrained: "" });
+        case "update_setting":
+        case "set_preset_suffix":
+        case "set_command_hook":
+          return Promise.resolve(undefined);
+        case "get_platform_capabilities":
+          return Promise.resolve({
+            can_pause_process: true,
+            priority_is_group_scoped: groupScopedFlag,
+          });
+        default:
+          return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }
+    }) as typeof invoke);
+
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText(/command to run/i);
+    await waitFor(() => expect(input).toHaveValue("/original.sh"));
+
+    fireEvent.change(input, { target: { value: "/new.sh" } });
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "set_command_hook"),
+    ).toHaveLength(0);
+
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_command_hook", {
+        trigger: "post_convert",
+        command: "/new.sh",
+      }),
+    );
   });
 });

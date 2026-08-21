@@ -1,10 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useSettings } from "../hooks/useSettings";
 import { commands } from "../lib/tauri";
 import UpdatePanel from "../components/UpdatePanel";
 import { isServerHead } from "../lib/head";
 import { RELEASES_URL } from "../lib/releases";
 import type { AppSettings, PresetMetadata } from "../lib/tauri";
+
+// get_command_hooks / set_command_hook are desktop-only #[tauri::command]s that bypass the
+// `commands` transport abstraction on purpose (CLAUDE.md, "Permissions (ACL)" background in
+// task 7): they are absent from ALLOWED_KEYS so the server head's HTTP API can't reach them, so
+// there is no httpCommands twin to unify them behind. Called only when !isServerHead.
+interface CommandHooksResponse {
+  postConvert: string;
+  queueDrained: string;
+}
 
 const DEFAULT_SUFFIX_TEMPLATE = ".{resolution}-{codec}";
 
@@ -51,6 +61,23 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   const [suffixDraft, setSuffixDraft] = useState(presetSuffix);
   const [resolvedSuffix, setResolvedSuffix] = useState("");
 
+  // Same commit-on-blur draft pattern as above, for the eight hook settings (task 3) plus the
+  // desktop-only command hook (task 7, fetched separately below).
+  const [pcUrlDraft, setPcUrlDraft] = useState(settings?.post_convert_webhook_url ?? "");
+  const [pcHeadersDraft, setPcHeadersDraft] = useState(settings?.post_convert_webhook_headers ?? "");
+  const [pcBodyDraft, setPcBodyDraft] = useState(settings?.post_convert_webhook_body ?? "");
+  const [qdUrlDraft, setQdUrlDraft] = useState(settings?.queue_drained_webhook_url ?? "");
+  const [qdHeadersDraft, setQdHeadersDraft] = useState(settings?.queue_drained_webhook_headers ?? "");
+  const [qdBodyDraft, setQdBodyDraft] = useState(settings?.queue_drained_webhook_body ?? "");
+  const [pathMapDraft, setPathMapDraft] = useState(settings?.hook_path_map ?? "");
+  const [timeoutDraft, setTimeoutDraft] = useState(settings?.hook_timeout_seconds ?? "30");
+
+  // Command hook: fetched via get_command_hooks (not part of `settings`), so `null` here means
+  // "not yet loaded" — distinct from "" (loaded, empty) — the same guard shape `commitDrafts`
+  // uses for `settings` itself, so an unmount before the fetch lands writes nothing.
+  const [commandHook, setCommandHook] = useState<string | null>(null);
+  const [commandDraft, setCommandDraft] = useState("");
+
   // getAppInfo() works on both heads (desktop composes it from getVersion() internally, server
   // hits /api/info). The version is only rendered on the server head, but the priority caveat is
   // per-OS and so is needed on both.
@@ -75,6 +102,43 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
   useEffect(() => {
     setSuffixDraft(presetSuffix);
   }, [presetSuffix]);
+  useEffect(() => {
+    if (settings) setPcUrlDraft(settings.post_convert_webhook_url);
+  }, [settings?.post_convert_webhook_url]);
+  useEffect(() => {
+    if (settings) setPcHeadersDraft(settings.post_convert_webhook_headers);
+  }, [settings?.post_convert_webhook_headers]);
+  useEffect(() => {
+    if (settings) setPcBodyDraft(settings.post_convert_webhook_body);
+  }, [settings?.post_convert_webhook_body]);
+  useEffect(() => {
+    if (settings) setQdUrlDraft(settings.queue_drained_webhook_url);
+  }, [settings?.queue_drained_webhook_url]);
+  useEffect(() => {
+    if (settings) setQdHeadersDraft(settings.queue_drained_webhook_headers);
+  }, [settings?.queue_drained_webhook_headers]);
+  useEffect(() => {
+    if (settings) setQdBodyDraft(settings.queue_drained_webhook_body);
+  }, [settings?.queue_drained_webhook_body]);
+  useEffect(() => {
+    if (settings) setPathMapDraft(settings.hook_path_map);
+  }, [settings?.hook_path_map]);
+  useEffect(() => {
+    if (settings) setTimeoutDraft(settings.hook_timeout_seconds);
+  }, [settings?.hook_timeout_seconds]);
+
+  // The server head can't serve this value (get_command_hooks is desktop-only), so it must never
+  // be called there — not even to read. Fires once, when `settings` first finishes loading
+  // (mirrors the rest of the page's gate on rendering at all), not on every settings change.
+  useEffect(() => {
+    if (isServerHead || !settings) return;
+    invoke<CommandHooksResponse>("get_command_hooks")
+      .then((hooks) => setCommandHook(hooks.postConvert))
+      .catch(() => {});
+  }, [!!settings]);
+  useEffect(() => {
+    if (commandHook !== null) setCommandDraft(commandHook);
+  }, [commandHook]);
 
   // Preview resolves the *draft* (so it updates as you type) via the backend resolver —
   // never a JS reimplementation, which diverged from the real output-name algorithm.
@@ -126,6 +190,51 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     if (suffixDraft !== presetSuffix) updatePresetSuffix(suffixDraft);
   };
 
+  const commitPcUrl = () => {
+    if (pcUrlDraft !== settings?.post_convert_webhook_url)
+      updateSetting("post_convert_webhook_url", pcUrlDraft);
+  };
+  const commitPcHeaders = () => {
+    if (pcHeadersDraft !== settings?.post_convert_webhook_headers)
+      updateSetting("post_convert_webhook_headers", pcHeadersDraft);
+  };
+  const commitPcBody = () => {
+    if (pcBodyDraft !== settings?.post_convert_webhook_body)
+      updateSetting("post_convert_webhook_body", pcBodyDraft);
+  };
+  const commitQdUrl = () => {
+    if (qdUrlDraft !== settings?.queue_drained_webhook_url)
+      updateSetting("queue_drained_webhook_url", qdUrlDraft);
+  };
+  const commitQdHeaders = () => {
+    if (qdHeadersDraft !== settings?.queue_drained_webhook_headers)
+      updateSetting("queue_drained_webhook_headers", qdHeadersDraft);
+  };
+  const commitQdBody = () => {
+    if (qdBodyDraft !== settings?.queue_drained_webhook_body)
+      updateSetting("queue_drained_webhook_body", qdBodyDraft);
+  };
+  const commitPathMap = () => {
+    if (pathMapDraft !== settings?.hook_path_map)
+      updateSetting("hook_path_map", pathMapDraft);
+  };
+  const commitTimeout = () => {
+    if (timeoutDraft !== settings?.hook_timeout_seconds)
+      updateSetting("hook_timeout_seconds", timeoutDraft);
+  };
+
+  // Not routed through useSettings/updateSetting: set_command_hook is the bespoke desktop-only
+  // command (see the CommandHooksResponse comment above), so this manages its own "last known
+  // committed value" instead of relying on the settings object's optimistic-merge machinery.
+  const commitCommand = () => {
+    if (commandHook !== null && commandDraft !== commandHook) {
+      invoke("set_command_hook", { trigger: "post_convert", command: commandDraft }).catch(
+        () => {},
+      );
+      setCommandHook(commandDraft);
+    }
+  };
+
   // Commit-on-blur alone loses data: crossing the 1300px layout breakpoint swaps App's two JSX
   // trees and remounts this page (browser zoom crosses it without touching the window), and an
   // unmount fires no `blur` — so a typed-but-unblurred draft was silently discarded. Flushing the
@@ -136,11 +245,20 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     // those would persist them over the user's stored values, so a pre-load unmount writes
     // nothing; each commit's own equality guard covers the loaded case. This is also what keeps
     // StrictMode's dev-only mount/unmount/mount cycle from writing anything.
+    commitCommand(); // independently guarded by `commandHook !== null`, not by `settings`
     if (!settings) return;
     commitHbPath();
     commitMarker();
     commitDisk();
     commitSuffix();
+    commitPcUrl();
+    commitPcHeaders();
+    commitPcBody();
+    commitQdUrl();
+    commitQdHeaders();
+    commitQdBody();
+    commitPathMap();
+    commitTimeout();
   };
   const commitDraftsRef = useRef(commitDrafts);
   useEffect(() => {
@@ -425,9 +543,12 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
       </div>
 
       <div className="setting-group">
-        <label className="setting-label">Pause when destination free space is low</label>
+        <label className="setting-label" htmlFor="low-disk-min-gb">
+          Pause when destination free space is low
+        </label>
         <div className="setting-row">
           <input
+            id="low-disk-min-gb"
             className="setting-input"
             type="number"
             min="0"
@@ -467,6 +588,173 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
           your downloader creates while downloading. Leave empty to disable.
         </p>
       </div>
+
+      <div className="setting-group">
+        <label className="setting-label" htmlFor="post-convert-url">
+          After each conversion — URL
+        </label>
+        <input
+          id="post-convert-url"
+          className="setting-input"
+          type="text"
+          value={pcUrlDraft}
+          onChange={(e) => setPcUrlDraft(e.target.value)}
+          onBlur={commitPcUrl}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+          placeholder="https://example.com/webhook"
+        />
+        <label className="setting-label" htmlFor="post-convert-headers">
+          After each conversion — Headers
+        </label>
+        <textarea
+          id="post-convert-headers"
+          className="setting-input"
+          rows={2}
+          value={pcHeadersDraft}
+          onChange={(e) => setPcHeadersDraft(e.target.value)}
+          onBlur={commitPcHeaders}
+          placeholder="ApiKey: your-key"
+        />
+        <label className="setting-label" htmlFor="post-convert-body">
+          After each conversion — Body
+        </label>
+        <textarea
+          id="post-convert-body"
+          className="setting-input"
+          rows={3}
+          value={pcBodyDraft}
+          onChange={(e) => setPcBodyDraft(e.target.value)}
+          onBlur={commitPcBody}
+          placeholder="Leave empty to send the raw JSON payload"
+        />
+        <p className="setting-hint">
+          Fires after every file finishes converting, whether it succeeded or failed. Leave the
+          URL empty to disable.
+        </p>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label" htmlFor="queue-drained-url">
+          When the queue finishes — URL
+        </label>
+        <input
+          id="queue-drained-url"
+          className="setting-input"
+          type="text"
+          value={qdUrlDraft}
+          onChange={(e) => setQdUrlDraft(e.target.value)}
+          onBlur={commitQdUrl}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+          placeholder="https://example.com/webhook"
+        />
+        <label className="setting-label" htmlFor="queue-drained-headers">
+          When the queue finishes — Headers
+        </label>
+        <textarea
+          id="queue-drained-headers"
+          className="setting-input"
+          rows={2}
+          value={qdHeadersDraft}
+          onChange={(e) => setQdHeadersDraft(e.target.value)}
+          onBlur={commitQdHeaders}
+          placeholder="ApiKey: your-key"
+        />
+        <label className="setting-label" htmlFor="queue-drained-body">
+          When the queue finishes — Body
+        </label>
+        <textarea
+          id="queue-drained-body"
+          className="setting-input"
+          rows={3}
+          value={qdBodyDraft}
+          onChange={(e) => setQdBodyDraft(e.target.value)}
+          onBlur={commitQdBody}
+          placeholder="Leave empty to send the raw JSON payload"
+        />
+        <p className="setting-hint">
+          Fires once the queue empties — not on every pause, only a true drain. Leave the URL
+          empty to disable.
+        </p>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label" htmlFor="hook-path-map">
+          Path mapping
+        </label>
+        <textarea
+          id="hook-path-map"
+          className="setting-input"
+          rows={3}
+          value={pathMapDraft}
+          onChange={(e) => setPathMapDraft(e.target.value)}
+          onBlur={commitPathMap}
+          placeholder="/media => /data"
+        />
+        <p className="setting-hint">
+          One rule per line. Applies to webhooks only — a command hook receives raw paths.
+        </p>
+      </div>
+
+      <div className="setting-group">
+        <label className="setting-label" htmlFor="hook-timeout">
+          Timeout (seconds)
+        </label>
+        <input
+          id="hook-timeout"
+          className="setting-input"
+          type="number"
+          min="1"
+          step="1"
+          value={timeoutDraft}
+          onChange={(e) => setTimeoutDraft(e.target.value)}
+          onBlur={commitTimeout}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+        />
+        <p className="setting-hint">
+          Per hook. With both a webhook and a command configured, a dead receiver costs twice
+          this per job.
+        </p>
+      </div>
+
+      {!isServerHead ? (
+        <div className="setting-group">
+          <label className="setting-label" htmlFor="post-convert-command">
+            Command to run
+          </label>
+          <div className="setting-row">
+            <input
+              id="post-convert-command"
+              className="setting-input flex-1"
+              type="text"
+              value={commandDraft}
+              onChange={(e) => setCommandDraft(e.target.value)}
+              onBlur={commitCommand}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+              placeholder="/path/to/script.sh"
+            />
+          </div>
+          <p className="setting-hint">
+            Runs after each conversion. Receives job details as environment variables. Leave
+            empty to disable.
+          </p>
+        </div>
+      ) : (
+        <div className="setting-group">
+          <span className="setting-label">Command to run</span>
+          <p className="setting-hint">
+            Set by environment variable on the server head (
+            <code>CONVERTBAR_POST_CONVERT_COMMAND</code>).
+          </p>
+        </div>
+      )}
 
       <div className="setting-group">
         <label className="setting-label">History</label>
