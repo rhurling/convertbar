@@ -249,7 +249,10 @@ against a private CA, and needs nothing installed in the image.
 
 Webhook headers are stored in plaintext in `convertbar.db` and are readable by any authenticated
 web-UI user, and an authenticated user can point the webhook at any address the container can
-reach. Both are the same trust class as the auth token itself.
+reach. Both are the same trust class as the auth token itself. Keeping the command keys out of
+the API means *those keys* are not reachable from the network — it is not a blanket
+no-code-execution guarantee: `handbrake_path` is API-writable and the queue spawns whatever it
+names, which is the same trust class again.
 
 ## Server (Docker)
 
