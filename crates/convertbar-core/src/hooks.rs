@@ -163,21 +163,20 @@ pub fn map_payload_paths(v: &mut Value, map: &PathMap) {
 ///
 /// Scalars are JSON-escaped WITHOUT surrounding quotes, so the template supplies them and a
 /// path containing `"` or `\` cannot break out of the surrounding JSON. `null` renders as the
-/// empty string, never the token `null`. A `_json` suffix inserts pre-formed JSON: raw when the
-/// placeholder sits outside any JSON string in the template (e.g. a bare `{{payload_json}}`
-/// body), but escaped like a scalar when it sits inside one (e.g. a GraphQL query embedded as a
-/// JSON string value) — otherwise the inserted quotes would terminate the enclosing string and
-/// the body would not parse. `{{payload_json}}` is the whole payload. An unknown placeholder is
-/// left untouched — a silent empty string would send a malformed request that looks well-formed.
+/// empty string, never the token `null`. A `_json` suffix inserts pre-formed JSON raw, and
+/// `{{payload_json}}` is the whole payload. An unknown placeholder is left untouched — a
+/// silent empty string would send a malformed request that looks well-formed.
+///
+/// `_json` insertion is deliberately NOT context-sensitive: it always means "insert raw at a
+/// JSON value position." A `_json` placeholder used inside an already-open JSON string (rather
+/// than at a value position) will produce invalid JSON — that is by design, not a bug; see
+/// `a_json_placeholder_inside_a_string_is_not_special_cased` below.
 pub fn render_body(template: &str, payload: &Value) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
-    let mut in_string = false;
 
     while let Some(start) = rest.find("{{") {
-        let literal = &rest[..start];
-        update_in_string(literal, &mut in_string);
-        out.push_str(literal);
+        out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let end = match after.find("}}") {
             Some(e) => e,
@@ -192,7 +191,7 @@ pub fn render_body(template: &str, payload: &Value) -> String {
         let name = after[..end].trim();
         let tail = &after[end + 2..];
 
-        match resolve_placeholder(name, payload, in_string) {
+        match resolve_placeholder(name, payload) {
             Some(text) => out.push_str(&text),
             None => {
                 out.push_str("{{");
@@ -206,53 +205,21 @@ pub fn render_body(template: &str, payload: &Value) -> String {
     out
 }
 
-/// Toggles `in_string` for each unescaped `"` in a run of literal template text, so callers
-/// know whether the next placeholder falls inside an already-open JSON string.
-fn update_in_string(literal: &str, in_string: &mut bool) {
-    let mut escaped = false;
-    for c in literal.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' if *in_string => escaped = true,
-            '"' => *in_string = !*in_string,
-            _ => {}
-        }
-    }
-}
-
-/// Escapes JSON text for embedding inside an already-open JSON string: JSON-encode it as a
-/// string value, then strip the surrounding quotes the caller's template already supplies.
-fn escape_for_string_context(raw: &str) -> String {
-    let quoted = Value::String(raw.to_string()).to_string();
-    quoted[1..quoted.len() - 1].to_string()
-}
-
-fn resolve_placeholder(name: &str, payload: &Value, in_string: bool) -> Option<String> {
+fn resolve_placeholder(name: &str, payload: &Value) -> Option<String> {
     if name == "payload_json" {
-        let raw = payload.to_string();
-        return Some(if in_string {
-            escape_for_string_context(&raw)
-        } else {
-            raw
-        });
+        return Some(payload.to_string());
     }
     if let Some(key) = name.strip_suffix("_json") {
-        return payload.get(key).map(|v| {
-            let raw = v.to_string();
-            if in_string {
-                escape_for_string_context(&raw)
-            } else {
-                raw
-            }
-        });
+        return payload.get(key).map(|v| v.to_string());
     }
     let v = payload.get(name)?;
     Some(match v {
         Value::Null => String::new(),
-        Value::String(s) => escape_for_string_context(s),
+        Value::String(s) => {
+            // Escape as a JSON string, then strip the quotes the template supplies.
+            let quoted = Value::String(s.clone()).to_string();
+            quoted[1..quoted.len() - 1].to_string()
+        }
         other => other.to_string(),
     })
 }
@@ -560,11 +527,27 @@ mod tests {
     fn the_stash_template_renders_to_valid_graphql_json() {
         let v = queue_drained_payload(&[sample()]);
         let out = render_body(
-            r#"{"query":"mutation { metadataScan(input: {paths: {{output_dirs_json}}}) }"}"#,
+            r#"{"query":"mutation($input: ScanMetadataInput!) { metadataScan(input: $input) }","variables":{"input":{"paths":{{output_dirs_json}}}}}"#,
             &v,
         );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-        assert!(parsed["query"].as_str().unwrap().contains("/media/movies"));
+        // The array is passed as a GraphQL VARIABLE, so the placeholder sits at a JSON value
+        // position and raw insertion is correct. Interpolating it into the query string
+        // instead would splice unescaped quotes into that string and break the outer JSON.
+        assert_eq!(
+            parsed["variables"]["input"]["paths"],
+            serde_json::json!(["/media/movies"])
+        );
+    }
+
+    #[test]
+    fn a_json_placeholder_inside_a_string_is_not_special_cased() {
+        // Documents the rule's boundary: `_json` means "insert raw at a value position". It is
+        // deliberately NOT context-sensitive, so this template produces invalid JSON rather
+        // than silently escaping. The Stash example uses GraphQL variables to avoid it.
+        let v = queue_drained_payload(&[sample()]);
+        let out = render_body(r#"{"q":"x {{output_dirs_json}} y"}"#, &v);
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_err());
     }
 
     #[test]
