@@ -18,7 +18,8 @@ use crate::types::{
 };
 
 const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts",
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg", "m2v", "m2ts",
+    "mts", "vob", "3gp", "ogv", "asf", "f4v",
 ];
 
 pub fn is_video_file(path: &Path) -> bool {
@@ -1631,6 +1632,30 @@ mod tests {
         assert!(is_video_file(Path::new("movie.mp4")));
         assert!(is_video_file(Path::new("movie.MKV")));
         assert!(is_video_file(Path::new("/a/b/c.MoV")));
+    }
+
+    #[test]
+    fn accepts_the_mpeg_family_and_other_common_containers() {
+        // Every one of these is a container HandBrake reads via libavformat. They are listed
+        // explicitly rather than as a loop over VIDEO_EXTENSIONS, so dropping one from the const
+        // fails here instead of the test silently shrinking with it.
+        for name in [
+            "clip.mpg",
+            "clip.mpeg",
+            "clip.m2v",
+            "clip.m2ts",
+            "clip.mts",
+            "clip.vob",
+            "clip.3gp",
+            "clip.ogv",
+            "clip.asf",
+            "clip.f4v",
+        ] {
+            assert!(is_video_file(Path::new(name)), "{name} must be queueable");
+        }
+        // Camcorder and DVD rips routinely arrive upper-cased.
+        assert!(is_video_file(Path::new("CLIP.MTS")));
+        assert!(is_video_file(Path::new("VTS_01_1.VOB")));
     }
 
     #[test]
