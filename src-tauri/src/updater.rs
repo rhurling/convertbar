@@ -847,17 +847,12 @@ async fn perform_install<R: tauri::Runtime>(
     match attempt {
         InstallAttempt::Installed => {
             set_pending(app, None);
-            notify(
-                app,
-                format!("Updated to {} — restart ConvertBar to apply", meta.version),
-            );
+            notify(app, format!("Updated to {} — restarting", meta.version));
+            // Left set as a fallback: `restart()` called off the main thread only *requests*
+            // the exit, so the panel stays up briefly and its Restart button must still work if
+            // the event loop never gets there.
             set_status(app, UpdateStatus::ReadyToRestart);
-            // Nothing else will. `claim_queue_slot` refused every `run_queue` for the length of
-            // the install — `start_queue` and the watcher both bail out during that window — so a
-            // file that landed meanwhile is sitting in a queue that is neither running nor
-            // paused. On macOS and Linux `install()` returns and this process keeps running the
-            // old binary until the user restarts, which may be hours.
-            resume_queue_after_install(app);
+            restart_after_install(app);
             InstallOutcome::Installed
         }
         InstallAttempt::Deferred => {
@@ -915,32 +910,32 @@ fn start_queue_now<R: tauri::Runtime>(app: &AppHandle<R>) {
     crate::converter::run_queue(ctx);
 }
 
-/// Re-triggers the queue once an install has finished holding the interlock.
+/// Restarts the app once the install has finished. There is NO safe "keep running the old binary
+/// until the user gets around to it" state on macOS or Linux, and this must not be softened back
+/// into one.
 ///
-/// A remembered pause is still honoured — including one this very install caused by draining a
-/// busy queue, which `take_drain_pause` lifts on the next launch instead. An empty queue makes
-/// this a no-op, so it costs nothing on the ordinary path.
-fn resume_queue_after_install<R: tauri::Runtime>(app: &AppHandle<R>) {
-    resume_queue_after_install_with(app, start_queue_now);
-}
-
-/// The rule above with the queue start injected, so a test can assert on the decision without a
-/// real install. Same seam as `restart_after_killing_encoder` (commands/updater.rs).
-fn resume_queue_after_install_with<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    run: impl FnOnce(&AppHandle<R>),
-) {
-    let Some(ctx) = ctx_of(app) else {
-        return;
-    };
-    let paused = match ctx.db.lock() {
-        Ok(conn) => crate::converter::is_queue_paused(&conn),
-        Err(_) => return,
-    };
-    if paused {
-        return;
-    }
-    run(app);
+/// `install_inner` (tauri-plugin-updater) renames the *running* bundle into a
+/// `tempfile::TempDir` and then drops that TempDir the moment `install()` returns — deleting it.
+/// From that instant this process is executing an unlinked bundle, so macOS can no longer
+/// validate its code identity against the TCC grants it holds, and every `open()` of a protected
+/// path (~/Downloads, ~/Movies) fails for it *and* for the HandBrakeCLI children it spawns. The
+/// symptom is not a permission error the user can read: HandBrake logs only
+/// `hb_stream_open: open <path> failed` / `scan: unrecognized file type`, which is
+/// indistinguishable at a glance from a corrupt source. v2.5.0 shipped the old behaviour and
+/// failed eight jobs that way against perfectly good files.
+///
+/// The tell, if this is ever suspected again: a genuinely bad file logs an ffmpeg diagnostic
+/// first (`[mov,mp4,... @ 0x...] moov atom not found`) because libavformat actually read bytes.
+/// No ffmpeg line at all means the file was never opened.
+///
+/// Restarting costs nothing: `try_install_now` refused to install unless the queue was idle, and
+/// `restart_app` kills and reaps the encoder before exiting, so a job that raced into the gap
+/// loses seconds and `recover_interrupted_jobs` requeues it on the new binary — which also
+/// restores the queue that `resume_queue_after_install` used to restart here.
+///
+/// Unreachable on Windows: `install()` exits the process and the installer relaunches the app.
+fn restart_after_install<R: tauri::Runtime>(app: &AppHandle<R>) {
+    crate::commands::updater::restart_app(app.clone());
 }
 
 /// Undoes a queue drain armed for an install that then did not happen.
@@ -2319,35 +2314,6 @@ mod tests {
         crate::converter::set_queue_paused(&conn, false);
         set_drain_pause(&conn, true);
         assert!(!should_resume_queue_at_launch(&conn, false));
-    }
-
-    #[test]
-    fn the_queue_is_re_triggered_after_an_install_unless_it_is_paused() {
-        // `claim_queue_slot` refuses every run_queue while `installing` is latched, and both
-        // start_queue and the watcher bail out during that window — so a file that landed
-        // mid-install sits in a queue that is neither running nor paused, and on macOS/Linux this
-        // process keeps running until the user restarts. Nothing else picks it up.
-        let app = mock_app();
-        let handle = app.handle().clone();
-        let db = db_of(&handle);
-
-        let started = StdMutex::new(0);
-        resume_queue_after_install_with(&handle, |_| *started.lock().unwrap() += 1);
-        assert_eq!(
-            *started.lock().unwrap(),
-            1,
-            "an idle, unpaused queue must be re-triggered"
-        );
-
-        // A remembered pause still wins — including the one a user-requested install just caused
-        // by draining the queue, which the next launch lifts instead.
-        crate::converter::set_queue_paused(&db.lock().unwrap(), true);
-        resume_queue_after_install_with(&handle, |_| *started.lock().unwrap() += 1);
-        assert_eq!(
-            *started.lock().unwrap(),
-            1,
-            "a remembered pause must not be overridden by an install finishing"
-        );
     }
 
     #[test]

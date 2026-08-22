@@ -80,6 +80,35 @@ The preflight step exists because both failure modes are silent: the bundler ski
 
 **On a Command Line Tools–only machine**, the Developer ID issuing intermediate is absent from the trust store (it ships with Xcode), so a freshly installed certificate shows "not trusted" and `security find-identity -v -p codesigning` reports zero identities. Fix by fetching the intermediate named in the certificate's own Authority Information Access extension; see Task 1 Step 4 of the plan. CI is unaffected — GitHub's macOS runners have full Xcode.
 
+## Restarting After an Auto-Update
+
+A successful install MUST restart the app. `updater.rs`'s `InstallAttempt::Installed` arm calls
+`restart_after_install`; there is no safe "keep running the old binary until the user gets around
+to it" state on macOS or Linux, and it must not be softened back into one.
+
+tauri-plugin-updater's `install_inner` renames the **running** bundle into a `tempfile::TempDir`,
+then drops that TempDir the moment `install()` returns — deleting it. From that instant the
+process executes an unlinked bundle, so macOS can no longer validate its code identity against
+the TCC grants it holds (see the designated-requirement note above), and every `open()` of a
+protected path fails for it **and** for the HandBrakeCLI children it spawns. This is not the
+periodic `/private/tmp` cleaner; it is immediate and happens on every macOS auto-install.
+
+The failure is silent and reads as data corruption: HandBrake logs only `hb_stream_open: open
+<path> failed` / `scan: unrecognized file type`. **The tell is the missing ffmpeg line** — a
+genuinely bad file logs `[mov,mp4,... @ 0x...] moov atom not found` first, because libavformat
+actually read bytes. No ffmpeg line means the file was never opened, so look at the process, not
+the file: `lsof -p <pid> | grep -i "txt.*convertbar"` pointing into `/private/tmp/tauri_*` is an
+orphaned process, and the fix is to relaunch from `/Applications`. v2.5.0 shipped the old
+behaviour and failed eight jobs this way against files that were fine.
+
+Restarting is free, which is why the old `resume_queue_after_install` is not worth reviving:
+`try_install_now` refuses to install unless the queue is idle, `restart_app` kills and reaps the
+encoder before exiting, and `recover_interrupted_jobs` requeues anything that raced into the gap.
+`should_resume_queue_at_launch` then restarts the queue on the new binary and lifts an
+updater-caused drain pause — logic that only ever runs *because* the app restarts.
+
+Unreachable on Windows: `install()` exits the process and the installer relaunches the app.
+
 ## Merging a PR (non-release)
 
 `main` is protected: signed commits, no merge commits, PR required. Claude cannot `git push` — ask the user to push with `! git push -u origin <branch>`. Then:
