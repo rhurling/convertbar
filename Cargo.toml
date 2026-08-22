@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/convertbar-core", "crates/convertbar-server", "src-tauri"]
 
 [workspace.package]
-version = "2.5.0"
+version = "2.5.1"
 edition = "2021"
 authors = ["Rouven Hurling"]
 license = "MIT"
