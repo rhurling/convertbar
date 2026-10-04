@@ -478,12 +478,20 @@ body {
   overflow-x: hidden;
 }
 
-/* Stacked, not side by side: at ~310px of panel width a filename and a reason can never
-   share a line, and competing for it is what collapsed the name to zero width. */
 .bad-sources-list li {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  gap: 4px;
   font-size: 12px;
+}
+
+/* Stacked, not side by side: at ~310px of panel width a filename and a reason can never
+   share a line, and competing for it is what collapsed the name to zero width. */
+.bad-sources-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
 }
 
 .bad-sources-name,
