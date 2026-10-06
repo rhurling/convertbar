@@ -141,6 +141,9 @@ pub struct ServerState {
     /// Per-source failed-credential ramp, shared by `auth_guard` and the login route
     /// so failures at either accumulate together.
     pub login_throttle: Arc<crate::throttle::LoginThrottle>,
+    /// The last `conversion-progress` broadcast, from `progress::spawn_progress_cache`.
+    pub progress:
+        tokio::sync::watch::Receiver<Option<convertbar_core::converter::ConversionProgress>>,
 }
 
 /// Nests all `/api` routes; the caller (`main.rs`) adds the static/embed fallback.
@@ -293,6 +296,7 @@ pub(crate) mod tests {
         );
         let (events_tx, _rx) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let progress = crate::progress::spawn_progress_cache(&events_tx);
         let state = ServerState {
             ctx,
             config: Arc::new(
@@ -311,6 +315,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
             )),
+            progress,
         };
         (state, shutdown_tx)
     }

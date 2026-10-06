@@ -22,12 +22,14 @@ pub struct StatusSnapshot {
 }
 
 pub async fn get_status(State(s): State<ServerState>) -> Response {
+    let progress = s.progress.borrow().clone();
     blocking_json(move || {
-        let (queued, errors, paused, encoding) = {
+        let (queued, errors, paused, encoding, in_flight) = {
             let db = s.ctx.db.lock().map_err(|e| e.to_string())?;
             db.query_row(
                 "SELECT COALESCE(SUM(status = 'queued'), 0), COALESCE(SUM(status = 'error'), 0),
-                        COALESCE(SUM(status = 'paused'), 0), COALESCE(SUM(status = 'encoding'), 0)
+                        COALESCE(SUM(status = 'paused'), 0), COALESCE(SUM(status = 'encoding'), 0),
+                        MAX(CASE WHEN status IN ('encoding', 'paused') THEN id END)
                  FROM jobs",
                 [],
                 |row| {
@@ -36,10 +38,17 @@ pub async fn get_status(State(s): State<ServerState>) -> Response {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)? > 0,
                         row.get::<_, i64>(3)? > 0,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
             .map_err(|e| e.to_string())?
+        };
+        // Only the job in flight's own progress: the cache keeps the last value until the next
+        // job's first progress line, which must not be shown as that job's.
+        let percent = match (progress, in_flight) {
+            (Some(p), Some(id)) if p.job_id == id => p.percent,
+            _ => 0.0,
         };
         // Read after the db guard is dropped: never hold two core locks at once here.
         let running = s.ctx.converter.is_running();
@@ -62,7 +71,7 @@ pub async fn get_status(State(s): State<ServerState>) -> Response {
 
         Ok(StatusSnapshot {
             state,
-            percent: 0.0,
+            percent,
             queued,
             errors,
         })
@@ -75,6 +84,8 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::StatusCode;
+    use convertbar_core::converter::ConversionProgress;
+    use convertbar_core::events::EventSinkExt;
     use rusqlite::params;
     use serde_json::{json, Value};
 
@@ -239,5 +250,84 @@ mod tests {
         assert_eq!(code, StatusCode::NO_CONTENT);
         assert!(convertbar_core::control::get_low_disk_pause(&state.ctx).is_some());
         assert_eq!(status(&state).await["state"], "idle");
+    }
+
+    fn set_job_status(state: &ServerState, id: &str, status: &str) {
+        state
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status = ?2 WHERE id = ?1",
+                params![id, status],
+            )
+            .unwrap();
+    }
+
+    /// Emits progress the way the converter does — the core's own payload type through the
+    /// server's real sink — and waits until the cache has taken it, so the next request
+    /// cannot race the cache task.
+    async fn emit_progress(state: &ServerState, job_id: &str, percent: f64) {
+        let mut seen = state.progress.clone();
+        seen.borrow_and_update();
+        crate::sink::ServerSink(state.events_tx.clone()).emit_t(
+            "conversion-progress",
+            ConversionProgress {
+                job_id: job_id.to_string(),
+                percent,
+                fps: 24.0,
+                avg_fps: 23.5,
+                eta_seconds: 90,
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(2), seen.changed())
+            .await
+            .expect("the progress cache never took the event")
+            .expect("the progress cache stopped");
+    }
+
+    #[tokio::test]
+    async fn progress_follows_the_job_in_flight_and_never_a_finished_one() {
+        let state = test_state();
+        insert_job(&state, "now", "encoding", 0);
+        set_running(&state, true);
+
+        emit_progress(&state, "now", 42.5).await;
+        let json = status(&state).await;
+        assert_eq!(json["state"], "encoding");
+        assert_eq!(json["percent"], 42.5);
+
+        // A paused encode is frozen where it stopped; 0 % would read as a restart.
+        set_job_status(&state, "now", "paused");
+        let json = status(&state).await;
+        assert_eq!(json["state"], "paused");
+        assert_eq!(json["percent"], 42.5);
+
+        // The next job starts before its first progress line: the cache still holds the
+        // finished job's value, which must not be shown as the new job's.
+        set_job_status(&state, "now", "done");
+        insert_job(&state, "next", "encoding", 1);
+        let json = status(&state).await;
+        assert_eq!(json["state"], "encoding");
+        assert_eq!(json["percent"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_burst_that_overruns_the_broadcast_does_not_end_the_cache() {
+        // The broadcast holds 256 events; a burst of queue updates while the cache task is not
+        // scheduled makes it lag. Lagging must skip ahead, never stop listening, or progress
+        // freezes for the rest of the process with no error anywhere.
+        let state = test_state();
+        insert_job(&state, "now", "encoding", 0);
+        set_running(&state, true);
+        for _ in 0..300 {
+            let _ = state
+                .events_tx
+                .send(("queue-updated".to_string(), json!({})));
+        }
+
+        emit_progress(&state, "now", 7.5).await;
+        assert_eq!(status(&state).await["percent"], 7.5);
     }
 }
