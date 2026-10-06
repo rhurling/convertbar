@@ -2237,9 +2237,10 @@ mod tests {
 
     #[test]
     fn a_clear_that_lifts_nothing_leaves_the_breadcrumb_alone() {
-        // The watcher clears the remembered pause on every add. While a drain is armed but has not
-        // landed yet, `queue_paused` is still false — that clear takes ownership of nothing, and
-        // spending the breadcrumb on it would leave the batch stopped after the update restart.
+        // Every start that wins the slot clears the remembered pause. While a drain is armed but
+        // has not landed yet, `queue_paused` is still false — that clear takes ownership of
+        // nothing, and spending the breadcrumb on it would leave the batch stopped after the
+        // update restart.
         let conn = test_conn();
         set_drain_pause(&conn, true);
         assert!(!crate::converter::is_queue_paused(&conn));

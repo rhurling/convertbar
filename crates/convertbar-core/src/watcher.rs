@@ -447,30 +447,13 @@ fn enqueue_and_start(ctx: &Arc<Ctx>, paths: Vec<String>) {
     if result.added.is_empty() {
         return;
     }
-    // An update install holds the queue interlock, so `run_queue` below would refuse — after the
-    // paused flag had already been cleared, leaving the queue neither running nor paused. Bail
-    // before touching it, exactly as `start_queue` does; the install re-triggers the queue when
-    // it finishes (`resume_queue_after_install`). The files themselves are already enqueued, so
-    // the UI still needs telling.
-    //
-    // Deliberately checked BEFORE clearing the pause rather than after, which is the opposite
-    // order to `set_queue_paused`'s own breadcrumb guard: leaving a remembered pause untouched
-    // during an install is recoverable with one click, whereas clearing it and then being refused
-    // leaves the queue in a state with no affordance to fix it.
-    if ctx
-        .converter
-        .installing
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        ctx.events.emit_t("queue-updated", ());
-        return;
-    }
-    // A watched-folder file arriving is an add; per the design, adding files starts the queue,
-    // so clear any remembered pause before running.
-    if let Ok(conn) = ctx.db.lock() {
-        crate::converter::set_queue_paused(&conn, false);
-    }
-    crate::converter::run_queue(ctx.clone());
+    // A watched-folder file arriving is an add, and adding files starts the queue — through
+    // `start_queue`, which claims the slot BEFORE it clears any remembered pause. Clearing first
+    // and then being refused (issue #190: a SIGSTOP-paused queue still holds the slot; or an
+    // update install holds the interlock) recorded "not paused" while nothing could run. A
+    // refusal now leaves the pause intact, and a busy-slot refusal is recorded so the running
+    // queue picks the file up. The files are enqueued either way, so the UI still needs telling.
+    let _ = crate::control::start_queue(ctx);
     ctx.events.emit_t("queue-updated", ());
 }
 
@@ -1140,17 +1123,47 @@ mod tests {
         assert_eq!(super::batch_label(&[]), "", "empty batch → empty label");
     }
 
-    // ---- enqueue_and_start's installing bail ----
+    // ---- enqueue_and_start when the queue slot is refused ----
 
     #[test]
     fn enqueue_and_start_leaves_the_persisted_pause_alone_while_an_update_installs() {
         // Same hazard `start_queue_leaves_the_persisted_pause_alone_while_an_update_installs`
         // pins, reached differently: an update install holds the queue interlock, so clearing the
-        // remembered pause here anyway would leave the queue neither running nor paused once
-        // `run_queue`'s own claim refuses it. `control::start_queue` no longer needs an
-        // installing bail of its own — it claims BEFORE it touches the pause, so the interlock
-        // refusal arrives before there is anything to undo. This path still clears the pause
-        // first, so it keeps the explicit check.
+        // remembered pause here anyway would leave the queue neither running nor paused once the
+        // claim refuses it.
+        let ctx = arrive_while_paused(|ctx| {
+            ctx.converter
+                .installing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            !*ctx.converter.is_running.lock().unwrap(),
+            "no queue may start underneath an install"
+        );
+    }
+
+    #[test]
+    fn enqueue_and_start_leaves_a_sigstop_pause_alone_while_the_frozen_queue_holds_the_slot() {
+        // Issue #190. A mid-encode pause on unix SIGSTOPs the child, and the queue thread stays
+        // parked in `child.wait()` — so `is_running` stays true and the claim refuses. Clearing
+        // the pause before that refusal recorded "not paused" while the encoder stayed frozen:
+        // neither resumed nor paused. The pause must survive, and the refusal must still be
+        // recorded so the frozen run picks the new file up once the user resumes it.
+        let ctx = arrive_while_paused(|ctx| {
+            *ctx.converter.is_running.lock().unwrap() = true;
+        });
+        assert!(
+            ctx.converter
+                .work_arrived_while_busy
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the refused start must be recorded, or the new file is stranded after Resume"
+        );
+    }
+
+    /// Runs a watched-file arrival against a persisted pause in a world `arrange` makes refuse
+    /// the queue slot, and asserts what every refusal shares: the pause survives and the UI is
+    /// still told about the add.
+    fn arrive_while_paused(arrange: impl FnOnce(&Arc<Ctx>)) -> Arc<Ctx> {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
         conn.execute(
@@ -1185,9 +1198,7 @@ mod tests {
             .lock()
             .unwrap()
             .push(config("/watch", false, 1));
-        ctx.converter
-            .installing
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        arrange(&ctx);
 
         enqueue_and_start(&ctx, vec!["/watch/movie.mp4".to_string()]);
 
@@ -1203,16 +1214,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             paused, "true",
-            "a watched-file arrival must not clear the persisted pause while an install is running"
-        );
-        assert!(
-            !*ctx.converter.is_running.lock().unwrap(),
-            "no queue may start underneath an install"
+            "a watched-file arrival must not clear the persisted pause when it cannot start the queue"
         );
         assert!(
             !sink.payloads("queue-updated").is_empty(),
             "the UI still needs telling that files were added, even though the queue can't start"
         );
+        ctx
     }
 
     // ---- F8: the watcher must not re-ingest a classified bad source forever ----
