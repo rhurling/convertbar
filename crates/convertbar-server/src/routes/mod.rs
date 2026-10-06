@@ -20,6 +20,7 @@ pub mod info;
 pub mod login;
 pub mod queue;
 pub mod settings;
+pub mod status;
 pub mod watch;
 
 /// Maps a core `Err(String)` — a failure the server means, such as a missing HandBrakeCLI —
@@ -150,6 +151,7 @@ pub fn api_router(state: ServerState) -> Router {
     // with 200 instead of a 404.
     let api = Router::new()
         .route("/info", get(info::get_app_info))
+        .route("/status", get(status::get_status))
         .route("/login", post(login::login))
         .route("/events", get(events::sse_handler))
         .route("/queue/files", post(queue::add_files))
