@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod embed;
+mod progress;
 mod routes;
 mod sink;
 mod startup;
@@ -53,6 +54,8 @@ async fn main() {
     convertbar_core::db::init_db(&conn).expect("initialize database");
 
     let (events_tx, _rx) = broadcast::channel(256);
+    // Before `boot`, which can resume an encode: its first progress events must be caught.
+    let progress = progress::spawn_progress_cache(&events_tx);
     let ctx = convertbar_core::ctx::Ctx::new(
         conn,
         Arc::new(ServerSink(events_tx.clone())),
@@ -91,6 +94,7 @@ async fn main() {
         login_throttle: Arc::new(throttle::LoginThrottle::new(
             throttle::ThrottlePolicy::default(),
         )),
+        progress,
     };
 
     let app = routes::app(state);

@@ -182,6 +182,22 @@ change is most likely to break:
   settled by the same DB-backed check as every other. The guard is disarmed after a successful
   release so its drop cannot free a slot another run has since claimed.
 
+## Status Endpoint (`GET /api/status`)
+
+A flat `{state, percent, queued, errors}` snapshot for pollers outside the app — the NAS
+dashboard's Homepage `customapi` tile, configured in the dotfiles repo, which this repo cannot
+see. The four names and the `state` values are that config's contract: change them only as a
+breaking change. `percent` is 0, never null, because Homepage renders null as "NaN%".
+
+- Live progress comes from `progress::spawn_progress_cache`, a task on the SSE broadcast. Do
+  not "simplify" it into `ServerSink` writing a slot: the sink runs on the converter thread
+  under core locks and must never lock (see Emitting Events Under the DB Lock). Its `Lagged`
+  arm must keep listening — a `break` there freezes progress for the life of the process.
+- The cache keeps the last job's value after it ends; `percent` is shown only for the job id
+  of the current `encoding`/`paused` row, so the next job never inherits it.
+- The route needs a `getStatus` member in the HTTP transport although no UI calls it: the
+  frontend contract test requires every `routes.json` command there.
+
 ## Cross-Platform
 
 - `libc` (SIGSTOP/SIGCONT) is a `[target.'cfg(unix)'.dependencies]` entry in `crates/convertbar-core/Cargo.toml`, and the signal call sites are gated with `#[cfg(unix)]` attributes — never the `cfg!()` macro, which only skips code at runtime and would still require linking libc on every platform. Mid-encode pause works on macOS and Linux; Windows falls back to queue-level pause.

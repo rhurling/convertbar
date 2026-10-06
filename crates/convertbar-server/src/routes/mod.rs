@@ -20,6 +20,7 @@ pub mod info;
 pub mod login;
 pub mod queue;
 pub mod settings;
+pub mod status;
 pub mod watch;
 
 /// Maps a core `Err(String)` — a failure the server means, such as a missing HandBrakeCLI —
@@ -140,6 +141,9 @@ pub struct ServerState {
     /// Per-source failed-credential ramp, shared by `auth_guard` and the login route
     /// so failures at either accumulate together.
     pub login_throttle: Arc<crate::throttle::LoginThrottle>,
+    /// The last `conversion-progress` broadcast, from `progress::spawn_progress_cache`.
+    pub progress:
+        tokio::sync::watch::Receiver<Option<convertbar_core::converter::ConversionProgress>>,
 }
 
 /// Nests all `/api` routes; the caller (`main.rs`) adds the static/embed fallback.
@@ -150,6 +154,7 @@ pub fn api_router(state: ServerState) -> Router {
     // with 200 instead of a 404.
     let api = Router::new()
         .route("/info", get(info::get_app_info))
+        .route("/status", get(status::get_status))
         .route("/login", post(login::login))
         .route("/events", get(events::sse_handler))
         .route("/queue/files", post(queue::add_files))
@@ -291,6 +296,7 @@ pub(crate) mod tests {
         );
         let (events_tx, _rx) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let progress = crate::progress::spawn_progress_cache(&events_tx);
         let state = ServerState {
             ctx,
             config: Arc::new(
@@ -309,6 +315,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
             )),
+            progress,
         };
         (state, shutdown_tx)
     }
@@ -328,7 +335,7 @@ pub(crate) mod tests {
     /// decoded response status and (if any) JSON body — `null` for an empty (e.g. 204)
     /// body. Shared by every route test below to keep the request/response boilerplate
     /// out of each individual test.
-    async fn request_json(
+    pub(crate) async fn request_json(
         app: Router,
         method: &str,
         uri: &str,

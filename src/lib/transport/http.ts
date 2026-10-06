@@ -14,6 +14,7 @@ import type {
   LowDiskPause,
   PresetMetadata,
   PurgeResult,
+  StatusSnapshot,
   Transport,
   WatchedDirectory,
 } from "./types";
@@ -173,7 +174,9 @@ export const httpCommands = {
   login: (token: string): Promise<void> => api("POST", "/api/login", { token }),
   fsList: (path: string): Promise<FsListResult> =>
     api("GET", `/api/fs/list?path=${encodeURIComponent(path)}`),
+  getStatus: (): Promise<StatusSnapshot> => api("GET", "/api/status"),
 } satisfies Transport & {
   login(token: string): Promise<void>;
   fsList(path: string): Promise<FsListResult>;
+  getStatus(): Promise<StatusSnapshot>;
 };

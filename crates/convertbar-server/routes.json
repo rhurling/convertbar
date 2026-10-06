@@ -37,5 +37,6 @@
   {"command": "remove_watched_directory",   "method": "DELETE", "path": "/api/watched/{id}"},
   {"command": "fs_list",                    "method": "GET",    "path": "/api/fs/list"},
   {"command": "get_app_info", "method": "GET",  "path": "/api/info"},
+  {"command": "get_status",   "method": "GET",  "path": "/api/status"},
   {"command": "login",        "method": "POST", "path": "/api/login"}
 ]

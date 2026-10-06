@@ -28,7 +28,7 @@ const ROUTES_JSON: &str = include_str!("../../routes.json");
 /// Human-visible tripwire: `routes.json`'s row count must match this literal. Bump it
 /// deliberately (as its own reviewed change) whenever a route is added or removed —
 /// never let it drift silently.
-const EXPECTED_ROUTE_COUNT: usize = 39;
+const EXPECTED_ROUTE_COUNT: usize = 40;
 
 fn parsed_routes() -> Vec<RouteRow> {
     serde_json::from_str(ROUTES_JSON).expect("routes.json must be valid JSON")
