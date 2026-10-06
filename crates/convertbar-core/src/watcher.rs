@@ -1136,6 +1136,11 @@ mod tests {
                 .installing
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         });
+        assert_eq!(
+            persisted_pause(&ctx),
+            "true",
+            "a watched-file arrival must not clear the persisted pause while an install is running"
+        );
         assert!(
             !*ctx.converter.is_running.lock().unwrap(),
             "no queue may start underneath an install"
@@ -1152,6 +1157,11 @@ mod tests {
         let ctx = arrive_while_paused(|ctx| {
             *ctx.converter.is_running.lock().unwrap() = true;
         });
+        assert_eq!(
+            persisted_pause(&ctx),
+            "true",
+            "a watched-file arrival must not clear a pause whose encoder is still frozen"
+        );
         assert!(
             ctx.converter
                 .work_arrived_while_busy
@@ -1160,9 +1170,22 @@ mod tests {
         );
     }
 
-    /// Runs a watched-file arrival against a persisted pause in a world `arrange` makes refuse
-    /// the queue slot, and asserts what every refusal shares: the pause survives and the UI is
-    /// still told about the add.
+    #[test]
+    fn enqueue_and_start_lifts_a_remembered_pause_when_the_slot_is_free() {
+        // The other half of #190's "resume or stay paused, never neither": with nothing holding
+        // the slot (a pause remembered across a restart, or one that let the run finish), an
+        // add starts the queue, so the pause must go. A watcher that stopped starting the queue
+        // at all passes both refusal tests above; this is what catches it.
+        let ctx = arrive_while_paused(|_| {});
+        assert_eq!(
+            persisted_pause(&ctx),
+            "false",
+            "a watched-file arrival that wins the slot starts the queue and lifts the pause"
+        );
+    }
+
+    /// Runs a watched-file arrival against a persisted pause in the world `arrange` sets up, and
+    /// asserts what every outcome shares: the UI is told about the add.
     fn arrive_while_paused(arrange: impl FnOnce(&Arc<Ctx>)) -> Arc<Ctx> {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -1202,8 +1225,15 @@ mod tests {
 
         enqueue_and_start(&ctx, vec!["/watch/movie.mp4".to_string()]);
 
-        let paused: String = ctx
-            .db
+        assert!(
+            !sink.payloads("queue-updated").is_empty(),
+            "the UI needs telling that files were added, whether or not the queue could start"
+        );
+        ctx
+    }
+
+    fn persisted_pause(ctx: &Arc<Ctx>) -> String {
+        ctx.db
             .lock()
             .unwrap()
             .query_row(
@@ -1211,16 +1241,7 @@ mod tests {
                 [],
                 |r| r.get(0),
             )
-            .unwrap();
-        assert_eq!(
-            paused, "true",
-            "a watched-file arrival must not clear the persisted pause when it cannot start the queue"
-        );
-        assert!(
-            !sink.payloads("queue-updated").is_empty(),
-            "the UI still needs telling that files were added, even though the queue can't start"
-        );
-        ctx
+            .unwrap()
     }
 
     // ---- F8: the watcher must not re-ingest a classified bad source forever ----
