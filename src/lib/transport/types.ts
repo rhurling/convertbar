@@ -252,7 +252,8 @@ export interface FsListResult {
 
 // Server-only, for pollers outside the app (no UI calls it): `GET /api/status`.
 export interface StatusSnapshot {
-  state: "encoding" | "paused" | "low_disk" | "stopped" | "idle";
+  /** Decided in this order: the first that applies wins. */
+  state: "paused" | "encoding" | "low_disk" | "stopped" | "idle";
   /** 0–100; 0 whenever nothing is encoding or paused, never null. */
   percent: number;
   queued: number;

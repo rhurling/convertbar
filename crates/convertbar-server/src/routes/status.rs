@@ -10,7 +10,7 @@ use super::{blocking_json, ServerState};
 
 #[derive(Serialize)]
 pub struct StatusSnapshot {
-    /// `encoding | paused | low_disk | stopped | idle`, decided in that order.
+    /// `paused | encoding | low_disk | stopped | idle`, decided in that order.
     pub state: &'static str,
     /// 0–100. Never null: Homepage's `percent` format renders a null as "NaN%", and `state`
     /// already tells a real 0 % apart from nothing encoding.
@@ -42,12 +42,7 @@ pub async fn get_status(State(s): State<ServerState>) -> Response {
             .map_err(|e| e.to_string())?
         };
         // Read after the db guard is dropped: never hold two core locks at once here.
-        let running = *s
-            .ctx
-            .converter
-            .is_running
-            .lock()
-            .map_err(|e| e.to_string())?;
+        let running = s.ctx.converter.is_running();
         let low_disk = s.ctx.converter.low_disk_pause().is_some();
 
         let state = if paused {
@@ -79,13 +74,11 @@ pub async fn get_status(State(s): State<ServerState>) -> Response {
 mod tests {
     use std::time::Duration;
 
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::StatusCode;
     use rusqlite::params;
     use serde_json::{json, Value};
-    use tower::ServiceExt;
 
-    use crate::routes::tests::{test_state, test_state_with_locator};
+    use crate::routes::tests::{request_json, test_state, test_state_with_locator};
     use crate::routes::{api_router, ServerState};
 
     async fn send(
@@ -94,28 +87,7 @@ mod tests {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let mut builder = Request::builder().method(method).uri(uri);
-        let request_body = match body {
-            Some(v) => {
-                builder = builder.header("content-type", "application/json");
-                Body::from(v.to_string())
-            }
-            None => Body::empty(),
-        };
-        let response = api_router(state.clone())
-            .oneshot(builder.body(request_body).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).expect("response body must be valid JSON")
-        };
-        (status, json)
+        request_json(api_router(state.clone()), method, uri, body).await
     }
 
     async fn status(state: &ServerState) -> Value {
@@ -180,7 +152,11 @@ mod tests {
         insert_job(&state, "next", "queued", 1);
         set_running(&state, true);
 
-        assert_eq!(status(&state).await["state"], "paused");
+        let json = status(&state).await;
+        assert_eq!(json["state"], "paused");
+        // The paused job is the one in flight, not one waiting.
+        assert_eq!(json["queued"], 1);
+        assert_eq!(json["errors"], 0);
     }
 
     #[tokio::test]

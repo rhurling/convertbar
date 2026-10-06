@@ -330,7 +330,7 @@ pub(crate) mod tests {
     /// decoded response status and (if any) JSON body — `null` for an empty (e.g. 204)
     /// body. Shared by every route test below to keep the request/response boilerplate
     /// out of each individual test.
-    async fn request_json(
+    pub(crate) async fn request_json(
         app: Router,
         method: &str,
         uri: &str,
