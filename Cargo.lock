@@ -625,7 +625,7 @@ checksum = "1a1ec0cfec728a79a5109075543131387f911cb4d07716436d7ae20533657a96"
 
 [[package]]
 name = "convertbar"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "chrono",
  "convertbar-core",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "convertbar-core"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "convertbar-server"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "axum",
  "axum-extra",
