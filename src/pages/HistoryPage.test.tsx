@@ -505,6 +505,51 @@ describe("HistoryPage", () => {
       ).toBeInTheDocument();
     });
 
+    // A source whose whole folder was deleted can never leave the list through purge: with the
+    // parent gone too, the backend can't tell a deleted folder from an unplugged drive, so it
+    // reports unverifiable and keeps the row — on every press, forever. Dismissing one row must
+    // forget that row alone and never route through purge, which is the only path that
+    // destroys files.
+    it("dismisses a single row that purge can never clear, without purging anything", async () => {
+      badSources = [badSourceJob("a"), badSourceJob("b")];
+      purgeResults = [
+        { id: "a", outcome: "purged" },
+        { id: "b", outcome: "unverifiable" },
+      ];
+      const removed = new Set<string>();
+      invokeMock.mockImplementation(((cmd: string, args?: { id?: string; ids?: string[] }) => {
+        if (cmd === "get_history") return Promise.resolve(page);
+        if (cmd === "get_history_summary") return Promise.resolve(summary);
+        if (cmd === "get_settings") return Promise.resolve(settings);
+        if (cmd === "get_bad_sources")
+          return Promise.resolve(badSources.filter((j) => !removed.has(j.id)));
+        if (cmd === "purge_bad_sources") {
+          removed.add("a");
+          return Promise.resolve(purgeResults);
+        }
+        if (cmd === "remove_history_entry") {
+          removed.add(args!.id!);
+          return Promise.resolve(undefined);
+        }
+        return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+      }) as typeof invoke);
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(2\)/i);
+      fireEvent.click(screen.getByRole("button", { name: /move 2 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+      await screen.findByText(/bad sources \(1\)/i);
+
+      invokeMock.mockClear();
+      fireEvent.click(screen.getByRole("button", { name: "Remove b.mp4 from list" }));
+
+      await waitFor(() => expect(screen.queryByText(/bad sources/i)).toBeNull());
+      expect(invokeMock).toHaveBeenCalledWith("remove_history_entry", { id: "b" });
+      expect(invokeMock).not.toHaveBeenCalledWith("purge_bad_sources", expect.anything());
+      // The row is gone from History too, so that list must not keep showing it.
+      expect(invokeMock).toHaveBeenCalledWith("get_history", expect.anything());
+    });
+
     // M4: with I3 wired up, a job-error event can bring in a bad source unrelated to whatever
     // purge last ran. A stale note from that earlier purge must not linger beside it — it would
     // read as if it described the newly-arrived row.

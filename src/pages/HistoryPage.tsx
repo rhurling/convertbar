@@ -68,7 +68,7 @@ const BAD_SOURCE_REASONS: Record<string, string> = {
 
 export default function HistoryPage() {
   const { history, summary, hasMore, loading, loadMore, refresh, setSearchDebounced, sortBy, setSortBy } = useHistory();
-  const { badSources, purge } = useBadSources();
+  const { badSources, purge, refresh: refreshBadSources } = useBadSources();
   // Values only — History renders no preset control, and in three-col it is mounted alongside
   // Settings, whose instance already loads the preset list off HandBrakeCLI.
   const { settings } = useSettings({ withPresets: false });
@@ -170,6 +170,20 @@ export default function HistoryPage() {
     }
   };
 
+  // Forgets one row without touching its file. Purge can't clear a source whose whole folder
+  // is gone: with the parent missing too, the backend can't tell a deleted folder from an
+  // unplugged drive, so it answers unverifiable and keeps the row on every press. Only the user
+  // knows which it is. The row is deleted outright, so it leaves History as well.
+  const dismissBadSource = async (id: string) => {
+    try {
+      await commands.removeHistoryEntry(id);
+    } catch (e) {
+      console.error("Failed to remove bad source:", e);
+    }
+    refreshBadSources();
+    refresh();
+  };
+
   // Desktop-only: every action the menu offers (checkPathsExist, openPath, revealInDir) is a
   // local-filesystem concern the server head has no equivalent for — gate the whole menu here
   // rather than showing it with those individual actions disabled/broken.
@@ -236,13 +250,24 @@ export default function HistoryPage() {
               <ul className="bad-sources-list">
                 {badSources.map((job) => (
                   <li key={job.id}>
-                    <span className="bad-sources-name" title={job.source_path}>
-                      {job.source_path.split(/[/\\]/).pop()}
-                    </span>
-                    <span className="bad-sources-reason">
-                      {BAD_SOURCE_REASONS[job.failure_class ?? ""] ??
-                        (job.error_message ?? "").split("\n")[0]}
-                    </span>
+                    <div className="bad-sources-text">
+                      <span className="bad-sources-name" title={job.source_path}>
+                        {job.source_path.split(/[/\\]/).pop()}
+                      </span>
+                      <span className="bad-sources-reason">
+                        {BAD_SOURCE_REASONS[job.failure_class ?? ""] ??
+                          (job.error_message ?? "").split("\n")[0]}
+                      </span>
+                    </div>
+                    <button
+                      className="btn-icon"
+                      onClick={() => dismissBadSource(job.id)}
+                      disabled={purging}
+                      title="Remove from list — the file itself is left alone"
+                      aria-label={`Remove ${job.source_path.split(/[/\\]/).pop()} from list`}
+                    >
+                      &times;
+                    </button>
                   </li>
                 ))}
               </ul>
