@@ -165,9 +165,11 @@ change is most likely to break:
   IGNORE`, and the legacy row is kept so a rollback still has a watermark).
 - **A drain hook can block for minutes**, and every start is refused for that whole time —
   silently. `claim_queue_slot` must stay the ONE place that decides what a refusal means:
-  `control::start_queue` (the path both heads use after an add) claims through it too, rather
-  than short-circuiting on its own `is_running` read, which is how that path stayed broken after
-  the watcher path was fixed. `process_queue` runs another pass when `work_arrived_while_busy`
+  `control::start_queue` (the path both heads use after an add, and the watcher's too) claims
+  through it, rather than short-circuiting on its own `is_running` read, which is how that path
+  stayed broken after the watcher path was fixed. It claims BEFORE clearing `queue_paused`: a
+  SIGSTOP pause keeps the slot held, so clear-then-claim recorded "not paused" over a frozen
+  encoder (#190). `process_queue` runs another pass when `work_arrived_while_busy`
   was set *and* the DB really holds a `queued` job; **no branch may loop on the flag alone** (a
   refusal can race a `clear_queue`, and an empty pass re-enters `fire_queue_drained`, which
   re-dispatches a pinned mechanism's whole backlog at up to 300s a batch — a hook whose side
