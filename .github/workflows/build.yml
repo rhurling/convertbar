@@ -198,10 +198,127 @@ jobs:
           grep -q 'source=Notarized Developer ID' <<<"$verdict" \
             || echo "::warning::spctl did not report a notarized Developer ID"
 
+  # The headless server for macOS hosts (the Docker image is linux/amd64 only). It runs
+  # under a LaunchAgent and reaches LAN hosts over ssh, and macOS keys that local-network
+  # grant on the code signature, so it ships Developer ID-signed and notarized like the
+  # app (ADR 0001). Runs after the app legs because tauri-action creates the draft it
+  # uploads to.
+  publish-server-darwin:
+    needs: publish-tauri
+    runs-on: macos-latest
+    permissions:
+      contents: write # upload the asset to the drafted release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same reasoning as the app legs' preflight: a missing secret must fail the
+      # build, never produce an ad-hoc-signed or unnotarized asset.
+      - name: Require macOS signing credentials
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          missing=0
+          for var in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                     APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8; do
+            if [ -z "${!var}" ]; then
+              echo "::error::$var is not set — refusing to publish an unsigned server asset"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: ". -> target"
+          save-if: false # restore-only, same as the app legs
+
+      # The web UI is embedded at compile time; without dist-web the server builds fine
+      # and serves nothing.
+      - name: Build the server
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build:web
+          cargo build --release -p convertbar-server --target aarch64-apple-darwin
+          version=$(cargo pkgid -p convertbar-server | sed 's/.*[@#]//')
+          [ "v$version" = "$GITHUB_REF_NAME" ] \
+            || { echo "::error::crate version $version does not match tag $GITHUB_REF_NAME"; exit 1; }
+          echo "SERVER_ZIP=convertbar-server_${version}_aarch64-apple-darwin.zip" >> "$GITHUB_ENV"
+
+      # A temporary keychain outside the checkout, as the Tauri CLI does for the app.
+      - name: Sign and package
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/server-signing.keychain-db"
+          kc_pass=$(openssl rand -base64 24)
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          KEYCHAIN="$keychain" scripts/package-server-macos.sh \
+            target/aarch64-apple-darwin/release/convertbar-server \
+            "$APPLE_SIGNING_IDENTITY" "$SERVER_ZIP"
+
+      # notarytool waits for Apple's verdict, but its exit code alone is not trusted:
+      # the status must read Accepted. A bare binary cannot be stapled, so Gatekeeper
+      # checks the ticket online when it checks at all.
+      - name: Notarize
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          result=$(xcrun notarytool submit "$SERVER_ZIP" --key "$key_path" \
+            --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait --output-format json)
+          echo "$result"
+          status=$(jq -r .status <<<"$result")
+          if [ "$status" != "Accepted" ]; then
+            xcrun notarytool log "$(jq -r .id <<<"$result")" --key "$key_path" \
+              --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
+            echo "::error::notarization status is $status, not Accepted"
+            exit 1
+          fi
+
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "$SERVER_ZIP" --clobber --repo "$GITHUB_REPOSITORY"
+
   # Publishing is the event that seals an immutable release, so it runs once,
   # after every platform has uploaded to the draft.
   publish-release:
-    needs: publish-tauri
+    needs: [publish-tauri, publish-server-darwin]
     runs-on: ubuntu-latest
     permissions:
       contents: write # flip the drafted release to published

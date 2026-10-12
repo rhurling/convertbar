@@ -266,6 +266,12 @@ docker pull ghcr.io/rhurling/convertbar:latest
 See [`docker-compose.example.yml`](docker-compose.example.yml) for a ready-to-copy
 compose file.
 
+The image is linux/amd64 only. For an Apple Silicon Mac, each release also carries
+`convertbar-server_<version>_aarch64-apple-darwin.zip`: the same server as one
+Developer ID–signed, notarized binary, configured by the same environment variables
+below. It expects `HandBrakeCLI` on `PATH`. It is signed so that a LaunchAgent running
+it keeps its macOS local-network permission across updates.
+
 The web UI takes files through the picker, not by dragging them onto the page — a
 browser tab receives no OS drag-drop event. Click **Add files or folders…** in the
 intake panel on the Queue tab to browse. Inside the picker, every row has a checkbox
