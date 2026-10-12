@@ -96,6 +96,72 @@ impl HandbrakeLocator for AbsentLocator {
     }
 }
 
+/// A preset file for HandBrakeCLI's `--preset-import-file`, set once by the server head before
+/// boot (ADR 0002) and never by the desktop. `builtins` are HandBrake's own preset names, listed
+/// once at startup without the import flag: an imported preset with a built-in's name is
+/// silently shadowed by the built-in, so the pre-flight refuses that collision.
+#[derive(Debug, Clone)]
+pub struct PresetImport {
+    pub path: std::path::PathBuf,
+    pub builtins: std::collections::HashSet<String>,
+}
+
+/// Every preset name a HandBrake preset file defines, recursing into folders. Read from the
+/// file itself rather than parsed out of `--preset-list`, whose layout depends on the file: a
+/// custom preset (`Type: 1`) prints under `My Presets/` at four spaces, but one exported from a
+/// built-in (`Type: 0`) prints at column 0 with its description at four spaces.
+pub fn imported_preset_names(file: &serde_json::Value) -> Vec<String> {
+    fn collect(list: &serde_json::Value, out: &mut Vec<String>) {
+        for entry in list.as_array().into_iter().flatten() {
+            if entry["Folder"].as_bool() == Some(true) {
+                collect(&entry["ChildrenArray"], out);
+            } else if let Some(name) = entry["PresetName"].as_str() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(&file["PresetList"], &mut out);
+    out
+}
+
+/// The arguments that make `preset` resolvable for HandBrakeCLI: none without a configured
+/// preset file, `--preset-import-file <file>` with one — after checking that the file can
+/// actually serve `preset`.
+///
+/// HandBrake re-reads the file on every run, and one it cannot parse is skipped with exit 0,
+/// leaving only the built-ins: an imported name then fails as "Invalid preset" deep inside a
+/// ~21 KB stderr (outside the tail the failure classifier sees), and a name that collides
+/// with a built-in silently encodes the built-in. Checking first turns both into an error
+/// that names the file.
+pub fn preset_import_args(ctx: &Ctx, preset: &str) -> Result<Vec<String>, String> {
+    let Some(import) = ctx.preset_import.get() else {
+        return Ok(Vec::new());
+    };
+    let path = import.path.display();
+    let raw = std::fs::read_to_string(&import.path)
+        .map_err(|e| format!("Preset file {path} cannot be read: {e}"))?;
+    let file: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("Preset file {path} is not valid JSON: {e}"))?;
+    let imported = imported_preset_names(&file).iter().any(|n| n == preset);
+    let builtin = import.builtins.contains(preset);
+    if imported && builtin {
+        return Err(format!(
+            "Preset \"{preset}\" in {path} has the name of a HandBrake built-in preset, which \
+             HandBrake would use instead; rename it in the file"
+        ));
+    }
+    if !imported && !builtin {
+        return Err(format!(
+            "Preset \"{preset}\" is neither in the preset file {path} nor built into HandBrake"
+        ));
+    }
+    Ok(vec![
+        "--preset-import-file".to_string(),
+        import.path.to_string_lossy().to_string(),
+    ])
+}
+
 /// The installed world, without requiring a real binary on the host.
 pub struct StubLocator(pub String);
 
@@ -241,8 +307,10 @@ fn parse_preset_list(stderr: &str) -> Vec<String> {
 pub(crate) fn get_preset_metadata(
     handbrake_path: &str,
     preset_name: &str,
+    import_args: &[String],
 ) -> Result<PresetMetadata, String> {
     let output = Command::new(handbrake_path)
+        .args(import_args)
         .arg("--preset")
         .arg(preset_name)
         .arg("--preset-export")
@@ -486,7 +554,8 @@ pub fn cached_preset_metadata(
         }
     }
 
-    let metadata = get_preset_metadata(hb_path, preset)?;
+    let import_args = preset_import_args(ctx, preset)?;
+    let metadata = get_preset_metadata(hb_path, preset, &import_args)?;
 
     ctx.preset_cache
         .lock()

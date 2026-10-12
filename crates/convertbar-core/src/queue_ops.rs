@@ -2094,6 +2094,79 @@ mod tests {
         p.to_string_lossy().to_string()
     }
 
+    /// A stub HandBrakeCLI whose `--preset-export` answers with an MKV preset only when it was
+    /// handed `--preset-import-file` — the way a custom preset exists for the real CLI only with
+    /// the flag — and with an MP4 one otherwise.
+    #[cfg(unix)]
+    fn import_aware_export_stub(dir: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let json = |ff: &str| {
+            format!(
+                r#"{{"PresetList":[{{"PresetName":"data","Type":1,"FileFormat":"{ff}","VideoEncoder":"x265_10bit","PictureHeight":1080}}]}}"#
+            )
+        };
+        let p = dir.join("hb-import-aware.sh");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" --preset-import-file \"*) echo '{}' ;;\n  *) echo '{}' ;;\nesac\n",
+                json("av_mkv"),
+                json("av_mp4")
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_metadata_fetch_reads_the_preset_file_and_refuses_when_it_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = import_aware_export_stub(dir.path());
+        let preset_file = dir.path().join("presets.json");
+        std::fs::write(
+            &preset_file,
+            r#"{"PresetList":[{"PresetName":"data","Type":1,"Folder":false,"FileFormat":"av_mkv"}]}"#,
+        )
+        .unwrap();
+        let src = dir.path().join("clip.wmv");
+        std::fs::write(&src, b"x").unwrap();
+        let ctx_with_file = || {
+            let (ctx, sink, disposer) = test_ctx_with_locator(
+                test_conn(),
+                Arc::new(crate::handbrake::StubLocator(stub.clone())),
+            );
+            crate::settings_ops::update_setting(&ctx, "preset", "data").unwrap();
+            crate::settings_ops::set_preset_suffix(&ctx, "data", "").unwrap();
+            ctx.preset_import
+                .set(crate::handbrake::PresetImport {
+                    path: preset_file.clone(),
+                    builtins: ["Fast 1080p30".to_string()].into_iter().collect(),
+                })
+                .unwrap();
+            (ctx, sink, disposer)
+        };
+
+        // The export carries the file: the stub answers MKV only when it was handed the flag.
+        let (ctx, _sink, _disposer) = ctx_with_file();
+        let added = add_files_inner(&ctx, &[src.to_string_lossy().to_string()], None).unwrap();
+        assert_eq!(
+            added.added[0].output_path,
+            dir.path().join("clip.mkv").to_string_lossy()
+        );
+
+        // A file deleted after startup fails the add by name, before HandBrake is asked.
+        std::fs::remove_file(&preset_file).unwrap();
+        let (ctx, _sink, _disposer) = ctx_with_file();
+        let err = add_files_inner(&ctx, &[src.to_string_lossy().to_string()], None)
+            .expect_err("a missing preset file must refuse the add");
+        assert!(
+            err.contains(&preset_file.to_string_lossy().to_string()),
+            "the file is named: {err}"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn an_unknown_container_in_the_preset_refuses_the_add() {

@@ -18,6 +18,9 @@ pub struct Ctx {
     pub preset_cache: Mutex<HashMap<String, crate::handbrake::PresetMetadata>>,
     pub watcher: crate::watcher::WatcherState,
     pub hooks: crate::hooks::HookSetup,
+    /// The server head's preset file, set once between construction and boot. Empty on the
+    /// desktop head, and in every test that does not declare one.
+    pub preset_import: std::sync::OnceLock<crate::handbrake::PresetImport>,
 }
 
 impl Ctx {
@@ -37,6 +40,7 @@ impl Ctx {
             preset_cache: Mutex::new(HashMap::new()),
             watcher: crate::watcher::WatcherState::new(),
             hooks,
+            preset_import: std::sync::OnceLock::new(),
         })
     }
 }

@@ -33,3 +33,4 @@ An ignored test drives the server head with a real preset file and the host's Ha
 ## Ledger
 - Slice 1: done at ac89b3b
 - Checkpoint 1: BASE 21a5ebb, reviewed HEAD ac89b3b; next interval BASE ac89b3b
+- Checkpoint 1 fix pass at 80e8c7f: fixed 5 (mapping table test, serde-default test, dead media-skip branch, stale temp comment, resolver error propagation); rejected 6 per spec/ADR 0004 (cache per name, unknown FileFormat refuses, watcher export cost, old-extension naming, extensionless fallback, serde default by design); both new tests mutation-proven

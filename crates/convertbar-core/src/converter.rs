@@ -1072,6 +1072,24 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             }
         };
 
+        // Checked before the claim and the spawn, like the missing-HandBrake case above: a
+        // preset file that cannot serve this job is booked by name instead of surfacing as
+        // HandBrake's own unclassifiable failure. See `handbrake::preset_import_args`.
+        let import_args = match crate::handbrake::preset_import_args(ctx, &job.preset) {
+            Ok(args) => args,
+            Err(e) => {
+                had_errors = true;
+                record_job_error(
+                    ctx,
+                    &job.id,
+                    &file_name,
+                    &e,
+                    crate::failure_class::FailureClass::Environment,
+                );
+                continue;
+            }
+        };
+
         // Claim the job by flipping it to 'encoding' ONLY if it is still 'queued'. The original
         // code did this select+flip under a single db-lock; relocating the flip past the disk
         // gate (whose statvfs can stall on a slow/asleep/network volume) reopened a window where
@@ -1151,6 +1169,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
         let mut cmd = Command::new(&handbrake_path);
         cmd.arg("-Z")
             .arg(&job.preset)
+            .args(&import_args)
             .arg("-O")
             .arg("-i")
             .arg(&job.source_path)
@@ -4119,6 +4138,152 @@ HandBrake has exited.";
         .unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    /// Records every invocation's full argument list, one line per run, arguments separated by
+    /// a tab, then exits 0 having written nothing.
+    #[cfg(unix)]
+    fn args_recording_fake_handbrake_script(
+        dir: &std::path::Path,
+        record_to: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("hb-all-args.sh");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nIFS=\"$(printf '\\t')\"\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                record_to.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// A preset file with one custom preset named `name`, shaped like a HandBrake 1.11.2 export.
+    fn write_preset_file(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join("presets.json");
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"PresetList":[{{"PresetName":"{name}","Type":1,"Folder":false,"FileFormat":"av_mkv","VideoEncoder":"x265_10bit"}}],"VersionMajor":79}}"#
+            ),
+        )
+        .unwrap();
+        p
+    }
+
+    fn import(path: &std::path::Path, builtins: &[&str]) -> crate::handbrake::PresetImport {
+        crate::handbrake::PresetImport {
+            path: path.to_path_buf(),
+            builtins: builtins.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_encode_passes_the_preset_file_exactly_when_one_is_configured() {
+        // A custom preset only loads with `--preset-import-file`; `-Z <name>` alone answers
+        // "Invalid preset". Without a configured file nothing may change.
+        for configured in [false, true] {
+            let (ctx, _sink, _disposer) = test_ctx(test_conn());
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("args.txt");
+            let script = args_recording_fake_handbrake_script(dir.path(), &record);
+            set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+            set_setting(&ctx.db, "preset", "data");
+            let file = write_preset_file(dir.path(), "data");
+            if configured {
+                ctx.preset_import
+                    .set(import(&file, &["Fast 1080p30"]))
+                    .unwrap();
+            } else {
+                // Without a file, "data" is just a name; give it a built-in name instead so the
+                // run reaches the spawn.
+                set_setting(&ctx.db, "preset", "Fast 1080p30");
+            }
+            let src = real_source(dir.path(), "a.wmv");
+            let out = dir.path().join("a.mkv");
+            queue_job(
+                &ctx.db,
+                "j1",
+                src.to_str().unwrap(),
+                out.to_str().unwrap(),
+                1000,
+            );
+
+            process_queue(&ctx);
+
+            let recorded = std::fs::read_to_string(&record).expect("the stub ran");
+            let args: Vec<&str> = recorded.trim_end().split('\t').collect();
+            let flag = args.iter().position(|a| *a == "--preset-import-file");
+            if configured {
+                let i = flag.expect("the flag is passed when a file is configured");
+                assert_eq!(args[i + 1], file.to_str().unwrap());
+            } else {
+                assert_eq!(flag, None, "no file configured, no flag: {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_preset_file_that_cannot_serve_the_jobs_preset_books_environment_without_spawning() {
+        // HandBrake re-reads the file on every run and silently skips one it cannot parse (exit
+        // 0), so its own failure is a 21 KB stderr ending in the preset list, classified Unknown.
+        // ConvertBar checks first and books an Environment error that says what is wrong.
+        enum Case {
+            FileDeleted,
+            PresetRemoved,
+            CollidesWithBuiltin,
+        }
+        for case in [
+            Case::FileDeleted,
+            Case::PresetRemoved,
+            Case::CollidesWithBuiltin,
+        ] {
+            let (ctx, _sink, _disposer) = test_ctx(test_conn());
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("args.txt");
+            let script = args_recording_fake_handbrake_script(dir.path(), &record);
+            set_setting(&ctx.db, "handbrake_path", script.to_str().unwrap());
+            set_setting(&ctx.db, "preset", "data");
+            let file = write_preset_file(dir.path(), "data");
+            let (builtins, want_in_message): (&[&str], String) = match case {
+                Case::FileDeleted => {
+                    std::fs::remove_file(&file).unwrap();
+                    (&["Fast 1080p30"], file.to_string_lossy().to_string())
+                }
+                Case::PresetRemoved => {
+                    write_preset_file(dir.path(), "something else");
+                    (&["Fast 1080p30"], file.to_string_lossy().to_string())
+                }
+                Case::CollidesWithBuiltin => (&["data"], "built-in".to_string()),
+            };
+            ctx.preset_import.set(import(&file, builtins)).unwrap();
+            let src = real_source(dir.path(), "a.wmv");
+            let out = dir.path().join("a.mkv");
+            queue_job(
+                &ctx.db,
+                "j1",
+                src.to_str().unwrap(),
+                out.to_str().unwrap(),
+                1000,
+            );
+
+            process_queue(&ctx);
+
+            let (status, message) = job_row(&ctx.db, "j1");
+            assert_eq!(status, "error");
+            let message = message.unwrap_or_default();
+            assert!(
+                message.contains(&want_in_message),
+                "the message says what is wrong: {message}"
+            );
+            assert_eq!(class_of(&ctx.db, "j1").as_deref(), Some("environment"));
+            assert!(!record.exists(), "HandBrake must never be spawned");
+        }
     }
 
     #[test]
