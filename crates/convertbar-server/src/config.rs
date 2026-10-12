@@ -124,6 +124,7 @@ impl ServerConfig {
             trusted_proxies,
             preset_file: vars
                 .get("CONVERTBAR_PRESET_FILE")
+                .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
         })
@@ -171,7 +172,7 @@ mod tests {
 
         let cfg = ServerConfig::from_vars(&vars(&[
             ("CONVERTBAR_AUTH_TOKEN", "abcdefghijklmnop"),
-            ("CONVERTBAR_PRESET_FILE", ""),
+            ("CONVERTBAR_PRESET_FILE", "  "),
         ]))
         .unwrap();
         assert_eq!(cfg.preset_file, None);

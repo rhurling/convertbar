@@ -126,7 +126,9 @@ mod tests {
                     {"PresetName": "Data x265", "Type": 1, "Folder": false},
                     {"PresetName": "Exported", "Type": 0, "Folder": false},
                     {"PresetName": "Shows", "Type": 1, "Folder": true, "ChildrenArray": [
-                        {"PresetName": "Episode x265", "Type": 1, "Folder": false}
+                        {"PresetName": "Episode x265", "Type": 1, "Folder": false},
+                        // A repeat: HandBrake uses one preset per name, so list it once.
+                        {"PresetName": "Data x265", "Type": 1, "Folder": false}
                     ]},
                     {"PresetName": extra, "Type": 1, "Folder": false}
                 ]})
@@ -140,7 +142,8 @@ mod tests {
             .preset_import
             .set(convertbar_core::handbrake::PresetImport {
                 path: file.clone(),
-                builtins: ["Fast 1080p30", "H.265 MKV 1080p30"]
+                // The startup snapshot also holds a built-in this HandBrake no longer lists.
+                builtins: ["Fast 1080p30", "H.265 MKV 1080p30", "Retired 720p30"]
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
@@ -173,9 +176,22 @@ mod tests {
 
         // The file changed after startup and now shadows a built-in: say so, don't list it.
         preset_file("Fast 1080p30");
+        let (code, body) = request_json(
+            api_router(state.clone()),
+            "GET",
+            "/api/handbrake/presets",
+            None,
+        )
+        .await;
+        assert_ne!(code, StatusCode::OK);
+        assert!(body.to_string().contains("Fast 1080p30"), "{body}");
+
+        // Collisions are judged against the startup snapshot, the set the encode pre-flight
+        // uses, so the list cannot offer a name the encode would then refuse.
+        preset_file("Retired 720p30");
         let (code, body) =
             request_json(api_router(state), "GET", "/api/handbrake/presets", None).await;
         assert_ne!(code, StatusCode::OK);
-        assert!(body.to_string().contains("Fast 1080p30"), "{body}");
+        assert!(body.to_string().contains("Retired 720p30"), "{body}");
     }
 }

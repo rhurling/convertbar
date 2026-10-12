@@ -51,14 +51,13 @@ pub fn normalize_server_settings(ctx: &Ctx) {
 pub fn load_preset_import(ctx: &Ctx, file: &std::path::Path) -> Result<(), String> {
     use convertbar_core::handbrake;
 
+    let imported = handbrake::read_preset_file(file)?;
+    // Absolute from here on: the path is handed to every HandBrake child as an argument.
+    let file = std::fs::canonicalize(file)
+        .map_err(|e| format!("Preset file {} cannot be read: {e}", file.display()))?;
     let path = file.display();
-    let raw = std::fs::read_to_string(file)
-        .map_err(|e| format!("preset file {path} cannot be read: {e}"))?;
-    let json: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("preset file {path} is not valid JSON: {e}"))?;
-    let imported = handbrake::imported_preset_names(&json);
     if imported.is_empty() {
-        return Err(format!("preset file {path} defines no presets"));
+        return Err(format!("Preset file {path} defines no presets"));
     }
     let hb = handbrake::resolve_handbrake_path(ctx)?.ok_or_else(|| {
         format!(
@@ -68,21 +67,12 @@ pub fn load_preset_import(ctx: &Ctx, file: &std::path::Path) -> Result<(), Strin
     })?;
     let builtins: std::collections::HashSet<String> =
         handbrake::list_presets(&hb)?.into_iter().collect();
-    let collisions: Vec<&str> = imported
-        .iter()
-        .filter(|name| builtins.contains(*name))
-        .map(String::as_str)
-        .collect();
-    if !collisions.is_empty() {
-        return Err(format!(
-            "preset file {path} reuses the name of a HandBrake built-in preset, which HandBrake \
-             would use instead: {}",
-            collisions.join(", ")
-        ));
+    if let Some(refusal) = handbrake::builtin_collision(&file, &imported, &builtins) {
+        return Err(refusal);
     }
     ctx.preset_import
         .set(handbrake::PresetImport {
-            path: file.to_path_buf(),
+            path: file.clone(),
             builtins,
         })
         .map_err(|_| "the preset file was already imported".to_string())
@@ -596,7 +586,11 @@ mod tests {
         load_preset_import(&ctx, &file).unwrap();
 
         let import = ctx.preset_import.get().expect("the file is imported");
-        assert_eq!(import.path, file);
+        assert_eq!(
+            import.path,
+            std::fs::canonicalize(&file).unwrap(),
+            "stored absolute: every HandBrake child receives it as an argument"
+        );
         let mut builtins: Vec<&str> = import.builtins.iter().map(String::as_str).collect();
         builtins.sort();
         assert_eq!(builtins, vec!["Fast 1080p30", "H.265 MKV 1080p30"]);

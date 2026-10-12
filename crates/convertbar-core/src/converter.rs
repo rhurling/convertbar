@@ -4251,13 +4251,14 @@ HandBrake has exited.";
             set_setting(&ctx.db, "preset", "data");
             let file = write_preset_file(dir.path(), "data");
             let (builtins, want_in_message): (&[&str], String) = match case {
+                // Each arm names the file AND says which of the three things is wrong.
                 Case::FileDeleted => {
                     std::fs::remove_file(&file).unwrap();
-                    (&["Fast 1080p30"], file.to_string_lossy().to_string())
+                    (&["Fast 1080p30"], "cannot be read".to_string())
                 }
                 Case::PresetRemoved => {
                     write_preset_file(dir.path(), "something else");
-                    (&["Fast 1080p30"], file.to_string_lossy().to_string())
+                    (&["Fast 1080p30"], "neither in the preset file".to_string())
                 }
                 Case::CollidesWithBuiltin => (&["data"], "built-in".to_string()),
             };
@@ -4280,6 +4281,10 @@ HandBrake has exited.";
             assert!(
                 message.contains(&want_in_message),
                 "the message says what is wrong: {message}"
+            );
+            assert!(
+                message.contains(&file.to_string_lossy().to_string()),
+                "the message names the file: {message}"
             );
             assert_eq!(class_of(&ctx.db, "j1").as_deref(), Some("environment"));
             assert!(!record.exists(), "HandBrake must never be spawned");

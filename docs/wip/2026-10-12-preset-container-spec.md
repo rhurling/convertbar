@@ -39,7 +39,7 @@ The server head can import one preset file, named by an environment variable (AD
   - the preset in use is in the file and is also a built-in's name.
 
   An encode refused this way books the job as an Environment error with that message and the queue moves on. An add refused this way fails the add with that message. This keeps the failure out of HandBrake's 21 KB stderr and out of `Unknown`.
-- Changing the file needs a restart to change what the preset list shows or what metadata (suffix, container) a cached preset yields. The pre-flight above keeps an edited file from silently encoding something else.
+- The preset list re-reads the file on every request, so a preset added to the file is listed at once. Changing what metadata (suffix, container) an already-cached preset yields, or HandBrake's own built-ins, needs a restart. The pre-flight above keeps an edited file from silently encoding something else.
 
 ### Listing presets
 

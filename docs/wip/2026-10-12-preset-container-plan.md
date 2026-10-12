@@ -36,3 +36,5 @@ An ignored test drives the server head with a real preset file and the host's Ha
 - Checkpoint 1 fix pass at 80e8c7f: fixed 5 (mapping table test, serde-default test, dead media-skip branch, stale temp comment, resolver error propagation); rejected 6 per spec/ADR 0004 (cache per name, unknown FileFormat refuses, watcher export cost, old-extension naming, extensionless fallback, serde default by design); both new tests mutation-proven
 - Slice 2: done at 2794473
 - Slice 3: done at b551e33 (live: real binary refuses a missing file and a real built-in collision)
+- Slice 4: done at ae0e76a
+- Checkpoint 2: BASE ac89b3b, reviewed HEAD ae0e76a; next interval BASE ae0e76a

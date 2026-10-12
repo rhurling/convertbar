@@ -2109,7 +2109,8 @@ mod tests {
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\ncase \" $* \" in\n  *\" --preset-import-file \"*) echo '{}' ;;\n  *) echo '{}' ;;\nesac\n",
+                "#!/bin/sh\necho call >> '{}'\ncase \" $* \" in\n  *\" --preset-import-file \"*) echo '{}' ;;\n  *) echo '{}' ;;\nesac\n",
+                dir.join("export-calls").display(),
                 json("av_mkv"),
                 json("av_mp4")
             ),
@@ -2157,6 +2158,13 @@ mod tests {
         );
 
         // A file deleted after startup fails the add by name, before HandBrake is asked.
+        let calls = || {
+            std::fs::read_to_string(dir.path().join("export-calls"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let calls_before = calls();
         std::fs::remove_file(&preset_file).unwrap();
         let (ctx, _sink, _disposer) = ctx_with_file();
         let err = add_files_inner(&ctx, &[src.to_string_lossy().to_string()], None)
@@ -2165,6 +2173,7 @@ mod tests {
             err.contains(&preset_file.to_string_lossy().to_string()),
             "the file is named: {err}"
         );
+        assert_eq!(calls(), calls_before, "HandBrake must not be asked");
     }
 
     #[test]
