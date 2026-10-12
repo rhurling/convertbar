@@ -854,8 +854,9 @@ pub fn remove_temp(setup: &RemoteSetup, host: &str, remote_temp: &str) {
 /// An ssh stand-in for tests: it drops the options and the host and runs the remote command
 /// locally, with GNU coreutils and findutils first on `PATH`, refusing a remote command over
 /// 128 KiB as a Linux host does. Control files in its directory:
-/// `fail-255` (one step per line answers exit 255), `hook-<step>` (run before that step), and
-/// `bin-<step>/` (prepended to `PATH` for that step). Every invocation's step is appended to `log`.
+/// `fail-255` (one step per line answers exit 255), `hook-<step>` (run before that step),
+/// `bin-<step>/` (prepended to `PATH` for that step), and `cut-<step>` (the stream ends after the
+/// line it matches). Every invocation's step is appended to `log`.
 #[cfg(all(unix, any(test, feature = "test-support")))]
 pub mod testing {
     use super::*;
@@ -931,6 +932,10 @@ if [ -d "$dir/bin-$step" ]; then
   PATH="$dir/bin-$step:$PATH"
 fi
 export PATH
+if [ -f "$dir/cut-$step" ]; then
+  sed "/$(cat "$dir/cut-$step")/q" | sh -c "$cmd"
+  exit $?
+fi
 exec sh -c "$cmd"
 "#,
             dir = quote(&dir.to_string_lossy()),
@@ -982,6 +987,16 @@ exec sh -c "$cmd"
         let path = setup.ssh.parent().unwrap().join(format!("hook-{step}"));
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Cuts `step`'s script stream short: the host receives it only up to and including the
+    /// first line matching the basic regular expression `pattern`, as a dropped connection would.
+    pub fn cut_stream_after(setup: &RemoteSetup, step: &str, pattern: &str) {
+        std::fs::write(
+            setup.ssh.parent().unwrap().join(format!("cut-{step}")),
+            pattern,
+        )
+        .unwrap();
     }
 
     /// Replaces `program` with one that fails, for `step` only.

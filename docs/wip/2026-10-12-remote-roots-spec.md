@@ -16,7 +16,7 @@ Remote roots configured by env (ADR 0002). A remote job pulls its source into lo
 
 - `CONVERTBAR_REMOTE_ROOTS`: a comma-separated list of `host:dir`, e.g. `unraid:/mnt/user/DATA,hetzner:/srv/media`. `host` is an ssh host alias from the account's ssh config. It must match `[A-Za-z0-9._-]+` and must not start with `-`; anything else refuses startup, so no host can smuggle an ssh option such as `-oProxyCommand=…`. `dir` must be absolute. Several roots may share a host; a path is matched to a root by containment. Unset or empty means no remote roots, which is today's behaviour.
 - `CONVERTBAR_STAGING_DIR`: the local staging directory, defaulting to a `staging` directory beside the database. It is created at startup and emptied at startup. Jobs run one at a time, and staging is emptied after every remote job, so it holds at most one job's source and result. The staged source keeps the remote file's basename.
-- The desktop head has neither. Its behaviour is unchanged, apart from two new nullable job fields it ignores.
+- The desktop head has neither. Its behaviour is unchanged, apart from two new nullable job fields it ignores and an unreachable-stop command that always answers none (the shared frontend asks both heads).
 - ssh is the system `ssh` binary, run with the account's config plus `BatchMode=yes`, a connect timeout and a keepalive interval. The host always follows `--`, so it can never be read as an option. ssh never prompts.
 - Remote hosts must provide a POSIX shell and GNU coreutils ≥ 9.5 (`stat -c` with `%.3Y`, `realpath -z`, `sha256sum`, `chown`/`chmod --reference`, `find -printf`, and `mv --update=none-fail`). Unraid has 9.11, probed 2026-10-12.
 
@@ -115,7 +115,7 @@ A remote source condemned as bad appears in the bad-sources list with its host. 
 
 ## Implementation decisions
 
-- **Data.** `jobs` gains two nullable text columns, `remote_host` and `skip_reason`, as additive migrations. Both cross to the frontends in the job info and to the hooks in the payload. The remembered unreachable job id is a backend-only settings row, read with a default and never in the allowed settings keys, like `queue_paused`. No other schema change.
+- **Data.** `jobs` gains two nullable text columns, `remote_host` and `skip_reason`, as additive migrations. Both cross to the frontends in the job info and to the hooks in the payload. The remembered unreachable job id is a backend-only settings row, read with a default and never in the allowed settings keys, like `queue_paused`; so is the marker of the job just re-queued after an outage, which the new-name edge reads. No other schema change.
 - **Context.** The context shared by both heads carries the remote roots, the staging directory, the ssh program, and the in-memory unreachable reason, all empty or defaulted, so existing construction sites need no change. The server sets them after building the context and before boot.
 - **One module owns all ssh I/O:** listing, test/stat, the realpath containment, pull, push, finalize, and the classification of exit 255. The queue thread, the routes, cancel and recovery call it and never build a remote command themselves.
 - **Staging.** The queue thread branches for a remote row ahead of the local vanished-source check and low-disk gate. It shares the spawn-to-decision part of the pipeline with local jobs, with the path roles listed in step 5, and replaces the local trash/delete/rename arms with push and finalize. No local gate is asked about a remote path (ADR 0005).

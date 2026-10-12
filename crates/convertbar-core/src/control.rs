@@ -147,10 +147,19 @@ pub fn pause_conversion(ctx: &Ctx) -> Result<(), String> {
                 )
                 .unwrap_or(false);
             if remote {
-                *ctx.converter
+                let mut armed = ctx
+                    .converter
                     .pause_after_current
                     .lock()
-                    .map_err(|e| e.to_string())? = true;
+                    .map_err(|e| e.to_string())?;
+                // Already armed by the user's "Pause after this": it stays theirs.
+                if !*armed {
+                    *armed = true;
+                    *ctx.converter
+                        .pause_armed_by_pause
+                        .lock()
+                        .map_err(|e| e.to_string())? = true;
+                }
             }
         }
     }
@@ -246,11 +255,20 @@ pub fn resume_conversion(ctx: &Ctx) -> Result<(), String> {
             }
         } else {
             // Nothing is frozen, so the pause being undone is the one Pause armed between a
-            // remote job's transfers.
-            *ctx.converter
+            // remote job's transfers — only that one, never the user's own "Pause after this".
+            let mut armed = ctx
+                .converter
                 .pause_after_current
                 .lock()
-                .map_err(|e| e.to_string())? = false;
+                .map_err(|e| e.to_string())?;
+            let mut by_pause = ctx
+                .converter
+                .pause_armed_by_pause
+                .lock()
+                .map_err(|e| e.to_string())?;
+            if std::mem::replace(&mut *by_pause, false) {
+                *armed = false;
+            }
         }
     }
     Ok(())
@@ -431,17 +449,26 @@ fn refuse_while_finalizing(ctx: &Ctx) -> Result<(), String> {
     }
 }
 
+/// The user's own arming: from here on the flag is theirs, and no Resume takes it back.
 pub fn pause_after_current(ctx: &Ctx) -> Result<(), String> {
     *ctx.converter
         .pause_after_current
         .lock()
         .map_err(|e| e.to_string())? = true;
+    *ctx.converter
+        .pause_armed_by_pause
+        .lock()
+        .map_err(|e| e.to_string())? = false;
     Ok(())
 }
 
 pub fn cancel_pause_after_current(ctx: &Ctx) -> Result<(), String> {
     *ctx.converter
         .pause_after_current
+        .lock()
+        .map_err(|e| e.to_string())? = false;
+    *ctx.converter
+        .pause_armed_by_pause
         .lock()
         .map_err(|e| e.to_string())? = false;
     Ok(())
@@ -624,6 +651,17 @@ mod tests {
 
             resume_conversion(&ctx).unwrap();
             assert!(!get_pause_after_current(&ctx), "{host:?}");
+
+            // The user's own "Pause after this" is theirs: neither a Pause on top of it nor the
+            // Resume that follows takes it back.
+            pause_after_current(&ctx).unwrap();
+            pause_conversion(&ctx).unwrap();
+            resume_conversion(&ctx).unwrap();
+            assert!(
+                get_pause_after_current(&ctx),
+                "{host:?}: the user's arming stays"
+            );
+            cancel_pause_after_current(&ctx).unwrap();
         }
     }
 

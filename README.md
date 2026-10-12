@@ -430,9 +430,9 @@ the job fails and both files stay.
   `BatchMode=yes`, so it never prompts: the key must work without a passphrase prompt or agent.
 - **Each host** needs a POSIX shell, GNU coreutils 9.5 or newer, and GNU findutils.
 - **The Docker image has no ssh client**, so remote roots are for the native server binary.
-- **An unreachable host** fails the job it hit with failure class `unreachable` and pauses the
-  queue, the way low disk space stops it; the web UI names the host. The next Start re-queues
-  that job and carries on.
+- **An unreachable host** fails the job it hit with failure class `unreachable` (its hooks
+  fire) and pauses the queue, so the jobs behind it are not failed one by one; the web UI names
+  the host. The next Start re-queues that job and carries on.
 - **Adding never starts the queue.** A client adds, then starts:
 
   ```sh
@@ -442,9 +442,10 @@ the job fails and both files stay.
   curl -X POST http://localhost:8080/api/converter/start -H "Authorization: Bearer $TOKEN"
   ```
 
-  The folder routes (`/api/folders/scan`, `/api/queue/folder`) and `/api/fs/list` take the same
-  `remote` field. An unknown host, a path outside the roots or a symlink answers 400, an
-  unreachable host 502.
+  The folder routes (`/api/folders/scan`, `/api/queue/folder`) take the same `remote` body
+  field, and `/api/fs/list` a `remote` query parameter (`?remote=unraid&path=/mnt/user/DATA`).
+  An unknown host, a path outside the roots or a symlink answers 400, an unreachable host 502.
+  A path that no longer exists is queued, and the queue reports it as gone, as for a local file.
 - **Skip-by-source-media** applies after the pull, before the encode.
 - **Watched folders** cannot point at a remote root.
 

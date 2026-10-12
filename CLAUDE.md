@@ -232,8 +232,13 @@ change here is most likely to break:
 - **`RemoteTurn`'s drop ends every remote turn** however it ends: it clears `current_job_id`,
   `finalizing_on`, the outage re-queue marker and the phase, and empties staging. It empties only
   `source/` and `result/`: `CONVERTBAR_STAGING_DIR` may name a directory holding anything.
-- **Cancel is refused while `finalizing_on` is set**, every booking writes only a row still
-  `encoding`/`paused`, and a cancel lifts the persisted pause only when it booked a row.
+- **Cancel is refused while `finalizing_on` is set**, every done or no-encode booking writes only
+  a row still `encoding`/`paused`, and a cancel lifts the persisted pause only when it booked a
+  row. A failure of a job a Cancel already booked is the Cancel's (`pull_source` and the publish
+  arm turn it into `Killed`): `record_job_error_quiet` is unguarded, and an outage booking over a
+  Cancel would have the next Start take the cancelled job back.
+- **Finalize re-reads `cleanup_mode`** (`begin_finalize`, under the lock a Cancel books under):
+  a push can take many minutes, and a switch to `keep` during it must still keep the original.
 - **Containment compares resolved paths.** A root may itself be a symlink (a share reached
   through one); anything below it must resolve to the resolved root plus the rest of the path as
   named, or it is a symlink and refused, so finalize never renames over a link. Listings use

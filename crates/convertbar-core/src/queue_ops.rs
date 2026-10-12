@@ -1220,7 +1220,7 @@ pub fn add_files(ctx: &Arc<Ctx>, paths: &[String]) -> Result<AddResult, String> 
 /// `Unreachable`, so a client can tell a wrong request from an outage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteAddError {
-    /// Unknown host, a path outside the roots, a symlink, a missing file.
+    /// Unknown host, a path outside the roots, a symlink, a path that is not a regular file.
     Refused(String),
     /// The host could not be reached; nothing was queued.
     Unreachable(String),
@@ -1311,12 +1311,9 @@ pub fn add_remote_files_inner(
                     item.path
                 )))
             }
-            None => {
-                return Err(RemoteAddError::Refused(format!(
-                    "{} does not exist on {host}",
-                    item.path
-                )))
-            }
+            // Queued without a fingerprint, as a missing local path is: one stale path must not
+            // refuse a whole batch, and the queue books it "no longer exists" when it gets there.
+            None => {}
         }
     }
     let dirs: Vec<String> = paths
@@ -2457,10 +2454,15 @@ mod tests {
             .unwrap();
         }
         let clip = file("a/clip.wmv");
+        // Gone since it was listed: one stale path in a `send` batch must not refuse the rest.
+        let stale = share.join("a/stale.wmv").to_string_lossy().into_owned();
 
-        let first =
-            add_remote_files_inner(&ctx, "unraid", &[wmv.clone(), show.clone(), clip.clone()])
-                .unwrap();
+        let first = add_remote_files_inner(
+            &ctx,
+            "unraid",
+            &[wmv.clone(), show.clone(), clip.clone(), stale.clone()],
+        )
+        .unwrap();
 
         let out = |src: &str| {
             first
@@ -2486,6 +2488,11 @@ mod tests {
             "a local job's output name says nothing about the host's directory"
         );
         assert_eq!(out(&wmv).remote_host.as_deref(), Some("unraid"));
+        assert_eq!(
+            out(&stale).original_size,
+            None,
+            "queued without a fingerprint, as a missing local path is"
+        );
         // The fingerprint is the host's stat, in the unit local fingerprints use.
         let (size, mtime): (Option<i64>, Option<i64>) = ctx
             .db
@@ -2586,7 +2593,6 @@ mod tests {
             "an unknown host and a path outside the roots, `..` included, never reach the host"
         );
         refused("unraid", s(&link), "symlink");
-        refused("unraid", s(&share.join("missing.mkv")), "does not exist");
 
         crate::remote::testing::fail_unreachable(ctx.remote.get().unwrap(), "inspect");
         assert!(matches!(
