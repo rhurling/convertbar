@@ -14,11 +14,10 @@ identity=${2:?signing identity}
 zip=${3:?zip output path}
 identifier=com.convertbar.server
 
-keychain_args=()
-[ -n "${KEYCHAIN:-}" ] && keychain_args=(--keychain "$KEYCHAIN")
-
+# Not an array: macOS's /bin/bash 3.2 treats an empty array expansion as unbound under `set -u`.
+# shellcheck disable=SC2086
 codesign --force --options runtime --timestamp --identifier "$identifier" \
-  "${keychain_args[@]}" --sign "$identity" "$bin"
+  ${KEYCHAIN:+--keychain "$KEYCHAIN"} --sign "$identity" "$bin"
 
 codesign --verify --strict --verbose=2 "$bin"
 desc=$(codesign -dvv "$bin" 2>&1)
@@ -41,7 +40,8 @@ page=""
 for _ in $(seq 1 50); do
   if { exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null; then
     printf 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3
-    page=$(cat <&3)
+    # Bounded: a listener that answers but never closes must not hang the release.
+    IFS= read -r -d '' -t 10 page <&3 || true
     exec 3<&-
     break
   fi

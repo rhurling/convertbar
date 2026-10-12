@@ -206,6 +206,8 @@ jobs:
   publish-server-darwin:
     needs: publish-tauri
     runs-on: macos-latest
+    # A stalled notarization must not pin the release as a draft for the 6h default.
+    timeout-minutes: 60
     permissions:
       contents: write # upload the asset to the drafted release
     steps:
@@ -298,9 +300,11 @@ jobs:
           key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$key_path"
           chmod 600 "$key_path"
+          # `|| true`: if notarytool exits non-zero on a rejection, the verdict and the log
+          # fetch below must still run, or the failure carries no submission id.
           result=$(xcrun notarytool submit "$SERVER_ZIP" --key "$key_path" \
             --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
-            --wait --output-format json)
+            --wait --timeout 30m --output-format json) || true
           echo "$result"
           status=$(jq -r .status <<<"$result")
           if [ "$status" != "Accepted" ]; then
