@@ -22,7 +22,7 @@ Remote roots configured by env (ADR 0002). A remote job pulls its source into lo
 
 ### Talking to the host safely
 
-- Remote scripts are sent on stdin to `sh -s` with their arguments after it. The one exception is the push, whose stdin is the file: its fixed one-line script travels as an argument instead. Every path argument is single-quote-escaped, and no path is ever interpolated unescaped into a remote command.
+- Remote scripts are sent on stdin to `sh -s`, their arguments set by a leading `set --` line in the same stream. On the command line they would be capped: sshd hands the remote command to the login shell as one argument, which Linux limits to 128 KiB, a few hundred paths of a folder add. The one exception is the push, whose stdin is the file: its fixed one-line script travels as an argument instead. Every path argument is single-quote-escaped, and no path is ever interpolated unescaped into a remote command.
 - Every multi-path answer from the host (listings, the add-time stat, realpath) is NUL-delimited, so a name containing a newline or a quote cannot corrupt the parse.
 - Every finalize script is wrapped in a function that is called only on its last line. A stream cut off part-way therefore runs nothing.
 - Remote mtimes are taken with millisecond precision, the same unit as local fingerprints. The unchanged-since-pull check compares size and that mtime.
