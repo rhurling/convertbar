@@ -220,6 +220,8 @@ it("shows the unreachable banner live, and drops it once a job is running again"
   act(() => handler!({ payload: { host: "hetzner", step: "finalize" } }));
   expect(screen.getByText(/hetzner is unreachable/i)).toBeInTheDocument();
 
+  // A running job means the stop is over, whatever a read racing the restart still answers.
+  vi.mocked(commands.getUnreachableStop).mockResolvedValue({ host: "hetzner", step: "finalize" });
   queueMock = { ...queueMock, activeJob: { id: "a", source_path: "/m/a.mp4", status: "encoding" } };
   rerender(<QueuePage hbStatus={null} adding={null} isAdding={false} intake={intakeStub} />);
   await waitFor(() => expect(screen.queryByText(/is unreachable/i)).toBeNull());
