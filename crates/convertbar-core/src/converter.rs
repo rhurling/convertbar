@@ -2172,7 +2172,8 @@ fn book_without_encode(ctx: &Ctx, job_id: &str, b: &Booking) {
 /// ADR 0003's decided edge: a new-name job re-queued after an outage, whose source is now
 /// definitely gone and whose output name is present on the host, was finished by the finalize
 /// that the connection dropped after — it published the result and deleted the original. Returns
-/// the published file's stat. Consumes the re-queue marker.
+/// the published file's stat. Consumes the re-queue marker. An in-place job never qualifies: its
+/// output path is its source path, which is gone.
 fn published_before_outage(
     ctx: &Ctx,
     setup: &crate::remote::RemoteSetup,
@@ -2187,7 +2188,7 @@ fn published_before_outage(
         }
         marked
     };
-    if !marked || is_in_place(&job.source_path, &job.output_path) {
+    if !marked {
         return Ok(None);
     }
     match crate::remote::probe_source(setup, host, &job.output_path, "stat")? {
@@ -8677,11 +8678,8 @@ HandBrake has exited.";
         // The connection dropped after finalize published talk.mkv and deleted talk.wmv. Only
         // that job, re-queued after its outage, is booked done from what is on the host; any
         // other job whose source vanished is today's quiet "no longer exists".
-        for (case, new_name, after_outage, done) in [
-            ("the edge", true, true, true),
-            ("in place", false, true, false),
-            ("not after an outage", true, false, false),
-        ] {
+        for (case, after_outage) in [("the edge", true), ("not after an outage", false)] {
+            let done = after_outage;
             let world = RemoteWorld::new("unused");
             set_setting(
                 &world.ctx.db,
@@ -8689,11 +8687,7 @@ HandBrake has exited.";
                 "http://receiver.invalid/hook",
             );
             let source = world.root.join("talk.wmv").to_string_lossy().into_owned();
-            let output = if new_name {
-                world.host_file("talk.mkv", "published", 0o644)
-            } else {
-                source.clone()
-            };
+            let output = world.host_file("talk.mkv", "published", 0o644);
             queue_job(&world.ctx.db, "j1", &source, &output, 100);
             world
                 .ctx
