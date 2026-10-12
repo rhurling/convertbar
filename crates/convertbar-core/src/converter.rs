@@ -8843,4 +8843,34 @@ HandBrake has exited.";
             assert!(!world.hb_inputs.exists(), "{case}: nothing encoded");
         }
     }
+
+    #[test]
+    fn finalize_begins_only_for_a_job_still_running() {
+        // The gap between the push and finalize holds only the local checksum, so no queue-level
+        // test can land a Cancel in it; this pins the decision taken there. A row Cancel booked
+        // in that gap must not be finalized, or the host's file is replaced under a job the
+        // user was told was cancelled.
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::AbsentLocator));
+        for (status, begins) in [("encoding", true), ("paused", true), ("error", false)] {
+            queue_job(&ctx.db, "j1", "/share/a.mkv", "/share/a.mkv", 1);
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute("UPDATE jobs SET status = ?1", params![status])
+                .unwrap();
+
+            assert_eq!(begin_finalize(&ctx, "j1", "unraid"), begins, "{status}");
+            assert_eq!(
+                ctx.converter.finalizing_on.lock().unwrap().take(),
+                begins.then(|| "unraid".to_string()),
+                "{status}"
+            );
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM jobs", [])
+                .unwrap();
+        }
+    }
 }
