@@ -7803,4 +7803,269 @@ HandBrake has exited.";
         );
         assert!(crate::remote::testing::shim_log(world.setup()).is_empty());
     }
+
+    #[cfg(unix)]
+    impl RemoteWorld {
+        fn names_in(&self, rel: &str) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(self.root.join(rel))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Queues an in-place job for a path that does not exist on the host.
+        fn queue_remote_missing(&self, id: &str, path: &str) {
+            queue_job(&self.ctx.db, id, path, path, 1);
+            self.ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET remote_host = 'unraid' WHERE id = ?1",
+                    params![id],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_new_name_is_published_and_the_original_deleted_or_kept_by_the_mode() {
+        for (mode, originals_left) in [("delete", false), ("keep", true)] {
+            let world = RemoteWorld::new("smaller");
+            set_setting(&world.ctx.db, "cleanup_mode", mode);
+            let wmv = world.host_file("talk.wmv", "the original, much larger", 0o600);
+            let mkv = world.root.join("talk.mkv").to_string_lossy().into_owned();
+            world.queue_remote("j1", &wmv, &mkv);
+
+            process_queue(&world.ctx);
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!(status, "done", "{mode}: {error:?}");
+            assert_eq!(std::fs::read_to_string(&mkv).unwrap(), "smaller", "{mode}");
+            let mut want = vec!["talk.mkv".to_string()];
+            if originals_left {
+                want.push("talk.wmv".to_string());
+            }
+            assert_eq!(world.names_in(""), want, "{mode}");
+            assert!(world.staging_is_empty(), "{mode}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_job_whose_original_wins_or_turns_keep_in_place_pushes_nothing() {
+        // The re-encode is larger: skipped, the original untouched, nothing uploaded.
+        let world = RemoteWorld::new("a re-encode far larger than the original");
+        let film = world.host_file("film.mkv", "small", 0o644);
+        world.queue_remote("j1", &film, &film);
+        process_queue(&world.ctx);
+        assert_eq!(world.row("j1").0, "skipped");
+        assert_eq!(std::fs::read_to_string(&film).unwrap(), "small");
+        assert!(!world.pushed());
+
+        // The mode became keep while an in-place job was already past the queue: its result is
+        // discarded and the row dropped, exactly as locally, and nothing reaches the host.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        set_setting(&world.ctx.db, "cleanup_mode", "keep");
+        process_queue(&world.ctx);
+        let rows: i64 = world
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(
+            std::fs::read_to_string(&film).unwrap(),
+            "the original, much larger"
+        );
+        assert!(!world.pushed());
+        assert!(world.staging_is_empty());
+    }
+
+    /// One finalize refusal: what the host is made to do just before finalize, what the error
+    /// must say, and which files must be left behind.
+    #[cfg(unix)]
+    struct Refusal {
+        name: &'static str,
+        before_finalize: &'static str,
+        message: &'static str,
+        temp_left: bool,
+        original: &'static str,
+        target: Option<&'static str>,
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn every_finalize_refusal_names_what_happened_and_leaves_the_files_it_promises() {
+        let original = "the original, much larger";
+        let cases = [
+            Refusal {
+                name: "the original changed since the pull",
+                before_finalize: "printf ' edited' >> \"$ROOT/talk.wmv\"",
+                message: "changed since it was pulled",
+                temp_left: true,
+                original: "the original, much larger edited",
+                target: None,
+            },
+            Refusal {
+                name: "the pushed result does not match",
+                before_finalize: "printf 'x' >> \"$ROOT/.talk.convertbar-tmp.mkv\"",
+                message: "did not match",
+                temp_left: false,
+                original,
+                target: None,
+            },
+            Refusal {
+                name: "the name appeared on the host",
+                before_finalize: "printf 'somebody else' > \"$ROOT/talk.mkv\"",
+                message: "already exists",
+                temp_left: true,
+                original,
+                target: Some("somebody else"),
+            },
+        ];
+        for case in cases {
+            let world = RemoteWorld::new("smaller");
+            let wmv = world.host_file("talk.wmv", original, 0o644);
+            let mkv = world.root.join("talk.mkv");
+            world.queue_remote("j1", &wmv, &mkv.to_string_lossy());
+            crate::remote::testing::hook_before(
+                world.setup(),
+                "finalize",
+                &format!("ROOT='{}'\n{}", world.root.display(), case.before_finalize),
+            );
+
+            process_queue(&world.ctx);
+
+            let (status, _, _, _, error) = world.row("j1");
+            let error = error.unwrap_or_default();
+            assert_eq!(status, "error", "{}", case.name);
+            assert!(error.contains(case.message), "{}: {error}", case.name);
+            assert_eq!(
+                std::fs::read_to_string(&wmv).unwrap(),
+                case.original,
+                "{}",
+                case.name
+            );
+            let temp = world.root.join(".talk.convertbar-tmp.mkv");
+            assert_eq!(temp.exists(), case.temp_left, "{}", case.name);
+            if case.temp_left {
+                assert!(
+                    error.contains(&*temp.to_string_lossy()),
+                    "{}: the message names the temp left behind: {error}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&mkv).ok().as_deref(),
+                case.target,
+                "{}: nothing was published or overwritten",
+                case.name
+            );
+            assert!(world.staging_is_empty(), "{}", case.name);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_chown_failure_leaves_both_files() {
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        crate::remote::testing::failing_program(world.setup(), "finalize", "chown");
+
+        process_queue(&world.ctx);
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(status, "error");
+        assert!(error.unwrap().contains("owner, group and mode"));
+        assert_eq!(
+            std::fs::read_to_string(&film).unwrap(),
+            "the original, much larger"
+        );
+        assert!(world.root.join(".film.convertbar-tmp.mkv").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_short_download_is_an_error_and_nothing_is_encoded() {
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        // Truncated after the baseline stat, before the stream: fewer bytes arrive than expected.
+        crate::remote::testing::hook_before(
+            world.setup(),
+            "pull",
+            &format!("printf 'short' > '{film}'"),
+        );
+
+        process_queue(&world.ctx);
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(status, "error");
+        assert!(error.unwrap().contains("short"));
+        assert!(!world.hb_inputs.exists(), "HandBrake never ran");
+        assert!(!world.pushed());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_a_definitely_missing_remote_source_is_no_longer_there() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads any directory");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let world = RemoteWorld::new("smaller");
+        let gone = world.root.join("gone.mkv").to_string_lossy().into_owned();
+        world.queue_remote_missing("j1", &gone);
+        let locked = world.host_file("locked/film.mkv", "x", 0o644);
+        world.queue_remote("j2", &locked, &locked);
+        let dir = world.root.join("locked");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        process_queue(&world.ctx);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            world.row("j1").4.as_deref(),
+            Some("Source file no longer exists")
+        );
+        let (status, _, _, _, error) = world.row("j2");
+        assert_eq!(status, "error");
+        assert_ne!(
+            error.as_deref(),
+            Some("Source file no longer exists"),
+            "a source the host cannot look at is not a vanished one"
+        );
+        assert_eq!(
+            class_of(&world.ctx.db, "j2").as_deref(),
+            Some("environment")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_condemned_remote_source_is_fingerprinted_by_the_hosts_stat() {
+        let world = RemoteWorld::new("unused");
+        let base = world.root.parent().unwrap().to_path_buf();
+        let hb = bad_source_fake_handbrake_script(&base);
+        set_setting(&world.ctx.db, "handbrake_path", &hb.to_string_lossy());
+        let film = world.host_file("film.mkv", "broken bytes", 0o644);
+        world.queue_remote("j1", &film, &film);
+
+        process_queue(&world.ctx);
+
+        assert_eq!(class_of(&world.ctx.db, "j1").as_deref(), Some("bad_source"));
+        let on_host = crate::probe_cache::file_identity(&film).unwrap();
+        let (_, _, size, mtime, _) = world.row("j1");
+        assert_eq!((size, mtime), (Some(on_host.size), Some(on_host.mtime)));
+    }
 }

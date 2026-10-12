@@ -610,9 +610,6 @@ const FINALIZE_SCRIPT: &str = r#"finalize() {
   if [ "$orig" = "$target" ]; then
     mv -f -T -- "$tmp" "$orig" || exit 25
   else
-    if [ -e "$target" ] || [ -L "$target" ]; then
-      exit 26
-    fi
     if ! mv -T --update=none-fail -- "$tmp" "$target"; then
       if [ -e "$target" ] || [ -L "$target" ]; then
         exit 26
