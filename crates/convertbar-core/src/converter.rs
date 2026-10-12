@@ -228,6 +228,9 @@ pub struct ConverterState {
     /// Why the queue stopped for an unreachable host (ADR 0003): held in memory like the
     /// low-disk reason, and gone after a restart while the persisted pause stays.
     pub(crate) unreachable_stop: Mutex<Option<UnreachableStop>>,
+    /// The host a remote job is finalizing on. Set and read under the `ctx.db` lock, so a
+    /// Cancel either books the job before finalize starts or is refused while it runs.
+    pub(crate) finalizing_on: Mutex<Option<String>>,
     /// Whether this queue run has already notified about a hook failure. Lives on the state
     /// rather than as a `process_queue` local because one fire point is inside
     /// `record_job_error_quiet`, a free function reached from nine places: threading `&mut`
@@ -261,6 +264,7 @@ impl ConverterState {
             installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
             unreachable_stop: Mutex::new(None),
+            finalizing_on: Mutex::new(None),
             hook_failure_notified: Mutex::new(false),
             work_arrived_while_busy: std::sync::atomic::AtomicBool::new(false),
         }
@@ -2343,7 +2347,11 @@ fn publish_result(
             "Could not checksum the staged result: {e}"
         )))
     })?;
-    crate::remote::finalize(
+    if !begin_finalize(ctx, &job.id, host) {
+        crate::remote::remove_temp(setup, host, &remote_temp);
+        return Err(PublishFailure::Killed);
+    }
+    let finalized = crate::remote::finalize(
         setup,
         host,
         &crate::remote::FinalizeRequest {
@@ -2355,8 +2363,27 @@ fn publish_result(
             baseline,
             delete_original,
         },
-    )
-    .map_err(PublishFailure::Failed)
+    );
+    *ctx.converter.finalizing_on.lock().unwrap() = None;
+    finalized.map_err(PublishFailure::Failed)
+}
+
+/// Finalize cannot be cancelled: a script already past its last line has replaced or deleted a
+/// file on the host. So it starts only while the job is still running, decided under the lock a
+/// Cancel books under, and from then on Cancel is refused until it ends.
+fn begin_finalize(ctx: &Ctx, job_id: &str, host: &str) -> bool {
+    let db = ctx.db.lock().unwrap();
+    let running = db
+        .query_row(
+            "SELECT status FROM jobs WHERE id = ?1",
+            params![job_id],
+            |r| r.get::<_, String>(0),
+        )
+        .is_ok_and(|s| s == "encoding" || s == "paused");
+    if running {
+        *ctx.converter.finalizing_on.lock().unwrap() = Some(host.to_string());
+    }
+    running
 }
 
 /// Stamps a condemned row's identity. A remote job's is its pull baseline: a stat of the staged
@@ -8053,45 +8080,102 @@ HandBrake has exited.";
 
     #[test]
     #[cfg(unix)]
-    fn a_cancel_during_the_push_is_booked_and_leaves_the_original() {
+    fn a_cancel_during_a_transfer_is_booked_and_leaves_the_original() {
         // The push runs after HandBrake has exited; the job must still be current so Cancel
-        // reaches it, and no half-pushed temp may stay on the host.
+        // reaches it, and no half-pushed temp may stay on the host. Nothing local is deleted.
+        for step in ["pull", "push"] {
+            let world = RemoteWorld::new("smaller");
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            // Off the transfer's pipes, or the orphaned sleep holds stderr open after the kill.
+            crate::remote::testing::hook_before(
+                world.setup(),
+                step,
+                "exec >/dev/null 2>&1\nsleep 30",
+            );
+
+            std::thread::scope(|s| {
+                let queue = s.spawn(|| process_queue(&world.ctx));
+                world.wait_for_step(step);
+                crate::control::cancel_conversion(&world.ctx).unwrap();
+                queue.join().unwrap();
+            });
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!(
+                (status.as_str(), error.as_deref()),
+                ("error", Some("Cancelled by user")),
+                "{step}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&film).unwrap(),
+                "the original, much larger",
+                "{step}"
+            );
+            assert!(
+                !world.root.join(".film.convertbar-tmp.mkv").exists(),
+                "{step}"
+            );
+            assert!(world.staging_is_empty(), "{step}");
+            assert!(
+                world.ctx.converter.current_job_id.lock().unwrap().is_none(),
+                "{step}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pause_freezes_a_transfer_and_between_transfers_waits_for_the_job() {
+        use std::time::Duration;
+        // During a transfer the ssh process is the current child: Pause stops it, Resume
+        // continues it.
         let world = RemoteWorld::new("smaller");
         let film = world.host_file("film.mkv", "the original, much larger", 0o644);
         world.queue_remote("j1", &film, &film);
-        // Off the transfer's pipes, or the orphaned sleep holds stderr open after the kill.
-        crate::remote::testing::hook_before(
-            world.setup(),
-            "push",
-            "exec >/dev/null 2>&1\nsleep 30",
-        );
-
+        crate::remote::testing::hook_before(world.setup(), "pull", "exec >/dev/null 2>&1\nsleep 1");
         std::thread::scope(|s| {
             let queue = s.spawn(|| process_queue(&world.ctx));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            while !world.pushed() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the push never started"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            crate::control::cancel_conversion(&world.ctx).unwrap();
+            world.wait_for_step("pull");
+            crate::control::pause_conversion(&world.ctx).unwrap();
+            assert_eq!(world.row("j1").0, "paused");
+            // Long enough for the hook to finish: a frozen ssh never starts the pull itself.
+            std::thread::sleep(Duration::from_millis(1500));
+            assert_eq!(world.row("j1").0, "paused");
+            assert!(!world.ran("stat", 2), "the pull is frozen, not finished");
+            crate::control::resume_conversion(&world.ctx).unwrap();
             queue.join().unwrap();
         });
+        assert_eq!(world.row("j1").0, "done");
 
-        let (status, _, _, _, error) = world.row("j1");
-        assert_eq!(
-            (status.as_str(), error.as_deref()),
-            ("error", Some("Cancelled by user"))
-        );
-        assert_eq!(
-            std::fs::read_to_string(&film).unwrap(),
-            "the original, much larger"
-        );
-        assert!(!world.root.join(".film.convertbar-tmp.mkv").exists());
-        assert!(world.staging_is_empty());
-        assert!(world.ctx.converter.current_job_id.lock().unwrap().is_none());
+        // During finalize there is no child to stop: Pause arms pause-after-current, and Cancel
+        // is refused, because a finalize past its last line has already replaced the file.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        let other = world.host_file("other.mkv", "another original, larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        world.queue_remote("j2", &other, &other);
+        world
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET queue_order = 1 WHERE id = 'j2'", [])
+            .unwrap();
+        crate::remote::testing::hook_before(world.setup(), "finalize", "sleep 1");
+        std::thread::scope(|s| {
+            let queue = s.spawn(|| process_queue(&world.ctx));
+            world.wait_for_step("finalize");
+            crate::control::pause_conversion(&world.ctx).unwrap();
+            assert!(crate::control::get_pause_after_current(&world.ctx));
+            let refused = crate::control::cancel_conversion(&world.ctx).unwrap_err();
+            assert_eq!(refused, "finishing on unraid; try again in a moment");
+            queue.join().unwrap();
+        });
+        assert_eq!(world.row("j1").0, "done");
+        assert_eq!(std::fs::read_to_string(&film).unwrap(), "smaller");
+        assert_eq!(world.row("j2").0, "queued", "paused after the current job");
+        assert_eq!(world.setting("queue_paused").as_deref(), Some("true"));
     }
 
     #[test]
@@ -8497,6 +8581,23 @@ HandBrake has exited.";
 
     #[cfg(unix)]
     impl RemoteWorld {
+        /// Whether the shim has run `step` at least `times` times.
+        fn ran(&self, step: &str, times: usize) -> bool {
+            crate::remote::testing::shim_log(self.setup())
+                .iter()
+                .filter(|s| *s == step)
+                .count()
+                >= times
+        }
+
+        fn wait_for_step(&self, step: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !self.ran(step, 1) {
+                assert!(std::time::Instant::now() < deadline, "{step} never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
         fn setting(&self, key: &str) -> Option<String> {
             read_setting_opt(&self.ctx.db.lock().unwrap(), key)
         }

@@ -133,6 +133,13 @@ pub fn pause_conversion(ctx: &Ctx) -> Result<(), String> {
                     },
                 );
             }
+        } else if job_id_val.is_some() {
+            // A job is running but nothing can be frozen: a remote job between its transfers
+            // (stat, probe, checksum, finalize). Pause after it rather than not at all.
+            *ctx.converter
+                .pause_after_current
+                .lock()
+                .map_err(|e| e.to_string())? = true;
         }
     }
     Ok(())
@@ -239,6 +246,7 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
     // pause remembered from an earlier SIGSTOP must be dropped — otherwise the next launch would
     // wrongly stay paused for a queue that was actively running.
     if let Ok(conn) = ctx.db.lock() {
+        refuse_while_finalizing(ctx)?;
         converter::set_queue_paused(&conn, false);
     }
 
@@ -258,6 +266,9 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
     let (paths, update_result) = match job_id_val {
         Some(ref job_id) => {
             let db = ctx.db.lock().map_err(|e| e.to_string())?;
+            // Again under the lock this booking takes: finalize may have begun since the check
+            // above, and it decides whether to start under this same lock.
+            refuse_while_finalizing(ctx)?;
             // A remote row's paths name files on its host: nothing local is deleted for it.
             let paths: Option<(String, String)> = db
                 .query_row(
@@ -381,6 +392,20 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Refuses a Cancel while a remote job finalizes. Call with `ctx.db` held.
+fn refuse_while_finalizing(ctx: &Ctx) -> Result<(), String> {
+    match ctx
+        .converter
+        .finalizing_on
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_deref()
+    {
+        Some(host) => Err(format!("finishing on {host}; try again in a moment")),
+        None => Ok(()),
+    }
 }
 
 pub fn pause_after_current(ctx: &Ctx) -> Result<(), String> {
