@@ -99,7 +99,9 @@ both confine a nice value to the process's own scheduling group — so use
 2. The output filename gets a suffix built from a template. The default,
    `.{resolution}-{codec}`, turns `vacation.mkv` into `vacation.1080p-h265.mp4`.
    Available variables: `{codec}`, `{resolution}`, `{quality}`, `{preset}`,
-   `{device}` — all read from the preset's own metadata.
+   `{device}` — all read from the preset's own metadata. The extension is the preset's
+   container: an MP4 preset writes `.mp4`, an MKV preset (such as the Linux default)
+   writes `.mkv`.
 3. When the encode finishes, the two files are compared and the larger one is
    removed, according to your **After conversion** setting.
 

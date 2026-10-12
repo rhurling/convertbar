@@ -58,8 +58,9 @@ pub fn recover_interrupted_jobs(db: &Connection) {
         let _ = std::fs::remove_file(&target);
         let _ = db.execute(
             // started_at is cleared with the status: the abandoned attempt's start time must
-            // not survive into the next one. Three error paths in process_queue (vanished
-            // source, HandBrake-not-found, ClaimOutcome::Failed) write completed_at WITHOUT
+            // not survive into the next one. Four error paths in process_queue (vanished
+            // source, HandBrake-not-found, the preset-file pre-flight, ClaimOutcome::Failed)
+            // write completed_at WITHOUT
             // re-claiming, so a surviving stamp would report the whole downtime as encode time.
             "UPDATE jobs SET status = 'queued', started_at = NULL WHERE id = ?1",
             params![id],

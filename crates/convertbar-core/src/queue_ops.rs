@@ -2078,6 +2078,25 @@ mod tests {
                 count: 1
             }]
         );
+
+        // A literal suffix goes before the preset's extension, renumbered names included.
+        crate::settings_ops::set_preset_suffix(&ctx, &configured_preset(&ctx), ".h265").unwrap();
+        let clip = file("clip.mkv");
+        let ep = file("ep.mp4");
+        file("busy.h265.mkv");
+        let busy = file("busy.mov");
+        let suffixed = add_files_inner(&ctx, &[clip.clone(), ep.clone(), busy.clone()], None)
+            .unwrap()
+            .added;
+        let outputs: Vec<_> = suffixed.iter().map(|j| j.output_path.clone()).collect();
+        assert_eq!(
+            outputs,
+            [
+                in_dir("clip.h265.mkv"),
+                in_dir("ep.h265.mkv"),
+                in_dir("busy (1).h265.mkv")
+            ]
+        );
     }
 
     /// A stub HandBrakeCLI that answers `--preset-export` with one preset of the given
@@ -2183,10 +2202,8 @@ mod tests {
         // mis-detect the output format from the name; refuse with the value named instead.
         let dir = tempfile::tempdir().unwrap();
         let stub = export_stub(dir.path(), "av_mov");
-        let (ctx, _sink, _disposer) = test_ctx_with_locator(
-            test_conn(),
-            Arc::new(crate::handbrake::StubLocator(stub)),
-        );
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::StubLocator(stub)));
         let src = dir.path().join("clip.wmv");
         std::fs::write(&src, b"x").unwrap();
 
@@ -2205,10 +2222,8 @@ mod tests {
         // The real fetch path end to end: export JSON -> metadata -> output name.
         let dir = tempfile::tempdir().unwrap();
         let stub = export_stub(dir.path(), "av_webm");
-        let (ctx, _sink, _disposer) = test_ctx_with_locator(
-            test_conn(),
-            Arc::new(crate::handbrake::StubLocator(stub)),
-        );
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::StubLocator(stub)));
         crate::settings_ops::set_preset_suffix(&ctx, &configured_preset(&ctx), ".x").unwrap();
         let src = dir.path().join("clip.wmv");
         std::fs::write(&src, b"x").unwrap();

@@ -52,8 +52,10 @@ pub fn load_preset_import(ctx: &Ctx, file: &std::path::Path) -> Result<(), Strin
     use convertbar_core::handbrake;
 
     let imported = handbrake::read_preset_file(file)?;
-    // Absolute from here on: the path is handed to every HandBrake child as an argument.
-    let file = std::fs::canonicalize(file)
+    // Absolute from here on: the path is handed to every HandBrake child as an argument. Not
+    // canonical: a symlinked file is followed on every read, so retargeting it takes effect the
+    // way an in-place rewrite does instead of pinning the target seen at startup.
+    let file = std::path::absolute(file)
         .map_err(|e| format!("Preset file {} cannot be read: {e}", file.display()))?;
     let path = file.display();
     if imported.is_empty() {
@@ -550,7 +552,7 @@ mod tests {
                 "HandBrake unresolvable",
                 ctx_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator)),
                 preset_file(dir.path(), "no-hb.json", ONE_PRESET),
-                "HandBrakeCLI",
+                "HandBrakeCLI cannot be found",
             ),
             (
                 "collision",
@@ -581,15 +583,20 @@ mod tests {
         let ctx = ctx_with_locator(Arc::new(convertbar_core::handbrake::StubLocator(
             preset_list_stub(dir.path()),
         )));
-        let file = preset_file(dir.path(), "presets.json", ONE_PRESET);
+        let target = preset_file(dir.path(), "presets.json", ONE_PRESET);
+        let file = dir.path().join("current.json");
+        std::os::unix::fs::symlink(&target, &file).unwrap();
 
         load_preset_import(&ctx, &file).unwrap();
 
         let import = ctx.preset_import.get().expect("the file is imported");
+        assert!(
+            import.path.is_absolute(),
+            "every HandBrake child receives it"
+        );
         assert_eq!(
-            import.path,
-            std::fs::canonicalize(&file).unwrap(),
-            "stored absolute: every HandBrake child receives it as an argument"
+            import.path, file,
+            "the link itself, not its target: retargeting it must reach the next read"
         );
         let mut builtins: Vec<&str> = import.builtins.iter().map(String::as_str).collect();
         builtins.sort();
