@@ -351,7 +351,9 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     return <div className="settings-page loading">Loading settings...</div>;
   }
 
-  const previewFilename = `vacation${resolvedSuffix}.mp4`;
+  // The output's extension is the preset's container (ADR 0004); mp4 until the metadata lands.
+  const container = presetMetadata?.container ?? "mp4";
+  const previewFilename = `vacation${resolvedSuffix}.${container}`;
 
   const visibleVariables = VARIABLES.filter(
     ({ key }) => presetMetadata && presetMetadata[key],
@@ -435,7 +437,7 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
                 `vacation .mp4`. Trimming here warned about skips that never happen. */}
             {resolvedSuffix === "" && (
               <div className="suffix-inplace-note">
-                Empty suffix: mp4 files are re-encoded in place, replacing the original. The fast
+                Empty suffix: {container} files are re-encoded in place, replacing the original. The fast
                 &quot;already converted&quot; skip-by-suffix is also disabled.
                 {settings.cleanup_mode === "keep" && (
                   <>
