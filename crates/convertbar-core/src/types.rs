@@ -21,6 +21,9 @@ pub struct JobInfo {
     /// converter::claim_job.
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// The ssh host alias a remote job's paths live on (ADR 0005); `None` for a local job.
+    #[serde(default)]
+    pub remote_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

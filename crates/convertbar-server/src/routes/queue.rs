@@ -14,17 +14,44 @@ use serde::Deserialize;
 
 use convertbar_core::queue_ops;
 
-use super::{blocking_json, core_err, ServerState};
+use super::{blocking_json, blocking_response, core_err, ServerState};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddFilesBody {
     paths: Vec<String>,
+    /// An ssh host alias from `CONVERTBAR_REMOTE_ROOTS`; the paths are then absolute paths on
+    /// that host (ADR 0005). Absent: local paths, as before.
+    #[serde(default)]
+    remote: Option<String>,
 }
 
 pub async fn add_files(State(s): State<ServerState>, Json(b): Json<AddFilesBody>) -> Response {
     let ctx = s.ctx.clone();
-    blocking_json(move || queue_ops::add_files(&ctx, &b.paths)).await
+    match b.remote {
+        None => blocking_json(move || queue_ops::add_files(&ctx, &b.paths)).await,
+        Some(host) => {
+            blocking_response(move || {
+                remote_add_response(queue_ops::add_remote_files(&ctx, &host, &b.paths))
+            })
+            .await
+        }
+    }
+}
+
+/// 400 for a request that names something it may not (unknown host, outside the roots, a
+/// symlink), 502 when the host cannot be reached, so a client can tell the two apart.
+fn remote_add_response(
+    result: Result<convertbar_core::types::AddResult, queue_ops::RemoteAddError>,
+) -> Response {
+    use queue_ops::RemoteAddError;
+    let (status, message) = match result {
+        Ok(added) => return Json(added).into_response(),
+        Err(RemoteAddError::Refused(m)) => (StatusCode::BAD_REQUEST, m),
+        Err(RemoteAddError::Unreachable(m)) => (StatusCode::BAD_GATEWAY, m),
+        Err(RemoteAddError::Failed(m)) => return core_err(m).into_response(),
+    };
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 /// Shared by `scan_folder` and `confirm_folder_add` — both bodies are just `{"path": "..."}`.

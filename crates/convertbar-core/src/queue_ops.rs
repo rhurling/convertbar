@@ -77,6 +77,7 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobInfo> {
         created_at: row.get(12)?,
         completed_at: row.get(13)?,
         started_at: row.get(14)?,
+        remote_host: row.get(15)?,
     })
 }
 
@@ -753,19 +754,25 @@ fn choose_output_path(
 /// pre-migration legacy history paths (scoped by `skip_already_converted`, plus in-place rows
 /// and — under `keep` — every unfingerprinted row), and the always-on `(size, mtime)`
 /// fingerprints of completed conversions.
+///
+/// The two path sets hold only rows on `host` (`None`: local rows), so a remote path never
+/// collides with an identical local path string. The fingerprints are path-independent and come
+/// from every row, local and remote alike.
 fn fetch_skip_sets(
     conn: &rusqlite::Connection,
     skip_already_converted: bool,
     cleanup_mode: &str,
+    host: Option<&str>,
 ) -> Result<(HashSet<String>, HashSet<String>, HashSet<(i64, i64)>), String> {
     let queued_paths: HashSet<String> = {
         let mut stmt = conn
             .prepare(
-                "SELECT source_path FROM jobs WHERE status IN ('queued', 'encoding', 'paused')",
+                "SELECT source_path FROM jobs WHERE status IN ('queued', 'encoding', 'paused') \
+                 AND remote_host IS ?1",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map(params![host], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
@@ -792,7 +799,7 @@ fn fetch_skip_sets(
     {
         let mut stmt = conn
             .prepare(
-                "SELECT source_path, output_path, source_size, source_mtime
+                "SELECT source_path, output_path, source_size, source_mtime, remote_host
                  FROM jobs WHERE status IN ('done', 'skipped')",
             )
             .map_err(|e| e.to_string())?;
@@ -803,14 +810,16 @@ fn fetch_skip_sets(
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
-        for (source_path, output_path, size, mtime) in rows.flatten() {
+        for (source_path, output_path, size, mtime, row_host) in rows.flatten() {
             match (size, mtime) {
                 (Some(s), Some(m)) => {
                     converted_identities.insert((s, m));
                 }
+                _ if row_host.as_deref() != host => {}
                 _ => {
                     let in_place = Path::new(&source_path) == Path::new(&output_path);
                     if in_place || cleanup_mode == "keep" || skip_already_converted {
@@ -835,7 +844,7 @@ fn probe_candidates(
     cleanup_mode: &str,
 ) -> Result<Vec<String>, String> {
     let (queued_paths, legacy_history_paths, converted_identities) =
-        fetch_skip_sets(conn, skip_already_converted, cleanup_mode)?;
+        fetch_skip_sets(conn, skip_already_converted, cleanup_mode, None)?;
     Ok(paths
         .iter()
         .filter(|p| {
@@ -999,6 +1008,19 @@ pub fn add_files_inner(
     Ok(result)
 }
 
+/// Where an intake's files live: the local disk, or one remote host whose answers were fetched
+/// before the DB lock was taken (nothing here may reach the network under that lock).
+struct IntakeSource<'a> {
+    /// `None` for local files; the ssh host alias otherwise. Rows are written and deduplicated
+    /// under it.
+    host: Option<&'a str>,
+    identity: &'a dyn Fn(&str) -> Option<crate::probe_cache::FileIdentity>,
+    /// The size for the space-saved display when the identity is unavailable.
+    fallback_size: &'a dyn Fn(&str) -> Option<i64>,
+    /// Whether a candidate output name already exists where the file lives.
+    exists: &'a dyn Fn(&str) -> bool,
+}
+
 /// DB-only core of `add_files_inner`: applies the skip rules and inserts queued jobs given an
 /// already-resolved output suffix. Separated from suffix resolution (which may shell out to
 /// HandBrakeCLI) so the skip-rule matrix can be tested against an in-memory database.
@@ -1011,8 +1033,38 @@ fn add_files_to_db(
     skip_already_converted: bool,
     cleanup_mode: &str,
 ) -> Result<AddResult, String> {
+    add_files_to_db_from(
+        conn,
+        paths,
+        preset,
+        suffix,
+        container,
+        skip_already_converted,
+        cleanup_mode,
+        &IntakeSource {
+            host: None,
+            identity: &|p| crate::probe_cache::file_identity(p),
+            fallback_size: &|p| std::fs::metadata(p).map(|m| m.len() as i64).ok(),
+            exists: &|p| Path::new(p).exists(),
+        },
+    )
+}
+
+/// The skip rules, naming and in-place rules for one intake, local or remote. One function so
+/// the two can never disagree about what is skipped, renumbered or refused under `keep`.
+#[allow(clippy::too_many_arguments)]
+fn add_files_to_db_from(
+    conn: &rusqlite::Connection,
+    paths: &[String],
+    preset: &str,
+    suffix: &str,
+    container: &str,
+    skip_already_converted: bool,
+    cleanup_mode: &str,
+    source: &IntakeSource,
+) -> Result<AddResult, String> {
     let (queued_paths, legacy_history_paths, converted_identities) =
-        fetch_skip_sets(conn, skip_already_converted, cleanup_mode)?;
+        fetch_skip_sets(conn, skip_already_converted, cleanup_mode, source.host)?;
 
     let mut queue_order = get_next_queue_order(conn)?;
     let mut added = Vec::new();
@@ -1023,7 +1075,7 @@ fn add_files_to_db(
     let mut n_in_place_keep = 0u32;
 
     for path_str in paths {
-        let identity = crate::probe_cache::file_identity(path_str);
+        let identity = (source.identity)(path_str);
         let id_tuple = identity.map(|i| (i.size, i.mtime));
         if let Some(reason) = cheap_skip_reason(
             path_str,
@@ -1047,19 +1099,20 @@ fn add_files_to_db(
             continue;
         }
 
-        let path = Path::new(path_str);
-        // Never clobber an existing output: if the default name is taken (on disk, by another job
-        // row, or earlier in this batch) the base name is renumbered. In-place jobs are returned
-        // verbatim by `choose_output_path` and never renumbered. The closure's borrow of
-        // `assigned` ends with this block, before the `assigned.insert` below.
+        // Never clobber an existing output: if the default name is taken (where the file lives,
+        // by another job row on the same host, or earlier in this batch) the base name is
+        // renumbered. In-place jobs are returned verbatim by `choose_output_path` and never
+        // renumbered. The closure's borrow of `assigned` ends with this block, before the
+        // `assigned.insert` below.
         let output_str = {
             let is_taken = |name: &str| -> bool {
                 assigned.contains(name)
-                    || Path::new(name).exists()
+                    || (source.exists)(name)
                     || conn
                         .query_row(
-                            "SELECT 1 FROM jobs WHERE output_path = ?1 LIMIT 1",
-                            params![name],
+                            "SELECT 1 FROM jobs WHERE output_path = ?1 AND remote_host IS ?2 \
+                             LIMIT 1",
+                            params![name, source.host],
                             |_| Ok(()),
                         )
                         .is_ok()
@@ -1082,13 +1135,13 @@ fn add_files_to_db(
         // Preserve original_size for the space-saved display even when only mtime is unreadable.
         let original_size = identity
             .map(|i| i.size)
-            .or_else(|| std::fs::metadata(path).map(|m| m.len() as i64).ok());
+            .or_else(|| (source.fallback_size)(path_str));
         let source_size = identity.map(|i| i.size);
         let source_mtime = identity.map(|i| i.mtime);
 
         conn.execute(
-            "INSERT INTO jobs (id, source_path, output_path, preset, status, original_size, source_size, source_mtime, queue_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, original_size, source_size, source_mtime, queue_order, created_at, remote_host)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 id,
                 path_str,
@@ -1099,6 +1152,7 @@ fn add_files_to_db(
                 source_mtime,
                 queue_order,
                 now,
+                source.host,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1119,6 +1173,7 @@ fn add_files_to_db(
             created_at: now,
             started_at: None,
             completed_at: None,
+            remote_host: source.host.map(str::to_string),
         });
 
         queue_order += 1;
@@ -1150,6 +1205,165 @@ pub fn add_files(ctx: &Arc<Ctx>, paths: &[String]) -> Result<AddResult, String> 
         add_files_inner(ctx, paths, Some(&reporter as &dyn Fn(u32, u32)))
         // `op` drops here → add-finished, before the queue-updated emit below.
     };
+    if result.is_ok() {
+        ctx.events.emit_t("queue-updated", ());
+    }
+    result
+}
+
+/// Why a remote add was refused. The server head answers 400 for `Refused` and 502 for
+/// `Unreachable`, so a client can tell a wrong request from an outage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteAddError {
+    /// Unknown host, a path outside the roots, a symlink, a missing file.
+    Refused(String),
+    /// The host could not be reached; nothing was queued.
+    Unreachable(String),
+    /// Anything else (HandBrake missing, a database error).
+    Failed(String),
+}
+
+impl From<crate::remote::RemoteError> for RemoteAddError {
+    fn from(e: crate::remote::RemoteError) -> Self {
+        match e {
+            crate::remote::RemoteError::Unreachable { .. } => {
+                RemoteAddError::Unreachable(e.message())
+            }
+            crate::remote::RemoteError::Failed(m) => RemoteAddError::Refused(m),
+        }
+    }
+}
+
+/// Queues files that live on `host` (ADR 0005). Two round trips — one to resolve and stat every
+/// path, one to list the names already in their directories — and then the same skip, naming and
+/// in-place rules as a local add, under one DB lock. Never starts the queue. Skip-by-source-media
+/// is not applied here: a remote file is probed after the pull.
+pub fn add_remote_files_inner(
+    ctx: &Ctx,
+    host: &str,
+    paths: &[String],
+) -> Result<AddResult, RemoteAddError> {
+    let setup = ctx.remote.get().ok_or_else(|| {
+        RemoteAddError::Refused("No remote roots are configured on this server".to_string())
+    })?;
+    // Before anything runs on the host.
+    for p in paths {
+        crate::remote::check_named_path(setup, host, p).map_err(RemoteAddError::Refused)?;
+    }
+    if paths.is_empty() {
+        return Ok(AddResult::default());
+    }
+
+    let (preset, suffix_template, hb_path, skip_already_converted) = {
+        let conn = ctx
+            .db
+            .lock()
+            .map_err(|e| RemoteAddError::Failed(e.to_string()))?;
+        let preset: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'preset'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| RemoteAddError::Failed(e.to_string()))?;
+        let suffix_template = crate::settings_ops::read_suffix_template(&conn, &preset);
+        let skip_already_converted = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'skip_already_converted'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let hb_path = get_handbrake_path(&conn, &*ctx.handbrake);
+        (preset, suffix_template, hb_path, skip_already_converted)
+    };
+    let hb = hb_path.map_err(RemoteAddError::Failed)?;
+    let metadata = crate::handbrake::cached_preset_metadata(ctx, &hb, &preset)
+        .map_err(RemoteAddError::Failed)?;
+    let suffix = if suffix_template.contains('{') {
+        handbrake::resolve_suffix_template(&suffix_template, &metadata)
+    } else {
+        suffix_template
+    };
+
+    let inspected = crate::remote::inspect_paths(setup, host, paths)?;
+    let mut identities = std::collections::HashMap::new();
+    for item in &inspected {
+        match item.stat {
+            Some(stat) if item.is_file => {
+                identities.insert(
+                    item.path.clone(),
+                    crate::probe_cache::FileIdentity {
+                        size: stat.size,
+                        mtime: stat.mtime_ms,
+                    },
+                );
+            }
+            Some(_) => {
+                return Err(RemoteAddError::Refused(format!(
+                    "{} on {host} is not a regular file",
+                    item.path
+                )))
+            }
+            None => {
+                return Err(RemoteAddError::Refused(format!(
+                    "{} does not exist on {host}",
+                    item.path
+                )))
+            }
+        }
+    }
+    let dirs: Vec<String> = paths
+        .iter()
+        .filter_map(|p| Path::new(p).parent())
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let names = crate::remote::list_names(setup, host, &dirs)?;
+
+    let conn = ctx
+        .db
+        .lock()
+        .map_err(|e| RemoteAddError::Failed(e.to_string()))?;
+    let cleanup_mode = crate::settings_ops::read_cleanup_mode(&conn);
+    add_files_to_db_from(
+        &conn,
+        paths,
+        &preset,
+        &suffix,
+        &metadata.container,
+        skip_already_converted,
+        &cleanup_mode,
+        &IntakeSource {
+            host: Some(host),
+            identity: &|p| identities.get(p).copied(),
+            fallback_size: &|_| None,
+            exists: &|candidate| {
+                let candidate = Path::new(candidate);
+                let dir = candidate
+                    .parent()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let name = candidate
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                names.get(&dir).is_some_and(|set| set.contains(&name))
+            },
+        },
+    )
+    .map_err(RemoteAddError::Failed)
+}
+
+/// [`add_remote_files_inner`] plus the `queue-updated` emit, mirroring [`add_files`].
+pub fn add_remote_files(
+    ctx: &Arc<Ctx>,
+    host: &str,
+    paths: &[String],
+) -> Result<AddResult, RemoteAddError> {
+    let result = add_remote_files_inner(ctx, host, paths);
     if result.is_ok() {
         ctx.events.emit_t("queue-updated", ());
     }
@@ -1210,7 +1424,7 @@ pub fn get_queue(ctx: &Ctx) -> Result<Vec<JobInfo>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host
              FROM jobs
              WHERE status IN ('queued', 'encoding', 'paused', 'error')
              ORDER BY queue_order ASC",
@@ -1314,7 +1528,7 @@ fn get_bad_sources_inner(conn: &rusqlite::Connection) -> Result<Vec<JobInfo>, St
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                     kept_file, space_saved, error_message, failure_class, queue_order, created_at,
-                    completed_at, started_at
+                    completed_at, started_at, remote_host
              FROM jobs
              WHERE status = 'error' AND failure_class IN (?1, ?2)
              ORDER BY completed_at DESC",
@@ -1433,7 +1647,7 @@ fn get_history_inner(
     let jobs = if has_search {
         let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped') AND (source_path LIKE ?1 OR output_path LIKE ?1)
              ORDER BY {}
@@ -1450,7 +1664,7 @@ fn get_history_inner(
     } else {
         let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped')
              ORDER BY {}
@@ -2099,6 +2313,160 @@ mod tests {
         );
     }
 
+    /// `ctx_with_cached_container` plus remote roots on host `unraid`, served by the ssh shim from
+    /// a canonical temp directory. Returns the share's path.
+    #[cfg(unix)]
+    fn remote_ctx(container: &str, tmp: &tempfile::TempDir) -> (Arc<Ctx>, std::path::PathBuf) {
+        let (ctx, _sink, _disposer) = ctx_with_cached_container(container);
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let share = base.join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let setup = crate::remote::testing::shim_setup(
+            &base,
+            &[("unraid", share.to_string_lossy().as_ref())],
+        );
+        ctx.remote.set(setup).unwrap();
+        (ctx, share)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_add_queues_under_its_host_and_names_against_the_hosts_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, share) = remote_ctx("mkv", &tmp);
+        crate::settings_ops::set_preset_suffix(&ctx, &configured_preset(&ctx), "").unwrap();
+        let file = |rel: &str| {
+            let p = share.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let wmv = file("a/film.wmv");
+        // Already on the host beside it, so the default name is taken there.
+        file("a/film.mkv");
+        let show = file("a/show.mkv");
+        // A LOCAL row with the very same path string: a different file on a different machine.
+        {
+            let conn = ctx.db.lock().unwrap();
+            add_files_to_db(
+                &conn,
+                std::slice::from_ref(&show),
+                "data",
+                "",
+                "mkv",
+                false,
+                "delete",
+            )
+            .unwrap();
+        }
+
+        let first = add_remote_files_inner(&ctx, "unraid", &[wmv.clone(), show.clone()]).unwrap();
+
+        let out = |src: &str| {
+            first
+                .added
+                .iter()
+                .find(|j| j.source_path == src)
+                .unwrap_or_else(|| panic!("{src} not queued: {:?}", first.skipped))
+                .clone()
+        };
+        assert_eq!(
+            out(&wmv).output_path,
+            share.join("a/film (1).mkv").to_string_lossy(),
+            "film.mkv exists on the host, so the name is renumbered"
+        );
+        assert_eq!(
+            out(&show).output_path,
+            show,
+            "an .mkv under MKV with no suffix is in place"
+        );
+        assert_eq!(out(&wmv).remote_host.as_deref(), Some("unraid"));
+        // The fingerprint is the host's stat, in the unit local fingerprints use.
+        let (size, mtime): (Option<i64>, Option<i64>) = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source_size, source_mtime FROM jobs WHERE source_path = ?1 \
+                 AND remote_host = 'unraid'",
+                params![wmv],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let local_view = crate::probe_cache::file_identity(&wmv).unwrap();
+        assert_eq!(
+            (size, mtime),
+            (Some(local_view.size), Some(local_view.mtime))
+        );
+
+        let second = add_remote_files_inner(&ctx, "unraid", &[wmv, show]).unwrap();
+        assert!(second.added.is_empty());
+        assert_eq!(
+            second.skipped,
+            vec![SkipCount {
+                reason: SkipReason::AlreadyQueued,
+                count: 2
+            }]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_add_refuses_what_it_may_not_touch_and_queues_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, share) = remote_ctx("mp4", &tmp);
+        let real = share.join("a/real.mkv");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "x").unwrap();
+        let link = share.join("link.mkv");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let outside = share.parent().unwrap().join("outside.mkv");
+        std::fs::write(&outside, "x").unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        let refused = |host: &str, path: String, want: &str| match add_remote_files_inner(
+            &ctx,
+            host,
+            &[path.clone()],
+        ) {
+            Err(RemoteAddError::Refused(m)) => {
+                assert!(m.contains(want), "{path}: {m}")
+            }
+            other => panic!("{path} must be refused, got {other:?}"),
+        };
+        refused("hetzner", s(&real), "not a configured remote host");
+        refused("unraid", s(&outside), "outside the remote roots");
+        refused(
+            "unraid",
+            format!("{}/a/../../outside.mkv", share.display()),
+            "symlink",
+        );
+        refused("unraid", s(&link), "symlink");
+        refused("unraid", s(&share.join("missing.mkv")), "does not exist");
+
+        crate::remote::testing::fail_unreachable(ctx.remote.get().unwrap(), "inspect");
+        assert!(matches!(
+            add_remote_files_inner(&ctx, "unraid", &[s(&real)]),
+            Err(RemoteAddError::Unreachable(m)) if m.contains("unraid")
+        ));
+
+        let rows: i64 = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(
+            crate::remote::testing::shim_log(ctx.remote.get().unwrap())
+                .iter()
+                .filter(|s| *s != "inspect")
+                .count(),
+            0,
+            "a refused request never reaches the naming round trip"
+        );
+    }
+
     /// A stub HandBrakeCLI that answers `--preset-export` with one preset of the given
     /// `FileFormat`, shaped like a real 1.11.2 export.
     #[cfg(unix)]
@@ -2498,7 +2866,7 @@ mod tests {
         insert_done_with_identity(&conn, "h1", "/m/a.mp4", "/m/a.h265.mp4", 500, 42);
 
         for flag in [false, true] {
-            let (_, legacy, identities) = fetch_skip_sets(&conn, flag, "trash").unwrap();
+            let (_, legacy, identities) = fetch_skip_sets(&conn, flag, "trash", None).unwrap();
             assert!(
                 identities.contains(&(500, 42)),
                 "a fingerprinted row is always in the identity set (flag={flag})"
@@ -2524,13 +2892,13 @@ mod tests {
             "2020-01-01T00:00:00Z",
         );
 
-        let (_, legacy_off, _) = fetch_skip_sets(&conn, false, "trash").unwrap();
+        let (_, legacy_off, _) = fetch_skip_sets(&conn, false, "trash", None).unwrap();
         assert!(
             !legacy_off.contains("/m/b.mkv"),
             "flag off: no legacy path skip"
         );
 
-        let (_, legacy_on, _) = fetch_skip_sets(&conn, true, "trash").unwrap();
+        let (_, legacy_on, _) = fetch_skip_sets(&conn, true, "trash", None).unwrap();
         assert!(
             legacy_on.contains("/m/b.mkv"),
             "flag on: legacy path skip preserved"
@@ -2550,7 +2918,7 @@ mod tests {
         .unwrap();
 
         for flag in [false, true] {
-            let (_, legacy, _) = fetch_skip_sets(&conn, flag, "trash").unwrap();
+            let (_, legacy, _) = fetch_skip_sets(&conn, flag, "trash", None).unwrap();
             assert!(
                 legacy.contains("/m//c.mp4"),
                 "a legacy in-place row is path-skipped regardless of flag (flag={flag})"
@@ -2578,7 +2946,7 @@ mod tests {
             "2020-01-01T00:00:00Z",
         );
 
-        let (_, legacy, _) = fetch_skip_sets(&conn, false, "keep").unwrap();
+        let (_, legacy, _) = fetch_skip_sets(&conn, false, "keep", None).unwrap();
         assert!(
             legacy.contains("/m/b.mkv"),
             "keep + no fingerprint + flag off: the path fallback is the ONLY protection left"
@@ -2587,7 +2955,7 @@ mod tests {
         // Under trash/delete the source is gone, so the fallback stays flag-gated — that gate
         // is what stops a genuinely different file recycling the path from being skipped.
         for mode in ["trash", "delete"] {
-            let (_, legacy, _) = fetch_skip_sets(&conn, false, mode).unwrap();
+            let (_, legacy, _) = fetch_skip_sets(&conn, false, mode, None).unwrap();
             assert!(
                 !legacy.contains("/m/b.mkv"),
                 "{mode}: the flag-off default must be unchanged"

@@ -685,6 +685,68 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn a_remote_add_queues_without_starting_and_tells_a_refusal_from_an_outage() {
+        let state = test_state_installed();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let share = base.join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let film = share.join("film.wmv");
+        std::fs::write(&film, "x").unwrap();
+        let setup = convertbar_core::remote::testing::shim_setup(
+            &base,
+            &[("unraid", share.to_string_lossy().as_ref())],
+        );
+        state.ctx.remote.set(setup).unwrap();
+        let app = api_router(state.clone());
+        let add = |path: String| json!({"remote": "unraid", "paths": [path]});
+
+        let (status, json) = request_json(
+            app.clone(),
+            "POST",
+            "/api/queue/files",
+            Some(add(film.to_string_lossy().into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["added"][0]["remote_host"], "unraid");
+        // `send` adds and then starts; the add alone must leave the queue idle.
+        assert!(!state.ctx.converter.is_running());
+
+        let outside = base.join("elsewhere.wmv");
+        std::fs::write(&outside, "x").unwrap();
+        let (status, json) = request_json(
+            app.clone(),
+            "POST",
+            "/api/queue/files",
+            Some(add(outside.to_string_lossy().into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("outside the remote roots"));
+
+        convertbar_core::remote::testing::fail_unreachable(
+            state.ctx.remote.get().unwrap(),
+            "inspect",
+        );
+        let other = share.join("other.wmv");
+        std::fs::write(&other, "x").unwrap();
+        let (status, json) = request_json(
+            app,
+            "POST",
+            "/api/queue/files",
+            Some(add(other.to_string_lossy().into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(json["error"].as_str().unwrap().contains("unraid"));
+    }
+
+    #[tokio::test]
     async fn remove_job_deletes_a_seeded_queued_row() {
         let app = api_router(test_state_installed());
 

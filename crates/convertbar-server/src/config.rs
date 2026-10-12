@@ -21,6 +21,8 @@ pub enum ConfigError {
     WeakToken,
     BadTrustedProxy(String),
     BadBind(String),
+    /// A `CONVERTBAR_REMOTE_ROOTS` entry that is not `host:/absolute/dir` with a safe host alias.
+    BadRemoteRoot(String),
 }
 
 /// Minimum viable auth token: long enough that online guessing is hopeless, and
@@ -48,6 +50,11 @@ pub struct ServerConfig {
     /// A HandBrake preset file to import (`CONVERTBAR_PRESET_FILE`). Env only, never a setting
     /// (ADR 0002); checked at startup by `startup::load_preset_import`.
     pub preset_file: Option<PathBuf>,
+    /// `CONVERTBAR_REMOTE_ROOTS`: ssh hosts and the directories on them ConvertBar may use (ADR
+    /// 0002, 0005). Empty means no remote roots.
+    pub remote_roots: Vec<convertbar_core::remote::RemoteRoot>,
+    /// `CONVERTBAR_STAGING_DIR`; `None` means `staging` beside the database.
+    pub staging_dir: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -116,6 +123,13 @@ impl ServerConfig {
             }
         }
 
+        let remote_roots = convertbar_core::remote::parse_roots(
+            vars.get("CONVERTBAR_REMOTE_ROOTS")
+                .map(String::as_str)
+                .unwrap_or(""),
+        )
+        .map_err(ConfigError::BadRemoteRoot)?;
+
         Ok(Self {
             bind,
             auth,
@@ -124,6 +138,12 @@ impl ServerConfig {
             trusted_proxies,
             preset_file: vars
                 .get("CONVERTBAR_PRESET_FILE")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            remote_roots,
+            staging_dir: vars
+                .get("CONVERTBAR_STAGING_DIR")
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
@@ -156,6 +176,47 @@ mod tests {
         assert_eq!(cfg.allowed_hosts, Vec::<String>::new());
         assert_eq!(cfg.browse_roots, vec![PathBuf::from("/")]);
         assert_eq!(cfg.preset_file, None, "no preset file unless one is named");
+        assert!(cfg.remote_roots.is_empty(), "no remote roots unless named");
+        assert_eq!(cfg.staging_dir, None);
+    }
+
+    #[test]
+    fn remote_roots_and_staging_are_read_and_a_malformed_root_refuses_startup() {
+        let cfg = ServerConfig::from_vars(&vars(&[
+            ("CONVERTBAR_AUTH_TOKEN", "abcdefghijklmnop"),
+            (
+                "CONVERTBAR_REMOTE_ROOTS",
+                "unraid:/mnt/user/DATA,hetzner:/srv/media",
+            ),
+            ("CONVERTBAR_STAGING_DIR", "/Volumes/Scratch/staging"),
+        ]))
+        .unwrap();
+        let roots: Vec<(&str, &str)> = cfg
+            .remote_roots
+            .iter()
+            .map(|r| (r.host.as_str(), r.dir.as_str()))
+            .collect();
+        assert_eq!(
+            roots,
+            [("unraid", "/mnt/user/DATA"), ("hetzner", "/srv/media")]
+        );
+        assert_eq!(
+            cfg.staging_dir,
+            Some(PathBuf::from("/Volumes/Scratch/staging"))
+        );
+
+        // A host that ssh would read as an option is the case that matters most.
+        for bad in ["-oProxyCommand=sh:/x", "unraid:relative", "unraid"] {
+            let err = ServerConfig::from_vars(&vars(&[
+                ("CONVERTBAR_AUTH_TOKEN", "abcdefghijklmnop"),
+                ("CONVERTBAR_REMOTE_ROOTS", bad),
+            ]))
+            .expect_err(bad);
+            assert!(
+                matches!(&err, ConfigError::BadRemoteRoot(m) if m.contains(bad)),
+                "{bad}: {err:?}"
+            );
+        }
     }
 
     #[test]

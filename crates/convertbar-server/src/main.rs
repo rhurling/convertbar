@@ -47,6 +47,10 @@ async fn main() {
             eprintln!("convertbar-server: invalid bind address or port: {value}");
             std::process::exit(1);
         }
+        Err(ConfigError::BadRemoteRoot(entry)) => {
+            eprintln!("convertbar-server: invalid CONVERTBAR_REMOTE_ROOTS entry: {entry}");
+            std::process::exit(1);
+        }
     };
 
     let db_path = convertbar_core::db::get_db_path();
@@ -71,6 +75,21 @@ async fn main() {
     // not fail every queued job in turn once the queue resumes.
     if let Some(file) = &config.preset_file {
         if let Err(e) = startup::load_preset_import(&ctx, file) {
+            eprintln!("convertbar-server: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Before `boot`, which can resume a remote job: staging must exist and be empty, and the
+    // roots known, before the queue thread runs.
+    if !config.remote_roots.is_empty() {
+        let staging = config.staging_dir.clone().unwrap_or_else(|| {
+            db_path
+                .parent()
+                .map(|d| d.join("staging"))
+                .unwrap_or_else(|| std::path::PathBuf::from("staging"))
+        });
+        if let Err(e) = startup::load_remote_roots(&ctx, config.remote_roots.clone(), staging) {
             eprintln!("convertbar-server: {e}");
             std::process::exit(1);
         }

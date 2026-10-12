@@ -13,6 +13,7 @@ pub mod priority;
 pub mod probe;
 pub mod probe_cache;
 pub mod queue_ops;
+pub mod remote;
 pub mod settings_ops;
 pub mod types;
 pub mod watch_ops;

@@ -210,6 +210,14 @@ pub fn init_db(conn: &Connection) -> Result<DbInit> {
         }
     }
 
+    // The ssh host of a remote job (ADR 0005); NULL for every local job, old or new. Same
+    // idempotent pattern as above.
+    if let Err(e) = conn.execute("ALTER TABLE jobs ADD COLUMN remote_host TEXT", []) {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+
     // Backfill: Linux DBs seeded before 0.13.1 stored "H.265 MKV 1080p", which is not a
     // valid preset name in current HandBrake (the built-in is "H.265 MKV 1080p30"), so
     // every default conversion failed. INSERT OR IGNORE below won't touch existing rows,

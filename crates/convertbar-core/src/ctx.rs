@@ -21,6 +21,9 @@ pub struct Ctx {
     /// The server head's preset file, set once between construction and boot. Empty on the
     /// desktop head, and in every test that does not declare one.
     pub preset_import: std::sync::OnceLock<crate::handbrake::PresetImport>,
+    /// The server head's remote roots, staging directory and ssh program, set once between
+    /// construction and boot. Empty on the desktop head: a remote row there is refused.
+    pub remote: std::sync::OnceLock<crate::remote::RemoteSetup>,
 }
 
 impl Ctx {
@@ -41,6 +44,7 @@ impl Ctx {
             watcher: crate::watcher::WatcherState::new(),
             hooks,
             preset_import: std::sync::OnceLock::new(),
+            remote: std::sync::OnceLock::new(),
         })
     }
 }

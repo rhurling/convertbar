@@ -48,6 +48,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      # The remote-root tests run the real remote scripts, which need GNU coreutils >= 9.5
+      # (`mv --update=none-fail`) and GNU findutils. ubuntu-22.04 ships coreutils 8.32 and macOS
+      # ships BSD tools, so take both from the runner's preinstalled Homebrew. Without them the
+      # tests fail loudly rather than skip.
+      - name: Install GNU coreutils for the remote-script tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew=$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew)
+          "$brew" install coreutils findutils
+          dirs=""
+          for formula in coreutils findutils; do
+            prefix=$("$brew" --prefix "$formula")
+            if [ -d "$prefix/libexec/gnubin" ]; then dir="$prefix/libexec/gnubin"; else dir="$prefix/bin"; fi
+            dirs="${dirs:+$dirs:}$dir"
+          done
+          echo "CONVERTBAR_TEST_GNUBIN=$dirs" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
