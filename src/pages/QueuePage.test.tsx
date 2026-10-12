@@ -33,6 +33,7 @@ vi.mock("../lib/tauri", () => ({
     clearQueue: vi.fn(() => Promise.resolve()),
     reorderQueue: vi.fn(() => Promise.resolve()),
     getLowDiskPause: vi.fn(() => Promise.resolve(null)),
+    getUnreachableStop: vi.fn(() => Promise.resolve(null)),
   },
 }));
 
@@ -189,4 +190,37 @@ it("has no separate intake button on the server head — the drop surface is the
   // The old standalone "Add files…" button is gone: two controls for one action was the
   // thing this task removes.
   expect(screen.queryByRole("button", { name: /^Add files…$/ })).not.toBeInTheDocument();
+});
+
+it("names an unreachable host even with nothing queued, and Retry starts the queue", async () => {
+  // The job that hit the outage is an error row, so the queue can be empty: the banner must
+  // still show, since Start is what takes that job back — and its own Retry is the only Start
+  // on screen, the Pending section being absent.
+  vi.mocked(commands.getUnreachableStop).mockResolvedValue({ host: "unraid", step: "pull" });
+  render(<QueuePage hbStatus={null} adding={null} isAdding={false} intake={intakeStub} />);
+
+  expect(await screen.findByText(/unraid is unreachable/i)).toBeInTheDocument();
+  expect(screen.getByText(/failed at the pull step/i)).toBeInTheDocument();
+  vi.mocked(commands.getUnreachableStop).mockResolvedValue(null);
+  fireEvent.click(screen.getByRole("button", { name: /^retry$/i }));
+  await waitFor(() => expect(commands.startQueue).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(screen.queryByText(/is unreachable/i)).toBeNull());
+});
+
+it("shows the unreachable banner live, and drops it once a job is running again", async () => {
+  let handler: ((e: { payload: unknown }) => void) | undefined;
+  vi.mocked(listen).mockImplementation(((name: string, cb: (e: { payload: unknown }) => void) => {
+    if (name === "queue-paused-unreachable") handler = cb;
+    return Promise.resolve(() => {});
+  }) as typeof listen);
+  const { rerender } = render(
+    <QueuePage hbStatus={null} adding={null} isAdding={false} intake={intakeStub} />,
+  );
+  await waitFor(() => expect(handler).toBeDefined());
+  act(() => handler!({ payload: { host: "hetzner", step: "finalize" } }));
+  expect(screen.getByText(/hetzner is unreachable/i)).toBeInTheDocument();
+
+  queueMock = { ...queueMock, activeJob: { id: "a", source_path: "/m/a.mp4", status: "encoding" } };
+  rerender(<QueuePage hbStatus={null} adding={null} isAdding={false} intake={intakeStub} />);
+  await waitFor(() => expect(screen.queryByText(/is unreachable/i)).toBeNull());
 });

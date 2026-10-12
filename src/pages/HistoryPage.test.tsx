@@ -449,6 +449,34 @@ describe("HistoryPage", () => {
       ).toBeInTheDocument();
     });
 
+    it("shows a remote bad source's host and says where to delete it by hand", async () => {
+      badSources = [
+        { ...badSourceJob("a"), remote_host: "unraid" },
+        { ...badSourceJob("b"), remote_host: "unraid" },
+        { ...badSourceJob("c"), remote_host: "hetzner" },
+      ];
+      purgeResults = [
+        { id: "a", outcome: "remote", host: "unraid" },
+        { id: "b", outcome: "remote", host: "unraid" },
+        { id: "c", outcome: "remote", host: "hetzner" },
+      ];
+
+      render(<HistoryPage />);
+      await screen.findByText(/bad sources \(3\)/i);
+      expect(screen.getAllByText(/^On unraid ·/)).toHaveLength(2);
+
+      fireEvent.click(screen.getByRole("button", { name: /move 3 to trash/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+
+      await waitFor(() =>
+        expect(
+          screen.getByText(
+            /0 file\(s\) removed\. 2 to delete by hand on unraid, 1 to delete by hand on hetzner\./i,
+          ),
+        ).toBeInTheDocument(),
+      );
+    });
+
     it("reports outcomes honestly when some files are left alone, not silently implying everything was destroyed", async () => {
       badSources = [badSourceJob("a"), badSourceJob("b")];
       purgeResults = [

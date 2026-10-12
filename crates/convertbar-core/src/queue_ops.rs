@@ -1657,11 +1657,34 @@ pub fn purge_bad_sources(ctx: &Arc<Ctx>, ids: Vec<String>) -> Result<Vec<PurgeRe
     let handbrake_path = handbrake::require_handbrake_path(ctx);
     Ok(ids
         .iter()
-        .map(|id| PurgeResult {
-            id: id.clone(),
-            outcome: purge_one_locked(&ctx.db, id, action, &handbrake_path, &*ctx.disposer),
+        .map(|id| match remote_host_of(&ctx.db, id) {
+            // Decided from the row alone, before any rung stats the path locally.
+            Some(host) => PurgeResult {
+                id: id.clone(),
+                outcome: PurgeOutcome::Remote,
+                host: Some(host),
+            },
+            None => PurgeResult {
+                id: id.clone(),
+                outcome: purge_one_locked(&ctx.db, id, action, &handbrake_path, &*ctx.disposer),
+                host: None,
+            },
         })
         .collect())
+}
+
+/// The host of a remote job row, or `None` for a local row, an unknown id, or a lock failure
+/// (all of which `purge_one_locked` then answers on its own terms).
+fn remote_host_of(db: &Mutex<rusqlite::Connection>, id: &str) -> Option<String> {
+    db.lock()
+        .ok()?
+        .query_row(
+            "SELECT remote_host FROM jobs WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
 }
 
 pub fn get_history(

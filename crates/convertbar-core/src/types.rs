@@ -165,10 +165,16 @@ pub enum PurgeOutcome {
     Unverifiable,
     /// The delete/trash call itself failed.
     Failed,
+    /// The file lives on a remote host (`PurgeResult::host`): ConvertBar never deletes a
+    /// remote source, so it is left for the user to delete by hand there.
+    Remote,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PurgeResult {
     pub id: String,
     pub outcome: PurgeOutcome,
+    /// The host of a `Remote` outcome; `None` otherwise.
+    #[serde(default)]
+    pub host: Option<String>,
 }

@@ -83,14 +83,16 @@ describe("useQueue", () => {
     expect(result.current.pendingJobs).toHaveLength(0);
   });
 
-  it("stores the payload from conversion-progress events", async () => {
+  it("stores the payloads from conversion-progress and job-phase events", async () => {
     const { result } = renderHook(() => useQueue());
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("get_queue"));
 
     const payload = { job_id: "1", percent: 50, eta_seconds: 30, fps: 24, avg_fps: 22 };
     act(() => emit("conversion-progress", payload));
+    act(() => emit("job-phase", { job_id: "1", phase: "Pushing…" }));
 
     expect(result.current.progress).toEqual(payload);
+    expect(result.current.phase).toEqual({ job_id: "1", phase: "Pushing…" });
   });
 
   it("ignores a stale getQueue response that resolves after a newer one", async () => {

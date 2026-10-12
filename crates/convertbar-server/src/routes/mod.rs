@@ -1100,6 +1100,48 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_remote_bad_source_is_listed_with_its_host_and_left_to_delete_by_hand() {
+        let state = test_state_installed();
+        // Its host path exists here too, with the class that needs no rescan: every local rung
+        // would pass for this unrelated local file.
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("film.wmv");
+        std::fs::write(&local, "a different file on this machine").unwrap();
+        let p = local.to_string_lossy().into_owned();
+        state
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, failure_class, remote_host)
+                 VALUES ('r1', ?1, ?1, 'p', 'error', 1, '2026-10-12T10:00:00Z',
+                         'bad_source_truncated', 'unraid')",
+                [&p],
+            )
+            .unwrap();
+        let app = api_router(state);
+
+        let (_, listed) = request_json(app.clone(), "GET", "/api/bad-sources", None).await;
+        assert_eq!(listed[0]["remote_host"], "unraid");
+
+        let (status, json) = request_json(
+            app,
+            "POST",
+            "/api/bad-sources/purge",
+            Some(json!({"ids": ["r1"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json,
+            json!([{"id": "r1", "outcome": "remote", "host": "unraid"}])
+        );
+        assert!(local.exists(), "a remote row's path is never touched here");
+    }
+
+    #[tokio::test]
     async fn classify_paths_with_no_paths_returns_empty_files_and_folders() {
         let (status, json) = request_json(
             api_router(test_state()),

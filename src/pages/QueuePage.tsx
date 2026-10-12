@@ -5,7 +5,7 @@ import DropZone from "../components/DropZone";
 import ActiveJob from "../components/ActiveJob";
 import QueueItem from "../components/QueueItem";
 import { commands } from "../lib/tauri";
-import type { HandbrakeStatus, LowDiskPause } from "../lib/tauri";
+import type { HandbrakeStatus, LowDiskPause, UnreachableStop } from "../lib/tauri";
 import { formatBytes } from "../lib/format";
 import AddingIndicator from "../components/AddingIndicator";
 import type { AddActivity } from "../lib/tauri";
@@ -28,10 +28,11 @@ function lowDiskMessage(p: LowDiskPause): string {
 }
 
 export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueuePageProps) {
-  const { activeJob, pendingJobs, progress, refresh } = useQueue();
+  const { activeJob, pendingJobs, progress, phase, refresh } = useQueue();
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [lowDiskMsg, setLowDiskMsg] = useState<string | null>(null);
   const [showBrowser, setShowBrowser] = useState(false);
+  const [unreachable, setUnreachable] = useState<UnreachableStop | null>(null);
 
   // The queue stops itself before starting a file when the destination disk is low; surface why.
   useEffect(() => {
@@ -58,6 +59,36 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
   // list empties (e.g. the user hit Clear) — otherwise the banner lingers over an empty queue.
   useEffect(() => {
     if (activeJob || pendingJobs.length === 0) setLowDiskMsg(null);
+  }, [activeJob, pendingJobs.length]);
+
+  // A remote host that could not be reached stops the queue (ADR 0003); say which, live and on
+  // mount. The stop outlives an empty queue — Start takes the failed job back — so it is not
+  // cleared with the pending list like the low-disk notice: it is re-read instead, which also
+  // drops it after Clear, which forgets it server-side.
+  useEffect(() => {
+    const un = listen<UnreachableStop>("queue-paused-unreachable", (e) => {
+      setUnreachable(e.payload);
+    });
+    return () => {
+      un.then((u) => u());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activeJob) {
+      setUnreachable(null);
+      return;
+    }
+    let live = true;
+    commands
+      .getUnreachableStop()
+      .then((s) => {
+        if (live) setUnreachable(s);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
   }, [activeJob, pendingJobs.length]);
 
   const handleDrop = async (draggedId: string, targetId: string) => {
@@ -95,9 +126,9 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
       {showBrowser && (
         <FileBrowserModal
           mode="files"
-          onSelect={(paths) => {
+          onSelect={(paths, remote) => {
             setShowBrowser(false);
-            intake.addPaths(paths);
+            intake.addPaths(paths, remote);
           }}
           onClose={() => setShowBrowser(false)}
         />
@@ -115,7 +146,34 @@ export default function QueuePage({ hbStatus, adding, isAdding, intake }: QueueP
         </div>
       )}
 
-      {activeJob && <ActiveJob job={activeJob} progress={progress} />}
+      {unreachable && (
+        <div className="hb-warning" role="status" aria-live="polite">
+          <span className="hb-warning-icon">&#9888;&#65039;</span>
+          <div>
+            <strong>Queue stopped — {unreachable.host} is unreachable</strong>
+            <p>
+              The last job failed at the {unreachable.step} step. Check the connection to{" "}
+              {unreachable.host}, then retry it.
+            </p>
+          </div>
+          {/* Its own control: the failed job is an error row, so with nothing else queued the
+              Pending section and its Start button are not shown at all. */}
+          <button
+            className="btn btn-small"
+            onClick={async () => {
+              await commands.startQueue();
+              // The run that starts clears the stop; if the host is still down, the event puts
+              // the banner straight back.
+              setUnreachable(null);
+              refresh();
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {activeJob && <ActiveJob job={activeJob} progress={progress} phase={phase} />}
 
       {pendingJobs.length > 0 && (
         <div className="section">

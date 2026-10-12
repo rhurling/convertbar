@@ -6,10 +6,24 @@ import { rangeBetween } from "../lib/pathSelection";
 
 const FALLBACK_ROOT = "/";
 
+/** A browsable root: a local directory (`host` null) or a directory on an ssh host. */
+interface Root {
+  dir: string;
+  host: string | null;
+}
+
+/** What a pick on a remote host needs besides its paths: which of them are folders, since the
+ * client has no way to classify a path on another machine. */
+export interface RemotePick {
+  host: string;
+  folders: string[];
+}
+
 interface FileBrowserModalProps {
   /** "files": multi-select files to add to the queue. "directory": pick one directory to watch. */
   mode: "files" | "directory";
-  onSelect: (paths: string[]) => void;
+  /** `remote` is set when the paths are on an ssh host (files mode only). */
+  onSelect: (paths: string[], remote?: RemotePick) => void;
   onClose: () => void;
 }
 
@@ -144,8 +158,12 @@ function joinUnderRoot(root: string, segments: string[]): string {
  * to `/media`) would otherwise 403 on the very first listing with no way to navigate anywhere.
  */
 export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowserModalProps) {
-  const [roots, setRoots] = useState<string[]>([FALLBACK_ROOT]);
+  const [roots, setRoots] = useState<Root[]>([{ dir: FALLBACK_ROOT, host: null }]);
   const [path, setPath] = useState<string | null>(null);
+  // The host the current listing is on; null for local. Changes only with a listing that landed.
+  const [host, setHost] = useState<string | null>(null);
+  // Whether each path seen in a listing on `host` is a folder, for the remote pick.
+  const isDirByPath = useRef(new Map<string, boolean>());
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [anchor, setAnchor] = useState<string | null>(null);
@@ -168,14 +186,23 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   // heading's id cannot be a fixed string.
   const titleId = useId();
 
-  const load = useCallback(async (target: string) => {
+  const hostRef = useRef<string | null>(null);
+  const load = useCallback(async (target: string, targetHost: string | null = hostRef.current) => {
     const request = ++latestRequest.current;
     const isCurrent = () => request === latestRequest.current;
     setLoading(true);
     setError(null);
     try {
-      const result = await httpCommands.fsList(target);
+      const result = await httpCommands.fsList(target, targetHost ?? undefined);
       if (!isCurrent()) return;
+      if (targetHost !== hostRef.current) {
+        // One add goes to one host: a selection cannot span machines.
+        hostRef.current = targetHost;
+        setHost(targetHost);
+        setSelected(new Set());
+        isDirByPath.current.clear();
+      }
+      for (const e of result.entries) isDirByPath.current.set(e.path, e.is_dir);
       setEntries(result.entries);
       // The directory the server says it listed, not the one we asked for: it resolves symlinks
       // before reading and builds entry paths from the result, so keeping `target` would leave
@@ -203,19 +230,24 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
       .getAppInfo()
       .then((info) => {
         if (!active) return;
-        const resolvedRoots = info.browse_roots.length > 0 ? info.browse_roots : [FALLBACK_ROOT];
-        setRoots(resolvedRoots);
-        return load(resolvedRoots[0]);
+        const local = info.browse_roots.length > 0 ? info.browse_roots : [FALLBACK_ROOT];
+        // Remote roots only take files to queue: a watched folder cannot be on another host.
+        const remote = mode === "files" ? (info.remote_roots ?? []) : [];
+        setRoots([
+          ...local.map((dir) => ({ dir, host: null })),
+          ...remote.map((r) => ({ dir: r.dir, host: r.host })),
+        ]);
+        return load(local[0], null);
       })
       .catch(() => {
         // getAppInfo itself failing is unexpected (it's the same endpoint that gated this
         // component's very presence) — fall back to "/" rather than leaving the modal stuck.
-        if (active) load(FALLBACK_ROOT);
+        if (active) load(FALLBACK_ROOT, null);
       });
     return () => {
       active = false;
     };
-  }, [load]);
+  }, [load, mode]);
 
   // Focus starts in the dialog rather than wherever the opening click left it, so Escape and
   // Tab-cycling both have somewhere to begin and a screen reader announces the dialog by name.
@@ -344,7 +376,16 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   };
 
   const handleConfirm = () => {
-    onSelect(mode === "directory" ? [path!] : [...selected]);
+    if (mode === "directory") {
+      onSelect([path!]);
+      return;
+    }
+    const paths = [...selected];
+    if (host === null) {
+      onSelect(paths);
+      return;
+    }
+    onSelect(paths, { host, folders: paths.filter((p) => isDirByPath.current.get(p) === true) });
   };
 
   // Breadcrumb: a crumb for the containing configured root (its own label, not always "/"),
@@ -352,7 +393,8 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
   // configured root contains the current path, the whole path becomes the single base crumb:
   // up-navigation has nowhere safe to go, and inventing intermediate crumbs from a root that
   // is not a prefix is how you get crumbs that 404.
-  const containing = path === null ? roots[0] : containingRoot(path, roots);
+  const hostRoots = roots.filter((r) => r.host === host).map((r) => r.dir);
+  const containing = path === null ? roots[0].dir : containingRoot(path, hostRoots);
   const root = containing ?? path!;
   const relativeSegments =
     path === null || path === root ? [] : path.slice(root.length).split("/").filter(Boolean);
@@ -388,23 +430,27 @@ export default function FileBrowserModal({ mode, onSelect, onClose }: FileBrowse
             screen said it existed. */}
         {roots.length > 1 && (
           <div className="file-browser-roots" role="group" aria-label="Browse roots">
-            {roots.map((r) => (
-              <button
-                key={r}
-                type="button"
-                className={`btn btn-small${r === containing ? " btn-active" : ""}`}
-                aria-current={r === containing ? "true" : undefined}
-                onClick={() => load(r)}
-              >
-                {r}
-              </button>
-            ))}
+            {roots.map((r) => {
+              const current = r.host === host && r.dir === containing;
+              const label = r.host === null ? r.dir : `${r.host}:${r.dir}`;
+              return (
+                <button
+                  key={label}
+                  type="button"
+                  className={`btn btn-small${current ? " btn-active" : ""}`}
+                  aria-current={current ? "true" : undefined}
+                  onClick={() => load(r.dir, r.host)}
+                >
+                  {label}
+                </button>
+              );
+            })}
           </div>
         )}
 
         <div className="file-browser-breadcrumb">
           <button type="button" onClick={() => load(root)}>
-            {root}
+            {host === null ? root : `${host}:${root}`}
           </button>
           {relativeSegments.map((seg, i) => (
             <span key={i}>

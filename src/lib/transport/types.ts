@@ -139,11 +139,15 @@ export type PurgeOutcome =
   | "changed"
   | "recovered"
   | "unverifiable"
-  | "failed";
+  | "failed"
+  // On a remote host: ConvertBar never deletes a remote source, so it is left to delete by hand.
+  | "remote";
 
 export interface PurgeResult {
   id: string;
   outcome: PurgeOutcome;
+  /** The host of a "remote" outcome. */
+  host?: string | null;
 }
 
 export interface ClassifiedPaths {
@@ -243,6 +247,21 @@ export interface AppInfo {
   // Confines the file-browser modal's starting path and up-navigation. Always empty on
   // desktop (no browse roots there); on server it mirrors ServerConfig::browse_roots.
   browse_roots: string[];
+  // Server-only: CONVERTBAR_REMOTE_ROOTS as configured (never resolved — remote listings answer
+  // in paths as named). Always empty on desktop.
+  remote_roots: RemoteRoot[];
+}
+
+/** A directory on an ssh host that the server re-encodes in place. */
+export interface RemoteRoot {
+  host: string;
+  dir: string;
+}
+
+/** `job-phase`: what a remote job is doing besides encoding; null when it is encoding. */
+export interface JobPhase {
+  job_id: string;
+  phase: string | null;
 }
 
 // Server-only (file browser; desktop never calls these):

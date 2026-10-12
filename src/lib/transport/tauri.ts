@@ -123,6 +123,7 @@ export const tauriCommands = {
       priority_is_group_scoped: caps.priority_is_group_scoped,
       auth_required: false,
       browse_roots: [], // no browse roots on desktop — it uses the native file picker instead
+      remote_roots: [],
     };
   },
 };

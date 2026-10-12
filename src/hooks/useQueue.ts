@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "../lib/events";
-import { commands, type JobInfo, type ConversionProgress } from "../lib/tauri";
+import { commands, type JobInfo, type ConversionProgress, type JobPhase } from "../lib/tauri";
 
 export function useQueue() {
   const [queue, setQueue] = useState<JobInfo[]>([]);
   const [progress, setProgress] = useState<ConversionProgress | null>(null);
+  const [phase, setPhase] = useState<JobPhase | null>(null);
   const mounted = useRef(true);
   // Monotonic request id: a single job transition fans out several events, each firing
   // its own getQueue(); responses can resolve out of order, so drop any that isn't the latest.
@@ -27,6 +28,9 @@ export function useQueue() {
     const unlisteners = [
       listen<ConversionProgress>("conversion-progress", (event) => {
         if (mounted.current) setProgress(event.payload);
+      }),
+      listen<JobPhase>("job-phase", (event) => {
+        if (mounted.current) setPhase(event.payload);
       }),
       listen("job-status-changed", () => {
         refresh();
@@ -58,5 +62,5 @@ export function useQueue() {
   );
   const pendingJobs = queue.filter((j) => j.status === "queued");
 
-  return { queue, activeJob, pendingJobs, progress, refresh };
+  return { queue, activeJob, pendingJobs, progress, phase, refresh };
 }
