@@ -16,6 +16,7 @@
 //!   cargo test -p convertbar-server --test live_remote_roots -- --ignored --nocapture
 //! `CONVERTBAR_LIVE_HOST` (default `unraid`) and `CONVERTBAR_LIVE_DIR` (default `/mnt/user/DATA`)
 //! choose where the scratch directory goes.
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
