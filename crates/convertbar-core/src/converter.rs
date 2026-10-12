@@ -1316,12 +1316,6 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             }
         };
 
-        // A Cancel during the stat has no child to kill; it booked the row, and that is the
-        // only sign of it. Nothing more runs for a cancelled job.
-        if remote.is_some() && !job_still_running(ctx, &job.id) {
-            continue;
-        }
-
         // Skip-by-source-media for a remote job probes the staged copy, the first moment the
         // file can be probed at all: one already at the target is neither encoded nor pushed.
         if remote.is_some() && already_at_target(ctx, &handbrake_path, &job, &input_path) {
@@ -1338,7 +1332,8 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             }
             continue;
         }
-        // And again after the probe, which has no child either: never encode a cancelled job.
+        // A Cancel since the pull (its re-stat, or the probe) had no child to kill: it only
+        // booked the row, and that is the only sign of it. Never encode a cancelled job.
         if remote.is_some() && !job_still_running(ctx, &job.id) {
             continue;
         }
@@ -9021,8 +9016,11 @@ HandBrake has exited.";
     #[cfg(unix)]
     fn a_cancel_between_transfers_stops_the_job_where_it_is() {
         // Neither the stat nor the staged copy's media probe has a child to kill: the Cancel
-        // only books the row, and the queue thread must notice before it does more.
-        for step in ["stat", "probe"] {
+        // only books the row, and the queue thread must notice before it does more. The probe
+        // is cancelled both when it finds the file at the target and when it does not.
+        for (step, codec) in [("stat", ""), ("probe", "hevc"), ("probe", "h264")] {
+            let step_case = format!("{step} {codec}");
+            let step_case = step_case.trim();
             let world = RemoteWorld::new("smaller");
             set_setting(
                 &world.ctx.db,
@@ -9035,11 +9033,13 @@ HandBrake has exited.";
             if step == "stat" {
                 crate::remote::testing::hook_before(world.setup(), "stat", "sleep 1");
             } else {
-                // Already at the target, and slow to say so.
+                // At the target (hevc) or not (h264), and slow to say so.
                 std::fs::write(
                     base.join("scan.out"),
-                    "JSON Title Set: {\"TitleList\": [{\"Geometry\": {\"Height\": 720}, \
-                     \"VideoCodec\": \"hevc\"}]}\n",
+                    format!(
+                        "JSON Title Set: {{\"TitleList\": [{{\"Geometry\": {{\"Height\": 720}}, \
+                         \"VideoCodec\": \"{codec}\"}}]}}\n"
+                    ),
                 )
                 .unwrap();
                 std::fs::write(base.join("scan.out.slow"), "").unwrap();
@@ -9080,23 +9080,23 @@ HandBrake has exited.";
             assert_eq!(
                 (status.as_str(), error.as_deref()),
                 ("error", Some("Cancelled by user")),
-                "{step}"
+                "{step_case}"
             );
             assert!(
                 world.webhook_events().is_empty(),
-                "{step}: nothing booked after it"
+                "{step_case}: nothing booked after it"
             );
-            assert!(!world.hb_inputs.exists(), "{step}: nothing encoded");
-            assert!(!world.pushed(), "{step}");
+            assert!(!world.hb_inputs.exists(), "{step_case}: nothing encoded");
+            assert!(!world.pushed(), "{step_case}");
             if step == "stat" {
                 assert!(!world.ran("pull", 1), "nothing pulled for a cancelled job");
             }
             assert_eq!(
                 std::fs::read_to_string(&film).unwrap(),
                 "the original, much larger",
-                "{step}"
+                "{step_case}"
             );
-            assert!(world.staging_is_empty(), "{step}");
+            assert!(world.staging_is_empty(), "{step_case}");
         }
     }
 }
