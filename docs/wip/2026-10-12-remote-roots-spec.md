@@ -175,7 +175,7 @@ The seams, the only places tests drive this cycle:
 - **Local network privacy on the mini is unverified there.** TN3179 says launchd agents are subject to it and the grant follows the code signature, hence the Developer ID-signed asset (ADR 0001). Still open: whether the alert appears for an ssh spawned by the agent, and that the first LAN ssh then needs someone at the GUI session to allow it. One live run on the mini after installing the signed asset settles it, and the dotfiles side should expect that one-time alert.
 - **`mv --update=none-fail` on Unraid's user-share filesystem** has not been exercised (the probe was read-only). The recorded artifact's new-name case covers it before the dotfiles cutover.
 - The remote shim tests do not run on macOS developer machines without GNU coreutils ≥ 9.5. Accepted; they run in the Linux CI leg.
-- **New-name job after a post-finalize drop** (not yet decided): the connection drops after finalize published `x.mp4` and deleted `x.wmv`. The re-queued job finds its source gone and would book the quiet "no longer exists" error, so a successful conversion reaches the drainer as an error with no rescan. Recommendation: when a re-queued `unreachable` job finds its source definitely gone and its stored output name present on the host, book it `done` with `kept_file = converted` and the remote size, and fire the hook. That costs one extra stat. Alternative: accept it, since the drainer alerts on the error and a person can rescan by hand.
+- **New-name job after a post-finalize drop** — decided 2026-10-12 (the recommendation, under the build's standing go-ahead): the connection drops after finalize published `x.mp4` and deleted `x.wmv`. When a re-queued `unreachable` job finds its source definitely gone and its stored output name present on the host, it is booked `done` with `kept_file = converted` and the remote size, and the hook fires. That costs one extra stat.
 
 ## Contract notes for the dotfiles side
 
@@ -186,7 +186,7 @@ The seams, the only places tests drive this cycle:
 - **Status:** an outage reads `stopped`, or `idle` if nothing else was queued. Only the hook says why.
 - **Hook payload additions:** `remote_host` (null for local jobs) and `skip_reason` (null, or `already_at_target`); `failure_class` may be `unreachable`. For a remote job, `source_path`, `output_path`, `result_path` and `output_dir` are paths on that host. Command hooks get `CONVERTBAR_REMOTE_HOST` and `CONVERTBAR_SKIP_REASON`.
 - **Skipped jobs:** `skipped` with `skip_reason: already_at_target` means nothing was encoded. `skipped` with no reason means the re-encode was larger. In both cases the original is untouched and no rescan is needed.
-- **Open edge:** the new-name post-finalize drop (Open questions), which decides whether a successful new-name conversion can ever arrive as an error.
+- **New-name drop after finalize:** a successful new-name conversion whose connection dropped after finalize still arrives as `done` (Open questions, decided), after one unreachable error for the same job.
 
 ## ADRs
 
