@@ -1195,8 +1195,11 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             },
         );
 
-        // Emptied when this job's turn ends, whichever `continue` ends it.
-        let _staging = remote.as_ref().map(|(_, setup)| StagingGuard(setup));
+        let _turn = remote.as_ref().map(|(_, setup)| RemoteTurn {
+            ctx,
+            setup,
+            job_id: job.id.clone(),
+        });
 
         // Which local file HandBrake reads. For a remote job it is the staged copy, and the pull
         // baseline is what every fingerprint of this job is taken from.
@@ -1388,7 +1391,10 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
 
         *ctx.converter.current_pid.lock().unwrap() = None;
         *ctx.converter.current_child.lock().unwrap() = None;
-        *ctx.converter.current_job_id.lock().unwrap() = None;
+        // A remote job is still current through its push and finalize: `RemoteTurn` clears it.
+        if remote.is_none() {
+            *ctx.converter.current_job_id.lock().unwrap() = None;
+        }
 
         // Joined here rather than inside individual arms: the child has already exited, so
         // the drain thread is at EOF and this returns promptly on every path. The success
@@ -1872,13 +1878,27 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
     }
 }
 
-/// Empties staging when a remote job's turn ends, on every path out of it: each `continue` in the
-/// queue loop drops it. Staging therefore holds at most one job's source and result.
-struct StagingGuard<'a>(&'a crate::remote::RemoteSetup);
+/// A remote job's turn. The job stays the current job through push and finalize, so Pause and
+/// Cancel reach its transfers. On every way out of the turn — each `continue` in the queue loop
+/// drops it — the current job and its phase label are cleared and staging is emptied, so staging
+/// holds at most one job's source and result. Dropped outside any `ctx.db` lock: locals declared
+/// after it drop first.
+struct RemoteTurn<'a> {
+    ctx: &'a Ctx,
+    setup: &'a crate::remote::RemoteSetup,
+    job_id: String,
+}
 
-impl Drop for StagingGuard<'_> {
+impl Drop for RemoteTurn<'_> {
     fn drop(&mut self) {
-        self.0.empty_staging();
+        *self
+            .ctx
+            .converter
+            .current_job_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        emit_phase(self.ctx, &self.job_id, None);
+        self.setup.empty_staging();
     }
 }
 
@@ -1946,6 +1966,12 @@ fn pull_source(
     job: &JobInfo,
 ) -> Result<(std::path::PathBuf, crate::remote::RemoteStat), PullFailure> {
     use crate::remote::{RemoteError, SourceState};
+    // The roots bound what ConvertBar may replace or delete (ADR 0002), and they may have changed
+    // since the job was queued. Nothing is pulled for a job that would finalize outside them.
+    for path in [&job.source_path, &job.output_path] {
+        crate::remote::check_named_path(setup, host, path)
+            .map_err(|m| PullFailure::Failed(RemoteError::Failed(m)))?;
+    }
     let baseline = match crate::remote::probe_source(setup, host, &job.source_path, "stat") {
         Ok(SourceState::Present(stat)) => stat,
         Ok(SourceState::Missing) => return Err(PullFailure::Gone),
@@ -7580,6 +7606,12 @@ HandBrake has exited.";
                 std::fs::read_dir(staging.join(sub)).map_or(true, |mut d| d.next().is_none())
             })
         }
+
+        fn pushed(&self) -> bool {
+            crate::remote::testing::shim_log(self.setup())
+                .iter()
+                .any(|s| s == "push")
+        }
     }
 
     #[test]
@@ -7637,7 +7669,8 @@ HandBrake has exited.";
                 serde_json::json!("Pulling…"),
                 serde_json::Value::Null,
                 serde_json::json!("Pushing…"),
-                serde_json::json!("Verifying…")
+                serde_json::json!("Verifying…"),
+                serde_json::Value::Null
             ]
         );
     }
@@ -7646,8 +7679,17 @@ HandBrake has exited.";
     #[cfg(unix)]
     fn the_low_disk_gate_for_a_remote_job_measures_staging_and_leaves_it_queued() {
         let world = RemoteWorld::new("smaller");
-        let film = world.host_file("film.mkv", "x", 0o644);
-        world.queue_remote("j1", &film, &film);
+        // A host path with no local counterpart: measuring it here fails open and never gates,
+        // so only a measurement of staging trips the gate.
+        let film = "/no-such-dir-on-this-machine/film.mkv";
+        queue_job(&world.ctx.db, "j1", film, film, 1);
+        world
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET remote_host = 'unraid'", [])
+            .unwrap();
         // More than any disk has: the gate trips on staging's volume.
         set_setting(&world.ctx.db, "low_disk_min_gb", "1000000000");
 
@@ -7693,5 +7735,72 @@ HandBrake has exited.";
             );
             assert!(world.staging_is_empty(), "{step}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_during_the_push_is_booked_and_leaves_the_original() {
+        // The push runs after HandBrake has exited; the job must still be current so Cancel
+        // reaches it, and no half-pushed temp may stay on the host.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        // Off the transfer's pipes, or the orphaned sleep holds stderr open after the kill.
+        crate::remote::testing::hook_before(
+            world.setup(),
+            "push",
+            "exec >/dev/null 2>&1\nsleep 30",
+        );
+
+        std::thread::scope(|s| {
+            let queue = s.spawn(|| process_queue(&world.ctx));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !world.pushed() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the push never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            crate::control::cancel_conversion(&world.ctx).unwrap();
+            queue.join().unwrap();
+        });
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(
+            (status.as_str(), error.as_deref()),
+            ("error", Some("Cancelled by user"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&film).unwrap(),
+            "the original, much larger"
+        );
+        assert!(!world.root.join(".film.convertbar-tmp.mkv").exists());
+        assert!(world.staging_is_empty());
+        assert!(world.ctx.converter.current_job_id.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_job_outside_the_current_roots_is_refused_before_the_pull() {
+        // A row whose path lies under no configured root of its host (a root dropped from the
+        // configuration after the add): nothing there may be replaced.
+        let world = RemoteWorld::new("smaller");
+        let elsewhere = world.root.parent().unwrap().join("old-root/film.mkv");
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        std::fs::write(&elsewhere, "the original, much larger").unwrap();
+        let film = elsewhere.to_string_lossy().into_owned();
+        world.queue_remote("j1", &film, &film);
+
+        process_queue(&world.ctx);
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(status, "error");
+        assert!(error.unwrap().contains("outside the remote roots"));
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "the original, much larger"
+        );
+        assert!(crate::remote::testing::shim_log(world.setup()).is_empty());
     }
 }

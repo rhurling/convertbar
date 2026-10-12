@@ -262,10 +262,12 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
             // completed_at must be set here, not left for the next launch's backfill: until
             // then the row sorts to the bottom of History (ordered by completed_at DESC)
             // instead of showing up as the most recent entry, which is where a just-cancelled
-            // job belongs.
+            // job belongs. Only a row still running is cancelled: a remote job stays current
+            // after its booking, through a post-convert hook that can block for minutes.
             let update_result = db.execute(
                 "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user', \
-                 failure_class = ?2, completed_at = ?3 WHERE id = ?1",
+                 failure_class = ?2, completed_at = ?3 \
+                 WHERE id = ?1 AND status IN ('encoding', 'paused')",
                 params![
                     job_id,
                     crate::failure_class::FailureClass::Environment.as_str(),
@@ -322,11 +324,12 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
         .map_err(|e| e.to_string())? = None;
 
     // Surface a status-write failure now that the process has been killed.
-    if let Some(res) = update_result {
-        res.map_err(|e| e.to_string())?;
-    }
+    let cancelled = match update_result {
+        Some(res) => res.map_err(|e| e.to_string())? > 0,
+        None => false,
+    };
 
-    if let Some(ref job_id) = job_id_val {
+    if let Some(job_id) = job_id_val.as_ref().filter(|_| cancelled) {
         if let Some((ref source_path, ref output_path)) = paths {
             // For an in-place job output_path == source_path, so deleting output_path would delete
             // the user's original. Remove the temp instead; otherwise remove the partial output.
@@ -535,6 +538,38 @@ mod tests {
             "the recorded PID must be cleared too, so a racing quit can't SIGCONT a reaped, \
              possibly-recycled PID before the queue loop clears it"
         );
+    }
+
+    #[test]
+    fn cancel_never_rewrites_a_job_that_already_finished() {
+        // A remote job stays the current job until its turn ends, which includes a post-convert
+        // hook that can block for minutes after the row is booked.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                               created_at, remote_host)
+             VALUES ('j1', '/share/a.mkv', '/share/a.mkv', 'p', 'done', 0,
+                     '2020-01-01T00:00:00Z', 'unraid')",
+            [],
+        )
+        .unwrap();
+        let ctx = test_ctx(conn);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".into());
+
+        cancel_conversion(&ctx).unwrap();
+
+        let (status, msg): (String, Option<String>) = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, error_message FROM jobs WHERE id = 'j1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), msg), ("done", None));
     }
 
     #[test]

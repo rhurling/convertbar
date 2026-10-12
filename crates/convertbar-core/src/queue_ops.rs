@@ -2444,6 +2444,10 @@ mod tests {
             format!("{}/a/../../outside.mkv", share.display()),
             "outside the remote roots",
         );
+        assert!(
+            crate::remote::testing::shim_log(ctx.remote.get().unwrap()).is_empty(),
+            "an unknown host and a path outside the roots, `..` included, never reach the host"
+        );
         refused("unraid", s(&link), "symlink");
         refused("unraid", s(&share.join("missing.mkv")), "does not exist");
 

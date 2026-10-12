@@ -245,7 +245,15 @@ pub fn check_named_path(setup: &RemoteSetup, host: &str, path: &str) -> Result<(
     if !path.starts_with('/') {
         return Err(format!("{path} is not an absolute path on {host}"));
     }
-    if !setup.roots_of(host).any(|r| is_within(path, &r.dir)) {
+    // `starts_with` compares components without collapsing `..`, so a path holding one could
+    // name anything; the host is never asked about it.
+    let dotted = Path::new(path).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    });
+    if dotted || !setup.roots_of(host).any(|r| is_within(path, &r.dir)) {
         return Err(format!("{path} is outside the remote roots of {host}"));
     }
     Ok(())

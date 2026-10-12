@@ -129,7 +129,7 @@ A remote source condemned as bad appears in the bad-sources list with its host. 
 
 The seams, the only places tests drive this cycle:
 
-- **The remote seam.** The ssh program is swapped for a shim script that drops the options and the host and runs the remote script locally against temp directories. The shim can inject exit 255 at a named step, change the original mid-job, fail the chown step, or cut a stream short. The real remote scripts run under it, so these tests need GNU coreutils ≥ 9.5. They are ignored with that reason off Linux and run in the required Linux CI leg; the ignore count stays visible in the output.
+- **The remote seam.** The ssh program is swapped for a shim script that drops the options and the host and runs the remote script locally against temp directories. The shim can inject exit 255 at a named step, change the original mid-job, fail the chown step, or cut a stream short. The real remote scripts run under it, so these tests need GNU coreutils ≥ 9.5 and GNU findutils. They take them from Homebrew's gnubin (or `CONVERTBAR_TEST_GNUBIN`) on every platform, the required Linux CI leg included, and fail loudly when there are none rather than skipping.
 - **The queue thread** (shim + the recording fake HandBrake scripts), one test per row:
   - in place replaces the original, keeping its mode;
   - a new name is published and the original deleted; under `keep`, the original is kept;
