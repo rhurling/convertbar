@@ -1456,7 +1456,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                         err_msg,
                         crate::failure_class::FailureClass::Environment,
                     );
-                    // Intentionally leave the temp (`.{stem}.convertbar-tmp.mp4`): it holds the
+                    // Intentionally leave the temp (`.{stem}.convertbar-tmp.{ext}`): it holds the
                     // re-encoded content, and when the original did reach the Trash it is the
                     // only in-place copy, so removing it would force trash recovery. The marker
                     // keeps it out of scans, and the next in-place encode pre-clears it.

@@ -31,3 +31,5 @@ An ignored test drives the server head with a real preset file and the host's Ha
 — Final review after slice 6 —
 
 ## Ledger
+- Slice 1: done at ac89b3b
+- Checkpoint 1: BASE 21a5ebb, reviewed HEAD ac89b3b; next interval BASE ac89b3b

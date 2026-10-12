@@ -692,6 +692,36 @@ Matroska/
     }
 
     #[test]
+    fn the_container_follows_the_presets_file_format() {
+        // The extension decides the container HandBrake writes (ADR 0004), so each row of the
+        // mapping is load-bearing: `av_mkv -> mp4` would silently put MKV presets back into MP4.
+        for (file_format, want) in [
+            (Some("av_mp4"), "mp4"),
+            (Some("av_mkv"), "mkv"),
+            (Some("av_webm"), "webm"),
+            (None, "mp4"),
+        ] {
+            let field = file_format
+                .map(|f| format!(r#","FileFormat":"{f}""#))
+                .unwrap_or_default();
+            let stdout = format!(r#"{{"PresetList":[{{"VideoEncoder":"x265"{field}}}]}}"#);
+            let m = interpret_preset_export(true, &stdout, "", "data").unwrap();
+            assert_eq!(m.container, want, "FileFormat {file_format:?}");
+        }
+    }
+
+    #[test]
+    fn metadata_without_a_container_deserialises_as_mp4() {
+        // The settings page sends metadata back to resolve a suffix preview; a payload from a
+        // build that predates the field must still deserialise, as MP4 (what it always was).
+        let m: PresetMetadata = serde_json::from_str(
+            r#"{"codec":"h265","resolution":"1080p","quality":"hq","preset":"p","device":""}"#,
+        )
+        .unwrap();
+        assert_eq!(m.container, "mp4");
+    }
+
+    #[test]
     fn cached_preset_metadata_serves_hits_without_shelling_out() {
         let ctx = test_ctx();
         ctx.preset_cache

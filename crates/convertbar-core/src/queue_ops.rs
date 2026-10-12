@@ -900,7 +900,7 @@ pub fn add_files_inner(
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        let hb_path = get_handbrake_path(&conn, &*ctx.handbrake).ok();
+        let hb_path = get_handbrake_path(&conn, &*ctx.handbrake);
 
         (
             preset,
@@ -913,7 +913,7 @@ pub fn add_files_inner(
 
     // Every add needs the preset's metadata, not only a templated suffix: the output's extension
     // is the preset's container (ADR 0004), and only HandBrake can say what that is.
-    let hb = hb_path.clone().ok_or(handbrake::HANDBRAKE_NOT_FOUND)?;
+    let hb = hb_path?;
     let metadata = crate::handbrake::cached_preset_metadata(ctx, &hb, &preset)?;
     let suffix = if suffix_template.contains('{') {
         handbrake::resolve_suffix_template(&suffix_template, &metadata)
@@ -923,8 +923,8 @@ pub fn add_files_inner(
 
     // Source-media skip: probe candidate files and drop those already at/below the target. Only
     // files that survive the probe-free skip checks are probed, so a re-scan of an already-handled
-    // folder shells out to HandBrake zero times. Probing runs outside the DB lock; on any
-    // uncertainty (no HandBrake, probe failure/timeout, unknown codec) the file is kept.
+    // folder runs no probe. Probing runs outside the DB lock; on any uncertainty (probe
+    // failure/timeout, unknown codec) the file is kept.
     let candidates_to_probe: Vec<String> = if skip_by_source_media {
         let conn = ctx.db.lock().map_err(|e| e.to_string())?;
         let cleanup_mode = crate::settings_ops::read_cleanup_mode(&conn);
@@ -934,46 +934,40 @@ pub fn add_files_inner(
     };
 
     let media_skipped: HashSet<String> = if !candidates_to_probe.is_empty() {
-        if let Some(hb) = hb_path.as_deref() {
-            let metadata = crate::handbrake::cached_preset_metadata(ctx, hb, &preset)?;
-            let target_codec = metadata.codec.clone();
-            let target_height =
-                crate::media_skip::target_height_from_resolution(&metadata.resolution);
-            // Stamp each candidate with its filesystem identity (stat outside the DB lock),
-            // then reuse cached media for unchanged files and probe only the misses.
-            // resolve_media calls lookup (brief lock) -> probe (no lock) -> store (brief
-            // lock), so the HandBrake shell-out never runs while the DB mutex is held.
-            let with_identity: Vec<(String, Option<crate::probe_cache::FileIdentity>)> =
-                candidates_to_probe
-                    .iter()
-                    .map(|p| (p.clone(), crate::probe_cache::file_identity(p)))
-                    .collect();
-            let total = candidates_to_probe.len() as u32;
-            let probe_count = std::cell::Cell::new(0u32);
-            let probed = crate::probe_cache::resolve_media(
-                &with_identity,
-                |ids| {
-                    let conn = ctx.db.lock().expect("db mutex poisoned");
-                    crate::probe_cache::lookup_batch(&conn, ids)
-                },
-                |p| {
-                    let media = crate::probe::probe_source(hb, p);
-                    let done = probe_count.get() + 1;
-                    probe_count.set(done);
-                    if let Some(report) = progress {
-                        report(done, total);
-                    }
-                    media
-                },
-                |items| {
-                    let conn = ctx.db.lock().expect("db mutex poisoned");
-                    crate::probe_cache::store_batch(&conn, items);
-                },
-            );
-            crate::media_skip::select_media_skips(&probed, &target_codec, target_height)
-        } else {
-            HashSet::new()
-        }
+        let target_codec = metadata.codec.clone();
+        let target_height = crate::media_skip::target_height_from_resolution(&metadata.resolution);
+        // Stamp each candidate with its filesystem identity (stat outside the DB lock),
+        // then reuse cached media for unchanged files and probe only the misses.
+        // resolve_media calls lookup (brief lock) -> probe (no lock) -> store (brief
+        // lock), so the HandBrake shell-out never runs while the DB mutex is held.
+        let with_identity: Vec<(String, Option<crate::probe_cache::FileIdentity>)> =
+            candidates_to_probe
+                .iter()
+                .map(|p| (p.clone(), crate::probe_cache::file_identity(p)))
+                .collect();
+        let total = candidates_to_probe.len() as u32;
+        let probe_count = std::cell::Cell::new(0u32);
+        let probed = crate::probe_cache::resolve_media(
+            &with_identity,
+            |ids| {
+                let conn = ctx.db.lock().expect("db mutex poisoned");
+                crate::probe_cache::lookup_batch(&conn, ids)
+            },
+            |p| {
+                let media = crate::probe::probe_source(&hb, p);
+                let done = probe_count.get() + 1;
+                probe_count.set(done);
+                if let Some(report) = progress {
+                    report(done, total);
+                }
+                media
+            },
+            |items| {
+                let conn = ctx.db.lock().expect("db mutex poisoned");
+                crate::probe_cache::store_batch(&conn, items);
+            },
+        );
+        crate::media_skip::select_media_skips(&probed, &target_codec, target_height)
     } else {
         HashSet::new()
     };
