@@ -41,6 +41,53 @@ pub fn normalize_server_settings(ctx: &Ctx) {
     }
 }
 
+/// Imports the configured preset file into `ctx`, or refuses with the reason startup must stop.
+///
+/// Every refusal here would otherwise fail each queued job in turn, one HandBrake run at a time.
+/// HandBrake must be resolvable because the collision check needs its built-in names, and a
+/// server with a preset file but no HandBrake can encode nothing anyway. The built-in names are
+/// listed once, without the import flag, and kept for the per-run pre-flight
+/// (`handbrake::preset_import_args`). Runs after the context is built and before `boot`.
+pub fn load_preset_import(ctx: &Ctx, file: &std::path::Path) -> Result<(), String> {
+    use convertbar_core::handbrake;
+
+    let path = file.display();
+    let raw = std::fs::read_to_string(file)
+        .map_err(|e| format!("preset file {path} cannot be read: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("preset file {path} is not valid JSON: {e}"))?;
+    let imported = handbrake::imported_preset_names(&json);
+    if imported.is_empty() {
+        return Err(format!("preset file {path} defines no presets"));
+    }
+    let hb = handbrake::resolve_handbrake_path(ctx)?.ok_or_else(|| {
+        format!(
+            "a preset file is configured ({path}) but HandBrakeCLI cannot be found: {}",
+            handbrake::HANDBRAKE_NOT_FOUND
+        )
+    })?;
+    let builtins: std::collections::HashSet<String> =
+        handbrake::list_presets(&hb)?.into_iter().collect();
+    let collisions: Vec<&str> = imported
+        .iter()
+        .filter(|name| builtins.contains(*name))
+        .map(String::as_str)
+        .collect();
+    if !collisions.is_empty() {
+        return Err(format!(
+            "preset file {path} reuses the name of a HandBrake built-in preset, which HandBrake \
+             would use instead: {}",
+            collisions.join(", ")
+        ));
+    }
+    ctx.preset_import
+        .set(handbrake::PresetImport {
+            path: file.to_path_buf(),
+            builtins,
+        })
+        .map_err(|_| "the preset file was already imported".to_string())
+}
+
 /// Direct port of the desktop setup block's auto-resume sequence (`src-tauri/src/lib.rs`,
 /// ~:337-360): reset interrupted jobs to `queued`, decide whether to auto-resume the queue,
 /// then arm the directory watchers. The db lock is taken and dropped BEFORE `run_queue`/
@@ -436,5 +483,122 @@ mod tests {
             has_queued,
             queue_paused
         ));
+    }
+
+    // --- load_preset_import ---
+
+    fn ctx_with_locator(
+        locator: Arc<dyn convertbar_core::handbrake::HandbrakeLocator>,
+    ) -> Arc<Ctx> {
+        Ctx::new(
+            test_conn(),
+            Arc::new(TestSink::default()),
+            Arc::new(RecordingDisposer::default()),
+            locator,
+            convertbar_core::hooks::HookSetup {
+                runner: Arc::new(convertbar_core::hooks::RecordingHookRunner::default()),
+                allow_stored_command: false,
+            },
+        )
+    }
+
+    /// A stub HandBrakeCLI whose `--preset-list` prints two built-ins to stderr, in the real
+    /// CLI's layout (category at the margin, preset at four spaces, description at eight).
+    #[cfg(unix)]
+    fn preset_list_stub(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("hb-list.sh");
+        std::fs::write(
+            &p,
+            "#!/bin/sh\ncat >&2 <<'EOF'\nGeneral/\n    Fast 1080p30\n        H.264 video.\n    H.265 MKV 1080p30\n        H.265 video.\nEOF\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    fn preset_file(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    const ONE_PRESET: &str =
+        r#"{"PresetList":[{"PresetName":"data","Type":1,"Folder":false,"FileFormat":"av_mkv"}]}"#;
+
+    #[test]
+    #[cfg(unix)]
+    fn a_preset_file_that_cannot_serve_refuses_startup_naming_the_cause() {
+        // Each of these would otherwise fail every queued job in turn, one HandBrake run at a
+        // time; refusing to start says it once, before anything is spawned.
+        let dir = tempfile::tempdir().unwrap();
+        let installed = || {
+            ctx_with_locator(Arc::new(convertbar_core::handbrake::StubLocator(
+                preset_list_stub(dir.path()),
+            )))
+        };
+        let cases: Vec<(&str, Arc<Ctx>, std::path::PathBuf, &str)> = vec![
+            (
+                "missing",
+                installed(),
+                dir.path().join("absent.json"),
+                "cannot be read",
+            ),
+            (
+                "invalid JSON",
+                installed(),
+                preset_file(dir.path(), "invalid.json", "{not json"),
+                "not valid JSON",
+            ),
+            (
+                "no presets",
+                installed(),
+                preset_file(dir.path(), "empty.json", r#"{"PresetList":[]}"#),
+                "defines no presets",
+            ),
+            (
+                "HandBrake unresolvable",
+                ctx_with_locator(Arc::new(convertbar_core::handbrake::AbsentLocator)),
+                preset_file(dir.path(), "no-hb.json", ONE_PRESET),
+                "HandBrakeCLI",
+            ),
+            (
+                "collision",
+                installed(),
+                preset_file(
+                    dir.path(),
+                    "collision.json",
+                    r#"{"PresetList":[{"PresetName":"Fast 1080p30","Type":1,"Folder":false,"FileFormat":"av_mkv"}]}"#,
+                ),
+                "Fast 1080p30",
+            ),
+        ];
+        for (case, ctx, file, want) in cases {
+            let err = load_preset_import(&ctx, &file)
+                .expect_err(&format!("{case}: startup must be refused"));
+            assert!(err.contains(want), "{case}: the cause is named: {err}");
+            assert!(
+                ctx.preset_import.get().is_none(),
+                "{case}: nothing is imported"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_valid_preset_file_is_imported_with_handbrakes_built_in_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_locator(Arc::new(convertbar_core::handbrake::StubLocator(
+            preset_list_stub(dir.path()),
+        )));
+        let file = preset_file(dir.path(), "presets.json", ONE_PRESET);
+
+        load_preset_import(&ctx, &file).unwrap();
+
+        let import = ctx.preset_import.get().expect("the file is imported");
+        assert_eq!(import.path, file);
+        let mut builtins: Vec<&str> = import.builtins.iter().map(String::as_str).collect();
+        builtins.sort();
+        assert_eq!(builtins, vec!["Fast 1080p30", "H.265 MKV 1080p30"]);
     }
 }

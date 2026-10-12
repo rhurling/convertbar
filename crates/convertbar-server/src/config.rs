@@ -45,6 +45,9 @@ pub struct ServerConfig {
     /// Addresses whose `X-Forwarded-For` is believed when resolving a request's
     /// throttling identity. Empty (the default) means the header is never read.
     pub trusted_proxies: Vec<IpNet>,
+    /// A HandBrake preset file to import (`CONVERTBAR_PRESET_FILE`). Env only, never a setting
+    /// (ADR 0002); checked at startup by `startup::load_preset_import`.
+    pub preset_file: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -119,6 +122,10 @@ impl ServerConfig {
             allowed_hosts,
             browse_roots,
             trusted_proxies,
+            preset_file: vars
+                .get("CONVERTBAR_PRESET_FILE")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
         })
     }
 
@@ -147,6 +154,27 @@ mod tests {
         assert_eq!(cfg.auth, AuthMode::Token("abcdefghijklmnop".to_string()));
         assert_eq!(cfg.allowed_hosts, Vec::<String>::new());
         assert_eq!(cfg.browse_roots, vec![PathBuf::from("/")]);
+        assert_eq!(cfg.preset_file, None, "no preset file unless one is named");
+    }
+
+    #[test]
+    fn a_preset_file_is_read_from_the_environment_and_an_empty_one_is_none() {
+        let cfg = ServerConfig::from_vars(&vars(&[
+            ("CONVERTBAR_AUTH_TOKEN", "abcdefghijklmnop"),
+            ("CONVERTBAR_PRESET_FILE", "/etc/convertbar/data.json"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.preset_file,
+            Some(PathBuf::from("/etc/convertbar/data.json"))
+        );
+
+        let cfg = ServerConfig::from_vars(&vars(&[
+            ("CONVERTBAR_AUTH_TOKEN", "abcdefghijklmnop"),
+            ("CONVERTBAR_PRESET_FILE", ""),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.preset_file, None);
     }
 
     #[test]
