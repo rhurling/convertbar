@@ -23,11 +23,7 @@ pub async fn detect_handbrake(State(s): State<ServerState>) -> Response {
 
 pub async fn list_handbrake_presets(State(s): State<ServerState>) -> Response {
     let ctx = s.ctx.clone();
-    blocking_json(move || {
-        let path = hb::require_handbrake_path(&ctx)?;
-        hb::list_presets(&path)
-    })
-    .await
+    blocking_json(move || hb::list_available_presets(&ctx)).await
 }
 
 pub async fn validate_handbrake(State(s): State<ServerState>) -> Response {
@@ -82,4 +78,104 @@ pub struct ResolveSuffixTemplateBody {
 
 pub async fn resolve_suffix_template(Json(b): Json<ResolveSuffixTemplateBody>) -> Json<String> {
     Json(hb::resolve_suffix_template(&b.template, &b.metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    use crate::routes::api_router;
+    use crate::routes::tests::{request_json, test_state_with_locator};
+
+    /// A stub HandBrakeCLI whose `--preset-list` prints two built-ins to stderr in the real
+    /// CLI's layout, and which records whether it was ever handed the import flag.
+    #[cfg(unix)]
+    fn preset_list_stub(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("hb-list.sh");
+        let flagged = dir.join("saw-import-flag");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" --preset-import-file \"*) touch '{}' ;; esac\ncat >&2 <<'EOF2'\nGeneral/\n    Fast 1080p30\n        H.264 video.\n    H.265 MKV 1080p30\n        H.265 video.\nEOF2\n",
+                flagged.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn the_preset_list_puts_the_files_presets_first_then_the_built_ins() {
+        // Names come from the file itself, not from `--preset-list` with the flag: the CLI prints
+        // a `Type 0` entry at column 0 with its description indented like a preset name.
+        let dir = tempfile::tempdir().unwrap();
+        let stub = preset_list_stub(dir.path());
+        let (state, _shutdown) =
+            test_state_with_locator(Arc::new(convertbar_core::handbrake::StubLocator(stub)));
+        let file = dir.path().join("presets.json");
+        let preset_file = |extra: &str| {
+            std::fs::write(
+                &file,
+                json!({"PresetList": [
+                    {"PresetName": "Data x265", "Type": 1, "Folder": false},
+                    {"PresetName": "Exported", "Type": 0, "Folder": false},
+                    {"PresetName": "Shows", "Type": 1, "Folder": true, "ChildrenArray": [
+                        {"PresetName": "Episode x265", "Type": 1, "Folder": false}
+                    ]},
+                    {"PresetName": extra, "Type": 1, "Folder": false}
+                ]})
+                .to_string(),
+            )
+            .unwrap();
+        };
+        preset_file("Extra");
+        state
+            .ctx
+            .preset_import
+            .set(convertbar_core::handbrake::PresetImport {
+                path: file.clone(),
+                builtins: ["Fast 1080p30", "H.265 MKV 1080p30"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            })
+            .unwrap();
+
+        let (code, body) = request_json(
+            api_router(state.clone()),
+            "GET",
+            "/api/handbrake/presets",
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!([
+                "Data x265",
+                "Exported",
+                "Episode x265",
+                "Extra",
+                "Fast 1080p30",
+                "H.265 MKV 1080p30"
+            ])
+        );
+        assert!(
+            !dir.path().join("saw-import-flag").exists(),
+            "the built-ins are listed without the import flag"
+        );
+
+        // The file changed after startup and now shadows a built-in: say so, don't list it.
+        preset_file("Fast 1080p30");
+        let (code, body) =
+            request_json(api_router(state), "GET", "/api/handbrake/presets", None).await;
+        assert_ne!(code, StatusCode::OK);
+        assert!(body.to_string().contains("Fast 1080p30"), "{body}");
+    }
 }

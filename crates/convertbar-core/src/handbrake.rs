@@ -125,6 +125,37 @@ pub fn imported_preset_names(file: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Every preset the user can pick: the preset file's own presets first, then HandBrake's
+/// built-ins. The built-ins are listed without the import flag, so nothing appears twice. A file
+/// that has changed since startup so that it now shadows a built-in is an error rather than a
+/// list that offers a preset HandBrake would replace with the built-in.
+pub fn list_available_presets(ctx: &Ctx) -> Result<Vec<String>, String> {
+    let hb = require_handbrake_path(ctx)?;
+    let builtins = list_presets(&hb)?;
+    let Some(import) = ctx.preset_import.get() else {
+        return Ok(builtins);
+    };
+    let path = import.path.display();
+    let raw = std::fs::read_to_string(&import.path)
+        .map_err(|e| format!("Preset file {path} cannot be read: {e}"))?;
+    let file: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("Preset file {path} is not valid JSON: {e}"))?;
+    let imported = imported_preset_names(&file);
+    let collisions: Vec<&str> = imported
+        .iter()
+        .filter(|name| builtins.contains(name))
+        .map(String::as_str)
+        .collect();
+    if !collisions.is_empty() {
+        return Err(format!(
+            "Preset file {path} reuses the name of a HandBrake built-in preset, which HandBrake \
+             would use instead: {}",
+            collisions.join(", ")
+        ));
+    }
+    Ok(imported.into_iter().chain(builtins).collect())
+}
+
 /// The arguments that make `preset` resolvable for HandBrakeCLI: none without a configured
 /// preset file, `--preset-import-file <file>` with one — after checking that the file can
 /// actually serve `preset`.

@@ -21,11 +21,7 @@ pub async fn detect_handbrake(ctx: State<'_, Arc<Ctx>>) -> Result<Option<String>
 #[tauri::command]
 pub async fn list_handbrake_presets(ctx: State<'_, Arc<Ctx>>) -> Result<Vec<String>, CommandError> {
     let ctx = ctx.inner().clone();
-    blocking(move || {
-        let path = hb::require_handbrake_path(&ctx)?;
-        hb::list_presets(&path)
-    })
-    .await
+    blocking(move || hb::list_available_presets(&ctx)).await
 }
 
 #[tauri::command]
