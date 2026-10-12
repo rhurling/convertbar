@@ -1,8 +1,8 @@
 //! All ssh I/O for remote roots (ADRs 0005 and 0006). Nothing else in the crate builds a remote
 //! command: the queue thread, the routes, cancel and recovery call these functions.
 //!
-//! Every remote script travels on stdin to `sh -s`, its arguments single-quote-escaped after it,
-//! and is wrapped in a function called only on its last line, so a stream cut off part-way runs
+//! Every remote script travels on stdin to `sh -s`, its single-quote-escaped arguments set by a
+//! leading `set --` line in the same stream, and is wrapped in a function called only on its last line, so a stream cut off part-way runs
 //! nothing. The push is the one exception: its stdin is the file, so its fixed one-line script is
 //! the remote command itself. Each remote command starts with `: convertbar-<step>;`, a no-op that
 //! names the step for the test shim and for anyone reading the host's process list.
@@ -143,13 +143,22 @@ fn ssh(setup: &RemoteSetup, host: &str, remote_command: &str) -> Command {
     cmd
 }
 
-fn script_command(step: &str, args: &[&str]) -> String {
-    let mut command = format!(": convertbar-{step}; sh -s --");
+fn script_command(step: &str) -> String {
+    format!(": convertbar-{step}; sh -s")
+}
+
+/// `script` with its arguments set by a leading `set --` line, so they travel on stdin. On the
+/// command line they would be capped: sshd hands the whole remote command to the login shell as
+/// one `-c` argument, which Linux limits to 128 KiB — a few hundred paths of a folder add.
+fn with_args(script: &str, args: &[&str]) -> String {
+    let mut text = String::from("set --");
     for arg in args {
-        command.push(' ');
-        command.push_str(&quote(arg));
+        text.push(' ');
+        text.push_str(&quote(arg));
     }
-    command
+    text.push('\n');
+    text.push_str(script);
+    text
 }
 
 /// The output of a finished remote script.
@@ -168,7 +177,7 @@ fn run_script(
     script: &str,
     args: &[&str],
 ) -> Result<ScriptOutput, RemoteError> {
-    let mut child = ssh(setup, host, &script_command(step, args))
+    let mut child = ssh(setup, host, &script_command(step))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -176,7 +185,7 @@ fn run_script(
         .map_err(|e| RemoteError::Failed(format!("Could not run ssh: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         // A host that refuses the connection closes the pipe early; the exit status says why.
-        let _ = stdin.write_all(script.as_bytes());
+        let _ = stdin.write_all(with_args(script, args).as_bytes());
     }
     let output = child
         .wait_with_output()
@@ -268,6 +277,33 @@ pub struct Inspected {
     pub is_file: bool,
 }
 
+/// The containment rule for a path the host resolved: below some root (as named, paired with its
+/// resolved form), `path` must resolve to exactly that root's resolved form joined with the rest
+/// of the path as named. A root may itself be a symlink (a share reached through one); anything
+/// below it that differs is a symlink, which finalize must never rename over.
+fn check_resolved(
+    host: &str,
+    path: &str,
+    resolved: &str,
+    roots: &[(&str, &str)],
+) -> Result<(), RemoteError> {
+    let resolves_as_named = roots.iter().any(|(named, real)| {
+        Path::new(path)
+            .strip_prefix(named)
+            .is_ok_and(|rest| Path::new(real).join(rest) == Path::new(resolved))
+    });
+    if resolves_as_named {
+        return Ok(());
+    }
+    Err(RemoteError::Failed(
+        if roots.iter().any(|(_, real)| is_within(resolved, real)) {
+            format!("{path} on {host} is or passes through a symlink; use the real path instead")
+        } else {
+            format!("{path} is outside the remote roots of {host}")
+        },
+    ))
+}
+
 const INSPECT_SCRIPT: &str = r#"inspect() {
   for p in "$@"; do
     realpath -e -z -- "$p" 2>/dev/null || printf '\0'
@@ -325,23 +361,7 @@ pub fn inspect_paths(
             });
             continue;
         }
-        let resolves_as_named = roots.iter().any(|(named, real)| {
-            Path::new(path)
-                .strip_prefix(named)
-                .is_ok_and(|rest| Path::new(real).join(rest) == Path::new(resolved))
-        });
-        if !resolves_as_named {
-            return Err(RemoteError::Failed(
-                if roots.iter().any(|(_, real)| is_within(resolved, real)) {
-                    format!(
-                        "{path} on {host} is or passes through a symlink; add the real path \
-                         instead"
-                    )
-                } else {
-                    format!("{path} is outside the remote roots of {host}")
-                },
-            ));
-        }
+        check_resolved(host, path, resolved, &roots)?;
         let (stat, kind) = match parse_stat_line(stat_line) {
             Some((s, k)) => (Some(s), k),
             None => (None, String::new()),
@@ -393,6 +413,131 @@ pub fn list_names(
         result.insert(dir, names);
     }
     Ok(result)
+}
+
+/// One entry of a remote directory listing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+}
+
+/// Resolves the roots and `dir`, then runs `body` on `dir` — one round trip. Answers the
+/// resolved roots, the resolved dir, then whatever `body` prints, all NUL-delimited.
+fn dir_script(body: &str) -> String {
+    format!(
+        r#"walk() {{
+  n=$1; shift
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    realpath -e -z -- "$1" 2>/dev/null || printf '\0'
+    shift; i=$((i + 1))
+  done
+  d=$1
+  realpath -e -z -- "$d" 2>/dev/null || {{ printf '\0'; exit 0; }}
+  [ -d "$d" ] || exit 12
+{body}
+}}
+walk "$@"
+"#
+    )
+}
+
+/// Immediate children: directories, and regular files with their size. A symlink is neither,
+/// so a listing never shows one; marker temps are left out.
+const LIST_BODY: &str = r#"  find -H "$d" -mindepth 1 -maxdepth 1 ! -name '.*.convertbar-tmp.*' \
+    \( \( -type d -printf '%f\0d\0\0' \) -o \( -type f -printf '%f\0f\0%s\0' \) \)"#;
+
+/// Every regular file below the directory, at any depth, without following a symlink and
+/// without marker temps.
+const FIND_BODY: &str =
+    r#"  find -H "$d" -mindepth 1 -type f ! -name '.*.convertbar-tmp.*' -printf '%p\0'"#;
+
+/// Runs a directory script for `dir` on `host` after the lexical checks, and checks the
+/// resolved dir against the resolved roots exactly as `inspect_paths` does. Returns the fields
+/// `body` printed.
+fn run_dir_script(
+    setup: &RemoteSetup,
+    host: &str,
+    dir: &str,
+    step: &'static str,
+    body: &str,
+) -> Result<Vec<String>, RemoteError> {
+    check_named_path(setup, host, dir).map_err(RemoteError::Failed)?;
+    let root_dirs: Vec<&str> = setup.roots_of(host).map(|r| r.dir.as_str()).collect();
+    let n = root_dirs.len().to_string();
+    let mut args: Vec<&str> = vec![&n];
+    args.extend(root_dirs.iter().copied());
+    args.push(dir);
+    let out = run_script(setup, host, step, &dir_script(body), &args)?;
+    match out.code {
+        Some(0) => {}
+        Some(12) => {
+            return Err(RemoteError::Failed(format!(
+                "{dir} on {host} is not a directory"
+            )))
+        }
+        _ => {
+            return Err(RemoteError::Failed(format!(
+                "Could not read {dir} on {host}: {}",
+                out.stderr.trim()
+            )))
+        }
+    }
+    let mut fields = nul_fields(&out.stdout);
+    if fields.len() < root_dirs.len() + 1 {
+        return Err(RemoteError::Failed(format!(
+            "Unexpected answer from {host} while reading {dir}"
+        )));
+    }
+    let rest = fields.split_off(root_dirs.len() + 1);
+    let resolved = fields.pop().unwrap_or_default();
+    if resolved.is_empty() {
+        return Err(RemoteError::Failed(format!(
+            "{dir} does not exist on {host}"
+        )));
+    }
+    let roots: Vec<(&str, &str)> = root_dirs
+        .iter()
+        .zip(fields.iter())
+        .map(|(named, real)| (*named, real.as_str()))
+        .filter(|(_, real)| !real.is_empty())
+        .collect();
+    check_resolved(host, dir, &resolved, &roots)?;
+    Ok(rest)
+}
+
+/// Lists `dir` on `host` in one round trip, for the file browser.
+pub fn list_dir(
+    setup: &RemoteSetup,
+    host: &str,
+    dir: &str,
+) -> Result<Vec<RemoteEntry>, RemoteError> {
+    let fields = run_dir_script(setup, host, dir, "list", LIST_BODY)?;
+    let mut entries = Vec::new();
+    for chunk in fields.chunks(3) {
+        let [name, kind, size] = chunk else { break };
+        let is_dir = kind == "d";
+        entries.push(RemoteEntry {
+            path: Path::new(dir).join(name).to_string_lossy().into_owned(),
+            name: name.clone(),
+            is_dir,
+            size: if is_dir { None } else { size.parse().ok() },
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+/// Every regular file below `dir` on `host`, in one round trip, for folder scans and adds.
+pub fn find_files(setup: &RemoteSetup, host: &str, dir: &str) -> Result<Vec<String>, RemoteError> {
+    run_dir_script(setup, host, dir, "find", FIND_BODY)
 }
 
 /// What the host says about a job's source just before the pull.
@@ -515,14 +660,14 @@ pub fn start_pull(
     }
     let file = std::fs::File::create(dest)
         .map_err(|e| RemoteError::Failed(format!("Could not write to staging: {e}")))?;
-    let mut child = ssh(setup, host, &script_command("pull", &[path]))
+    let mut child = ssh(setup, host, &script_command("pull"))
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file))
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| RemoteError::Failed(format!("Could not run ssh: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(PULL_SCRIPT.as_bytes());
+        let _ = stdin.write_all(with_args(PULL_SCRIPT, &[path]).as_bytes());
     }
     Ok((
         child,
@@ -707,7 +852,8 @@ pub fn remove_temp(setup: &RemoteSetup, host: &str, remote_temp: &str) {
 }
 
 /// An ssh stand-in for tests: it drops the options and the host and runs the remote command
-/// locally, with GNU coreutils and findutils first on `PATH`. Control files in its directory:
+/// locally, with GNU coreutils and findutils first on `PATH`, refusing a remote command over
+/// 128 KiB as a Linux host does. Control files in its directory:
 /// `fail-255` (one step per line answers exit 255), `hook-<step>` (run before that step), and
 /// `bin-<step>/` (prepended to `PATH` for that step). Every invocation's step is appended to `log`.
 #[cfg(all(unix, any(test, feature = "test-support")))]
@@ -766,6 +912,11 @@ while [ $# -gt 0 ]; do
 done
 shift
 cmd=$*
+# Linux caps the one argument sshd hands the login shell at 128 KiB.
+if [ ${{#cmd}} -gt 131072 ]; then
+  echo "sh: Argument list too long" >&2
+  exit 126
+fi
 step=${{cmd#: convertbar-}}
 step=${{step%%;*}}
 echo "$step" >> "$dir/log"

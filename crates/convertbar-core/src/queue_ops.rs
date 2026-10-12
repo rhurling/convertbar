@@ -1368,7 +1368,62 @@ pub fn add_remote_files(
     host: &str,
     paths: &[String],
 ) -> Result<AddResult, RemoteAddError> {
-    let result = add_remote_files_inner(ctx, host, paths);
+    let result = {
+        let _op = crate::add_progress::AddOp::new(ctx.events.clone(), String::new());
+        add_remote_files_inner(ctx, host, paths)
+    };
+    if result.is_ok() {
+        ctx.events.emit_t("queue-updated", ());
+    }
+    result
+}
+
+/// The video files below `dir` on `host`, from one `find` round trip. Symlinks and marker temps
+/// are never among them.
+fn remote_video_files(ctx: &Ctx, host: &str, dir: &str) -> Result<Vec<String>, RemoteAddError> {
+    let setup = ctx.remote.get().ok_or_else(|| {
+        RemoteAddError::Refused("No remote roots are configured on this server".to_string())
+    })?;
+    let mut files = crate::remote::find_files(setup, host, dir)?;
+    files.retain(|f| is_video_file(Path::new(f)));
+    files.sort();
+    Ok(files)
+}
+
+fn folder_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// [`scan_folder`] for a directory on `host`.
+pub fn scan_remote_folder(
+    ctx: &Ctx,
+    host: &str,
+    path: String,
+) -> Result<FolderScanResult, RemoteAddError> {
+    let files = remote_video_files(ctx, host, &path)?;
+    Ok(FolderScanResult {
+        file_count: files.len(),
+        folder_name: folder_name(&path),
+        folder_path: path,
+    })
+}
+
+/// [`confirm_folder_add`] for a directory on `host`: the folder's video files go through
+/// [`add_remote_files_inner`], so they meet exactly the rules of a remote file add.
+pub fn confirm_remote_folder_add(
+    ctx: &Arc<Ctx>,
+    host: &str,
+    path: String,
+) -> Result<AddResult, RemoteAddError> {
+    let result = {
+        let _op = crate::add_progress::AddOp::new(ctx.events.clone(), folder_name(&path));
+        remote_video_files(ctx, host, &path)
+            .and_then(|files| add_remote_files_inner(ctx, host, &files))
+    };
     if result.is_ok() {
         ctx.events.emit_t("queue-updated", ());
     }
@@ -2369,9 +2424,20 @@ mod tests {
                 "delete",
             )
             .unwrap();
+            // A local job whose output name is the very name the remote clip will want.
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order, \
+                 created_at) VALUES ('local-clip', '/elsewhere/clip.wmv', ?1, 'data', 'queued', \
+                 99, '2026-10-12T00:00:00Z')",
+                params![share.join("a/clip.mkv").to_string_lossy()],
+            )
+            .unwrap();
         }
+        let clip = file("a/clip.wmv");
 
-        let first = add_remote_files_inner(&ctx, "unraid", &[wmv.clone(), show.clone()]).unwrap();
+        let first =
+            add_remote_files_inner(&ctx, "unraid", &[wmv.clone(), show.clone(), clip.clone()])
+                .unwrap();
 
         let out = |src: &str| {
             first
@@ -2390,6 +2456,11 @@ mod tests {
             out(&show).output_path,
             show,
             "an .mkv under MKV with no suffix is in place"
+        );
+        assert_eq!(
+            out(&clip).output_path,
+            share.join("a/clip.mkv").to_string_lossy(),
+            "a local job's output name says nothing about the host's directory"
         );
         assert_eq!(out(&wmv).remote_host.as_deref(), Some("unraid"));
         // The fingerprint is the host's stat, in the unit local fingerprints use.
@@ -2410,7 +2481,7 @@ mod tests {
             (Some(local_view.size), Some(local_view.mtime))
         );
 
-        let second = add_remote_files_inner(&ctx, "unraid", &[wmv, show]).unwrap();
+        let second = add_remote_files_inner(&ctx, "unraid", &[wmv.clone(), show]).unwrap();
         assert!(second.added.is_empty());
         assert_eq!(
             second.skipped,
@@ -2419,6 +2490,41 @@ mod tests {
                 count: 2
             }]
         );
+
+        // The other way round: the remote row says nothing about a local file of the same path.
+        let local = add_files_to_db(
+            &ctx.db.lock().unwrap(),
+            std::slice::from_ref(&wmv),
+            "data",
+            "",
+            "mkv",
+            false,
+            "delete",
+        )
+        .unwrap();
+        assert_eq!(local.added.len(), 1, "{:?}", local.skipped);
+        assert_eq!(local.added[0].remote_host, None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_folder_add_carries_any_number_of_paths_to_the_host() {
+        // A share's season folder: hundreds of long names, far past the 128 KiB a Linux host
+        // accepts as one command line, which the shim enforces as such a host would.
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, share) = remote_ctx("mkv", &tmp);
+        let season = share.join("Show/Season 1");
+        std::fs::create_dir_all(&season).unwrap();
+        let stem = "A Rather Long Episode Title ".repeat(7);
+        for i in 0..600 {
+            std::fs::write(season.join(format!("{stem}{i:03}.wmv")), "x").unwrap();
+        }
+        let dir = share.join("Show").to_string_lossy().into_owned();
+
+        let scan = scan_remote_folder(&ctx, "unraid", dir.clone()).unwrap();
+        assert_eq!((scan.file_count, scan.folder_name.as_str()), (600, "Show"));
+        let added = confirm_remote_folder_add(&ctx, "unraid", dir).unwrap();
+        assert_eq!(added.added.len(), 600, "{:?}", added.skipped);
     }
 
     #[test]

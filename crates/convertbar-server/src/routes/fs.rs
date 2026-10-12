@@ -46,6 +46,9 @@ use super::{blocking_response, ServerState};
 #[derive(Deserialize)]
 pub struct FsListQuery {
     path: String,
+    /// An ssh host alias from `CONVERTBAR_REMOTE_ROOTS`: `path` is then a directory on that host.
+    #[serde(default)]
+    remote: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -81,11 +84,39 @@ fn io_err_status(e: &std::io::Error) -> StatusCode {
 }
 
 pub async fn fs_list(State(s): State<ServerState>, Query(q): Query<FsListQuery>) -> Response {
+    if let Some(host) = q.remote {
+        let ctx = s.ctx.clone();
+        return blocking_response(move || remote_list(&ctx, &host, &q.path)).await;
+    }
     let roots = s.config.browse_roots.clone();
     // `blocking_response`, not a local match: a join failure here is the same server bug it is
     // on every other route, and this handler's own copy of that mapping was the tenth site —
     // the one a `core_err` grep missed.
     blocking_response(move || fs_list_blocking(q.path, roots)).await
+}
+
+/// A directory on `host`, from one round trip. Unlike the local listing, the answer's `path` and
+/// every entry's path are the path *as named*, never resolved: `/api/info` advertises the remote
+/// roots as configured, and the client slices that root off `path` for its breadcrumb. A root
+/// reached through a symlink would otherwise be a prefix of nothing it is shown.
+fn remote_list(ctx: &convertbar_core::ctx::Ctx, host: &str, path: &str) -> Response {
+    use convertbar_core::queue_ops::RemoteAddError;
+    let Some(setup) = ctx.remote.get() else {
+        return super::remote_json::<()>(Err(RemoteAddError::Refused(
+            "No remote roots are configured on this server".to_string(),
+        )));
+    };
+    // Without a trailing slash or doubled separators, so the client's prefix compare holds.
+    let path: String = Path::new(path)
+        .components()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned();
+    super::remote_json(
+        convertbar_core::remote::list_dir(setup, host, &path)
+            .map(|entries| json!({ "path": path, "entries": entries }))
+            .map_err(RemoteAddError::from),
+    )
 }
 
 fn fs_list_blocking(requested: String, roots: Vec<PathBuf>) -> Response {

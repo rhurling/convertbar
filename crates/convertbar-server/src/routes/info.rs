@@ -27,6 +27,9 @@ pub struct AppInfo {
     /// to build the breadcrumb. A root advertised as the raw config string is a prefix of
     /// nothing the client will ever be shown the moment the path involves a symlink.
     pub browse_roots: Vec<String>,
+    /// `CONVERTBAR_REMOTE_ROOTS` as configured, never resolved: remote listings answer in paths
+    /// as named (see `routes::fs`), so the two compare.
+    pub remote_roots: Vec<convertbar_core::remote::RemoteRoot>,
 }
 
 pub async fn get_app_info(State(state): State<ServerState>) -> Response {
@@ -55,6 +58,7 @@ pub async fn get_app_info(State(state): State<ServerState>) -> Response {
                         .into_owned()
                 })
                 .collect(),
+            remote_roots: state.config.remote_roots.clone(),
         })
         .into_response()
     })
