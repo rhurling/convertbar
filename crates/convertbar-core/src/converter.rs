@@ -858,7 +858,6 @@ fn record_job_error(
 /// replaces the previous read-then-clear (two separate lock acquisitions) at the call site.
 fn take_pause_after_current(converter: &ConverterState) -> bool {
     let mut guard = converter.pause_after_current.lock().unwrap();
-    *converter.pause_armed_by_pause.lock().unwrap() = false;
     std::mem::replace(&mut *guard, false)
 }
 
