@@ -2185,7 +2185,7 @@ mod tests {
         let stub = export_stub(dir.path(), "av_mov");
         let (ctx, _sink, _disposer) = test_ctx_with_locator(
             test_conn(),
-            Arc::new(crate::handbrake::StubLocator(stub.into())),
+            Arc::new(crate::handbrake::StubLocator(stub)),
         );
         let src = dir.path().join("clip.wmv");
         std::fs::write(&src, b"x").unwrap();
@@ -2207,7 +2207,7 @@ mod tests {
         let stub = export_stub(dir.path(), "av_webm");
         let (ctx, _sink, _disposer) = test_ctx_with_locator(
             test_conn(),
-            Arc::new(crate::handbrake::StubLocator(stub.into())),
+            Arc::new(crate::handbrake::StubLocator(stub)),
         );
         crate::settings_ops::set_preset_suffix(&ctx, &configured_preset(&ctx), ".x").unwrap();
         let src = dir.path().join("clip.wmv");

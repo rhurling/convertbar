@@ -40,3 +40,4 @@ An ignored test drives the server head with a real preset file and the host's Ha
 - Checkpoint 2: BASE ac89b3b, reviewed HEAD ae0e76a; next interval BASE ae0e76a
 - Checkpoint 2 fix pass at 8e002d6: fixed 7 (shared preset-file reader + one collision message, listing judged against the startup snapshot, de-duplicated names, add-side test proves HandBrake not asked, per-cause refusal assertions, trimmed + canonical env path, spec line on list refresh); rejected 7 per spec (per-job error rows, cache vs edits, Type 0 collision refusal, stale built-in snapshot, per-job parse, ignored real-HB test args, cross-module stub copies); snapshot and dedupe mutation-proven
 - Slice 5: done at 43b3d90
+- Slice 6: done at 7a5fed2 (live, HandBrakeCLI 1.11.2: in-place mkv and mkv beside mp4, both h264→hevc with 1v/2a/2s kept; dropping the import args from the spawn turns it red)
