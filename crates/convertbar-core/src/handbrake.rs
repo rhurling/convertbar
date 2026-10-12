@@ -13,6 +13,14 @@ pub struct PresetMetadata {
     pub quality: String,
     pub preset: String,
     pub device: String,
+    /// The output file extension, from the preset's `FileFormat`. Defaults to `mp4` when
+    /// absent so metadata the frontend sends back from an older build still deserialises.
+    #[serde(default = "default_container")]
+    pub container: String,
+}
+
+fn default_container() -> String {
+    "mp4".to_string()
 }
 
 pub fn detect_handbrake_path() -> Option<String> {
@@ -125,6 +133,7 @@ pub fn seed_preset_cache(ctx: &Ctx) {
             quality: "22".into(),
             preset: "Fast 1080p30".into(),
             device: "VideoToolbox".into(),
+            container: "mp4".into(),
         },
     );
 }
@@ -275,13 +284,18 @@ fn interpret_preset_export(
         )
     })?;
 
-    Ok(classify_preset(&json["PresetList"][0], preset_name))
+    classify_preset(&json["PresetList"][0], preset_name)
 }
 
 /// Pure classification of a preset's exported JSON (the `PresetList[0]` object) plus its
 /// name into the metadata used for output-filename suffixes. Split out of
 /// `get_preset_metadata` so it can be table-tested without invoking HandBrakeCLI.
-fn classify_preset(preset_obj: &serde_json::Value, preset_name: &str) -> PresetMetadata {
+fn classify_preset(
+    preset_obj: &serde_json::Value,
+    preset_name: &str,
+) -> Result<PresetMetadata, String> {
+    let container = container_extension(preset_obj["FileFormat"].as_str(), preset_name)?;
+
     let video_encoder = preset_obj["VideoEncoder"]
         .as_str()
         .unwrap_or("")
@@ -375,12 +389,28 @@ fn classify_preset(preset_obj: &serde_json::Value, preset_name: &str) -> PresetM
     }
     .to_string();
 
-    PresetMetadata {
+    Ok(PresetMetadata {
         codec,
         resolution,
         quality,
         preset: preset_slug,
         device,
+        container,
+    })
+}
+
+/// The output extension for a preset's `FileFormat`. HandBrakeCLI picks the container from the
+/// output's extension, so this IS the container (ADR 0004). A missing field means MP4, as every
+/// output was before; an unknown value is refused rather than guessed, because a guessed
+/// extension lets HandBrake mis-detect the format.
+fn container_extension(file_format: Option<&str>, preset_name: &str) -> Result<String, String> {
+    match file_format {
+        None | Some("av_mp4") => Ok("mp4".to_string()),
+        Some("av_mkv") => Ok("mkv".to_string()),
+        Some("av_webm") => Ok("webm".to_string()),
+        Some(other) => Err(format!(
+            "Preset \"{preset_name}\" has an unsupported FileFormat \"{other}\"; ConvertBar knows av_mp4, av_mkv and av_webm"
+        )),
     }
 }
 
@@ -552,6 +582,7 @@ mod tests {
             quality: "hq".into(),
             preset: "preset".into(),
             device: device.into(),
+            container: "mp4".into(),
         }
     }
 
@@ -741,7 +772,7 @@ Matroska/
         for (encoder, want) in cases {
             let obj = serde_json::json!({ "VideoEncoder": encoder });
             assert_eq!(
-                classify_preset(&obj, "preset").codec,
+                classify_preset(&obj, "preset").unwrap().codec,
                 want,
                 "encoder {encoder}"
             );
@@ -767,7 +798,11 @@ Matroska/
         ];
         for (name, want) in cases {
             let obj = serde_json::json!({});
-            assert_eq!(classify_preset(&obj, name).device, want, "name {name}");
+            assert_eq!(
+                classify_preset(&obj, name).unwrap().device,
+                want,
+                "name {name}"
+            );
         }
     }
 
@@ -785,7 +820,11 @@ Matroska/
         ];
         for (name, want) in cases {
             let obj = serde_json::json!({});
-            assert_eq!(classify_preset(&obj, name).quality, want, "name {name}");
+            assert_eq!(
+                classify_preset(&obj, name).unwrap().quality,
+                want,
+                "name {name}"
+            );
         }
     }
 
@@ -794,7 +833,9 @@ Matroska/
         // No recognized name prefix -> q{rounded VideoQualitySlider}.
         let obj = serde_json::json!({ "VideoQualitySlider": 22.4 });
         assert_eq!(
-            classify_preset(&obj, "Apple 1080p30 Surround").quality,
+            classify_preset(&obj, "Apple 1080p30 Surround")
+                .unwrap()
+                .quality,
             "q22"
         );
     }
@@ -802,9 +843,9 @@ Matroska/
     #[test]
     fn classify_preset_reads_resolution_from_height() {
         let zero = serde_json::json!({ "PictureHeight": 0 });
-        assert_eq!(classify_preset(&zero, "preset").resolution, "");
+        assert_eq!(classify_preset(&zero, "preset").unwrap().resolution, "");
         let hd = serde_json::json!({ "PictureHeight": 1080 });
-        assert_eq!(classify_preset(&hd, "preset").resolution, "1080p");
+        assert_eq!(classify_preset(&hd, "preset").unwrap().resolution, "1080p");
     }
 
     #[test]

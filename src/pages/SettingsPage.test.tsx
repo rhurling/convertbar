@@ -58,6 +58,7 @@ const META: PresetMetadata = {
   quality: "hq",
   preset: "Fast 1080p30",
   device: "apple",
+  container: "mp4",
 };
 
 /**

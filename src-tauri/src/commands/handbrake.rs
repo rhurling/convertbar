@@ -89,6 +89,7 @@ mod tests {
             quality: "q30".to_string(),
             preset: "test".to_string(),
             device: String::new(),
+            container: "mp4".to_string(),
         }
     }
 

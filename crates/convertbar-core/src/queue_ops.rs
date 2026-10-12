@@ -715,14 +715,19 @@ fn cheap_skip_reason(
 /// In-place jobs (default output == source) are returned verbatim and never renumbered, so the
 /// converter's in-place path stays intact. `is_taken` reports whether a candidate name is already
 /// claimed (on disk, by another job row, or earlier in the same batch).
-fn choose_output_path(source_path: &str, suffix: &str, is_taken: &dyn Fn(&str) -> bool) -> String {
+fn choose_output_path(
+    source_path: &str,
+    suffix: &str,
+    container: &str,
+    is_taken: &dyn Fn(&str) -> bool,
+) -> String {
     let path = Path::new(source_path);
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("output");
     let parent = path.parent().unwrap_or(Path::new("."));
-    let default = parent.join(format!("{}{}.mp4", stem, suffix));
+    let default = parent.join(format!("{stem}{suffix}.{container}"));
     // In-place guard first: an in-place source's own on-disk presence must never trigger a rename.
     if default.as_path() == path {
         return default.to_string_lossy().to_string();
@@ -734,7 +739,7 @@ fn choose_output_path(source_path: &str, suffix: &str, is_taken: &dyn Fn(&str) -
     let mut n = 1;
     loop {
         let candidate = parent
-            .join(format!("{} ({}){}.mp4", stem, n, suffix))
+            .join(format!("{stem} ({n}){suffix}.{container}"))
             .to_string_lossy()
             .to_string();
         if !is_taken(&candidate) {
@@ -895,13 +900,7 @@ pub fn add_files_inner(
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        // Source-media skip also needs the target preset metadata, so fetch HandBrake when
-        // either the suffix template or the skip toggle requires it.
-        let hb_path = if suffix_template.contains('{') || skip_by_source_media {
-            get_handbrake_path(&conn, &*ctx.handbrake).ok()
-        } else {
-            None
-        };
+        let hb_path = get_handbrake_path(&conn, &*ctx.handbrake).ok();
 
         (
             preset,
@@ -912,10 +911,11 @@ pub fn add_files_inner(
         )
     }; // db lock released
 
-    // Resolve template if needed
+    // Every add needs the preset's metadata, not only a templated suffix: the output's extension
+    // is the preset's container (ADR 0004), and only HandBrake can say what that is.
+    let hb = hb_path.clone().ok_or(handbrake::HANDBRAKE_NOT_FOUND)?;
+    let metadata = crate::handbrake::cached_preset_metadata(ctx, &hb, &preset)?;
     let suffix = if suffix_template.contains('{') {
-        let hb = hb_path.clone().ok_or(handbrake::HANDBRAKE_NOT_FOUND)?;
-        let metadata = crate::handbrake::cached_preset_metadata(ctx, &hb, &preset)?;
         handbrake::resolve_suffix_template(&suffix_template, &metadata)
     } else {
         suffix_template
@@ -992,6 +992,7 @@ pub fn add_files_inner(
         &survivors,
         &preset,
         &suffix,
+        &metadata.container,
         skip_already_converted,
         &cleanup_mode,
     )?;
@@ -1012,6 +1013,7 @@ fn add_files_to_db(
     paths: &[String],
     preset: &str,
     suffix: &str,
+    container: &str,
     skip_already_converted: bool,
     cleanup_mode: &str,
 ) -> Result<AddResult, String> {
@@ -1068,7 +1070,7 @@ fn add_files_to_db(
                         )
                         .is_ok()
             };
-            choose_output_path(path_str, suffix, &is_taken)
+            choose_output_path(path_str, suffix, container, &is_taken)
         };
 
         // In-place under keep is impossible by construction: output_path == source_path, so
@@ -1687,7 +1689,7 @@ mod tests {
         let source = "/movies/clip.mp4".to_string();
 
         let blocked =
-            add_files_to_db(&conn, &[source.clone()], "preset", "", false, "keep").unwrap();
+            add_files_to_db(&conn, &[source.clone()], "preset", "", "mp4", false, "keep").unwrap();
         assert!(
             blocked.added.is_empty(),
             "no in-place job may be queued under keep"
@@ -1702,7 +1704,8 @@ mod tests {
 
         // The same source under delete still queues: the block is scoped to keep, not to
         // in-place encoding in general.
-        let queued = add_files_to_db(&conn, &[source], "preset", "", false, "delete").unwrap();
+        let queued =
+            add_files_to_db(&conn, &[source], "preset", "", "mp4", false, "delete").unwrap();
         assert_eq!(queued.added.len(), 1);
     }
 
@@ -1755,6 +1758,7 @@ mod tests {
             &["/movies/clip.mp4".to_string()],
             "preset",
             "-conv",
+            "mp4",
             false,
             "keep",
         )
@@ -1789,8 +1793,16 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            add_files_to_db(&conn, &[source_str], "preset", "-conv", false, "keep").unwrap();
+        let result = add_files_to_db(
+            &conn,
+            &[source_str],
+            "preset",
+            "-conv",
+            "mp4",
+            false,
+            "keep",
+        )
+        .unwrap();
 
         assert!(
             result.added.is_empty(),
@@ -1815,6 +1827,7 @@ mod tests {
             &["/movies/a.mp4".to_string()],
             "preset",
             "",
+            "mp4",
             false,
             "trash",
         )
@@ -1848,7 +1861,8 @@ mod tests {
         std::fs::write(dir.path().join("clip-conv.mp4"), b"x").unwrap();
         let source = dir.path().join("clip.mov").to_string_lossy().to_string();
 
-        let result = add_files_to_db(&conn, &[source], "preset", "-conv", false, "trash").unwrap();
+        let result =
+            add_files_to_db(&conn, &[source], "preset", "-conv", "mp4", false, "trash").unwrap();
 
         assert_eq!(
             result.added.len(),
@@ -1871,6 +1885,7 @@ mod tests {
             &["/movies/clip-conv.mov".to_string()],
             "preset",
             "-conv",
+            "mp4",
             false,
             "trash",
         )
@@ -1911,6 +1926,7 @@ mod tests {
             &["/movies/done.mkv".to_string()],
             "preset",
             "",
+            "mp4",
             true,
             "trash",
         )
@@ -1929,6 +1945,7 @@ mod tests {
             &["/movies/done.mkv".to_string()],
             "preset",
             "",
+            "mp4",
             false,
             "trash",
         )
@@ -1956,30 +1973,174 @@ mod tests {
     }
 
     #[test]
-    fn add_files_inner_with_a_literal_suffix_never_resolves_handbrake() {
-        // Before this branch, three tests incidentally covered the "literal suffix -> don't
-        // resolve HandBrake at all" branch (the `suffix_template.contains('{') ||
-        // skip_by_source_media` guard above) via a pinned `.conv`-style suffix; all three pins are
-        // gone now (see the locator-seam design doc) and nothing else exercises it. Built with the
-        // plain `test_ctx` (the `PanickingLocator` default) rather than a declared world on
-        // purpose: if this guard were ever removed or broken, resolution would be reached and the
-        // fixture default would panic instead of this assertion quietly passing for the wrong
-        // reason — the cleanest demonstration in the suite that the guard is a real guard.
-        let (ctx, _sink, _disposer) = test_ctx(test_conn());
-        let preset: String = ctx
-            .db
+    fn add_files_inner_with_a_literal_suffix_still_needs_handbrake_for_the_container() {
+        // The output's extension is the preset's container (ADR 0004), and only HandBrake can
+        // say what that is. A literal suffix used to skip resolution entirely; it must not any
+        // more, or an MKV preset's job is queued as `.mp4` and HandBrake writes MP4 into it,
+        // dropping every track MP4 cannot carry. With HandBrake absent the add fails by name.
+        let (ctx, _sink, _disposer) = test_ctx_with_locator(test_conn(), Arc::new(AbsentLocator));
+        let preset = configured_preset(&ctx);
+        crate::settings_ops::set_preset_suffix(&ctx, &preset, "-conv").unwrap();
+
+        let err = add_files_inner(&ctx, &["/movies/clip.mp4".to_string()], None)
+            .expect_err("a literal suffix no longer makes HandBrake optional");
+        assert!(
+            err.contains(crate::handbrake::HANDBRAKE_NOT_FOUND),
+            "got: {err}"
+        );
+    }
+
+    fn configured_preset(ctx: &Ctx) -> String {
+        ctx.db
             .lock()
             .unwrap()
             .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
                 r.get(0)
             })
-            .unwrap();
-        crate::settings_ops::set_preset_suffix(&ctx, &preset, "-conv").unwrap();
+            .unwrap()
+    }
 
-        let result = add_files_inner(&ctx, &["/movies/clip.mp4".to_string()], None);
+    /// The installed world with the configured preset's metadata cached, as a real
+    /// `--preset-export` of an MKV preset would have filled it.
+    fn ctx_with_cached_container(
+        container: &str,
+    ) -> (Arc<Ctx>, Arc<TestSink>, Arc<RecordingDisposer>) {
+        let (ctx, sink, disposer) = test_ctx_with_locator(
+            test_conn(),
+            Arc::new(crate::handbrake::StubLocator("/stub/HandBrakeCLI".into())),
+        );
+        let preset = configured_preset(&ctx);
+        ctx.preset_cache.lock().unwrap().insert(
+            preset,
+            crate::handbrake::PresetMetadata {
+                codec: "h265".into(),
+                resolution: "1080p".into(),
+                quality: "22".into(),
+                preset: "data".into(),
+                device: String::new(),
+                container: container.into(),
+            },
+        );
+        (ctx, sink, disposer)
+    }
+
+    #[test]
+    fn an_mkv_preset_names_outputs_mkv_and_replaces_mkv_sources_in_place() {
+        // HandBrake picks the container from the output's extension, so the name IS the
+        // container: an `.mp4` name under an MKV preset silently writes MP4.
+        let (ctx, _sink, _disposer) = ctx_with_cached_container("mkv");
+        crate::settings_ops::set_preset_suffix(&ctx, &configured_preset(&ctx), "").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let wmv = file("talk.wmv");
+        let mkv = file("movie.mkv");
+        let mp4 = file("show.mp4");
+        // `taken.mkv` already exists, so `taken.avi` must renumber — and keep the container.
+        file("taken.mkv");
+        let avi = file("taken.avi");
+
+        let result = add_files_inner(
+            &ctx,
+            &[wmv.clone(), mkv.clone(), mp4.clone(), avi.clone()],
+            None,
+        )
+        .unwrap();
+        let output_of = |src: &str| {
+            result
+                .added
+                .iter()
+                .find(|j| j.source_path == src)
+                .map(|j| j.output_path.clone())
+                .unwrap_or_else(|| panic!("{src} was not queued: {:?}", result.skipped))
+        };
+        let in_dir = |name: &str| dir.path().join(name).to_string_lossy().to_string();
+
+        assert_eq!(output_of(&wmv), in_dir("talk.mkv"));
+        assert_eq!(
+            output_of(&mkv),
+            mkv,
+            "an .mkv source under an MKV preset with no suffix is re-encoded in place"
+        );
+        assert_eq!(
+            output_of(&mp4),
+            in_dir("show.mkv"),
+            "an .mp4 source is not in place under an MKV preset"
+        );
+        assert_eq!(output_of(&avi), in_dir("taken (1).mkv"));
+
+        // Under keep, the in-place MKV job is impossible (there is no "both" to keep).
+        crate::settings_ops::update_setting(&ctx, "cleanup_mode", "keep").unwrap();
+        let other = file("other.mkv");
+        let blocked = add_files_inner(&ctx, &[other], None).unwrap();
+        assert!(blocked.added.is_empty());
+        assert_eq!(
+            blocked.skipped,
+            vec![SkipCount {
+                reason: SkipReason::InPlaceKeepBlocked,
+                count: 1
+            }]
+        );
+    }
+
+    /// A stub HandBrakeCLI that answers `--preset-export` with one preset of the given
+    /// `FileFormat`, shaped like a real 1.11.2 export.
+    #[cfg(unix)]
+    fn export_stub(dir: &Path, file_format: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let json = format!(
+            r#"{{"PresetList":[{{"PresetName":"data","Type":1,"FileFormat":"{file_format}","VideoEncoder":"x265_10bit","PictureHeight":1080,"VideoQualitySlider":22.0}}],"VersionMajor":79}}"#
+        );
+        let p = dir.join("hb-export.sh");
+        std::fs::write(&p, format!("#!/bin/sh\ncat <<'EOF'\n{json}\nEOF\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unknown_container_in_the_preset_refuses_the_add() {
+        // Guessing an extension for a container ConvertBar does not know would let HandBrake
+        // mis-detect the output format from the name; refuse with the value named instead.
+        let dir = tempfile::tempdir().unwrap();
+        let stub = export_stub(dir.path(), "av_mov");
+        let (ctx, _sink, _disposer) = test_ctx_with_locator(
+            test_conn(),
+            Arc::new(crate::handbrake::StubLocator(stub.into())),
+        );
+        let src = dir.path().join("clip.wmv");
+        std::fs::write(&src, b"x").unwrap();
+
+        let err = add_files_inner(&ctx, &[src.to_string_lossy().to_string()], None)
+            .expect_err("an unknown FileFormat must refuse the add");
+        assert!(err.contains("av_mov"), "the value is named: {err}");
         assert!(
-            result.is_ok(),
-            "a literal suffix must never reach HandBrake resolution, got: {result:?}"
+            err.contains(&configured_preset(&ctx)),
+            "the preset is named: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_preset_export_fills_the_container_from_its_file_format() {
+        // The real fetch path end to end: export JSON -> metadata -> output name.
+        let dir = tempfile::tempdir().unwrap();
+        let stub = export_stub(dir.path(), "av_webm");
+        let (ctx, _sink, _disposer) = test_ctx_with_locator(
+            test_conn(),
+            Arc::new(crate::handbrake::StubLocator(stub.into())),
+        );
+        crate::settings_ops::set_preset_suffix(&ctx, &configured_preset(&ctx), ".x").unwrap();
+        let src = dir.path().join("clip.wmv");
+        std::fs::write(&src, b"x").unwrap();
+
+        let result = add_files_inner(&ctx, &[src.to_string_lossy().to_string()], None).unwrap();
+        assert_eq!(
+            result.added[0].output_path,
+            dir.path().join("clip.x.webm").to_string_lossy()
         );
     }
 
@@ -2045,8 +2206,16 @@ mod tests {
         std::fs::write(&src, b"x").unwrap();
         let src_str = src.to_string_lossy().to_string();
 
-        let result =
-            add_files_to_db(&conn, &[src_str.clone()], "preset", "", false, "trash").unwrap();
+        let result = add_files_to_db(
+            &conn,
+            &[src_str.clone()],
+            "preset",
+            "",
+            "mp4",
+            false,
+            "trash",
+        )
+        .unwrap();
 
         assert_eq!(
             result.added.len(),
@@ -2166,7 +2335,7 @@ mod tests {
     fn choose_output_path_renumbers_the_base_name_when_taken() {
         let free = |_: &str| false;
         assert_eq!(
-            norm(&choose_output_path("/m/clip.mov", ".h265", &free)),
+            norm(&choose_output_path("/m/clip.mov", ".h265", "mp4", &free)),
             "/m/clip.h265.mp4",
             "an untaken default name is used as-is"
         );
@@ -2174,7 +2343,12 @@ mod tests {
         let taken1: HashSet<String> = ["/m/clip.h265.mp4".to_string()].into_iter().collect();
         let is_taken1 = |n: &str| taken1.contains(&norm(n));
         assert_eq!(
-            norm(&choose_output_path("/m/clip.mov", ".h265", &is_taken1)),
+            norm(&choose_output_path(
+                "/m/clip.mov",
+                ".h265",
+                "mp4",
+                &is_taken1
+            )),
             "/m/clip (1).h265.mp4"
         );
 
@@ -2184,7 +2358,12 @@ mod tests {
             .collect();
         let is_taken2 = |n: &str| taken2.contains(&norm(n));
         assert_eq!(
-            norm(&choose_output_path("/m/clip.mov", ".h265", &is_taken2)),
+            norm(&choose_output_path(
+                "/m/clip.mov",
+                ".h265",
+                "mp4",
+                &is_taken2
+            )),
             "/m/clip (2).h265.mp4"
         );
     }
@@ -2195,7 +2374,7 @@ mod tests {
         // would route it through the distinct-file overwrite path.
         let always_taken = |_: &str| true;
         assert_eq!(
-            norm(&choose_output_path("/m/clip.mp4", "", &always_taken)),
+            norm(&choose_output_path("/m/clip.mp4", "", "mp4", &always_taken)),
             "/m/clip.mp4"
         );
     }
@@ -2205,12 +2384,12 @@ mod tests {
         let mut assigned: HashSet<String> = HashSet::new();
         let first = {
             let is_taken = |n: &str| assigned.contains(n);
-            choose_output_path("/m/clip.mov", ".h265", &is_taken)
+            choose_output_path("/m/clip.mov", ".h265", "mp4", &is_taken)
         };
         assigned.insert(first.clone());
         let second = {
             let is_taken = |n: &str| assigned.contains(n);
-            choose_output_path("/m/clip.mov", ".h265", &is_taken)
+            choose_output_path("/m/clip.mov", ".h265", "mp4", &is_taken)
         };
         assert_eq!(norm(&first), "/m/clip.h265.mp4");
         assert_eq!(
@@ -2347,6 +2526,7 @@ mod tests {
             &["/m/movie.mkv".to_string()],
             "preset",
             ".h265",
+            "mp4",
             false,
             "keep",
         )
@@ -2385,7 +2565,8 @@ mod tests {
             id.mtime,
         );
 
-        let result = add_files_to_db(&conn, &[src_str], "preset", ".h265", false, "trash").unwrap();
+        let result =
+            add_files_to_db(&conn, &[src_str], "preset", ".h265", "mp4", false, "trash").unwrap();
 
         assert!(
             result.added.is_empty(),
@@ -2426,7 +2607,8 @@ mod tests {
         // A different video B recycles the same path.
         std::fs::write(&src, b"B is a completely different, longer video").unwrap();
 
-        let result = add_files_to_db(&conn, &[src_str], "preset", ".h265", false, "trash").unwrap();
+        let result =
+            add_files_to_db(&conn, &[src_str], "preset", ".h265", "mp4", false, "trash").unwrap();
 
         assert_eq!(
             result.added.len(),
@@ -2850,6 +3032,7 @@ mod tests {
                 quality: "hq".into(),
                 preset: "p".into(),
                 device: String::new(),
+                container: "mp4".into(),
             },
         );
 

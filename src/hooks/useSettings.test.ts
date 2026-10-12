@@ -44,7 +44,7 @@ function makeSettings(preset: string): AppSettings {
 }
 
 function makeMeta(preset: string): PresetMetadata {
-  return { codec: "h265", resolution: "1080p", quality: "hq", preset, device: "apple" };
+  return { codec: "h265", resolution: "1080p", quality: "hq", preset, device: "apple", container: "mp4" };
 }
 
 // Backend state the dispatcher reads from; tests mutate these before rendering.
