@@ -4044,6 +4044,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_consumed_pause_leaves_no_marker_for_a_later_resume_to_act_on() {
+        // Pause arms pause-after-current for a remote job between transfers; the queue consumes
+        // it. Whatever arms the flag next (the desktop updater writes it directly) must not see
+        // a Resume with nothing frozen take it back on the strength of that old marker.
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                               created_at, remote_host)
+             VALUES ('j1', '/share/a.mkv', '/share/a.mkv', 'p', 'encoding', 0,
+                     '2020-01-01T00:00:00Z', 'unraid')",
+            [],
+        )
+        .unwrap();
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(conn, Arc::new(crate::handbrake::AbsentLocator));
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".into());
+        crate::control::pause_conversion(&ctx).unwrap();
+        assert!(take_pause_after_current(&ctx.converter));
+
+        *ctx.converter.pause_after_current.lock().unwrap() = true;
+        crate::control::resume_conversion(&ctx).unwrap();
+        assert!(ctx.converter.is_pause_after_current());
+    }
+
+    #[test]
     fn final_run_status_is_error_only_when_a_job_failed() {
         // The end-of-queue menu-bar transition: a clean run returns to idle; any failure leaves
         // the tray showing an error state until the next run starts.
