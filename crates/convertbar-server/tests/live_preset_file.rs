@@ -206,7 +206,12 @@ fn a_keep_all_mkv_preset_file_replaces_mkv_in_place_and_writes_mkv_beside_mp4() 
     let history = loop {
         let (_, queue) = http(port, "GET", "/api/queue", None);
         let (_, history) = http(port, "GET", "/api/history?limit=10&offset=0", None);
-        if queue.as_array().is_some_and(|q| q.is_empty()) {
+        let jobs = queue.as_array().expect("the queue is a list");
+        // An `error` row stays in the queue listing, so fail on it at once instead of waiting
+        // for a drain that never comes.
+        let failed: Vec<_> = jobs.iter().filter(|j| j["status"] == "error").collect();
+        assert!(failed.is_empty(), "an encode failed: {failed:#?}");
+        if jobs.is_empty() {
             break history;
         }
         assert!(Instant::now() < deadline, "queue never drained: {queue}");
