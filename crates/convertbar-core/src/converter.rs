@@ -992,7 +992,13 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
     // never reached at all by the low-disk and shutdown returns. Only this flag gates the
     // queue-drained hook.
     let mut drained = false;
+    // Set once a remote job's turn has ended. Its error paths `continue` past the done path's
+    // pause-after-current check, and Pause arms that flag between a remote job's transfers.
+    let mut after_remote_job = false;
     loop {
+        if after_remote_job && pause_if_armed(ctx) {
+            break;
+        }
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
         // job — teardown would otherwise race a fresh HandBrakeCLI spawn and orphan it.
         // Return (not break) so no "Queue complete" notification fires mid-quit, and `Stopped`
@@ -1219,6 +1225,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             },
         );
 
+        after_remote_job = remote.is_some();
         let _turn = remote.as_ref().map(|(_, setup)| RemoteTurn {
             ctx,
             setup,
@@ -1241,8 +1248,10 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                     Err(PullFailure::Gone) => {
                         match published_before_outage(ctx, setup, host, &job) {
                             Ok(Some(published)) => {
-                                let saved = job.original_size.unwrap_or(0) - published.size;
-                                book_without_encode(
+                                let saved = job
+                                    .original_size
+                                    .map_or(0, |original| original - published.size);
+                                if !book_without_encode(
                                     ctx,
                                     &job.id,
                                     &Booking {
@@ -1252,7 +1261,9 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                                         space_saved: saved,
                                         skip_reason: None,
                                     },
-                                );
+                                ) {
+                                    continue;
+                                }
                                 notify_file_finished(
                                     ctx,
                                     false,
@@ -1305,10 +1316,18 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             }
         };
 
+        // A Cancel during the stat has no child to kill; it booked the row, and that is the
+        // only sign of it. Nothing more runs for a cancelled job.
+        if remote.is_some() && !job_still_running(ctx, &job.id) {
+            continue;
+        }
+
         // Skip-by-source-media for a remote job probes the staged copy, the first moment the
         // file can be probed at all: one already at the target is neither encoded nor pushed.
         if remote.is_some() && already_at_target(ctx, &handbrake_path, &job, &input_path) {
-            book_without_encode(ctx, &job.id, &ALREADY_AT_TARGET);
+            if !book_without_encode(ctx, &job.id, &ALREADY_AT_TARGET) {
+                continue;
+            }
             notify_file_finished(
                 ctx,
                 false,
@@ -1317,6 +1336,10 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             if pause_if_armed(ctx) {
                 break;
             }
+            continue;
+        }
+        // And again after the probe, which has no child either: never encode a cancelled job.
+        if remote.is_some() && !job_still_running(ctx, &job.id) {
             continue;
         }
 
@@ -1767,10 +1790,13 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
 
                 let now = chrono::Utc::now().to_rfc3339();
 
-                {
+                // Only a row still running is booked: a remote job is current after HandBrake
+                // exits, so a Cancel may already have booked it. That Cancel stands.
+                let booked = {
                     let db = ctx.db.lock().unwrap();
-                    let _ = db.execute(
-                        "UPDATE jobs SET status = ?2, converted_size = ?3, kept_file = ?4, space_saved = ?5, completed_at = ?6 WHERE id = ?1",
+                    let booked = db.execute(
+                        "UPDATE jobs SET status = ?2, converted_size = ?3, kept_file = ?4, space_saved = ?5, completed_at = ?6 \
+                         WHERE id = ?1 AND status IN ('encoding', 'paused')",
                         params![job.id, status_str, converted_size, kept_file, space_saved, now],
                     );
                     // In-place encoding replaced the file at source_path, so its insert-time
@@ -1784,6 +1810,10 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                     } else if in_place && remote.is_none() {
                         record_source_identity(&db, &job.id, &job.source_path);
                     }
+                    !matches!(booked, Ok(0))
+                };
+                if !booked {
+                    continue;
                 }
 
                 ctx.events.emit_t(
@@ -1940,6 +1970,17 @@ impl Drop for RemoteTurn<'_> {
             .current_job_id
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .ctx
+            .converter
+            .finalizing_on
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        if let Ok(db) = self.ctx.db.lock() {
+            if read_setting_opt(&db, REQUEUED_AFTER_OUTAGE_KEY).as_deref() == Some(&self.job_id) {
+                write_setting(&db, REQUEUED_AFTER_OUTAGE_KEY, None);
+            }
+        }
         emit_phase(self.ctx, &self.job_id, None);
         self.setup.empty_staging();
     }
@@ -2092,17 +2133,8 @@ fn pause_if_armed(ctx: &Ctx) -> bool {
 /// Whether skip-by-source-media is on and the staged copy already meets the target, by the
 /// same decision as a local add. Any uncertainty (no metadata, a failed probe) encodes.
 fn already_at_target(ctx: &Ctx, handbrake_path: &str, job: &JobInfo, staged: &str) -> bool {
-    let on = ctx
-        .db
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'skip_by_source_media'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .is_ok_and(|v| v == "true");
-    if !on {
+    let on = read_setting_opt(&ctx.db.lock().unwrap(), "skip_by_source_media");
+    if on.as_deref() != Some("true") {
         return false;
     }
     let Ok(target) = crate::handbrake::cached_preset_metadata(ctx, handbrake_path, &job.preset)
@@ -2139,13 +2171,14 @@ const ALREADY_AT_TARGET: Booking<'static> = Booking {
 };
 
 /// Books a job that finished without an encode in this turn, emits as the encode path does, and
-/// fires its post-convert hook.
-fn book_without_encode(ctx: &Ctx, job_id: &str, b: &Booking) {
+/// fires its post-convert hook. Only a row still running is booked; false means a Cancel got
+/// there first, and nothing is emitted.
+fn book_without_encode(ctx: &Ctx, job_id: &str, b: &Booking) -> bool {
     {
         let db = ctx.db.lock().unwrap();
-        let _ = db.execute(
+        let booked = db.execute(
             "UPDATE jobs SET status = ?2, kept_file = ?3, converted_size = ?4, space_saved = ?5, \
-             skip_reason = ?6, completed_at = ?7 WHERE id = ?1",
+             skip_reason = ?6, completed_at = ?7 WHERE id = ?1 AND status IN ('encoding', 'paused')",
             params![
                 job_id,
                 b.status,
@@ -2156,6 +2189,9 @@ fn book_without_encode(ctx: &Ctx, job_id: &str, b: &Booking) {
                 chrono::Utc::now().to_rfc3339()
             ],
         );
+        if matches!(booked, Ok(0)) {
+            return false;
+        }
     } // dropped before the emits: the tray listener re-locks ctx.db on this thread
     ctx.events.emit_t(
         "job-completed",
@@ -2171,6 +2207,7 @@ fn book_without_encode(ctx: &Ctx, job_id: &str, b: &Booking) {
         serde_json::json!({ "job_id": job_id, "status": b.status }),
     );
     crate::hooks::fire_post_convert(ctx, job_id);
+    true
 }
 
 /// ADR 0003's decided edge: a new-name job re-queued after an outage, whose source is now
@@ -2243,7 +2280,7 @@ fn run_transfer(
                 params![job_id],
                 |r| r.get::<_, String>(0),
             )
-            .map_or(true, |s| s == "error");
+            .is_ok_and(|s| s == "error");
     transfer.finish(status, &stderr, killed_by_us)
 }
 
@@ -2277,6 +2314,10 @@ fn pull_source(
         Ok(SourceState::Unknown(m)) => return Err(PullFailure::Failed(RemoteError::Failed(m))),
         Err(e) => return Err(PullFailure::Failed(e)),
     };
+    // A Cancel during the stat had no child to kill: it only booked the row.
+    if !job_still_running(ctx, &job.id) {
+        return Err(PullFailure::Killed);
+    }
     let staged = setup.staged_source(&job.source_path);
     let started = crate::remote::start_pull(setup, host, &job.source_path, &staged)
         .map_err(PullFailure::Failed)?;
@@ -2364,8 +2405,22 @@ fn publish_result(
             delete_original,
         },
     );
-    *ctx.converter.finalizing_on.lock().unwrap() = None;
+    // `finalizing_on` stays set until the turn ends (`RemoteTurn`): once the host's file is
+    // replaced, a Cancel must not book the job before its done booking does.
     finalized.map_err(PublishFailure::Failed)
+}
+
+/// Whether the job's row is still running: neither booked by a Cancel nor anything else.
+fn job_still_running(ctx: &Ctx, job_id: &str) -> bool {
+    ctx.db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM jobs WHERE id = ?1",
+            params![job_id],
+            |r| r.get::<_, String>(0),
+        )
+        .is_ok_and(|s| s == "encoding" || s == "paused")
 }
 
 /// Finalize cannot be cancelled: a script already past its last line has replaced or deleted a
@@ -7820,7 +7875,7 @@ HandBrake has exited.";
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = --scan ]; then\n  [ -f '{scan}' ] && cat '{scan}'\n  exit 0\nfi\nwhile [ $# -gt 0 ]; do\n  case $1 in\n    -i) printf '%s\\n' \"$2\" >> '{rec}' ;;\n    -o) out=$2 ;;\n  esac\n  shift\ndone\nprintf '%s' '{content}' > \"$out\"\nexit 0\n",
+                "#!/bin/sh\nif [ \"$1\" = --scan ]; then\n  [ -f '{scan}.slow' ] && sleep 1\n  [ -f '{scan}' ] && cat '{scan}'\n  exit 0\nfi\nwhile [ $# -gt 0 ]; do\n  case $1 in\n    -i) printf '%s\\n' \"$2\" >> '{rec}' ;;\n    -o) out=$2 ;;\n  esac\n  shift\ndone\nprintf '%s' '{content}' > \"$out\"\nexit 0\n",
                 scan = dir.join("scan.out").display(),
                 rec = record_to.display(),
             ),
@@ -8176,6 +8231,49 @@ HandBrake has exited.";
         assert_eq!(std::fs::read_to_string(&film).unwrap(), "smaller");
         assert_eq!(world.row("j2").0, "queued", "paused after the current job");
         assert_eq!(world.setting("queue_paused").as_deref(), Some("true"));
+        assert!(
+            world.ctx.converter.finalizing_on.lock().unwrap().is_none(),
+            "Cancel works again once the turn is over"
+        );
+
+        // The job that Pause armed for ends in an error instead (its original changed during
+        // finalize): the queue still pauses after it, and only Resume with nothing frozen
+        // takes the pause back.
+        for resume in [false, true] {
+            let world = RemoteWorld::new("smaller");
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            let other = world.host_file("other.mkv", "another original, larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            world.queue_remote("j2", &other, &other);
+            world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute("UPDATE jobs SET queue_order = 1 WHERE id = 'j2'", [])
+                .unwrap();
+            crate::remote::testing::hook_before(
+                world.setup(),
+                "finalize",
+                &format!("sleep 1\nprintf ' edited' >> '{film}'"),
+            );
+            std::thread::scope(|s| {
+                let queue = s.spawn(|| process_queue(&world.ctx));
+                world.wait_for_step("finalize");
+                crate::control::pause_conversion(&world.ctx).unwrap();
+                if resume {
+                    crate::control::resume_conversion(&world.ctx).unwrap();
+                }
+                queue.join().unwrap();
+            });
+            assert_eq!(world.row("j1").0, "error", "resume {resume}");
+            if resume {
+                assert_eq!(world.row("j2").0, "done", "the pause was taken back");
+            } else {
+                assert_eq!(world.row("j2").0, "queued", "paused after the failed job");
+                assert_eq!(world.setting("queue_paused").as_deref(), Some("true"));
+            }
+        }
     }
 
     #[test]
@@ -8243,6 +8341,14 @@ HandBrake has exited.";
             let (status, _, _, _, error) = world.row("j1");
             assert_eq!(status, "done", "{mode}: {error:?}");
             assert_eq!(std::fs::read_to_string(&mkv).unwrap(), "smaller", "{mode}");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&mkv).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{mode}: the new name takes over the original's mode"
+                );
+            }
             let mut want = vec!["talk.mkv".to_string()];
             if originals_left {
                 want.push("talk.wmv".to_string());
@@ -8716,10 +8822,41 @@ HandBrake has exited.";
             );
 
             crate::remote::testing::reachable_again(world.setup());
+            // Slow the re-run's first stat once, to look at the row while it runs again: its
+            // `completed_at` is gone, so the queue-drained batch cannot count it as finished.
+            crate::remote::testing::hook_before(world.setup(), "stat", "sleep 1\nrm -f \"$0\"");
+            let stats = |w: &RemoteWorld| {
+                crate::remote::testing::shim_log(w.setup())
+                    .iter()
+                    .filter(|s| *s == "stat")
+                    .count()
+            };
+            let before = stats(&world);
+            crate::control::start_queue(&world.ctx).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while stats(&world) == before {
+                assert!(std::time::Instant::now() < deadline, "{step}: never re-ran");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let completed_at: Option<String> = world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT completed_at FROM jobs WHERE id = 'j1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(completed_at, None, "{step}");
             world.start_and_wait();
 
             let (status, _, _, _, error) = world.row("j1");
             assert_eq!((status.as_str(), error), ("done", None), "{step}");
+            assert_eq!(
+                world.setting(REQUEUED_AFTER_OUTAGE_KEY),
+                None,
+                "{step}: the re-queue marker ends with the job's turn"
+            );
             assert_eq!(class_of(&world.ctx.db, "j1"), None, "{step}");
             assert_eq!(world.row("j2").0, "done", "{step}");
             assert_eq!(std::fs::read_to_string(&film).unwrap(), "smaller", "{step}");
@@ -8779,7 +8916,12 @@ HandBrake has exited.";
         // The connection dropped after finalize published talk.mkv and deleted talk.wmv. Only
         // that job, re-queued after its outage, is booked done from what is on the host; any
         // other job whose source vanished is today's quiet "no longer exists".
-        for (case, after_outage) in [("the edge", true), ("not after an outage", false)] {
+        // With no recorded original size, nothing is claimed as saved rather than a negative.
+        for (case, after_outage, original, saved) in [
+            ("the edge", true, Some(100), 91),
+            ("the edge, no original size", true, None, 0),
+            ("not after an outage", false, Some(100), 0),
+        ] {
             let done = after_outage;
             let world = RemoteWorld::new("unused");
             set_setting(
@@ -8797,8 +8939,9 @@ HandBrake has exited.";
                 .unwrap()
                 .execute(
                     "UPDATE jobs SET remote_host = 'unraid', status = 'error',
-                            failure_class = 'unreachable', error_message = 'x'",
-                    [],
+                            failure_class = 'unreachable', error_message = 'x',
+                            original_size = ?1",
+                    params![original],
                 )
                 .unwrap();
             if after_outage {
@@ -8822,7 +8965,7 @@ HandBrake has exited.";
             let (status, converted, _, _, error) = world.row("j1");
             if done {
                 assert_eq!((status.as_str(), converted), ("done", Some(9)), "{case}");
-                let saved: i64 = world
+                let booked_saved: i64 = world
                     .ctx
                     .db
                     .lock()
@@ -8831,7 +8974,7 @@ HandBrake has exited.";
                         r.get(0)
                     })
                     .unwrap();
-                assert_eq!(saved, 91, "{case}");
+                assert_eq!(booked_saved, saved, "{case}");
                 assert_eq!(world.webhook_events()[0]["status"], "done", "{case}");
             } else {
                 assert_eq!(
@@ -8871,6 +9014,89 @@ HandBrake has exited.";
                 .unwrap()
                 .execute("DELETE FROM jobs", [])
                 .unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_between_transfers_stops_the_job_where_it_is() {
+        // Neither the stat nor the staged copy's media probe has a child to kill: the Cancel
+        // only books the row, and the queue thread must notice before it does more.
+        for step in ["stat", "probe"] {
+            let world = RemoteWorld::new("smaller");
+            set_setting(
+                &world.ctx.db,
+                "post_convert_webhook_url",
+                "http://receiver.invalid/hook",
+            );
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            let base = world.root.parent().unwrap().to_path_buf();
+            if step == "stat" {
+                crate::remote::testing::hook_before(world.setup(), "stat", "sleep 1");
+            } else {
+                // Already at the target, and slow to say so.
+                std::fs::write(
+                    base.join("scan.out"),
+                    "JSON Title Set: {\"TitleList\": [{\"Geometry\": {\"Height\": 720}, \
+                     \"VideoCodec\": \"hevc\"}]}\n",
+                )
+                .unwrap();
+                std::fs::write(base.join("scan.out.slow"), "").unwrap();
+                let preset: String =
+                    read_setting_opt(&world.ctx.db.lock().unwrap(), "preset").unwrap();
+                world.ctx.preset_cache.lock().unwrap().insert(
+                    preset,
+                    crate::handbrake::PresetMetadata {
+                        codec: "h265".into(),
+                        resolution: "1080p".into(),
+                        quality: "22".into(),
+                        preset: "data".into(),
+                        device: String::new(),
+                        container: "mkv".into(),
+                    },
+                );
+                set_setting(&world.ctx.db, "skip_by_source_media", "true");
+            }
+
+            std::thread::scope(|s| {
+                let queue = s.spawn(|| process_queue(&world.ctx));
+                if step == "stat" {
+                    world.wait_for_step("stat");
+                } else {
+                    // The second stat follows the pull; the slow probe starts right after it.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                    while !world.ran("stat", 2) {
+                        assert!(std::time::Instant::now() < deadline, "the pull never ended");
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                crate::control::cancel_conversion(&world.ctx).unwrap();
+                queue.join().unwrap();
+            });
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!(
+                (status.as_str(), error.as_deref()),
+                ("error", Some("Cancelled by user")),
+                "{step}"
+            );
+            assert!(
+                world.webhook_events().is_empty(),
+                "{step}: nothing booked after it"
+            );
+            assert!(!world.hb_inputs.exists(), "{step}: nothing encoded");
+            assert!(!world.pushed(), "{step}");
+            if step == "stat" {
+                assert!(!world.ran("pull", 1), "nothing pulled for a cancelled job");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&film).unwrap(),
+                "the original, much larger",
+                "{step}"
+            );
+            assert!(world.staging_is_empty(), "{step}");
         }
     }
 }

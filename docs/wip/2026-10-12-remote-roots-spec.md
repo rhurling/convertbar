@@ -30,7 +30,7 @@ Remote roots configured by env (ADR 0002). A remote job pulls its source into lo
 ### Containment
 
 - Every remote path a request names is resolved on the host (`realpath -e -z`). It must equal or lie under one of that host's configured root dirs (also resolved), compared by path components. This holds for browse, scan and add; finalize re-checks the stored row's paths.
-- A path whose resolved form differs from the path as named (a symlink anywhere along it) is refused at add, so finalize can never rename over a link. Listings show symlinks as nothing.
+- A path whose resolved form differs from the path as named below its root (a symlink anywhere under the root) is refused at add, so finalize can never rename over a link. A root that is itself a symlink (a share reached through one) is accepted: what lies below it is compared against its resolved form, and its listings are read through it. Listings show symlinks as nothing.
 - An unknown host, or a path outside every root of that host, is refused before anything else runs on the host.
 
 ### Browsing and queueing (web UI and API)
