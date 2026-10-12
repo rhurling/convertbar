@@ -259,11 +259,14 @@ struct BadSourceRow {
 /// failure_class). An id that fails this (wrong status, wrong/absent failure_class, or simply
 /// nonexistent) matches no row — the UI is expected to only ever pass ids from the review list,
 /// but a wiring mistake (e.g. passing a History row's id) must never be able to reach a live
-/// `done`/`queued` row. DB-only: no filesystem I/O.
+/// `done`/`queued` row. A remote row never matches either: its path names a file on its host,
+/// and every later rung would stat and destroy the local path of that name (ADR 0005).
+/// DB-only: no filesystem I/O.
 fn lookup_bad_source_row(conn: &rusqlite::Connection, id: &str) -> Option<BadSourceRow> {
     conn.query_row(
         "SELECT source_path, failure_class, source_size, source_mtime FROM jobs
-         WHERE id = ?1 AND status = 'error' AND failure_class IN (?2, ?3)",
+         WHERE id = ?1 AND status = 'error' AND failure_class IN (?2, ?3)
+           AND remote_host IS NULL",
         params![id, CLASS_BAD_SOURCE, CLASS_BAD_SOURCE_TRUNCATED],
         |r| {
             Ok(BadSourceRow {
@@ -2427,7 +2430,7 @@ mod tests {
         let refused = |host: &str, path: String, want: &str| match add_remote_files_inner(
             &ctx,
             host,
-            &[path.clone()],
+            std::slice::from_ref(&path),
         ) {
             Err(RemoteAddError::Refused(m)) => {
                 assert!(m.contains(want), "{path}: {m}")
@@ -2439,7 +2442,7 @@ mod tests {
         refused(
             "unraid",
             format!("{}/a/../../outside.mkv", share.display()),
-            "symlink",
+            "outside the remote roots",
         );
         refused("unraid", s(&link), "symlink");
         refused("unraid", s(&share.join("missing.mkv")), "does not exist");
@@ -2465,6 +2468,48 @@ mod tests {
             0,
             "a refused request never reaches the naming round trip"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_root_reached_through_a_symlink_is_still_a_root() {
+        // A share mounted through a symlink: the root resolves elsewhere, and what lies below it
+        // is judged against the resolved root. A symlink below it is still refused.
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, _sink, _disposer) = ctx_with_cached_container("mp4");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let real_share = base.join("disk1");
+        std::fs::create_dir_all(&real_share).unwrap();
+        let share = base.join("share");
+        std::os::unix::fs::symlink(&real_share, &share).unwrap();
+        let setup = crate::remote::testing::shim_setup(
+            &base,
+            &[("unraid", share.to_string_lossy().as_ref())],
+        );
+        ctx.remote.set(setup).unwrap();
+        crate::settings_ops::set_preset_suffix(&ctx, &configured_preset(&ctx), "").unwrap();
+        std::fs::write(real_share.join("film.mkv"), "x").unwrap();
+        std::fs::write(real_share.join("film.mp4"), "already there").unwrap();
+        std::os::unix::fs::symlink(real_share.join("film.mkv"), real_share.join("link.mkv"))
+            .unwrap();
+        let film = share.join("film.mkv").to_string_lossy().into_owned();
+        let link = share.join("link.mkv").to_string_lossy().into_owned();
+
+        let added = add_remote_files_inner(&ctx, "unraid", std::slice::from_ref(&film)).unwrap();
+        assert_eq!(added.added.len(), 1, "{:?}", added.skipped);
+        assert_eq!(
+            added.added[0].source_path, film,
+            "queued under the name as given"
+        );
+        assert_eq!(
+            added.added[0].output_path,
+            share.join("film (1).mp4").to_string_lossy(),
+            "the names in a symlinked root are read through it"
+        );
+        assert!(matches!(
+            add_remote_files_inner(&ctx, "unraid", &[link]),
+            Err(RemoteAddError::Refused(m)) if m.contains("symlink")
+        ));
     }
 
     /// A stub HandBrakeCLI that answers `--preset-export` with one preset of the given
@@ -4034,6 +4079,29 @@ mod tests {
             f.exists(),
             "a completed job's file must never be destroyed, even if the wrong id reaches purge"
         );
+
+        // A remote bad source whose host path exists locally too, with a matching fingerprint
+        // and the class that needs no rescan: every later rung would pass for the LOCAL file.
+        let identity = crate::probe_cache::file_identity(p).unwrap();
+        db.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                               created_at, failure_class, source_size, source_mtime, remote_host)
+             VALUES ('remote1', ?1, ?1, 'p', 'error', 1, '2026-07-25T10:00:00Z', ?2, ?3, ?4,
+                     'unraid')",
+                params![p, CLASS_BAD_SOURCE_TRUNCATED, identity.size, identity.mtime],
+            )
+            .unwrap();
+        let outcome = purge_one_locked(
+            &db,
+            "remote1",
+            PurgeAction::Delete,
+            &handbrake_path_not_needed(),
+            &DeleteDisposer,
+        );
+        assert_eq!(outcome, PurgeOutcome::Failed);
+        assert!(f.exists(), "a remote row's path is never destroyed locally");
     }
 
     // Pins the exact mapping I2's fix depends on. If someone later collapses NoTitle and

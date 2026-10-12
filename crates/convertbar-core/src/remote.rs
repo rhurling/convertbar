@@ -51,17 +51,11 @@ impl RemoteSetup {
         self.staging.join("result").join(basename(output_path))
     }
 
-    /// Empties staging, keeping the directory itself. Best-effort.
+    /// Empties staging. Best-effort. Only the two subdirectories ConvertBar writes are removed:
+    /// `CONVERTBAR_STAGING_DIR` may name a directory that holds anything else.
     pub fn empty_staging(&self) {
-        if let Ok(entries) = std::fs::read_dir(&self.staging) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let _ = std::fs::remove_dir_all(&path);
-                } else {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
+        for sub in ["source", "result"] {
+            let _ = std::fs::remove_dir_all(self.staging.join(sub));
         }
     }
 }
@@ -303,9 +297,13 @@ pub fn inspect_paths(
             "Unexpected answer from {host} while inspecting paths"
         )));
     }
-    let resolved_roots: Vec<&str> = (0..root_dirs.len())
-        .map(|i| fields[i * 2].as_str())
-        .filter(|r| !r.is_empty())
+    // (named, resolved) per root that resolved. A root may itself be a symlink (a share reached
+    // through one); only what lies below it must resolve to exactly the path as named.
+    let roots: Vec<(&str, &str)> = root_dirs
+        .iter()
+        .enumerate()
+        .map(|(i, named)| (*named, fields[i * 2].as_str()))
+        .filter(|(_, real)| !real.is_empty())
         .collect();
     let mut inspected = Vec::with_capacity(paths.len());
     for (i, path) in paths.iter().enumerate() {
@@ -319,15 +317,22 @@ pub fn inspect_paths(
             });
             continue;
         }
-        if resolved != path {
-            return Err(RemoteError::Failed(format!(
-                "{path} on {host} is or passes through a symlink; add the real path instead"
-            )));
-        }
-        if !resolved_roots.iter().any(|r| is_within(resolved, r)) {
-            return Err(RemoteError::Failed(format!(
-                "{path} is outside the remote roots of {host}"
-            )));
+        let resolves_as_named = roots.iter().any(|(named, real)| {
+            Path::new(path)
+                .strip_prefix(named)
+                .is_ok_and(|rest| Path::new(real).join(rest) == Path::new(resolved))
+        });
+        if !resolves_as_named {
+            return Err(RemoteError::Failed(
+                if roots.iter().any(|(_, real)| is_within(resolved, real)) {
+                    format!(
+                        "{path} on {host} is or passes through a symlink; add the real path \
+                         instead"
+                    )
+                } else {
+                    format!("{path} is outside the remote roots of {host}")
+                },
+            ));
         }
         let (stat, kind) = match parse_stat_line(stat_line) {
             Some((s, k)) => (Some(s), k),
@@ -345,7 +350,7 @@ pub fn inspect_paths(
 const NAMES_SCRIPT: &str = r#"names() {
   for d in "$@"; do
     printf '%s\0' "$d"
-    find "$d" -mindepth 1 -maxdepth 1 -printf '%f\0' 2>/dev/null
+    find -H "$d" -mindepth 1 -maxdepth 1 -printf '%f\0' 2>/dev/null
     printf '\0'
   done
 }
@@ -450,31 +455,41 @@ pub struct Transfer {
 }
 
 impl Transfer {
-    /// Maps the transfer's exit status. `Ok(None)` means it was killed (a cancel or shutdown):
-    /// the caller decides what that means.
+    /// Maps the transfer's exit status. `Ok(None)` means a cancel or a shutdown killed it, as
+    /// `killed_by_us` says, and the caller must not book. Any other death is a failure: left
+    /// unbooked, the row would stay `encoding` until the next restart.
     pub fn finish(
         &self,
         status: std::io::Result<std::process::ExitStatus>,
         stderr: &str,
+        killed_by_us: bool,
     ) -> Result<Option<()>, RemoteError> {
+        let what = if self.step == "pull" {
+            "Download from"
+        } else {
+            "Upload to"
+        };
         match status {
             Ok(s) if s.success() => Ok(Some(())),
             Ok(s) if s.code() == Some(SSH_UNREACHABLE) => Err(RemoteError::Unreachable {
                 host: self.host.clone(),
                 step: self.step,
             }),
-            Ok(s) if s.code().is_none() => Ok(None),
+            Ok(s) if s.code().is_none() && killed_by_us => Ok(None),
+            Err(_) if killed_by_us => Ok(None),
+            Ok(s) if s.code().is_none() => Err(RemoteError::Failed(format!(
+                "{what} {} was interrupted ({s})",
+                self.host
+            ))),
+            Err(e) => Err(RemoteError::Failed(format!(
+                "{what} {} was lost: {e}",
+                self.host
+            ))),
             Ok(_) => Err(RemoteError::Failed(format!(
-                "{} {} failed: {}",
-                if self.step == "pull" {
-                    "Download from"
-                } else {
-                    "Upload to"
-                },
+                "{what} {} failed: {}",
                 self.host,
                 stderr.trim()
             ))),
-            Err(_) => Ok(None),
         }
     }
 }

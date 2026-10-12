@@ -250,9 +250,11 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
     let (paths, update_result) = match job_id_val {
         Some(ref job_id) => {
             let db = ctx.db.lock().map_err(|e| e.to_string())?;
+            // A remote row's paths name files on its host: nothing local is deleted for it.
             let paths: Option<(String, String)> = db
                 .query_row(
-                    "SELECT source_path, output_path FROM jobs WHERE id = ?1",
+                    "SELECT source_path, output_path FROM jobs WHERE id = ?1 \
+                     AND remote_host IS NULL",
                     params![job_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
@@ -533,6 +535,44 @@ mod tests {
             "the recorded PID must be cleared too, so a racing quit can't SIGCONT a reaped, \
              possibly-recycled PID before the queue loop clears it"
         );
+    }
+
+    #[test]
+    fn cancelling_a_remote_job_deletes_nothing_local() {
+        // A remote row's paths name files on its host. Local files that happen to share them —
+        // the distinct output, and the temp sibling an in-place job would have — must survive.
+        let dir = tempfile::tempdir().unwrap();
+        for (output_name, local_name) in [
+            ("remote.h265.mkv", "remote.h265.mkv"),
+            ("remote.wmv", ".remote.convertbar-tmp.wmv"),
+        ] {
+            let source = dir.path().join("remote.wmv");
+            let output = dir.path().join(output_name);
+            let local = dir.path().join(local_name);
+            std::fs::write(&local, b"a local file").unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            crate::db::init_db(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, remote_host)
+                 VALUES ('j1', ?1, ?2, 'p', 'encoding', 0, '2020-01-01T00:00:00Z', 'unraid')",
+                params![source.to_str().unwrap(), output.to_str().unwrap()],
+            )
+            .unwrap();
+            let ctx = test_ctx(conn);
+            *ctx.converter.current_job_id.lock().unwrap() = Some("j1".into());
+
+            cancel_conversion(&ctx).unwrap();
+
+            assert!(local.exists(), "{local_name} must survive");
+            let status: String = ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT status FROM jobs WHERE id = 'j1'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(status, "error", "the cancel itself is still booked");
+        }
     }
 
     #[test]
