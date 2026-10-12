@@ -168,6 +168,12 @@ export interface LowDiskPause {
   required_bytes: number;
 }
 
+/** The ssh host a remote job could not reach, and the step it was at. */
+export interface UnreachableStop {
+  host: string;
+  step: string;
+}
+
 export interface PresetMetadata {
   codec: string;
   resolution: string;

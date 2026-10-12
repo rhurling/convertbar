@@ -184,6 +184,10 @@ pub fn api_router(state: ServerState) -> Router {
             "/converter/low-disk-pause",
             get(converter::get_low_disk_pause),
         )
+        .route(
+            "/converter/unreachable-stop",
+            get(converter::get_unreachable_stop),
+        )
         .route("/settings", get(settings::get_settings))
         .route("/settings/{key}", put(settings::update_setting))
         .route(

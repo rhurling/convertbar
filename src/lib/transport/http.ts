@@ -16,6 +16,7 @@ import type {
   PurgeResult,
   StatusSnapshot,
   Transport,
+  UnreachableStop,
   WatchedDirectory,
 } from "./types";
 
@@ -136,6 +137,8 @@ export const httpCommands = {
     api("DELETE", "/api/converter/pause-after-current"),
   getPauseAfterCurrent: (): Promise<boolean> => api("GET", "/api/converter/pause-after-current"),
   getLowDiskPause: (): Promise<LowDiskPause | null> => api("GET", "/api/converter/low-disk-pause"),
+  getUnreachableStop: (): Promise<UnreachableStop | null> =>
+    api("GET", "/api/converter/unreachable-stop"),
   getPlatformCapabilities: notAvailable,
   validateHandbrake: (): Promise<HandbrakeStatus> => api("GET", "/api/handbrake/validate"),
   quitApp: notAvailable,

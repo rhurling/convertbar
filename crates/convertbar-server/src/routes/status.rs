@@ -330,4 +330,64 @@ mod tests {
         emit_progress(&state, "now", 7.5).await;
         assert_eq!(status(&state).await["percent"], 7.5);
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_outage_reads_stopped_with_work_behind_it_and_idle_without() {
+        // No new state value (ADR 0003): the dashboard keeps its contract, and the reason is a
+        // route of its own for the banner.
+        let (state, _shutdown) = test_state_with_locator(std::sync::Arc::new(
+            convertbar_core::handbrake::StubLocator("/opt/fake/HandBrakeCLI".into()),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let share = base.join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let film = share.join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let setup = convertbar_core::remote::testing::shim_setup(
+            &base,
+            &[("unraid", share.to_string_lossy().as_ref())],
+        );
+        convertbar_core::remote::testing::fail_unreachable(&setup, "stat");
+        state.ctx.remote.set(setup).unwrap();
+        state
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, remote_host)
+                 VALUES ('j1', ?1, ?1, 'Fast 1080p30', 'queued', 0, '2020-01-01T00:00:00Z',
+                         'unraid'),
+                        ('j2', '/local/b.mkv', '/local/b.mp4', 'Fast 1080p30', 'queued', 1,
+                         '2020-01-01T00:00:00Z', NULL)",
+                params![film.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let (code, _) = send(&state, "POST", "/api/converter/start", None).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let mut waited = Duration::ZERO;
+        while convertbar_core::control::get_unreachable_stop(&state.ctx).is_none()
+            || *state.ctx.converter.is_running.lock().unwrap()
+        {
+            assert!(
+                waited < Duration::from_secs(10),
+                "the outage never stopped the queue"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += Duration::from_millis(20);
+        }
+
+        assert_eq!(status(&state).await["state"], "stopped");
+        let (code, reason) = send(&state, "GET", "/api/converter/unreachable-stop", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(reason, json!({"host": "unraid", "step": "stat"}));
+
+        let (code, _) = send(&state, "DELETE", "/api/queue/jobs/j2", None).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        assert_eq!(status(&state).await["state"], "idle");
+    }
 }

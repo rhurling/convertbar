@@ -16,6 +16,7 @@ import type {
   PlatformCapabilities,
   PresetMetadata,
   PurgeResult,
+  UnreachableStop,
   UpdateState,
   WatchedDirectory,
 } from "./types";
@@ -65,6 +66,7 @@ export const tauriCommands = {
   cancelPauseAfterCurrent: () => invoke<void>("cancel_pause_after_current"),
   getPauseAfterCurrent: () => invoke<boolean>("get_pause_after_current"),
   getLowDiskPause: () => invoke<LowDiskPause | null>("get_low_disk_pause"),
+  getUnreachableStop: () => invoke<UnreachableStop | null>("get_unreachable_stop"),
   getPlatformCapabilities: () =>
     invoke<PlatformCapabilities>("get_platform_capabilities"),
   validateHandbrake: () => invoke<HandbrakeStatus>("validate_handbrake"),

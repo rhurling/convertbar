@@ -225,6 +225,9 @@ pub struct ConverterState {
     /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
     /// backend state on mount, not just the live `queue-paused-low-disk` event.
     pub(crate) low_disk_pause: Mutex<Option<LowDiskPause>>,
+    /// Why the queue stopped for an unreachable host (ADR 0003): held in memory like the
+    /// low-disk reason, and gone after a restart while the persisted pause stays.
+    pub(crate) unreachable_stop: Mutex<Option<UnreachableStop>>,
     /// Whether this queue run has already notified about a hook failure. Lives on the state
     /// rather than as a `process_queue` local because one fire point is inside
     /// `record_job_error_quiet`, a free function reached from nine places: threading `&mut`
@@ -257,6 +260,7 @@ impl ConverterState {
             shutdown: std::sync::atomic::AtomicBool::new(false),
             installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
+            unreachable_stop: Mutex::new(None),
             hook_failure_notified: Mutex::new(false),
             work_arrived_while_busy: std::sync::atomic::AtomicBool::new(false),
         }
@@ -275,6 +279,13 @@ impl ConverterState {
 
     pub fn low_disk_pause(&self) -> Option<LowDiskPause> {
         self.low_disk_pause
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(None)
+    }
+
+    pub fn unreachable_stop(&self) -> Option<UnreachableStop> {
+        self.unreachable_stop
             .lock()
             .map(|g| g.clone())
             .unwrap_or(None)
@@ -378,6 +389,13 @@ pub struct ConversionProgress {
     pub fps: f64,
     pub avg_fps: f64,
     pub eta_seconds: u64,
+}
+
+/// The host a remote job could not reach, and the step it was at.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UnreachableStop {
+    pub host: String,
+    pub step: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -959,6 +977,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
     // Every run/resume starts fresh: a stale reason from a prior pause must not linger once
     // the queue is running again (and be gone entirely if this run never hits the gate).
     *ctx.converter.low_disk_pause.lock().unwrap() = None;
+    *ctx.converter.unreachable_stop.lock().unwrap() = None;
     // Once per run, not once per file: a broken receiver on a 200-file queue must produce one
     // notification, and the next run must be able to notify again.
     *ctx.converter.hook_failure_notified.lock().unwrap() = false;
@@ -1216,6 +1235,41 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                     }
                     // Only a definite "not there" from a readable parent, like the local gate.
                     Err(PullFailure::Gone) => {
+                        match published_before_outage(ctx, setup, host, &job) {
+                            Ok(Some(published)) => {
+                                let saved = job.original_size.unwrap_or(0) - published.size;
+                                book_without_encode(
+                                    ctx,
+                                    &job.id,
+                                    &Booking {
+                                        status: "done",
+                                        kept_file: "converted",
+                                        converted_size: Some(published.size),
+                                        space_saved: saved,
+                                        skip_reason: None,
+                                    },
+                                );
+                                notify_file_finished(
+                                    ctx,
+                                    false,
+                                    &format!(
+                                        "{} converted — saved {}",
+                                        file_name,
+                                        format_bytes_short(saved)
+                                    ),
+                                );
+                                if pause_if_armed(ctx) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(e @ crate::remote::RemoteError::Unreachable { .. }) => {
+                                stop_for_unreachable(ctx, &job.id, &file_name, &e);
+                                return PassOutcome::Stopped;
+                            }
+                            // Not that edge, or the host could not say: today's quiet booking.
+                            Ok(None) | Err(_) => {}
+                        }
                         had_errors = true;
                         record_job_error_quiet(
                             ctx,
@@ -1224,6 +1278,12 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                             crate::failure_class::FailureClass::Environment,
                         );
                         continue;
+                    }
+                    Err(PullFailure::Failed(
+                        e @ crate::remote::RemoteError::Unreachable { .. },
+                    )) => {
+                        stop_for_unreachable(ctx, &job.id, &file_name, &e);
+                        return PassOutcome::Stopped;
                     }
                     Err(PullFailure::Failed(e)) => {
                         had_errors = true;
@@ -1244,7 +1304,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
         // Skip-by-source-media for a remote job probes the staged copy, the first moment the
         // file can be probed at all: one already at the target is neither encoded nor pushed.
         if remote.is_some() && already_at_target(ctx, &handbrake_path, &job, &input_path) {
-            book_already_at_target(ctx, &job.id);
+            book_without_encode(ctx, &job.id, &ALREADY_AT_TARGET);
             notify_file_finished(
                 ctx,
                 false,
@@ -1537,6 +1597,12 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                         ) {
                             Ok(stat) => remote_identity = Some(stat),
                             Err(PublishFailure::Killed) => continue,
+                            Err(PublishFailure::Failed(
+                                e @ crate::remote::RemoteError::Unreachable { .. },
+                            )) => {
+                                stop_for_unreachable(ctx, &job.id, &file_name, &e);
+                                return PassOutcome::Stopped;
+                            }
                             Err(PublishFailure::Failed(e)) => {
                                 had_errors = true;
                                 record_job_error(
@@ -1875,6 +1941,108 @@ impl Drop for RemoteTurn<'_> {
     }
 }
 
+/// Backend-only settings row naming the job that hit an outage, which the next queue start
+/// re-queues (ADR 0003). Read with a default, never in `ALLOWED_KEYS`, like `queue_paused`.
+pub(crate) const UNREACHABLE_JOB_KEY: &str = "unreachable_job_id";
+
+/// Backend-only settings row naming a job re-queued after an outage, for the one case where its
+/// source being gone means it already finished: a new-name job whose connection dropped after
+/// finalize published the result and deleted the original.
+pub(crate) const REQUEUED_AFTER_OUTAGE_KEY: &str = "requeued_after_outage_job_id";
+
+pub(crate) fn read_setting_opt(db: &Connection, key: &str) -> Option<String> {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+pub(crate) fn write_setting(db: &Connection, key: &str, value: Option<&str>) {
+    let _ = match value {
+        Some(v) => db.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, v],
+        ),
+        None => db.execute("DELETE FROM settings WHERE key = ?1", params![key]),
+    };
+}
+
+/// The next queue start re-queues the job an outage stopped on (ADR 0003) and forgets it.
+/// Only that one row, only while it is still the unreachable error it was booked as, and not
+/// when its host and path already have an active row. Its timestamps and error are cleared and
+/// its place in the order is kept; it starts again from the pull. Returns whether it re-queued.
+pub(crate) fn requeue_after_outage(db: &Connection) -> bool {
+    let Some(id) = read_setting_opt(db, UNREACHABLE_JOB_KEY) else {
+        return false;
+    };
+    write_setting(db, UNREACHABLE_JOB_KEY, None);
+    let requeued = db
+        .execute(
+            "UPDATE jobs SET status = 'queued', error_message = NULL, failure_class = NULL,
+                    completed_at = NULL, started_at = NULL
+             WHERE id = ?1 AND status = 'error' AND failure_class = 'unreachable'
+               AND NOT EXISTS (
+                   SELECT 1 FROM jobs AS active
+                   WHERE active.remote_host IS jobs.remote_host
+                     AND active.source_path = jobs.source_path
+                     AND active.status IN ('queued', 'encoding', 'paused'))",
+            params![id],
+        )
+        .is_ok_and(|n| n > 0);
+    if requeued {
+        write_setting(db, REQUEUED_AFTER_OUTAGE_KEY, Some(&id));
+    }
+    requeued
+}
+
+/// An unreachable host stops the queue instead of failing every job behind it (ADR 0003). The
+/// pause and the remembered job are persisted first, so a restart in the middle neither retries
+/// into the outage nor forgets the job; then the job is booked through the notifying path, so
+/// its post-convert hook carries the class. The caller ends the pass as the low-disk stop does:
+/// no "Queue complete" and no queue-drained hook, because nothing drained.
+fn stop_for_unreachable(
+    ctx: &Ctx,
+    job_id: &str,
+    file_name: &str,
+    error: &crate::remote::RemoteError,
+) {
+    let crate::remote::RemoteError::Unreachable { host, step } = error else {
+        return;
+    };
+    {
+        let db = ctx.db.lock().unwrap();
+        set_user_queue_pause(&db);
+        write_setting(&db, UNREACHABLE_JOB_KEY, Some(job_id));
+    } // dropped before the emits below: the tray listener re-locks ctx.db on this thread
+    let stop = UnreachableStop {
+        host: host.clone(),
+        step: step.to_string(),
+    };
+    *ctx.converter.unreachable_stop.lock().unwrap() = Some(stop.clone());
+    ctx.events.emit_t("queue-paused-unreachable", &stop);
+    ctx.events.emit_t(
+        "menu-bar-update",
+        MenuBarUpdate {
+            status: final_run_status(true).to_string(),
+            percent: None,
+            file_name: None,
+            eta_seconds: None,
+            queue_count: None,
+            fps: None,
+        },
+    );
+    record_job_error(
+        ctx,
+        job_id,
+        file_name,
+        &error.message(),
+        crate::failure_class::FailureClass::Unreachable,
+    );
+}
+
 /// Sends a finished file's per-file notification, as the notification settings allow.
 fn notify_file_finished(ctx: &Ctx, is_error: bool, body: &str) {
     let (notify_per_file, errors_only) = {
@@ -1948,31 +2116,84 @@ fn already_at_target(ctx: &Ctx, handbrake_path: &str, job: &JobInfo, staged: &st
     )
 }
 
-/// Books a job that was never encoded because its source is already at the target: `skipped`,
-/// the original kept, no converted size, nothing saved.
-fn book_already_at_target(ctx: &Ctx, job_id: &str) {
+/// How a job that finished without an encode in this turn is booked.
+struct Booking<'a> {
+    status: &'a str,
+    kept_file: &'a str,
+    converted_size: Option<i64>,
+    space_saved: i64,
+    skip_reason: Option<&'a str>,
+}
+
+/// Already at the target: `skipped`, the original kept, no converted size, nothing saved.
+const ALREADY_AT_TARGET: Booking<'static> = Booking {
+    status: "skipped",
+    kept_file: "original",
+    converted_size: None,
+    space_saved: 0,
+    skip_reason: Some("already_at_target"),
+};
+
+/// Books a job that finished without an encode in this turn, emits as the encode path does, and
+/// fires its post-convert hook.
+fn book_without_encode(ctx: &Ctx, job_id: &str, b: &Booking) {
     {
         let db = ctx.db.lock().unwrap();
         let _ = db.execute(
-            "UPDATE jobs SET status = 'skipped', kept_file = 'original', converted_size = NULL, \
-             space_saved = 0, skip_reason = 'already_at_target', completed_at = ?2 WHERE id = ?1",
-            params![job_id, chrono::Utc::now().to_rfc3339()],
+            "UPDATE jobs SET status = ?2, kept_file = ?3, converted_size = ?4, space_saved = ?5, \
+             skip_reason = ?6, completed_at = ?7 WHERE id = ?1",
+            params![
+                job_id,
+                b.status,
+                b.kept_file,
+                b.converted_size,
+                b.space_saved,
+                b.skip_reason,
+                chrono::Utc::now().to_rfc3339()
+            ],
         );
     } // dropped before the emits: the tray listener re-locks ctx.db on this thread
     ctx.events.emit_t(
         "job-completed",
         serde_json::json!({
             "job_id": job_id,
-            "status": "skipped",
-            "kept_file": "original",
-            "space_saved": 0,
+            "status": b.status,
+            "kept_file": b.kept_file,
+            "space_saved": b.space_saved,
         }),
     );
     ctx.events.emit_t(
         "job-status-changed",
-        serde_json::json!({ "job_id": job_id, "status": "skipped" }),
+        serde_json::json!({ "job_id": job_id, "status": b.status }),
     );
     crate::hooks::fire_post_convert(ctx, job_id);
+}
+
+/// ADR 0003's decided edge: a new-name job re-queued after an outage, whose source is now
+/// definitely gone and whose output name is present on the host, was finished by the finalize
+/// that the connection dropped after — it published the result and deleted the original. Returns
+/// the published file's stat. Consumes the re-queue marker.
+fn published_before_outage(
+    ctx: &Ctx,
+    setup: &crate::remote::RemoteSetup,
+    host: &str,
+    job: &JobInfo,
+) -> Result<Option<crate::remote::RemoteStat>, crate::remote::RemoteError> {
+    let marked = {
+        let db = ctx.db.lock().unwrap();
+        let marked = read_setting_opt(&db, REQUEUED_AFTER_OUTAGE_KEY).as_deref() == Some(&job.id);
+        if marked {
+            write_setting(&db, REQUEUED_AFTER_OUTAGE_KEY, None);
+        }
+        marked
+    };
+    if !marked || is_in_place(&job.source_path, &job.output_path) {
+        return Ok(None);
+    }
+    match crate::remote::probe_source(setup, host, &job.output_path, "stat")? {
+        crate::remote::SourceState::Present(stat) => Ok(Some(stat)),
+        _ => Ok(None),
+    }
 }
 
 /// The remote phase shown on the encoding row: "Pulling…", "Pushing…", "Verifying…", or `None`
@@ -8270,6 +8491,261 @@ HandBrake has exited.";
                 assert!(world.pushed(), "{case}");
             }
             assert!(world.staging_is_empty(), "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    impl RemoteWorld {
+        fn setting(&self, key: &str) -> Option<String> {
+            read_setting_opt(&self.ctx.db.lock().unwrap(), key)
+        }
+
+        /// Starts the queue the way Start does, and waits for the run to end.
+        fn start_and_wait(&self) {
+            crate::control::start_queue(&self.ctx).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while self.ctx.converter.is_running() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the queue never stopped"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        fn webhook_events(&self) -> Vec<serde_json::Value> {
+            self.hooks
+                .webhooks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| serde_json::from_str(&r.body).unwrap())
+                .collect()
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unreachable_host_stops_the_queue_and_the_next_start_takes_the_job_back() {
+        for step in ["stat", "pull", "push", "finalize"] {
+            let world = RemoteWorld::new("smaller");
+            set_setting(
+                &world.ctx.db,
+                "post_convert_webhook_url",
+                "http://receiver.invalid/hook",
+            );
+            set_setting(
+                &world.ctx.db,
+                "queue_drained_webhook_url",
+                "http://receiver.invalid/drained",
+            );
+            set_setting(&world.ctx.db, "notifications_queue_done", "true");
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            let other = world.host_file("other.mkv", "another original, larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            world.queue_remote("j2", &other, &other);
+            world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute("UPDATE jobs SET queue_order = 1 WHERE id = 'j2'", [])
+                .unwrap();
+            crate::remote::testing::fail_unreachable(world.setup(), step);
+
+            process_queue(&world.ctx);
+
+            assert_eq!(world.row("j1").0, "error", "{step}");
+            assert_eq!(
+                class_of(&world.ctx.db, "j1").as_deref(),
+                Some("unreachable"),
+                "{step}"
+            );
+            let message = world.row("j1").4.unwrap();
+            assert!(
+                message.contains("unraid") && message.contains(step),
+                "{step}: {message}"
+            );
+            assert_eq!(
+                world.row("j2").0,
+                "queued",
+                "{step}: the job behind it waits"
+            );
+            assert_eq!(
+                world.setting("queue_paused").as_deref(),
+                Some("true"),
+                "{step}"
+            );
+            assert_eq!(
+                world.setting(UNREACHABLE_JOB_KEY).as_deref(),
+                Some("j1"),
+                "{step}"
+            );
+            let stop = UnreachableStop {
+                host: "unraid".into(),
+                step: step.into(),
+            };
+            assert_eq!(world.ctx.converter.unreachable_stop(), Some(stop), "{step}");
+            assert_eq!(
+                world.sink.payloads("queue-paused-unreachable"),
+                [serde_json::json!({"host": "unraid", "step": step})],
+                "{step}"
+            );
+            let sent = world.webhook_events();
+            assert_eq!(sent.len(), 1, "{step}: one post-convert, no queue-drained");
+            assert_eq!(sent[0]["event"], "post-convert", "{step}");
+            assert_eq!(sent[0]["failure_class"], "unreachable", "{step}");
+            assert_eq!(sent[0]["remote_host"], "unraid", "{step}");
+            assert!(
+                world
+                    .sink
+                    .notifications
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, b)| !b.contains("complete")),
+                "{step}: an outage is not a drain"
+            );
+            assert!(world.staging_is_empty(), "{step}");
+            assert_eq!(
+                world.root.join(".film.convertbar-tmp.mkv").exists(),
+                step == "finalize",
+                "{step}: only a push that landed leaves its temp, for the next push to overwrite"
+            );
+
+            crate::remote::testing::reachable_again(world.setup());
+            world.start_and_wait();
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!((status.as_str(), error), ("done", None), "{step}");
+            assert_eq!(class_of(&world.ctx.db, "j1"), None, "{step}");
+            assert_eq!(world.row("j2").0, "done", "{step}");
+            assert_eq!(std::fs::read_to_string(&film).unwrap(), "smaller", "{step}");
+            assert!(
+                !world.root.join(".film.convertbar-tmp.mkv").exists(),
+                "{step}"
+            );
+            assert_eq!(world.setting(UNREACHABLE_JOB_KEY), None, "{step}");
+            assert_eq!(
+                world.setting("queue_paused").as_deref(),
+                Some("false"),
+                "{step}"
+            );
+            assert_eq!(world.ctx.converter.unreachable_stop(), None, "{step}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_remembered_job_is_taken_back_only_while_nothing_else_holds_its_path() {
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        crate::remote::testing::fail_unreachable(world.setup(), "stat");
+        process_queue(&world.ctx);
+        assert_eq!(world.setting(UNREACHABLE_JOB_KEY).as_deref(), Some("j1"));
+
+        // The same file queued again by hand meanwhile: that row is the one that runs.
+        crate::remote::testing::reachable_again(world.setup());
+        world.queue_remote("j2", &film, &film);
+        world.start_and_wait();
+        assert_eq!(world.row("j1").0, "error");
+        assert_eq!(world.row("j2").0, "done");
+        assert_eq!(
+            world.setting(UNREACHABLE_JOB_KEY),
+            None,
+            "forgotten either way"
+        );
+
+        // Clearing the queue forgets the stop: the next start takes nothing back.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        crate::remote::testing::fail_unreachable(world.setup(), "stat");
+        process_queue(&world.ctx);
+        crate::queue_ops::clear_queue(&world.ctx).unwrap();
+        assert_eq!(world.setting(UNREACHABLE_JOB_KEY), None);
+        assert_eq!(world.ctx.converter.unreachable_stop(), None);
+        crate::remote::testing::reachable_again(world.setup());
+        world.start_and_wait();
+        assert_eq!(world.row("j1").0, "error", "its error row stays in history");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_new_name_job_whose_finalize_landed_before_the_drop_is_booked_done() {
+        // The connection dropped after finalize published talk.mkv and deleted talk.wmv. Only
+        // that job, re-queued after its outage, is booked done from what is on the host; any
+        // other job whose source vanished is today's quiet "no longer exists".
+        for (case, new_name, after_outage, done) in [
+            ("the edge", true, true, true),
+            ("in place", false, true, false),
+            ("not after an outage", true, false, false),
+        ] {
+            let world = RemoteWorld::new("unused");
+            set_setting(
+                &world.ctx.db,
+                "post_convert_webhook_url",
+                "http://receiver.invalid/hook",
+            );
+            let source = world.root.join("talk.wmv").to_string_lossy().into_owned();
+            let output = if new_name {
+                world.host_file("talk.mkv", "published", 0o644)
+            } else {
+                source.clone()
+            };
+            queue_job(&world.ctx.db, "j1", &source, &output, 100);
+            world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET remote_host = 'unraid', status = 'error',
+                            failure_class = 'unreachable', error_message = 'x'",
+                    [],
+                )
+                .unwrap();
+            if after_outage {
+                write_setting(
+                    &world.ctx.db.lock().unwrap(),
+                    UNREACHABLE_JOB_KEY,
+                    Some("j1"),
+                );
+            } else {
+                world
+                    .ctx
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE jobs SET status = 'queued'", [])
+                    .unwrap();
+            }
+
+            world.start_and_wait();
+
+            let (status, converted, _, _, error) = world.row("j1");
+            if done {
+                assert_eq!((status.as_str(), converted), ("done", Some(9)), "{case}");
+                let saved: i64 = world
+                    .ctx
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT space_saved FROM jobs WHERE id = 'j1'", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(saved, 91, "{case}");
+                assert_eq!(world.webhook_events()[0]["status"], "done", "{case}");
+            } else {
+                assert_eq!(
+                    (status.as_str(), error.as_deref()),
+                    ("error", Some("Source file no longer exists")),
+                    "{case}"
+                );
+            }
+            assert!(!world.hb_inputs.exists(), "{case}: nothing encoded");
         }
     }
 }

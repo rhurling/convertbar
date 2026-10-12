@@ -35,6 +35,9 @@ pub enum FailureClass {
     Environment,
     /// Not enough evidence. Never destructive.
     Unknown,
+    /// A remote job's ssh host could not be reached (ADR 0003). Never returned by [`classify`]:
+    /// only the queue thread's outage stop constructs it.
+    Unreachable,
 }
 
 impl FailureClass {
@@ -45,6 +48,7 @@ impl FailureClass {
             FailureClass::BadSourceTruncated => CLASS_BAD_SOURCE_TRUNCATED,
             FailureClass::Environment => "environment",
             FailureClass::Unknown => "unknown",
+            FailureClass::Unreachable => "unreachable",
         }
     }
 }
@@ -289,6 +293,7 @@ HandBrake has exited.
         );
         assert_eq!(FailureClass::Environment.as_str(), "environment");
         assert_eq!(FailureClass::Unknown.as_str(), "unknown");
+        assert_eq!(FailureClass::Unreachable.as_str(), "unreachable");
         assert_eq!(CLASS_BAD_SOURCE, "bad_source");
         assert_eq!(CLASS_BAD_SOURCE_TRUNCATED, "bad_source_truncated");
         assert_eq!(CLASS_BAD_SOURCE_PURGED, "bad_source_purged");

@@ -1520,6 +1520,12 @@ pub fn clear_queue(ctx: &Ctx) -> Result<(), String> {
         .low_disk_pause
         .lock()
         .map_err(|e| e.to_string())? = None;
+    // Nor an outage stop: forget its job (its error row stays in history) and its reason.
+    crate::converter::write_setting(&conn, crate::converter::UNREACHABLE_JOB_KEY, None);
+    *ctx.converter
+        .unreachable_stop
+        .lock()
+        .map_err(|e| e.to_string())? = None;
     // A cleared queue has no jobs to stay paused for.
     crate::converter::set_queue_paused(&conn, false);
     Ok(())

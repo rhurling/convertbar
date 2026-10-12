@@ -46,6 +46,12 @@ pub fn get_low_disk_pause(ctx: State<'_, Arc<Ctx>>) -> Option<crate::converter::
     control::get_low_disk_pause(&ctx)
 }
 
+/// Always `None` on the desktop head, which has no remote roots; kept for transport parity.
+#[tauri::command]
+pub fn get_unreachable_stop(ctx: State<'_, Arc<Ctx>>) -> Option<crate::converter::UnreachableStop> {
+    control::get_unreachable_stop(&ctx)
+}
+
 #[derive(serde::Serialize)]
 pub struct PlatformCapabilities {
     pub can_pause_process: bool,

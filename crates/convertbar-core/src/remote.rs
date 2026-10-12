@@ -820,6 +820,11 @@ exec sh -c "$cmd"
         std::fs::write(path, text).unwrap();
     }
 
+    /// Ends every outage `fail_unreachable` set up.
+    pub fn reachable_again(setup: &RemoteSetup) {
+        let _ = std::fs::remove_file(setup.ssh.parent().unwrap().join("fail-255"));
+    }
+
     /// Runs `script` (a POSIX sh body) just before `step` reaches the host.
     pub fn hook_before(setup: &RemoteSetup, step: &str, script: &str) {
         use std::os::unix::fs::PermissionsExt;

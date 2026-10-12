@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use convertbar_core::control;
-use convertbar_core::converter::LowDiskPause;
+use convertbar_core::converter::{LowDiskPause, UnreachableStop};
 
 use super::{core_err, ServerState};
 
@@ -60,4 +60,8 @@ pub async fn get_pause_after_current(State(s): State<ServerState>) -> Json<bool>
 
 pub async fn get_low_disk_pause(State(s): State<ServerState>) -> Json<Option<LowDiskPause>> {
     Json(control::get_low_disk_pause(&s.ctx))
+}
+
+pub async fn get_unreachable_stop(State(s): State<ServerState>) -> Json<Option<UnreachableStop>> {
+    Json(control::get_unreachable_stop(&s.ctx))
 }

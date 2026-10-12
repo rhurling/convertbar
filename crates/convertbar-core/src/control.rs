@@ -39,9 +39,17 @@ pub fn start_queue(ctx: &Arc<Ctx>) -> Result<(), String> {
     // The slot is ours from here: `process_queue`'s `RunningGuard` releases it.
 
     // A user (re)starting the queue — Resume button, or a drag-drop add which routes through
-    // startQueue — clears any remembered pause.
-    if let Ok(conn) = ctx.db.lock() {
-        converter::set_queue_paused(&conn, false);
+    // startQueue — clears any remembered pause, and takes back the job an outage stopped on.
+    let requeued = match ctx.db.lock() {
+        Ok(conn) => {
+            let requeued = converter::requeue_after_outage(&conn);
+            converter::set_queue_paused(&conn, false);
+            requeued
+        }
+        Err(_) => false,
+    };
+    if requeued {
+        ctx.events.emit_t("queue-updated", ());
     }
 
     converter::spawn_queue_thread(ctx.clone());
@@ -397,6 +405,10 @@ pub fn get_pause_after_current(ctx: &Ctx) -> bool {
 
 pub fn get_low_disk_pause(ctx: &Ctx) -> Option<LowDiskPause> {
     ctx.converter.low_disk_pause()
+}
+
+pub fn get_unreachable_stop(ctx: &Ctx) -> Option<converter::UnreachableStop> {
+    ctx.converter.unreachable_stop()
 }
 
 #[cfg(test)]
