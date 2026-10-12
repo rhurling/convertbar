@@ -24,6 +24,9 @@ pub struct JobInfo {
     /// The ssh host alias a remote job's paths live on (ADR 0005); `None` for a local job.
     #[serde(default)]
     pub remote_host: Option<String>,
+    /// `already_at_target` for a `skipped` job nothing was encoded for; `None` otherwise.
+    #[serde(default)]
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

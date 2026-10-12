@@ -476,7 +476,7 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                 kept_file, space_saved, error_message, failure_class, queue_order, created_at,
-                completed_at, started_at, remote_host
+                completed_at, started_at, remote_host, skip_reason
          FROM jobs WHERE status = 'queued'
          ORDER BY queue_order ASC LIMIT 1",
         )
@@ -500,6 +500,7 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
             completed_at: row.get(13)?,
             started_at: row.get(14)?,
             remote_host: row.get(15)?,
+            skip_reason: row.get(16)?,
         })
     })
     .ok()
@@ -1240,6 +1241,21 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             }
         };
 
+        // Skip-by-source-media for a remote job probes the staged copy, the first moment the
+        // file can be probed at all: one already at the target is neither encoded nor pushed.
+        if remote.is_some() && already_at_target(ctx, &handbrake_path, &job, &input_path) {
+            book_already_at_target(ctx, &job.id);
+            notify_file_finished(
+                ctx,
+                false,
+                &format!("{file_name} — already at the target, left as it is"),
+            );
+            if pause_if_armed(ctx) {
+                break;
+            }
+            continue;
+        }
+
         let in_place = is_in_place(&job.source_path, &job.output_path);
         let encode_target = match &remote {
             // Straight to staging under the result's name: there is no local in-place temp.
@@ -1722,61 +1738,18 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                 // hold ctx.db across a hook, which is slower than an emit.
                 crate::hooks::fire_post_convert(ctx, &job.id);
 
-                // Notification logic for successful/skipped jobs
-                {
-                    let (notify_per_file, errors_only) = {
-                        let db = ctx.db.lock().unwrap();
-                        let get = |k: &str, default: bool| -> bool {
-                            db.query_row(
-                                "SELECT value FROM settings WHERE key=?1",
-                                params![k],
-                                |r| r.get::<_, String>(0),
-                            )
-                            .map(|v| v == "true")
-                            .unwrap_or(default)
-                        };
-                        (
-                            get("notifications_per_file", true),
-                            get("notifications_errors_only", false),
-                        )
-                    };
+                let body = match status_str {
+                    "done" => format!(
+                        "{} converted — saved {}",
+                        file_name,
+                        format_bytes_short(space_saved)
+                    ),
+                    "skipped" => format!("{} — kept original (converted was larger)", file_name),
+                    _ => format!("{} failed", file_name),
+                };
+                notify_file_finished(ctx, status_str == "error", &body);
 
-                    if notify_per_file {
-                        let is_error = status_str == "error";
-                        let should_notify = if errors_only { is_error } else { true };
-
-                        if should_notify {
-                            let body = match status_str {
-                                "done" => format!(
-                                    "{} converted — saved {}",
-                                    file_name,
-                                    format_bytes_short(space_saved)
-                                ),
-                                "skipped" => {
-                                    format!("{} — kept original (converted was larger)", file_name)
-                                }
-                                _ => format!("{} failed", file_name),
-                            };
-                            ctx.events.notify("ConvertBar", &body);
-                        }
-                    }
-                }
-
-                // Pause after this job if the one-shot flag is armed (consumed here so the next
-                // queued job does not also pause).
-                if take_pause_after_current(&ctx.converter) {
-                    set_queue_paused(&ctx.db.lock().unwrap(), true);
-                    ctx.events.emit_t(
-                        "menu-bar-update",
-                        MenuBarUpdate {
-                            status: "idle".to_string(),
-                            percent: None,
-                            file_name: None,
-                            eta_seconds: None,
-                            queue_count: None,
-                            fps: None,
-                        },
-                    );
+                if pause_if_armed(ctx) {
                     break;
                 }
             }
@@ -1900,6 +1873,106 @@ impl Drop for RemoteTurn<'_> {
         emit_phase(self.ctx, &self.job_id, None);
         self.setup.empty_staging();
     }
+}
+
+/// Sends a finished file's per-file notification, as the notification settings allow.
+fn notify_file_finished(ctx: &Ctx, is_error: bool, body: &str) {
+    let (notify_per_file, errors_only) = {
+        let db = ctx.db.lock().unwrap();
+        let get = |k: &str, default: bool| -> bool {
+            db.query_row("SELECT value FROM settings WHERE key=?1", params![k], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|v| v == "true")
+            .unwrap_or(default)
+        };
+        (
+            get("notifications_per_file", true),
+            get("notifications_errors_only", false),
+        )
+    };
+    if notify_per_file && (is_error || !errors_only) {
+        ctx.events.notify("ConvertBar", body);
+    }
+}
+
+/// Pauses the queue after this job if the one-shot flag is armed, consuming it so the next
+/// queued job does not also pause. True means the caller stops the pass.
+fn pause_if_armed(ctx: &Ctx) -> bool {
+    if !take_pause_after_current(&ctx.converter) {
+        return false;
+    }
+    set_queue_paused(&ctx.db.lock().unwrap(), true);
+    ctx.events.emit_t(
+        "menu-bar-update",
+        MenuBarUpdate {
+            status: "idle".to_string(),
+            percent: None,
+            file_name: None,
+            eta_seconds: None,
+            queue_count: None,
+            fps: None,
+        },
+    );
+    true
+}
+
+/// Whether skip-by-source-media is on and the staged copy already meets the target, by the
+/// same decision as a local add. Any uncertainty (no metadata, a failed probe) encodes.
+fn already_at_target(ctx: &Ctx, handbrake_path: &str, job: &JobInfo, staged: &str) -> bool {
+    let on = ctx
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'skip_by_source_media'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .is_ok_and(|v| v == "true");
+    if !on {
+        return false;
+    }
+    let Ok(target) = crate::handbrake::cached_preset_metadata(ctx, handbrake_path, &job.preset)
+    else {
+        return false;
+    };
+    let Some(media) = crate::probe::probe_source(handbrake_path, staged) else {
+        return false;
+    };
+    crate::media_skip::should_skip_by_media(
+        &media.codec,
+        media.height,
+        &target.codec,
+        crate::media_skip::target_height_from_resolution(&target.resolution),
+    )
+}
+
+/// Books a job that was never encoded because its source is already at the target: `skipped`,
+/// the original kept, no converted size, nothing saved.
+fn book_already_at_target(ctx: &Ctx, job_id: &str) {
+    {
+        let db = ctx.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE jobs SET status = 'skipped', kept_file = 'original', converted_size = NULL, \
+             space_saved = 0, skip_reason = 'already_at_target', completed_at = ?2 WHERE id = ?1",
+            params![job_id, chrono::Utc::now().to_rfc3339()],
+        );
+    } // dropped before the emits: the tray listener re-locks ctx.db on this thread
+    ctx.events.emit_t(
+        "job-completed",
+        serde_json::json!({
+            "job_id": job_id,
+            "status": "skipped",
+            "kept_file": "original",
+            "space_saved": 0,
+        }),
+    );
+    ctx.events.emit_t(
+        "job-status-changed",
+        serde_json::json!({ "job_id": job_id, "status": "skipped" }),
+    );
+    crate::hooks::fire_post_convert(ctx, job_id);
 }
 
 /// The remote phase shown on the encoding row: "Pulling…", "Pushing…", "Verifying…", or `None`
@@ -5778,6 +5851,10 @@ HandBrake has exited.";
         assert_eq!(body["status"], "done");
         assert_eq!(body["result_path"], body["output_path"]);
         assert_eq!(body["job_id"], "j1");
+        // Present and null for a local job, so a receiver can read them unconditionally.
+        for key in ["remote_host", "skip_reason"] {
+            assert_eq!(body.get(key), Some(&serde_json::Value::Null), "{key}");
+        }
     }
 
     #[test]
@@ -5815,6 +5892,11 @@ HandBrake has exited.";
 
         let body = only_webhook_body(&hooks);
         assert_eq!(body["status"], "skipped");
+        assert_eq!(
+            body.get("skip_reason"),
+            Some(&serde_json::Value::Null),
+            "a larger re-encode is a skip with no reason: something WAS encoded"
+        );
         assert_eq!(body["result_path"], body["source_path"]);
         assert_ne!(
             body["result_path"], body["output_path"],
@@ -7489,9 +7571,9 @@ HandBrake has exited.";
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  case $1 in\n    -i) printf '%s\\n' \"$2\" >> '{}' ;;\n    -o) out=$2 ;;\n  esac\n  shift\ndone\nprintf '%s' '{}' > \"$out\"\nexit 0\n",
-                record_to.display(),
-                content
+                "#!/bin/sh\nif [ \"$1\" = --scan ]; then\n  [ -f '{scan}' ] && cat '{scan}'\n  exit 0\nfi\nwhile [ $# -gt 0 ]; do\n  case $1 in\n    -i) printf '%s\\n' \"$2\" >> '{rec}' ;;\n    -o) out=$2 ;;\n  esac\n  shift\ndone\nprintf '%s' '{content}' > \"$out\"\nexit 0\n",
+                scan = dir.join("scan.out").display(),
+                rec = record_to.display(),
             ),
         )
         .unwrap();
@@ -7509,6 +7591,7 @@ HandBrake has exited.";
         hb_inputs: std::path::PathBuf,
         ctx: Arc<Ctx>,
         sink: Arc<TestSink>,
+        hooks: Arc<crate::hooks::RecordingHookRunner>,
     }
 
     #[cfg(unix)]
@@ -7520,9 +7603,17 @@ HandBrake has exited.";
             std::fs::create_dir_all(&root).unwrap();
             let hb_inputs = base.join("hb-inputs");
             let hb = input_recording_fake_handbrake_script(&base, result, &hb_inputs);
-            let (ctx, sink, _disposer) = test_ctx_with_locator(
+            let sink = Arc::new(TestSink::default());
+            let hooks = Arc::new(crate::hooks::RecordingHookRunner::default());
+            let ctx = Ctx::new(
                 test_conn(),
+                sink.clone(),
+                Arc::new(RecordingDisposer::default()),
                 Arc::new(crate::handbrake::StubLocator(hb.to_string_lossy().into())),
+                crate::hooks::HookSetup {
+                    runner: hooks.clone(),
+                    allow_stored_command: true,
+                },
             );
             set_setting(&ctx.db, "cleanup_mode", "delete");
             let setup = crate::remote::testing::shim_setup(
@@ -7538,6 +7629,7 @@ HandBrake has exited.";
                 hb_inputs,
                 ctx,
                 sink,
+                hooks,
             }
         }
 
@@ -8067,5 +8159,117 @@ HandBrake has exited.";
         let on_host = crate::probe_cache::file_identity(&film).unwrap();
         let (_, _, size, mtime, _) = world.row("j1");
         assert_eq!((size, mtime), (Some(on_host.size), Some(on_host.mtime)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_file_already_at_the_target_is_skipped_after_the_pull_and_says_so() {
+        // The target is H.265 1080p. The add could not probe a file on the host, so the staged
+        // copy is probed: an HEVC 720p source cannot improve, an H.264 one can, and with the
+        // setting off nothing is probed at all.
+        for (case, setting, codec, skipped) in [
+            ("hevc 720p", "true", "hevc", true),
+            ("h264 720p", "true", "h264", false),
+            ("setting off", "false", "hevc", false),
+        ] {
+            let world = RemoteWorld::new("smaller");
+            let base = world.root.parent().unwrap().to_path_buf();
+            std::fs::write(
+                base.join("scan.out"),
+                format!(
+                    "JSON Title Set: {{\"TitleList\": [{{\"Geometry\": {{\"Height\": 720}}, \
+                     \"VideoCodec\": \"{codec}\"}}]}}\n"
+                ),
+            )
+            .unwrap();
+            let preset: String = world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            world.ctx.preset_cache.lock().unwrap().insert(
+                preset,
+                crate::handbrake::PresetMetadata {
+                    codec: "h265".into(),
+                    resolution: "1080p".into(),
+                    quality: "22".into(),
+                    preset: "data".into(),
+                    device: String::new(),
+                    container: "mkv".into(),
+                },
+            );
+            set_setting(&world.ctx.db, "skip_by_source_media", setting);
+            set_setting(&world.ctx.db, "notifications_per_file", "true");
+            set_setting(
+                &world.ctx.db,
+                "post_convert_webhook_url",
+                "http://receiver.invalid/hook",
+            );
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+
+            process_queue(&world.ctx);
+
+            let body = only_webhook_body(&world.hooks);
+            assert_eq!(body["remote_host"], "unraid", "{case}");
+            let (status, kept, converted, saved, reason): (
+                String,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+            ) = world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT status, kept_file, converted_size, space_saved, skip_reason
+                     FROM jobs WHERE id = 'j1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            let notes = world.sink.notifications.lock().unwrap().clone();
+            if skipped {
+                assert_eq!(
+                    (status.as_str(), kept.as_deref(), converted, saved),
+                    ("skipped", Some("original"), None, Some(0)),
+                    "{case}"
+                );
+                assert_eq!(reason.as_deref(), Some("already_at_target"), "{case}");
+                assert_eq!(body["skip_reason"], "already_at_target", "{case}");
+                assert_eq!(body["status"], "skipped", "{case}");
+                assert!(!world.hb_inputs.exists(), "{case}: nothing encoded");
+                assert!(!world.pushed(), "{case}: nothing pushed");
+                assert_eq!(
+                    std::fs::read_to_string(&film).unwrap(),
+                    "the original, much larger",
+                    "{case}"
+                );
+                assert!(
+                    notes
+                        .iter()
+                        .any(|(_, b)| b.contains("already at the target")),
+                    "{case}: {notes:?}"
+                );
+                assert!(
+                    notes
+                        .iter()
+                        .all(|(_, b)| !b.contains("converted was larger")),
+                    "{case}: {notes:?}"
+                );
+            } else {
+                assert_eq!(status, "done", "{case}");
+                assert_eq!(reason, None, "{case}");
+                assert!(body["skip_reason"].is_null(), "{case}");
+                assert!(world.pushed(), "{case}");
+            }
+            assert!(world.staging_is_empty(), "{case}");
+        }
     }
 }

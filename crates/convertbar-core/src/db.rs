@@ -218,6 +218,14 @@ pub fn init_db(conn: &Connection) -> Result<DbInit> {
         }
     }
 
+    // Why a `skipped` job was skipped: `already_at_target` when nothing was encoded; NULL when
+    // the re-encode was larger, and on every other row.
+    if let Err(e) = conn.execute("ALTER TABLE jobs ADD COLUMN skip_reason TEXT", []) {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+
     // Backfill: Linux DBs seeded before 0.13.1 stored "H.265 MKV 1080p", which is not a
     // valid preset name in current HandBrake (the built-in is "H.265 MKV 1080p30"), so
     // every default conversion failed. INSERT OR IGNORE below won't touch existing rows,

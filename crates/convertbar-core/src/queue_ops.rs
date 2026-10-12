@@ -78,6 +78,7 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobInfo> {
         completed_at: row.get(13)?,
         started_at: row.get(14)?,
         remote_host: row.get(15)?,
+        skip_reason: row.get(16)?,
     })
 }
 
@@ -1177,6 +1178,7 @@ fn add_files_to_db_from(
             started_at: None,
             completed_at: None,
             remote_host: source.host.map(str::to_string),
+            skip_reason: None,
         });
 
         queue_order += 1;
@@ -1427,7 +1429,7 @@ pub fn get_queue(ctx: &Ctx) -> Result<Vec<JobInfo>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host, skip_reason
              FROM jobs
              WHERE status IN ('queued', 'encoding', 'paused', 'error')
              ORDER BY queue_order ASC",
@@ -1531,7 +1533,7 @@ fn get_bad_sources_inner(conn: &rusqlite::Connection) -> Result<Vec<JobInfo>, St
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                     kept_file, space_saved, error_message, failure_class, queue_order, created_at,
-                    completed_at, started_at, remote_host
+                    completed_at, started_at, remote_host, skip_reason
              FROM jobs
              WHERE status = 'error' AND failure_class IN (?1, ?2)
              ORDER BY completed_at DESC",
@@ -1650,7 +1652,7 @@ fn get_history_inner(
     let jobs = if has_search {
         let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host, skip_reason
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped') AND (source_path LIKE ?1 OR output_path LIKE ?1)
              ORDER BY {}
@@ -1667,7 +1669,7 @@ fn get_history_inner(
     } else {
         let sql = format!(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
-                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host
+                    kept_file, space_saved, error_message, failure_class, queue_order, created_at, completed_at, started_at, remote_host, skip_reason
              FROM jobs
              WHERE status IN ('done', 'error', 'skipped')
              ORDER BY {}

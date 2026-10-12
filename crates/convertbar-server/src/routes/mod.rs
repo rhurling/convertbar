@@ -711,6 +711,10 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["added"][0]["remote_host"], "unraid");
+        assert_eq!(
+            json["added"][0].get("skip_reason"),
+            Some(&serde_json::Value::Null)
+        );
         // `send` adds and then starts; the add alone must leave the queue idle.
         assert!(!state.ctx.converter.is_running());
 

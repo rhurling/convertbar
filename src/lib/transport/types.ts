@@ -16,6 +16,10 @@ export interface JobInfo {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  /** The ssh host a remote job's paths live on; null for a local job. */
+  remote_host?: string | null;
+  /** Set on a `skipped` job that was never encoded; null when the re-encode was larger. */
+  skip_reason?: "already_at_target" | null;
 }
 
 export type SkipReason =
