@@ -44,3 +44,5 @@ The README environment table and the compose example document both variables, an
 - Slice 2: done at 03099fc (slice 1's finalize already behaved; tests added and 10 mutants killed; finalize's redundant name-taken pre-check removed so the atomic mv carries it)
 - Slice 3: done at 5356447 (7 mutants killed)
 - Slice 4: done at 3d25243 (13 mutants killed)
+- Slice 5: done at 8a14a9f (recovery and the local-delete guards landed in checkpoint 1's fix pass; 6 mutants killed; the begin_finalize call site has no queue-level seam, since only the local checksum sits between push and finalize, so its decision is pinned by a direct test)
+- Checkpoint 2: BASE 7b004d4, reviewed HEAD 8a14a9f; next interval BASE 8a14a9f
