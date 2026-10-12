@@ -858,6 +858,9 @@ fn record_job_error(
 /// replaces the previous read-then-clear (two separate lock acquisitions) at the call site.
 fn take_pause_after_current(converter: &ConverterState) -> bool {
     let mut guard = converter.pause_after_current.lock().unwrap();
+    // Pause's marker lives only as long as the arming it marks: the desktop updater arms the flag
+    // directly, and a marker left over from a consumed pause must never let a Resume undo that.
+    *converter.pause_armed_by_pause.lock().unwrap() = false;
     std::mem::replace(&mut *guard, false)
 }
 
