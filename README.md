@@ -204,7 +204,8 @@ in the body **verbatim**, producing an invalid request that ConvertBar still rep
 | `source_path`, `output_path`, `result_path`, `output_dir` | yes | — | ditto. Act on `result_path`: on a skipped job the converted file was discarded, so `output_path` names a file that no longer exists |
 | `in_place`, `kept_file` | yes | — | ditto |
 | `original_size`, `converted_size`, `space_saved`, `duration_seconds` | yes | — | ditto |
-| `error_message`, `failure_class`, `started_at`, `completed_at` | yes | — | ditto |
+| `error_message`, `failure_class`, `started_at`, `completed_at` | yes | — | ditto. `failure_class` is `unreachable` when an ssh host could not be reached |
+| `remote_host`, `skip_reason` | yes | — | ditto. `remote_host` is the ssh host alias of a job on a [remote root](#remote-roots-over-ssh), whose paths are then paths on that host; `null` for a local job. `skip_reason` is `already_at_target` when the source already met the target and was not encoded, otherwise `null` |
 | `run_status` | — | yes | `"idle"` or `"error"` |
 | `completed`, `errors`, `space_saved` | — | yes | totals across the batch |
 | `output_dirs` | — | yes | deduped directories to rescan; **`{{output_dirs_json}}` exists only here** |
@@ -306,6 +307,8 @@ caveats it also documents inline:
 | `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; needed if you browse by hostname instead of IP (e.g. `nas.local`) or use a reverse proxy. |
 | `CONVERTBAR_BROWSE_ROOTS` | `/` | Colon-separated paths the web file browser may navigate. Restrict it to your media mount(s), e.g. `/media`. |
 | `CONVERTBAR_PRESET_FILE` | *(none)* | Path to a HandBrake preset file (as exported from HandBrake) to import. Its presets are listed ahead of the built-ins and every encode passes it to HandBrakeCLI, so custom presets, e.g. one that keeps every audio and subtitle track, can be selected. The output's extension follows the chosen preset's container (MP4, MKV or WebM). The server refuses to start if the file is unreadable, defines no presets, reuses a built-in preset's name (HandBrake would silently use the built-in), or HandBrakeCLI cannot be found. Not configurable through the web UI or the HTTP API. |
+| `CONVERTBAR_REMOTE_ROOTS` | *(none)* | Comma-separated `host:/dir` pairs naming directories on other machines that ConvertBar re-encodes over ssh, e.g. `unraid:/mnt/user/DATA,hetzner:/srv/media`. `host` is an alias from the server account's ssh config. A malformed entry refuses startup. Native server binary only — see [Remote roots over ssh](#remote-roots-over-ssh). Not configurable through the web UI or the HTTP API. |
+| `CONVERTBAR_STAGING_DIR` | `staging` beside the database | Local directory a remote job's source is pulled to and its result encoded into. It needs room for twice the largest source; the low-disk check looks here for remote jobs. ConvertBar only ever writes and empties its `source/` and `result/` subdirectories. |
 | `CONVERTBAR_TRUSTED_PROXIES` | *(none)* | Comma-separated IPs or CIDR ranges whose `X-Forwarded-For` header is believed, so login throttling counts real client addresses instead of the proxy's. **Set this as narrowly as possible** — see [Auth](#auth). |
 | `CONVERTBAR_POST_CONVERT_COMMAND` | *(none)* | Script or executable to run after each conversion — see [Post-convert hooks](#post-convert-hooks). Not configurable through the web UI or the HTTP API; environment-variable-only by design. |
 | `CONVERTBAR_QUEUE_DRAINED_COMMAND` | *(none)* | Script or executable to run when the queue finishes a true drain. Same restriction as above. |
@@ -411,6 +414,39 @@ Watched folders rely on `inotify`, which doesn't fire for changes made over NFS
 or SMB mounts. A watched directory on a network filesystem only picks up new
 files when the container restarts — bind-mount local disks instead for live
 intake.
+
+### Remote roots over ssh
+
+The server can re-encode files that stay on other machines, without a network mount:
+`CONVERTBAR_REMOTE_ROOTS` names the directories, and the web file browser offers them beside the
+local roots. For each remote job ConvertBar pulls the source into staging, encodes it there, and
+pushes the result beside the original under a temp name (`.<name>.convertbar-tmp.<ext>`, never
+treated as a source). It then checks the upload's size and SHA-256, gives it the original's owner,
+group and mode, and replaces the original (same name) or publishes it and deletes the original
+(new name) — but only if the original has not changed since the pull (size and mtime). Otherwise
+the job fails and both files stay.
+
+- **ssh** is the system `ssh` with the server account's own config (aliases, keys), run with
+  `BatchMode=yes`, so it never prompts: the key must work without a passphrase prompt or agent.
+- **Each host** needs a POSIX shell, GNU coreutils 9.5 or newer, and GNU findutils.
+- **The Docker image has no ssh client**, so remote roots are for the native server binary.
+- **An unreachable host** fails the job it hit with failure class `unreachable` and pauses the
+  queue, the way low disk space stops it; the web UI names the host. The next Start re-queues
+  that job and carries on.
+- **Adding never starts the queue.** A client adds, then starts:
+
+  ```sh
+  curl -X POST http://localhost:8080/api/queue/files -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"remote":"unraid","paths":["/mnt/user/DATA/Film.wmv"]}'
+  curl -X POST http://localhost:8080/api/converter/start -H "Authorization: Bearer $TOKEN"
+  ```
+
+  The folder routes (`/api/folders/scan`, `/api/queue/folder`) and `/api/fs/list` take the same
+  `remote` field. An unknown host, a path outside the roots or a symlink answers 400, an
+  unreachable host 502.
+- **Skip-by-source-media** applies after the pull, before the encode.
+- **Watched folders** cannot point at a remote root.
 
 ## Development
 
