@@ -68,8 +68,8 @@ The queue thread branches for a remote row where today it runs the vanished-sour
    - **remote baseline:** the condemned-identity stamp (bad source, truncated) and every fingerprint written. A stat of a staging file never becomes a fingerprint, because its mtime is the pull time;
    - **remote row paths:** the booked row, the hook payload, and the file name shown in the UI. They are never touched on the local disk.
 6. **Original wins** (the result is not smaller): nothing is pushed. Book `skipped` as today, with `skip_reason` null.
-7. **Result wins:** push the result into a marked temp beside the target, `.{output stem}.convertbar-tmp.{ext}`, overwriting any leftover with that name. Phase label: "Pushing…".
-8. **Re-read the cleanup mode**, as today's success arm does. If it has become `keep` and the job is in place, discard the result as today's in-place-keep backstop does: remove the remote temp, delete the row, leave the original. Otherwise:
+7. **Re-read the cleanup mode**, as today's success arm does, before anything is pushed. If it has become `keep` and the job is in place, discard the result as today's in-place-keep backstop does: delete the row, leave the original, push nothing.
+8. **Result wins:** push the result into a marked temp beside the target, `.{output stem}.convertbar-tmp.{ext}`, overwriting any leftover with that name. Phase label: "Pushing…".
 9. **Finalize**, one remote script. Phase label: "Verifying…".
    1. if the original's size or mtime differs from the pull baseline, fail with original and temp left;
    2. if the temp's size or SHA-256 differs from the local result, fail and remove the temp;
@@ -87,10 +87,10 @@ The cleanup mode keeps its meaning. The server never uses `trash` (it is forced 
 - ssh's own exit status 255 at any remote step of a running job (test, stat, pull, push, finalize) means unreachable. That covers refused connections, timeouts, authentication and host-key failures.
 - The job is booked `error` with failure class `unreachable` and a message naming the host and the step, through the notifying error path like any other failure; its post-convert hook fires. Staging is emptied. The queue then takes a persisted pause, set as a user pause is set, and the job's id is remembered as the pending re-queue, persisted the same way. The pass then ends the way the low-disk stop does: no "Queue complete" notification and no queue-drained hook, because it is not a drain.
 - The UI shows a banner naming the host and the step. Its reason is held in memory like the low-disk reason, with a route and an event of its own. After a restart the banner is gone, while the pause, the remembered id and the error row remain.
-- `/api/status` reads `stopped` while the pause holds (work queued, queue not running). No status value changes meaning.
+- `/api/status` reads `stopped` while the pause holds and other work is queued, and `idle` when the job that hit the outage was the last one. No status value changes meaning. The hook payload's `failure_class: unreachable` is the only reliable signal of an outage.
 - **The next queue start** (`POST /api/converter/start`, which the web UI's Start/Resume and API clients use, and which a local watched folder's intake also calls) re-queues the remembered job and forgets it. The job goes back to `queued` with its error message, failure class, `completed_at` and `started_at` cleared, keeping its place in the order. If its host + path already has an active row, it is left as an error instead. A re-queued job starts again from the pull. Clearing the queue also forgets the remembered id; the error row then stays in history.
 - Accepted: a local watched folder's intake lifts the pause too, and runs the remote job first. On the mini there are no watched folders.
-- Accepted edge: a connection that drops after the finalize script has completed is still booked as unreachable. An in-place job re-queued that way pulls its own result; skip-by-source-media, which the mini runs with, skips it, and with that setting off the file would be re-encoded once. A new-name job re-queued that way finds its source gone and books the quiet "no longer exists" error, although its result was published: the result is on the host, but no done row or hook for it exists, so the Stash rescan must come from Stash's own scan.
+- Accepted edge: a connection that drops after the finalize script has completed is still booked as unreachable. An in-place job re-queued that way pulls its own result; skip-by-source-media, which the mini runs with, skips it, and with that setting off the file would be re-encoded once. The new-name variant is an open question (below).
 
 ### Interruption, pause and cancel
 
@@ -152,7 +152,7 @@ The seams, the only places tests drive this cycle:
   - add without start leaves the queue idle;
   - remote browse, including a name with a newline;
   - `/api/info` roots;
-  - `/api/status` reading `stopped` after an unreachable stop;
+  - `/api/status` reading `stopped` after an unreachable stop with other work queued, and `idle` when none is;
   - purge of a remote bad source refused before any local stat;
   - the route-contract test for any new route.
 - **Hook payload and command environment:** `remote_host` and `skip_reason` present, and null for local jobs.
@@ -175,12 +175,18 @@ The seams, the only places tests drive this cycle:
 - **Local network privacy on the mini is unverified there.** TN3179 says launchd agents are subject to it and the grant follows the code signature, hence the Developer ID-signed asset (ADR 0001). Still open: whether the alert appears for an ssh spawned by the agent, and that the first LAN ssh then needs someone at the GUI session to allow it. One live run on the mini after installing the signed asset settles it, and the dotfiles side should expect that one-time alert.
 - **`mv --update=none-fail` on Unraid's user-share filesystem** has not been exercised (the probe was read-only). The recorded artifact's new-name case covers it before the dotfiles cutover.
 - The remote shim tests do not run on macOS developer machines without GNU coreutils ≥ 9.5. Accepted; they run in the Linux CI leg.
+- **New-name job after a post-finalize drop** (not yet decided): the connection drops after finalize published `x.mp4` and deleted `x.wmv`. The re-queued job finds its source gone and would book the quiet "no longer exists" error, so a successful conversion reaches the drainer as an error with no rescan. Recommendation: when a re-queued `unreachable` job finds its source definitely gone and its stored output name present on the host, book it `done` with `kept_file = converted` and the remote size, and fire the hook. That costs one extra stat. Alternative: accept it, since the drainer alerts on the error and a person can rescan by hand.
 
 ## Contract notes for the dotfiles side
 
-- Queueing is two requests: add (with `remote`), then `POST /api/converter/start`.
-- An unreachable outage reads `stopped` on `/api/status`; the hook payload's `failure_class: unreachable` is the signal.
-- `CONVERTBAR_REMOTE_ROOTS` and `CONVERTBAR_STAGING_DIR` go into the LaunchAgent's environment, not the API (ADR 0002).
+- **Release asset:** `convertbar-server_<X.Y.Z>_aarch64-apple-darwin.zip` on every GitHub release, holding the single binary `convertbar-server`. It is Developer ID-signed with hardened runtime and notarized (ADR 0001); no ticket is stapled to a bare binary. The first ssh over the LAN may raise macOS's Local Network alert once, and someone at the GUI session must allow it.
+- **Environment (LaunchAgent plist):** `CONVERTBAR_REMOTE_ROOTS` (e.g. `unraid:/mnt/user/DATA`; the share is upper-case), `CONVERTBAR_STAGING_DIR` (optional), and `CONVERTBAR_PRESET_FILE` (cycle 2). None of these can be set through the API (ADR 0002). The preset *name* is still set with `PUT /api/settings/preset`, after the server has started with the file.
+- **Remote hosts:** a POSIX shell and GNU coreutils ≥ 9.5, reached with the account's ssh config in `BatchMode`.
+- **Queueing:** two requests. First the add, with `"remote": "<ssh host alias>"` and absolute paths on that host, or the folder add with `"remote"` and one path; then `POST /api/converter/start`, which also lifts an unreachable pause.
+- **Status:** an outage reads `stopped`, or `idle` if nothing else was queued. Only the hook says why.
+- **Hook payload additions:** `remote_host` (null for local jobs) and `skip_reason` (null, or `already_at_target`); `failure_class` may be `unreachable`. For a remote job, `source_path`, `output_path`, `result_path` and `output_dir` are paths on that host. Command hooks get `CONVERTBAR_REMOTE_HOST` and `CONVERTBAR_SKIP_REASON`.
+- **Skipped jobs:** `skipped` with `skip_reason: already_at_target` means nothing was encoded. `skipped` with no reason means the re-encode was larger. In both cases the original is untouched and no rescan is needed.
+- **Open edge:** the new-name post-finalize drop (Open questions), which decides whether a successful new-name conversion can ever arrive as an error.
 
 ## ADRs
 
