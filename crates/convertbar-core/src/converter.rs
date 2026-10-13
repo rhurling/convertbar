@@ -206,10 +206,12 @@ pub struct ConverterState {
     // reaches across the crate boundary to lock/read them directly — `try_install_now` claims
     // the same `is_running` mutex `run_queue`/`claim_queue_slot` use so the two atomically
     // exclude each other, and `restart_after_killing_encoder`'s test seeds a live child via
-    // `current_pid`/`current_child`. Fields not touched cross-crate stay narrowed below.
+    // `current_pid`/`current_child`. `current_job_id` is `pub` for the server's status-route
+    // test, which pauses a stand-in encode by hand. Fields not touched cross-crate stay
+    // narrowed below.
     pub current_pid: Mutex<Option<u32>>,
     pub current_child: Mutex<Option<Child>>,
-    pub(crate) current_job_id: Mutex<Option<String>>,
+    pub current_job_id: Mutex<Option<String>>,
     pub(crate) is_paused: Mutex<bool>,
     pub is_running: Mutex<bool>,
     pub pause_after_current: Mutex<bool>,
