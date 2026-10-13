@@ -1,0 +1,3 @@
+# An unreachable host books an error and pauses the queue
+
+When a remote job cannot reach its ssh host, the job is booked as an error with a failure class of its own, its post-convert hook fires once as for any finished job, and the queue pauses the way it does for low disk space. Resume re-queues the rows of that class. The low-disk pause leaves its job queued and fires no hook, but the hook receivers need to learn about the outage from the job that hit it. Rejected: leaving the job queued and firing post-convert anyway, which breaks "one post-convert per finished job"; and a third hook event for pauses, which every receiver would have to learn.

@@ -37,6 +37,25 @@ while the mode is `keep`, not just for in-place ones. Without that fallback the 
 nothing left to be recognized by and a watched folder re-queues it every pass. Clearing
 history removes both signals, so it re-converts kept sources.
 
+## Preset File and Output Container
+
+HandBrakeCLI picks the container from the output's **extension**, never from the preset, so the
+extension is the container (ADR 0004): it comes from the preset's `FileFormat` at add time and is
+stored in `output_path`. Never pass `--format` and never hard-code `.mp4` again — an MKV preset
+named `.mp4` silently writes MP4 and drops every track MP4 cannot carry. The in-place temp keeps
+the source's extension for the same reason.
+
+The server's `CONVERTBAR_PRESET_FILE` (env only, ADR 0002) is imported with
+`--preset-import-file` on every export and encode, after `handbrake::preset_import_args` re-reads
+the file. Do not drop that pre-flight as redundant with the startup check. HandBrake re-reads the
+file on every run, skips an invalid one with **exit 0**, and lets a built-in silently win a name
+collision. Its "Invalid preset" lands ~21 KB into stderr, outside the classified tail, so without
+the pre-flight these become `Unknown` errors or a wrong-preset encode. Preset names come from the
+file's JSON, never from `--preset-list`, whose layout depends on the preset's `Type`. The path is
+stored absolute but not canonical, so a symlinked file is followed on every read.
+`crates/convertbar-server/tests/live_preset_file.rs` is the `#[ignore]`d live check against a real
+HandBrake.
+
 ## HandBrake Locator Test Fixtures
 
 Test fixtures default to `PanickingLocator` (`crates/convertbar-core/src/handbrake.rs`): a test that reaches HandBrake resolution without declaring its world fails loud instead of silently reading whatever the host has installed. Declare the world explicitly — `AbsentLocator` for the CI world, `StubLocator` for the installed world, `PathLocator` only in `#[ignore]`d tests that genuinely want the host binary. On the queue thread (`process_queue` runs on a spawned thread), a `PanickingLocator` panic poisons `ctx.db`, so the test thread's own `.lock().unwrap()` on that mutex can surface a `PoisonError` instead of the locator's message — a confusing poison error there is a hint to check for a missing locator declaration before chasing something else.

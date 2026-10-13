@@ -94,6 +94,7 @@ beforeEach(() => {
           quality: "hq",
           preset: "Fast 1080p30",
           device: "apple",
+          container: "mp4",
         });
       case "resolve_suffix_template":
         return Promise.resolve(".RESOLVED");

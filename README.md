@@ -99,7 +99,9 @@ both confine a nice value to the process's own scheduling group — so use
 2. The output filename gets a suffix built from a template. The default,
    `.{resolution}-{codec}`, turns `vacation.mkv` into `vacation.1080p-h265.mp4`.
    Available variables: `{codec}`, `{resolution}`, `{quality}`, `{preset}`,
-   `{device}` — all read from the preset's own metadata.
+   `{device}` — all read from the preset's own metadata. The extension is the preset's
+   container: an MP4 preset writes `.mp4`, an MKV preset (such as the Linux default)
+   writes `.mkv`.
 3. When the encode finishes, the two files are compared and the larger one is
    removed, according to your **After conversion** setting.
 
@@ -297,6 +299,7 @@ caveats it also documents inline:
 | `CONVERTBAR_PORT` | `8080` | Port to listen on. |
 | `CONVERTBAR_ALLOWED_HOSTS` | *(none)* | Comma-separated extra `Host` header values to accept (anti DNS-rebinding). Localhost and IP literals are always allowed; needed if you browse by hostname instead of IP (e.g. `nas.local`) or use a reverse proxy. |
 | `CONVERTBAR_BROWSE_ROOTS` | `/` | Colon-separated paths the web file browser may navigate. Restrict it to your media mount(s), e.g. `/media`. |
+| `CONVERTBAR_PRESET_FILE` | *(none)* | Path to a HandBrake preset file (as exported from HandBrake) to import. Its presets are listed ahead of the built-ins and every encode passes it to HandBrakeCLI, so custom presets, e.g. one that keeps every audio and subtitle track, can be selected. The output's extension follows the chosen preset's container (MP4, MKV or WebM). The server refuses to start if the file is unreadable, defines no presets, reuses a built-in preset's name (HandBrake would silently use the built-in), or HandBrakeCLI cannot be found. Not configurable through the web UI or the HTTP API. |
 | `CONVERTBAR_TRUSTED_PROXIES` | *(none)* | Comma-separated IPs or CIDR ranges whose `X-Forwarded-For` header is believed, so login throttling counts real client addresses instead of the proxy's. **Set this as narrowly as possible** — see [Auth](#auth). |
 | `CONVERTBAR_POST_CONVERT_COMMAND` | *(none)* | Script or executable to run after each conversion — see [Post-convert hooks](#post-convert-hooks). Not configurable through the web UI or the HTTP API; environment-variable-only by design. |
 | `CONVERTBAR_QUEUE_DRAINED_COMMAND` | *(none)* | Script or executable to run when the queue finishes a true drain. Same restriction as above. |

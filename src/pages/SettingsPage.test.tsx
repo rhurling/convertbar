@@ -58,6 +58,7 @@ const META: PresetMetadata = {
   quality: "hq",
   preset: "Fast 1080p30",
   device: "apple",
+  container: "mp4",
 };
 
 /**
@@ -164,7 +165,7 @@ function updateCallsFor(key: string) {
 }
 
 /** Desktop head with a given cleanup mode and a literal (already-resolved) suffix. */
-function withMode(cleanup_mode: string, suffix: string) {
+function withMode(cleanup_mode: string, suffix: string, meta: PresetMetadata | null = META) {
   invokeMock.mockImplementation(((cmd: string) => {
     switch (cmd) {
       case "get_settings":
@@ -174,7 +175,8 @@ function withMode(cleanup_mode: string, suffix: string) {
       case "get_preset_suffix":
         return Promise.resolve(suffix);
       case "generate_preset_suffix":
-        return Promise.resolve(META);
+        // null: the metadata fetch fails (unknown FileFormat, broken preset file).
+        return meta ? Promise.resolve(meta) : Promise.reject("Preset file cannot be read");
       case "resolve_suffix_template":
         return Promise.resolve(suffix);
       default:
@@ -653,6 +655,30 @@ describe("SettingsPage", () => {
     withMode("keep", "");
     render(<SettingsPage />);
     expect(await screen.findByText(warning)).toBeInTheDocument();
+  });
+
+  it("names outputs and in-place files by the preset's container, not always mp4", async () => {
+    // HandBrake writes the container named by the output's extension, which now comes from the
+    // preset (ADR 0004): under an MKV preset the outputs are .mkv, and it is .mkv sources that
+    // are replaced in place. A preview still saying .mp4 would describe files that never appear.
+    withMode("delete", "", { ...META, container: "mkv" });
+    render(<SettingsPage />);
+
+    await waitFor(() => expect(screen.getByText("vacation.mkv")).toBeInTheDocument());
+    expect(screen.getByText(/mkv files are re-encoded in place/i)).toBeInTheDocument();
+    expect(screen.queryByText(/mp4/i)).not.toBeInTheDocument();
+  });
+
+  it("does not guess which originals are replaced in place when the preset's container is unknown", async () => {
+    // A failed metadata fetch leaves the container unknown. Saying "mp4 files are re-encoded in
+    // place" then would tell a user of an MKV preset that their .mkv originals are safe.
+    withMode("delete", "", null);
+    render(<SettingsPage />);
+
+    expect(
+      await screen.findByText(/files already in the preset's container are re-encoded in place/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/mp4 files are re-encoded/i)).not.toBeInTheDocument();
   });
 
   it("does not call a whitespace-only suffix in-place — the engine only treats the exactly-empty one that way", async () => {

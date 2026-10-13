@@ -351,7 +351,11 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
     return <div className="settings-page loading">Loading settings...</div>;
   }
 
-  const previewFilename = `vacation${resolvedSuffix}.mp4`;
+  // The output's extension is the preset's container (ADR 0004). Without metadata the preview
+  // stays approximate (it already shows the unresolved template), but the in-place note names
+  // which originals get replaced, so it must not guess a container.
+  const container = presetMetadata?.container;
+  const previewFilename = `vacation${resolvedSuffix}.${container ?? "mp4"}`;
 
   const visibleVariables = VARIABLES.filter(
     ({ key }) => presetMetadata && presetMetadata[key],
@@ -435,7 +439,9 @@ export default function SettingsPage({ onHbPathChanged }: SettingsPageProps) {
                 `vacation .mp4`. Trimming here warned about skips that never happen. */}
             {resolvedSuffix === "" && (
               <div className="suffix-inplace-note">
-                Empty suffix: mp4 files are re-encoded in place, replacing the original. The fast
+                Empty suffix:{" "}
+                {container ? `${container} files are` : "files already in the preset's container are"}{" "}
+                re-encoded in place, replacing the original. The fast
                 &quot;already converted&quot; skip-by-suffix is also disabled.
                 {settings.cleanup_mode === "keep" && (
                   <>

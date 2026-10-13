@@ -13,6 +13,7 @@ services:
       # PGID: "1000"                         # its output files run/land as this uid:gid
       # CONVERTBAR_BROWSE_ROOTS: "/media"    # optional: restrict the file browser
       # CONVERTBAR_ALLOWED_HOSTS: "nas.local"   # needed if you browse by hostname instead of IP
+      # CONVERTBAR_PRESET_FILE: "/config/presets.json"   # optional: import custom HandBrake presets
       # Hook scripts live under ./config/hooks on the host — already covered by the ./config
       # mount below. Do NOT add a second mount for them: the entrypoint chown -R's /config when
       # PUID/PGID are set, so a separately mounted host directory would have its ownership

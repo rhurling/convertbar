@@ -67,6 +67,15 @@ async fn main() {
         },
     );
 
+    // Before binding and before `boot`: a preset file that cannot serve must stop startup here,
+    // not fail every queued job in turn once the queue resumes.
+    if let Some(file) = &config.preset_file {
+        if let Err(e) = startup::load_preset_import(&ctx, file) {
+            eprintln!("convertbar-server: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let bind = config.bind;
 

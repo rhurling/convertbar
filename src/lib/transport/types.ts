@@ -170,6 +170,8 @@ export interface PresetMetadata {
   quality: string;
   preset: string;
   device: string;
+  /** Output extension from the preset's FileFormat: "mp4", "mkv" or "webm". */
+  container: string;
 }
 
 export interface WatchedDirectory {

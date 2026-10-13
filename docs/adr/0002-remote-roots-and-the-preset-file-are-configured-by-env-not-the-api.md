@@ -1,0 +1,3 @@
+# Remote roots and the preset file are configured by env, not the API
+
+The server head takes its remote roots (an ssh host alias plus a directory) and the HandBrake preset file to import from environment variables, the same way it takes `CONVERTBAR_BROWSE_ROOTS`, and never from `PUT /api/settings`. A remote root lets ConvertBar delete files on another machine, so a root settable over HTTP would let anyone holding the token aim deletes at any host in the account's ssh config. The same boundary keeps the command hooks out of `ALLOWED_KEYS`. The cost: a change needs a restart of the LaunchAgent, and the host's install script writes these into the agent's plist instead of applying them through the API.

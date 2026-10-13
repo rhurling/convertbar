@@ -109,6 +109,16 @@
     Mask="false">/media</Config>
 
   <Config
+    Name="Preset File"
+    Target="CONVERTBAR_PRESET_FILE"
+    Default=""
+    Description="Optional path to a HandBrake preset file to import, e.g. /config/presets.json. Its presets appear ahead of the built-ins, and outputs take the chosen preset's container (MP4, MKV or WebM). The server refuses to start if the file cannot be used."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false"/>
+
+  <Config
     Name="Allowed Hosts"
     Target="CONVERTBAR_ALLOWED_HOSTS"
     Default=""

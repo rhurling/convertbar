@@ -13,6 +13,14 @@ pub struct PresetMetadata {
     pub quality: String,
     pub preset: String,
     pub device: String,
+    /// The output file extension, from the preset's `FileFormat`. Defaults to `mp4` when
+    /// absent so metadata the frontend sends back from an older build still deserialises.
+    #[serde(default = "default_container")]
+    pub container: String,
+}
+
+fn default_container() -> String {
+    "mp4".to_string()
 }
 
 pub fn detect_handbrake_path() -> Option<String> {
@@ -88,6 +96,127 @@ impl HandbrakeLocator for AbsentLocator {
     }
 }
 
+/// A preset file for HandBrakeCLI's `--preset-import-file`, set once by the server head before
+/// boot (ADR 0002) and never by the desktop. `builtins` are HandBrake's own preset names, listed
+/// once at startup without the import flag: an imported preset with a built-in's name is
+/// silently shadowed by the built-in, so the pre-flight refuses that collision.
+#[derive(Debug, Clone)]
+pub struct PresetImport {
+    pub path: std::path::PathBuf,
+    pub builtins: std::collections::HashSet<String>,
+}
+
+/// Every preset name a HandBrake preset file defines, recursing into folders. Read from the
+/// file itself rather than parsed out of `--preset-list`, whose layout depends on the file: a
+/// custom preset (`Type: 1`) prints under `My Presets/` at four spaces, but one exported from a
+/// built-in (`Type: 0`) prints at column 0 with its description at four spaces.
+pub fn imported_preset_names(file: &serde_json::Value) -> Vec<String> {
+    fn collect(list: &serde_json::Value, out: &mut Vec<String>) {
+        for entry in list.as_array().into_iter().flatten() {
+            if entry["Folder"].as_bool() == Some(true) {
+                collect(&entry["ChildrenArray"], out);
+            } else if let Some(name) = entry["PresetName"].as_str() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(&file["PresetList"], &mut out);
+    out
+}
+
+/// The preset names a preset file defines, in file order without repeats (HandBrake uses only
+/// one preset per name). The one place that reads the file, so startup, the preset list and the
+/// per-run pre-flight word every failure the same way.
+pub fn read_preset_file(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let shown = path.display();
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("Preset file {shown} cannot be read: {e}"))?;
+    let file: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("Preset file {shown} is not valid JSON: {e}"))?;
+    let mut names: Vec<String> = Vec::new();
+    for name in imported_preset_names(&file) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// The refusal for preset-file names that equal HandBrake built-ins, which HandBrake would use
+/// instead without a word. `None` when nothing collides.
+pub fn builtin_collision(
+    path: &std::path::Path,
+    imported: &[String],
+    builtins: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let collisions: Vec<&str> = imported
+        .iter()
+        .filter(|name| builtins.contains(*name))
+        .map(String::as_str)
+        .collect();
+    (!collisions.is_empty()).then(|| {
+        format!(
+            "Preset file {} reuses the name of a HandBrake built-in preset, which HandBrake \
+             would use instead: {}",
+            path.display(),
+            collisions.join(", ")
+        )
+    })
+}
+
+/// Every preset the user can pick: the preset file's own presets first, then HandBrake's
+/// built-ins. The built-ins are listed without the import flag, so nothing appears twice. A file
+/// that has changed since startup so that it now shadows a built-in is an error rather than a
+/// list offering a preset HandBrake would replace. Collisions are judged against the built-in
+/// names taken at startup — the same set the per-run pre-flight uses — so the list and the
+/// encode can never disagree about one.
+pub fn list_available_presets(ctx: &Ctx) -> Result<Vec<String>, String> {
+    let hb = require_handbrake_path(ctx)?;
+    let builtins = list_presets(&hb)?;
+    let Some(import) = ctx.preset_import.get() else {
+        return Ok(builtins);
+    };
+    let imported = read_preset_file(&import.path)?;
+    if let Some(refusal) = builtin_collision(&import.path, &imported, &import.builtins) {
+        return Err(refusal);
+    }
+    Ok(imported.into_iter().chain(builtins).collect())
+}
+
+/// The arguments that make `preset` resolvable for HandBrakeCLI: none without a configured
+/// preset file, `--preset-import-file <file>` with one — after checking that the file can
+/// actually serve `preset`.
+///
+/// HandBrake re-reads the file on every run, and one it cannot parse is skipped with exit 0,
+/// leaving only the built-ins: an imported name then fails as "Invalid preset" deep inside a
+/// ~21 KB stderr (outside the tail the failure classifier sees), and a name that collides
+/// with a built-in silently encodes the built-in. Checking first turns both into an error
+/// that names the file.
+pub fn preset_import_args(ctx: &Ctx, preset: &str) -> Result<Vec<String>, String> {
+    let Some(import) = ctx.preset_import.get() else {
+        return Ok(Vec::new());
+    };
+    let imported = read_preset_file(&import.path)?;
+    let in_file = imported.iter().any(|n| n == preset);
+    let builtin = import.builtins.contains(preset);
+    if in_file && builtin {
+        let mine = [preset.to_string()];
+        return Err(builtin_collision(&import.path, &mine, &import.builtins)
+            .expect("the preset is both imported and built in"));
+    }
+    if !in_file && !builtin {
+        return Err(format!(
+            "Preset \"{preset}\" is neither in the preset file {} nor built into HandBrake",
+            import.path.display()
+        ));
+    }
+    Ok(vec![
+        "--preset-import-file".to_string(),
+        import.path.to_string_lossy().to_string(),
+    ])
+}
+
 /// The installed world, without requiring a real binary on the host.
 pub struct StubLocator(pub String);
 
@@ -125,6 +254,7 @@ pub fn seed_preset_cache(ctx: &Ctx) {
             quality: "22".into(),
             preset: "Fast 1080p30".into(),
             device: "VideoToolbox".into(),
+            container: "mp4".into(),
         },
     );
 }
@@ -232,8 +362,10 @@ fn parse_preset_list(stderr: &str) -> Vec<String> {
 pub(crate) fn get_preset_metadata(
     handbrake_path: &str,
     preset_name: &str,
+    import_args: &[String],
 ) -> Result<PresetMetadata, String> {
     let output = Command::new(handbrake_path)
+        .args(import_args)
         .arg("--preset")
         .arg(preset_name)
         .arg("--preset-export")
@@ -275,13 +407,18 @@ fn interpret_preset_export(
         )
     })?;
 
-    Ok(classify_preset(&json["PresetList"][0], preset_name))
+    classify_preset(&json["PresetList"][0], preset_name)
 }
 
 /// Pure classification of a preset's exported JSON (the `PresetList[0]` object) plus its
 /// name into the metadata used for output-filename suffixes. Split out of
 /// `get_preset_metadata` so it can be table-tested without invoking HandBrakeCLI.
-fn classify_preset(preset_obj: &serde_json::Value, preset_name: &str) -> PresetMetadata {
+fn classify_preset(
+    preset_obj: &serde_json::Value,
+    preset_name: &str,
+) -> Result<PresetMetadata, String> {
+    let container = container_extension(preset_obj["FileFormat"].as_str(), preset_name)?;
+
     let video_encoder = preset_obj["VideoEncoder"]
         .as_str()
         .unwrap_or("")
@@ -375,12 +512,28 @@ fn classify_preset(preset_obj: &serde_json::Value, preset_name: &str) -> PresetM
     }
     .to_string();
 
-    PresetMetadata {
+    Ok(PresetMetadata {
         codec,
         resolution,
         quality,
         preset: preset_slug,
         device,
+        container,
+    })
+}
+
+/// The output extension for a preset's `FileFormat`. HandBrakeCLI picks the container from the
+/// output's extension, so this IS the container (ADR 0004). A missing field means MP4, as every
+/// output was before; an unknown value is refused rather than guessed, because a guessed
+/// extension lets HandBrake mis-detect the format.
+fn container_extension(file_format: Option<&str>, preset_name: &str) -> Result<String, String> {
+    match file_format {
+        None | Some("av_mp4") => Ok("mp4".to_string()),
+        Some("av_mkv") => Ok("mkv".to_string()),
+        Some("av_webm") => Ok("webm".to_string()),
+        Some(other) => Err(format!(
+            "Preset \"{preset_name}\" has an unsupported FileFormat \"{other}\"; ConvertBar knows av_mp4, av_mkv and av_webm"
+        )),
     }
 }
 
@@ -456,7 +609,8 @@ pub fn cached_preset_metadata(
         }
     }
 
-    let metadata = get_preset_metadata(hb_path, preset)?;
+    let import_args = preset_import_args(ctx, preset)?;
+    let metadata = get_preset_metadata(hb_path, preset, &import_args)?;
 
     ctx.preset_cache
         .lock()
@@ -552,6 +706,7 @@ mod tests {
             quality: "hq".into(),
             preset: "preset".into(),
             device: device.into(),
+            container: "mp4".into(),
         }
     }
 
@@ -661,6 +816,36 @@ Matroska/
     }
 
     #[test]
+    fn the_container_follows_the_presets_file_format() {
+        // The extension decides the container HandBrake writes (ADR 0004), so each row of the
+        // mapping is load-bearing: `av_mkv -> mp4` would silently put MKV presets back into MP4.
+        for (file_format, want) in [
+            (Some("av_mp4"), "mp4"),
+            (Some("av_mkv"), "mkv"),
+            (Some("av_webm"), "webm"),
+            (None, "mp4"),
+        ] {
+            let field = file_format
+                .map(|f| format!(r#","FileFormat":"{f}""#))
+                .unwrap_or_default();
+            let stdout = format!(r#"{{"PresetList":[{{"VideoEncoder":"x265"{field}}}]}}"#);
+            let m = interpret_preset_export(true, &stdout, "", "data").unwrap();
+            assert_eq!(m.container, want, "FileFormat {file_format:?}");
+        }
+    }
+
+    #[test]
+    fn metadata_without_a_container_deserialises_as_mp4() {
+        // The settings page sends metadata back to resolve a suffix preview; a payload from a
+        // build that predates the field must still deserialise, as MP4 (what it always was).
+        let m: PresetMetadata = serde_json::from_str(
+            r#"{"codec":"h265","resolution":"1080p","quality":"hq","preset":"p","device":""}"#,
+        )
+        .unwrap();
+        assert_eq!(m.container, "mp4");
+    }
+
+    #[test]
     fn cached_preset_metadata_serves_hits_without_shelling_out() {
         let ctx = test_ctx();
         ctx.preset_cache
@@ -741,7 +926,7 @@ Matroska/
         for (encoder, want) in cases {
             let obj = serde_json::json!({ "VideoEncoder": encoder });
             assert_eq!(
-                classify_preset(&obj, "preset").codec,
+                classify_preset(&obj, "preset").unwrap().codec,
                 want,
                 "encoder {encoder}"
             );
@@ -767,7 +952,11 @@ Matroska/
         ];
         for (name, want) in cases {
             let obj = serde_json::json!({});
-            assert_eq!(classify_preset(&obj, name).device, want, "name {name}");
+            assert_eq!(
+                classify_preset(&obj, name).unwrap().device,
+                want,
+                "name {name}"
+            );
         }
     }
 
@@ -785,7 +974,11 @@ Matroska/
         ];
         for (name, want) in cases {
             let obj = serde_json::json!({});
-            assert_eq!(classify_preset(&obj, name).quality, want, "name {name}");
+            assert_eq!(
+                classify_preset(&obj, name).unwrap().quality,
+                want,
+                "name {name}"
+            );
         }
     }
 
@@ -794,7 +987,9 @@ Matroska/
         // No recognized name prefix -> q{rounded VideoQualitySlider}.
         let obj = serde_json::json!({ "VideoQualitySlider": 22.4 });
         assert_eq!(
-            classify_preset(&obj, "Apple 1080p30 Surround").quality,
+            classify_preset(&obj, "Apple 1080p30 Surround")
+                .unwrap()
+                .quality,
             "q22"
         );
     }
@@ -802,9 +997,9 @@ Matroska/
     #[test]
     fn classify_preset_reads_resolution_from_height() {
         let zero = serde_json::json!({ "PictureHeight": 0 });
-        assert_eq!(classify_preset(&zero, "preset").resolution, "");
+        assert_eq!(classify_preset(&zero, "preset").unwrap().resolution, "");
         let hd = serde_json::json!({ "PictureHeight": 1080 });
-        assert_eq!(classify_preset(&hd, "preset").resolution, "1080p");
+        assert_eq!(classify_preset(&hd, "preset").unwrap().resolution, "1080p");
     }
 
     #[test]
