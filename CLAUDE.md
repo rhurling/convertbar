@@ -91,6 +91,15 @@ Notarization authenticates with the App Store Connect API key — deliberately n
 
 The preflight step exists because both failure modes are silent: the bundler skips notarization with only a *warning* when the API-key variables are absent, and falls back to an ad-hoc signature when the certificate is absent. Either would ship a release that looks fine and breaks every user's permission grants. A missing secret fails the macOS legs instead, which leaves the release an unpublished draft (`publish-release` needs every matrix leg green).
 
+The darwin-arm64 server asset (`publish-server-darwin` job, `scripts/package-server-macos.sh`)
+is signed with the same identity and secrets, under the fixed identifier `com.convertbar.server`,
+and notarized through `notarytool` (ADR 0001). The identifier is load-bearing: the designated
+requirement is identifier + team, which is what keeps the LaunchAgent's local-network grant
+(TN3179) across releases. Changing it costs every install that grant once. The script refuses
+an ad-hoc or non-Developer-ID signature and smoke-tests that the signed binary serves the
+embedded web UI. Run it locally with the installed identity to rehearse everything except
+notarization.
+
 `tauri.conf.json` intentionally carries no `signingIdentity`: local builds, including the rebuild inside `scripts/release.sh`, stay ad-hoc and need no private key. Only CI signs.
 
 **Renewal:** the certificate expires **2031-07-30**. Re-run Task 1 of `docs/superpowers/plans/2026-07-29-macos-code-signing.md` and replace the first three secrets. A renewed certificate under the same Team ID does **not** cost users their permissions again — the designated requirement anchors to the team and bundle identifier, not to the particular certificate. Builds already shipped keep working after expiry; notarization tickets do not expire with the cert.
