@@ -355,10 +355,22 @@ jobs:
             exit 1
           fi
 
+      # By id, not `gh release upload <tag>`: gh resolves a tag to one arbitrary release when
+      # two drafts share it. Delete-then-upload replaces the asset on a re-run.
       - name: Upload to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" "$SERVER_ZIP" --clobber --repo "$GITHUB_REPOSITORY"
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --jq '.assets[] | select(.name == $ENV.SERVER_ZIP) | .id')
+          if [ -n "$old" ]; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+          fi
+          gh api -X POST \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$SERVER_ZIP" \
+            -H "Content-Type: application/zip" --input "$SERVER_ZIP" --silent
 
   # Publishing is the event that seals an immutable release, so it runs once,
   # after every platform has uploaded to the draft.
@@ -372,7 +384,7 @@ jobs:
       # platforms. The legs also merge their platforms into one shared latest.json, a
       # read-modify-write that a near-simultaneous finish can lose. Publishing is the last
       # moment anything can be added, so check the draft itself. On a failure, re-run the
-      # leg whose platform is missing, then this job.
+      # leg(s) whose platforms are missing, then this job.
       - name: Refuse an incomplete release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
