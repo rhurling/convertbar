@@ -21,6 +21,12 @@ pub struct JobInfo {
     /// converter::claim_job.
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// The ssh host alias a remote job's paths live on (ADR 0005); `None` for a local job.
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    /// `already_at_target` for a `skipped` job nothing was encoded for; `None` otherwise.
+    #[serde(default)]
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,10 +165,16 @@ pub enum PurgeOutcome {
     Unverifiable,
     /// The delete/trash call itself failed.
     Failed,
+    /// The file lives on a remote host (`PurgeResult::host`): ConvertBar never deletes a
+    /// remote source, so it is left for the user to delete by hand there.
+    Remote,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PurgeResult {
     pub id: String,
     pub outcome: PurgeOutcome,
+    /// The host of a `Remote` outcome; `None` otherwise.
+    #[serde(default)]
+    pub host: Option<String>,
 }

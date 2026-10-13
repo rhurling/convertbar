@@ -26,6 +26,8 @@ constant_time_eq = "0.5"
 ipnet = "2"
 
 [dev-dependencies]
+# The ssh shim behind the remote-root route tests.
+convertbar-core = { path = "../convertbar-core", features = ["test-support"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util"] }

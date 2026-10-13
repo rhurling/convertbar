@@ -14,33 +14,65 @@ use serde::Deserialize;
 
 use convertbar_core::queue_ops;
 
-use super::{blocking_json, core_err, ServerState};
+use super::{blocking_json, blocking_response, core_err, remote_json, ServerState};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddFilesBody {
     paths: Vec<String>,
+    /// An ssh host alias from `CONVERTBAR_REMOTE_ROOTS`; the paths are then absolute paths on
+    /// that host (ADR 0005). Absent: local paths, as before.
+    #[serde(default)]
+    remote: Option<String>,
 }
 
 pub async fn add_files(State(s): State<ServerState>, Json(b): Json<AddFilesBody>) -> Response {
     let ctx = s.ctx.clone();
-    blocking_json(move || queue_ops::add_files(&ctx, &b.paths)).await
+    match b.remote {
+        None => blocking_json(move || queue_ops::add_files(&ctx, &b.paths)).await,
+        Some(host) => {
+            blocking_response(move || {
+                remote_json(queue_ops::add_remote_files(&ctx, &host, &b.paths))
+            })
+            .await
+        }
+    }
 }
 
-/// Shared by `scan_folder` and `confirm_folder_add` — both bodies are just `{"path": "..."}`.
+/// Shared by `scan_folder` and `confirm_folder_add` — both bodies are `{"path": "..."}`, plus
+/// `remote` as in [`AddFilesBody`].
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathBody {
     path: String,
+    #[serde(default)]
+    remote: Option<String>,
 }
 
-pub async fn scan_folder(Json(b): Json<PathBody>) -> Response {
-    blocking_json(move || queue_ops::scan_folder(b.path)).await
+pub async fn scan_folder(State(s): State<ServerState>, Json(b): Json<PathBody>) -> Response {
+    match b.remote {
+        None => blocking_json(move || queue_ops::scan_folder(b.path)).await,
+        Some(host) => {
+            let ctx = s.ctx.clone();
+            blocking_response(move || {
+                remote_json(queue_ops::scan_remote_folder(&ctx, &host, b.path))
+            })
+            .await
+        }
+    }
 }
 
 pub async fn confirm_folder_add(State(s): State<ServerState>, Json(b): Json<PathBody>) -> Response {
     let ctx = s.ctx.clone();
-    blocking_json(move || queue_ops::confirm_folder_add(&ctx, b.path)).await
+    match b.remote {
+        None => blocking_json(move || queue_ops::confirm_folder_add(&ctx, b.path)).await,
+        Some(host) => {
+            blocking_response(move || {
+                remote_json(queue_ops::confirm_remote_folder_add(&ctx, &host, b.path))
+            })
+            .await
+        }
+    }
 }
 
 #[derive(Deserialize)]

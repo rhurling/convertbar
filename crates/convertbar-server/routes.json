@@ -21,6 +21,7 @@
   {"command": "cancel_pause_after_current", "method": "DELETE", "path": "/api/converter/pause-after-current"},
   {"command": "get_pause_after_current",    "method": "GET",    "path": "/api/converter/pause-after-current"},
   {"command": "get_low_disk_pause",         "method": "GET",    "path": "/api/converter/low-disk-pause"},
+  {"command": "get_unreachable_stop",       "method": "GET",    "path": "/api/converter/unreachable-stop"},
   {"command": "get_settings",               "method": "GET",    "path": "/api/settings"},
   {"command": "update_setting",             "method": "PUT",    "path": "/api/settings/{key}"},
   {"command": "get_preset_suffix",          "method": "GET",    "path": "/api/presets/{preset}/suffix"},

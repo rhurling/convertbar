@@ -69,6 +69,21 @@ beforeEach(() => {
 });
 
 describe("ActiveJob", () => {
+  it("names a remote job's transfer step in place of Encoding, for its own job only", async () => {
+    const { rerender } = render(
+      <ActiveJob job={job()} progress={null} phase={{ job_id: "1", phase: "Pulling…" }} />,
+    );
+    expect(await screen.findByText("Pulling…")).toBeInTheDocument();
+    expect(screen.queryByText("Encoding")).toBeNull();
+
+    // The last job's phase never carries over to the next one.
+    rerender(<ActiveJob job={job({ id: "2" })} progress={null} phase={{ job_id: "1", phase: "Verifying…" }} />);
+    expect(screen.getByText("Encoding")).toBeInTheDocument();
+
+    rerender(<ActiveJob job={job()} progress={null} phase={{ job_id: "1", phase: null }} />);
+    expect(screen.getByText("Encoding")).toBeInTheDocument();
+  });
+
   it("seeds the pause-after-current button from the backend flag on mount", async () => {
     pauseAfter = true; // queue already armed elsewhere (e.g. the updater flow)
 

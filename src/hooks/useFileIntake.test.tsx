@@ -18,6 +18,14 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
   }),
 }));
 
+// The remote calls go straight to the server's routes (remote roots exist only there).
+const remoteApi = vi.hoisted(() => ({
+  addRemoteFiles: vi.fn(),
+  scanRemoteFolder: vi.fn(),
+  confirmRemoteFolderAdd: vi.fn(),
+}));
+vi.mock("../lib/transport/http", () => ({ httpCommands: remoteApi }));
+
 import { invoke } from "@tauri-apps/api/core";
 import { useFileIntake } from "./useFileIntake";
 import type { ClassifiedPaths, AddResult } from "../lib/tauri";
@@ -445,5 +453,35 @@ describe("useFileIntake", () => {
     });
 
     expect(result.current.status).toBe("Nothing added · 1 path no longer exists");
+  });
+
+  it("adds a remote pick on its host, counting its folders there and never classifying locally", async () => {
+    const counts: Record<string, number> = { "/D/Show": 2, "/D/Big": 9 };
+    remoteApi.scanRemoteFolder.mockImplementation((_host: string, path: string) =>
+      Promise.resolve({ file_count: counts[path], folder_name: path.slice(3), folder_path: path }),
+    );
+    remoteApi.addRemoteFiles.mockResolvedValue({ added: [], skipped: [] });
+    remoteApi.confirmRemoteFolderAdd.mockResolvedValue({ added: [], skipped: [] });
+    const { result } = renderHook(() => useFileIntake({ onDrop: vi.fn() }));
+
+    await act(() =>
+      result.current.addPaths(["/D/Show", "/D/film.wmv", "/D/Big"], {
+        host: "unraid",
+        folders: ["/D/Show", "/D/Big"],
+      }),
+    );
+
+    await waitFor(() => expect(remoteApi.addRemoteFiles).toHaveBeenCalledWith("unraid", ["/D/film.wmv"]));
+    await waitFor(() => expect(remoteApi.confirmRemoteFolderAdd).toHaveBeenCalledWith("unraid", "/D/Show"));
+    expect(remoteApi.scanRemoteFolder).toHaveBeenCalledWith("unraid", "/D/Big");
+    expect(invokeMock).not.toHaveBeenCalledWith("classify_paths", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("add_files", expect.anything());
+    expect(invokeMock).toHaveBeenCalledWith("start_queue");
+
+    // The big folder waits for confirmation and, once confirmed, still goes to its host.
+    await waitFor(() => expect(result.current.pendingConfirm?.folder_path).toBe("/D/Big"));
+    act(() => result.current.onAdd());
+    await waitFor(() => expect(remoteApi.confirmRemoteFolderAdd).toHaveBeenCalledWith("unraid", "/D/Big"));
+    expect(invokeMock).not.toHaveBeenCalledWith("confirm_folder_add", expect.anything());
   });
 });

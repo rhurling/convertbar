@@ -10,6 +10,10 @@ repository.workspace = true
 [lib]
 name = "convertbar_core"
 
+[features]
+# The ssh shim for remote-root tests, for the server crate's own tests.
+test-support = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +29,8 @@ fs4 = { version = "1.1", features = ["sync"] }
 # rustls setup bundles webpki-roots and ignores the OS trust store, so a receiver behind a
 # private CA or a self-signed homelab proxy would fail with no obvious cause.
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+# Verifies a remote job's pushed result before the original is replaced (ADR 0006).
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 # SIGSTOP/SIGCONT (control::pause_conversion/resume_conversion/cancel_conversion,

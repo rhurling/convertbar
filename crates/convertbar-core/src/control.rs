@@ -39,9 +39,17 @@ pub fn start_queue(ctx: &Arc<Ctx>) -> Result<(), String> {
     // The slot is ours from here: `process_queue`'s `RunningGuard` releases it.
 
     // A user (re)starting the queue — Resume button, or a drag-drop add which routes through
-    // startQueue — clears any remembered pause.
-    if let Ok(conn) = ctx.db.lock() {
-        converter::set_queue_paused(&conn, false);
+    // startQueue — clears any remembered pause, and takes back the job an outage stopped on.
+    let requeued = match ctx.db.lock() {
+        Ok(conn) => {
+            let requeued = converter::requeue_after_outage(&conn);
+            converter::set_queue_paused(&conn, false);
+            requeued
+        }
+        Err(_) => false,
+    };
+    if requeued {
+        ctx.events.emit_t("queue-updated", ());
     }
 
     converter::spawn_queue_thread(ctx.clone());
@@ -124,6 +132,34 @@ pub fn pause_conversion(ctx: &Ctx) -> Result<(), String> {
                         fps: None,
                     },
                 );
+            }
+        } else if let Some(ref job_id) = job_id_val {
+            // A remote job between its transfers (stat, probe, checksum, finalize) has nothing to
+            // freeze: pause after it rather than not at all. A local job keeps today's behaviour.
+            let remote = ctx
+                .db
+                .lock()
+                .map_err(|e| e.to_string())?
+                .query_row(
+                    "SELECT remote_host IS NOT NULL FROM jobs WHERE id = ?1",
+                    params![job_id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+            if remote {
+                let mut armed = ctx
+                    .converter
+                    .pause_after_current
+                    .lock()
+                    .map_err(|e| e.to_string())?;
+                // Already armed by the user's "Pause after this": it stays theirs.
+                if !*armed {
+                    *armed = true;
+                    *ctx.converter
+                        .pause_armed_by_pause
+                        .lock()
+                        .map_err(|e| e.to_string())? = true;
+                }
             }
         }
     }
@@ -217,6 +253,22 @@ pub fn resume_conversion(ctx: &Ctx) -> Result<(), String> {
                     },
                 );
             }
+        } else {
+            // Nothing is frozen, so the pause being undone is the one Pause armed between a
+            // remote job's transfers — only that one, never the user's own "Pause after this".
+            let mut armed = ctx
+                .converter
+                .pause_after_current
+                .lock()
+                .map_err(|e| e.to_string())?;
+            let mut by_pause = ctx
+                .converter
+                .pause_armed_by_pause
+                .lock()
+                .map_err(|e| e.to_string())?;
+            if std::mem::replace(&mut *by_pause, false) {
+                *armed = false;
+            }
         }
     }
     Ok(())
@@ -227,11 +279,8 @@ pub fn resume_conversion(ctx: &Ctx) -> Result<(), String> {
 /// delete partial output (in-place-aware: `in_place_temp_path` for in-place jobs, never
 /// `output_path`).
 pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
-    // Cancelling the current job doesn't stop the queue (it continues with the next job), so a
-    // pause remembered from an earlier SIGSTOP must be dropped — otherwise the next launch would
-    // wrongly stay paused for a queue that was actively running.
-    if let Ok(conn) = ctx.db.lock() {
-        converter::set_queue_paused(&conn, false);
+    if let Ok(_conn) = ctx.db.lock() {
+        refuse_while_finalizing(ctx)?;
     }
 
     let job_id_val = {
@@ -250,9 +299,14 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
     let (paths, update_result) = match job_id_val {
         Some(ref job_id) => {
             let db = ctx.db.lock().map_err(|e| e.to_string())?;
+            // Again under the lock this booking takes: finalize may have begun since the check
+            // above, and it decides whether to start under this same lock.
+            refuse_while_finalizing(ctx)?;
+            // A remote row's paths name files on its host: nothing local is deleted for it.
             let paths: Option<(String, String)> = db
                 .query_row(
-                    "SELECT source_path, output_path FROM jobs WHERE id = ?1",
+                    "SELECT source_path, output_path FROM jobs WHERE id = ?1 \
+                     AND remote_host IS NULL",
                     params![job_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
@@ -260,16 +314,26 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
             // completed_at must be set here, not left for the next launch's backfill: until
             // then the row sorts to the bottom of History (ordered by completed_at DESC)
             // instead of showing up as the most recent entry, which is where a just-cancelled
-            // job belongs.
+            // job belongs. Only a row still running is cancelled: a remote job stays current
+            // after its booking, through a post-convert hook that can block for minutes.
             let update_result = db.execute(
                 "UPDATE jobs SET status = 'error', error_message = 'Cancelled by user', \
-                 failure_class = ?2, completed_at = ?3 WHERE id = ?1",
+                 failure_class = ?2, completed_at = ?3 \
+                 WHERE id = ?1 AND status IN ('encoding', 'paused')",
                 params![
                     job_id,
                     crate::failure_class::FailureClass::Environment.as_str(),
                     chrono::Utc::now().to_rfc3339(),
                 ],
             );
+            // Cancelling the current job doesn't stop the queue (it continues with the next
+            // job), so a pause remembered from an earlier SIGSTOP must be dropped — otherwise the
+            // next launch would wrongly stay paused for a queue that was actively running. Only
+            // when something was cancelled: a refused or empty Cancel leaves the pause alone,
+            // including an outage's persisted pause while that job's hook still runs.
+            if matches!(update_result, Ok(n) if n > 0) {
+                converter::set_queue_paused(&db, false);
+            }
             (paths, Some(update_result))
         }
         None => (None, None),
@@ -320,11 +384,12 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
         .map_err(|e| e.to_string())? = None;
 
     // Surface a status-write failure now that the process has been killed.
-    if let Some(res) = update_result {
-        res.map_err(|e| e.to_string())?;
-    }
+    let cancelled = match update_result {
+        Some(res) => res.map_err(|e| e.to_string())? > 0,
+        None => false,
+    };
 
-    if let Some(ref job_id) = job_id_val {
+    if let Some(job_id) = job_id_val.as_ref().filter(|_| cancelled) {
         if let Some((ref source_path, ref output_path)) = paths {
             // For an in-place job output_path == source_path, so deleting output_path would delete
             // the user's original. Remove the temp instead; otherwise remove the partial output.
@@ -370,17 +435,40 @@ pub fn cancel_conversion(ctx: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a Cancel while a remote job finalizes. Call with `ctx.db` held.
+fn refuse_while_finalizing(ctx: &Ctx) -> Result<(), String> {
+    match ctx
+        .converter
+        .finalizing_on
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_deref()
+    {
+        Some(host) => Err(format!("finishing on {host}; try again in a moment")),
+        None => Ok(()),
+    }
+}
+
+/// The user's own arming: from here on the flag is theirs, and no Resume takes it back.
 pub fn pause_after_current(ctx: &Ctx) -> Result<(), String> {
     *ctx.converter
         .pause_after_current
         .lock()
         .map_err(|e| e.to_string())? = true;
+    *ctx.converter
+        .pause_armed_by_pause
+        .lock()
+        .map_err(|e| e.to_string())? = false;
     Ok(())
 }
 
 pub fn cancel_pause_after_current(ctx: &Ctx) -> Result<(), String> {
     *ctx.converter
         .pause_after_current
+        .lock()
+        .map_err(|e| e.to_string())? = false;
+    *ctx.converter
+        .pause_armed_by_pause
         .lock()
         .map_err(|e| e.to_string())? = false;
     Ok(())
@@ -392,6 +480,10 @@ pub fn get_pause_after_current(ctx: &Ctx) -> bool {
 
 pub fn get_low_disk_pause(ctx: &Ctx) -> Option<LowDiskPause> {
     ctx.converter.low_disk_pause()
+}
+
+pub fn get_unreachable_stop(ctx: &Ctx) -> Option<converter::UnreachableStop> {
+    ctx.converter.unreachable_stop()
 }
 
 #[cfg(test)]
@@ -533,6 +625,126 @@ mod tests {
             "the recorded PID must be cleared too, so a racing quit can't SIGCONT a reaped, \
              possibly-recycled PID before the queue loop clears it"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pause_with_nothing_to_freeze_waits_for_a_remote_job_only_until_resume() {
+        // A remote job between transfers has no child: Pause arms pause-after-current, and a
+        // Resume with nothing frozen takes it back. A local job keeps the desktop's behaviour.
+        for (host, armed) in [(Some("unraid"), true), (None, false)] {
+            let conn = Connection::open_in_memory().unwrap();
+            crate::db::init_db(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, remote_host)
+                 VALUES ('j1', '/share/a.mkv', '/share/a.mkv', 'p', 'encoding', 0,
+                         '2020-01-01T00:00:00Z', ?1)",
+                params![host],
+            )
+            .unwrap();
+            let ctx = test_ctx(conn);
+            *ctx.converter.current_job_id.lock().unwrap() = Some("j1".into());
+
+            pause_conversion(&ctx).unwrap();
+            assert_eq!(get_pause_after_current(&ctx), armed, "{host:?}");
+
+            resume_conversion(&ctx).unwrap();
+            assert!(!get_pause_after_current(&ctx), "{host:?}");
+
+            // The user's own "Pause after this" is theirs: neither a Pause on top of it nor the
+            // Resume that follows takes it back.
+            pause_after_current(&ctx).unwrap();
+            pause_conversion(&ctx).unwrap();
+            resume_conversion(&ctx).unwrap();
+            assert!(
+                get_pause_after_current(&ctx),
+                "{host:?}: the user's arming stays"
+            );
+            cancel_pause_after_current(&ctx).unwrap();
+        }
+    }
+
+    #[test]
+    fn cancel_never_rewrites_a_job_that_already_finished() {
+        // A remote job stays the current job until its turn ends, which includes a post-convert
+        // hook that can block for minutes after the row is booked.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                               created_at, remote_host)
+             VALUES ('j1', '/share/a.mkv', '/share/a.mkv', 'p', 'done', 0,
+                     '2020-01-01T00:00:00Z', 'unraid')",
+            [],
+        )
+        .unwrap();
+        // The outage that booked it: a persisted pause and a remembered job, which a Cancel that
+        // cancels nothing must not undo.
+        converter::set_user_queue_pause(&conn);
+        converter::write_setting(&conn, converter::UNREACHABLE_JOB_KEY, Some("j1"));
+        let ctx = test_ctx(conn);
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".into());
+
+        cancel_conversion(&ctx).unwrap();
+
+        {
+            let db = ctx.db.lock().unwrap();
+            assert!(converter::is_queue_paused(&db), "the pause stays");
+            assert_eq!(
+                converter::read_setting_opt(&db, converter::UNREACHABLE_JOB_KEY).as_deref(),
+                Some("j1")
+            );
+        }
+        let (status, msg): (String, Option<String>) = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, error_message FROM jobs WHERE id = 'j1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), msg), ("done", None));
+    }
+
+    #[test]
+    fn cancelling_a_remote_job_deletes_nothing_local() {
+        // A remote row's paths name files on its host. Local files that happen to share them —
+        // the distinct output, and the temp sibling an in-place job would have — must survive.
+        let dir = tempfile::tempdir().unwrap();
+        for (output_name, local_name) in [
+            ("remote.h265.mkv", "remote.h265.mkv"),
+            ("remote.wmv", ".remote.convertbar-tmp.wmv"),
+        ] {
+            let source = dir.path().join("remote.wmv");
+            let output = dir.path().join(output_name);
+            let local = dir.path().join(local_name);
+            std::fs::write(&local, b"a local file").unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            crate::db::init_db(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, remote_host)
+                 VALUES ('j1', ?1, ?2, 'p', 'encoding', 0, '2020-01-01T00:00:00Z', 'unraid')",
+                params![source.to_str().unwrap(), output.to_str().unwrap()],
+            )
+            .unwrap();
+            let ctx = test_ctx(conn);
+            *ctx.converter.current_job_id.lock().unwrap() = Some("j1".into());
+
+            cancel_conversion(&ctx).unwrap();
+
+            assert!(local.exists(), "{local_name} must survive");
+            let status: String = ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT status FROM jobs WHERE id = 'j1'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(status, "error", "the cancel itself is still booked");
+        }
     }
 
     #[test]

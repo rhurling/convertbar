@@ -3,12 +3,17 @@ import { render, screen, waitFor, fireEvent, act } from "@testing-library/react"
 
 const fsListMock = vi.fn();
 let browseRoots: string[] = ["/"];
+let remoteRoots: { host: string; dir: string }[] = [];
 vi.mock("../lib/transport/http", () => ({
   httpCommands: {
     // The real route always reports the directory it listed, so the seam supplies it too:
     // by default the one that was asked for, which is right whenever no symlink is involved.
     // A fixture that returns its own `path` (a listing that resolved elsewhere) wins.
-    fsList: async (path: string) => ({ path, ...(await fsListMock(path)) }),
+    // A remote listing passes its host on; a local one is called exactly as before.
+    fsList: async (path: string, remote?: string) => ({
+      path,
+      ...(await (remote === undefined ? fsListMock(path) : fsListMock(path, remote))),
+    }),
     getAppInfo: () =>
       Promise.resolve({
         version: "1.0.0",
@@ -16,6 +21,7 @@ vi.mock("../lib/transport/http", () => ({
         can_pause_process: false,
         auth_required: false,
         browse_roots: browseRoots,
+        remote_roots: remoteRoots,
       }),
   },
 }));
@@ -30,6 +36,7 @@ function entry(overrides: Partial<FsEntry>): FsEntry {
 beforeEach(() => {
   vi.clearAllMocks();
   browseRoots = ["/"];
+  remoteRoots = [];
 });
 
 describe("FileBrowserModal", () => {
@@ -282,6 +289,52 @@ describe("FileBrowserModal", () => {
 
     await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/data"));
     expect(await screen.findByText("in-data")).toBeInTheDocument();
+  });
+
+  it("browses a remote root on its host and picks from that host alone", async () => {
+    browseRoots = ["/media"];
+    remoteRoots = [{ host: "unraid", dir: "/mnt/user/DATA" }];
+    fsListMock.mockImplementation((path: string, remote?: string) => {
+      if (remote === undefined && path === "/media") {
+        return Promise.resolve({ entries: [entry({ name: "local.mp4", path: "/media/local.mp4" })] });
+      }
+      if (remote === "unraid" && path === "/mnt/user/DATA") {
+        return Promise.resolve({
+          entries: [
+            entry({ name: "Show", path: "/mnt/user/DATA/Show", is_dir: true }),
+            entry({ name: "film.wmv", path: "/mnt/user/DATA/film.wmv", size: 5 }),
+          ],
+        });
+      }
+      return Promise.reject(new Error(`unexpected listing: ${remote}:${path}`));
+    });
+    const onSelect = vi.fn();
+
+    render(<FileBrowserModal mode="files" onSelect={onSelect} onClose={vi.fn()} />);
+
+    // A local pick first: it cannot travel with an add to another machine.
+    fireEvent.click(await screen.findByText("local.mp4"));
+    fireEvent.click(screen.getByRole("button", { name: "unraid:/mnt/user/DATA" }));
+    await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/mnt/user/DATA", "unraid"));
+    fireEvent.click(await screen.findByText("Show"));
+    fireEvent.click(screen.getByText("film.wmv"));
+    fireEvent.click(screen.getByRole("button", { name: /add 2 items/i }));
+
+    expect(onSelect).toHaveBeenCalledWith(["/mnt/user/DATA/Show", "/mnt/user/DATA/film.wmv"], {
+      host: "unraid",
+      folders: ["/mnt/user/DATA/Show"],
+    });
+  });
+
+  it("never offers a remote root for a watched folder", async () => {
+    browseRoots = ["/media"];
+    remoteRoots = [{ host: "unraid", dir: "/mnt/user/DATA" }];
+    fsListMock.mockResolvedValue({ entries: [] });
+
+    render(<FileBrowserModal mode="directory" onSelect={vi.fn()} onClose={vi.fn()} />);
+
+    await waitFor(() => expect(fsListMock).toHaveBeenCalledWith("/media"));
+    expect(screen.queryByRole("button", { name: /unraid/ })).toBeNull();
   });
 
   it("leaves the root switcher out when there is only one root", async () => {

@@ -41,6 +41,30 @@ pub fn normalize_server_settings(ctx: &Ctx) {
     }
 }
 
+/// Prepares staging (created, then emptied: a crash can leave a job's copy behind) and hands the
+/// remote roots to `ctx`, with the system `ssh`. Refuses when staging cannot be created.
+pub fn load_remote_roots(
+    ctx: &Ctx,
+    roots: Vec<convertbar_core::remote::RemoteRoot>,
+    staging: std::path::PathBuf,
+) -> Result<(), String> {
+    std::fs::create_dir_all(&staging).map_err(|e| {
+        format!(
+            "the staging directory {} cannot be created: {e}",
+            staging.display()
+        )
+    })?;
+    let setup = convertbar_core::remote::RemoteSetup {
+        roots,
+        staging,
+        ssh: std::path::PathBuf::from("ssh"),
+    };
+    setup.empty_staging();
+    ctx.remote
+        .set(setup)
+        .map_err(|_| "the remote roots were already loaded".to_string())
+}
+
 /// Imports the configured preset file into `ctx`, or refuses with the reason startup must stop.
 ///
 /// Every refusal here would otherwise fail each queued job in turn, one HandBrake run at a time.

@@ -1,14 +1,18 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { commands, type FolderScanResult, type AddResult } from "../lib/tauri";
+import { commands, type FolderScanResult, type AddResult, type ClassifiedPaths } from "../lib/tauri";
 import { isServerHead } from "../lib/head";
 import { summarizeAdds } from "../lib/addSummary";
 import { errorText } from "../lib/errors";
+import { httpCommands } from "../lib/transport/http";
+import type { RemotePick } from "../components/FileBrowserModal";
 
 /** Folders with this many files or fewer are added without a confirm prompt. */
 const AUTO_ADD_MAX = 5;
 
 type AddTask = ({ kind: "files"; paths: string[] } | { kind: "folder"; folder: FolderScanResult }) & {
+  /** The ssh host the paths are on; absent for local paths. */
+  remote?: string;
   /** What classify dropped from the same selection (empty folders, vanished paths), appended to
    * this task's own summary. It cannot be shown when it is discovered: every task overwrites the
    * status with its summary as it lands, so a message set at classify time is wiped within
@@ -18,7 +22,7 @@ type AddTask = ({ kind: "files"; paths: string[] } | { kind: "folder"; folder: F
 
 /** A folder awaiting the user's confirmation, plus any notice its selection has to report once
  * the user answers — the notice outlives the prompt because the prompt has no deadline. */
-type PendingConfirm = { folder: FolderScanResult; notice?: string };
+type PendingConfirm = { folder: FolderScanResult; notice?: string; remote?: string };
 
 export interface FileIntake {
   pendingConfirm: FolderScanResult | null;
@@ -27,7 +31,17 @@ export interface FileIntake {
   status: string | null;
   isDragOver: boolean;
   /** Feeds the same classify → enqueue pipeline as a drag-drop, for the server head's file-browser modal. */
-  addPaths: (paths: string[]) => Promise<void>;
+  addPaths: (paths: string[], remote?: RemotePick) => Promise<void>;
+}
+
+/** The remote counterpart of `classify_paths`: the picker already knows which paths are folders
+ * (the client cannot look at another machine), and each folder is counted on its host. */
+async function classifyRemote(paths: string[], remote: RemotePick): Promise<ClassifiedPaths> {
+  const folders: FolderScanResult[] = [];
+  for (const folder of remote.folders) {
+    folders.push(await httpCommands.scanRemoteFolder(remote.host, folder));
+  }
+  return { files: paths.filter((p) => !remote.folders.includes(p)), folders };
 }
 
 /**
@@ -77,8 +91,11 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
       while (taskQueueRef.current.length > 0) {
         const task = taskQueueRef.current.shift()!;
         try {
-          const res: AddResult =
-            task.kind === "files"
+          const res: AddResult = task.remote
+            ? task.kind === "files"
+              ? await httpCommands.addRemoteFiles(task.remote, task.paths)
+              : await httpCommands.confirmRemoteFolderAdd(task.remote, task.folder.folder_path)
+            : task.kind === "files"
               ? await commands.addFiles(task.paths)
               : await commands.confirmFolderAdd(task.folder.folder_path);
           await commands.startQueue();
@@ -103,11 +120,11 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
   );
 
   const handlePaths = useCallback(
-    async (paths: string[]) => {
+    async (paths: string[], remote?: RemotePick) => {
       setStatusMsg("Adding…"); // immediate feedback so a slow classify walk isn't dead air
       let classified;
       try {
-        classified = await commands.classifyPaths(paths);
+        classified = remote ? await classifyRemote(paths, remote) : await commands.classifyPaths(paths);
       } catch (e) {
         setStatusMsg(`Error: ${errorText(e)}`, true);
         return;
@@ -119,14 +136,14 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
       const tasks: AddTask[] = [];
       let emptyFolders = 0;
       if (classified.files.length > 0) {
-        tasks.push({ kind: "files", paths: classified.files });
+        tasks.push({ kind: "files", paths: classified.files, remote: remote?.host });
       }
       const confirms: FolderScanResult[] = [];
       for (const folder of classified.folders) {
         if (folder.file_count === 0) {
           emptyFolders++;
         } else if (folder.file_count <= AUTO_ADD_MAX) {
-          tasks.push({ kind: "folder", folder });
+          tasks.push({ kind: "folder", folder, remote: remote?.host });
         } else {
           confirms.push(folder);
         }
@@ -149,7 +166,7 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
       const notice = skipped.join(" · ");
 
       // push, never replace — the anti-clobber invariant.
-      const pending: PendingConfirm[] = confirms.map((folder) => ({ folder }));
+      const pending: PendingConfirm[] = confirms.map((folder) => ({ folder, remote: remote?.host }));
       confirmQueueRef.current.push(...pending);
 
       if (tasks.length > 0) {
@@ -211,7 +228,7 @@ export function useFileIntake(opts: { onDrop: () => void }): FileIntake {
     if (!next) return;
     confirmQueueRef.current.shift();
     bump();
-    enqueue({ kind: "folder", folder: next.folder, notice: next.notice });
+    enqueue({ kind: "folder", folder: next.folder, notice: next.notice, remote: next.remote });
   }, [enqueue, bump]);
 
   const onSkip = useCallback(() => {

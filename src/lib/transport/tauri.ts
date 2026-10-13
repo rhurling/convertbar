@@ -16,6 +16,7 @@ import type {
   PlatformCapabilities,
   PresetMetadata,
   PurgeResult,
+  UnreachableStop,
   UpdateState,
   WatchedDirectory,
 } from "./types";
@@ -65,6 +66,7 @@ export const tauriCommands = {
   cancelPauseAfterCurrent: () => invoke<void>("cancel_pause_after_current"),
   getPauseAfterCurrent: () => invoke<boolean>("get_pause_after_current"),
   getLowDiskPause: () => invoke<LowDiskPause | null>("get_low_disk_pause"),
+  getUnreachableStop: () => invoke<UnreachableStop | null>("get_unreachable_stop"),
   getPlatformCapabilities: () =>
     invoke<PlatformCapabilities>("get_platform_capabilities"),
   validateHandbrake: () => invoke<HandbrakeStatus>("validate_handbrake"),
@@ -121,6 +123,7 @@ export const tauriCommands = {
       priority_is_group_scoped: caps.priority_is_group_scoped,
       auth_required: false,
       browse_roots: [], // no browse roots on desktop — it uses the native file picker instead
+      remote_roots: [],
     };
   },
 };

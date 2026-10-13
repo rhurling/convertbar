@@ -170,9 +170,12 @@ Window position is persisted across restarts via `tauri-plugin-window-state`. Sc
 `HookRunner` seam, same pattern as `FileDisposer`/`HandbrakeLocator`. Six invariants a future
 change is most likely to break:
 
-- `post-convert` has two fire points; the error one must stay on `record_job_error_quiet`, not
+- `post-convert` has three fire points; the error one must stay on `record_job_error_quiet`, not
   the `record_job_error` wrapper, or the direct `record_job_error_quiet` call in the
-  vanished-source gate (the one that bypasses the `record_job_error` wrapper) is missed.
+  vanished-source gate (the one that bypasses the `record_job_error` wrapper) is missed. The
+  third is `book_without_encode`, which books a remote job that never reaches the encoder
+  (already at the target after the pull, or published by a finalize an outage cut off); a new
+  no-encode booking must go through it, or its job ends silently.
 - `queue-drained` fires only on a true drain. The queue-done block is also reached by
   `pause_after_current`, which is every pause on Windows.
 - `post_convert_command` / `queue_drained_command` are absent from `ALLOWED_KEYS` and from the
@@ -209,6 +212,41 @@ change is most likely to break:
   the two — and deliberately LEAVES the flag set when it refuses to release, so that refusal is
   settled by the same DB-backed check as every other. The guard is disarmed after a successful
   release so its drop cannot free a slot another run has since claimed.
+
+## Remote Roots over ssh
+
+The server head re-encodes files on other machines (`CONVERTBAR_REMOTE_ROOTS`, ADRs 0003, 0005,
+0006): pull into staging, encode, push to a marked temp, then finalize on the host. What a
+change here is most likely to break:
+
+- **`remote.rs` owns all ssh I/O.** Scripts travel on stdin to `sh -s`, their arguments in a
+  leading `set --` line, never on the command line: sshd hands the remote command to the login
+  shell as one argument, which Linux caps at 128 KiB — a few hundred paths of a folder add. The
+  ssh shim enforces that cap. Each script is a function called on its last line, so a cut-off
+  stream runs nothing. ssh's exit 255 means unreachable, so no script may exit 255.
+- **A remote row's path names a file on its host, never here.** Every site that stats, trashes
+  or deletes a job's local path excludes remote rows (`remote_host IS NULL`): recovery, cancel,
+  the bad-source lookup, and purge, which answers `remote` from the row before any local rung. A
+  new local-file site must do the same, or it destroys an unrelated local file of the same path.
+  Dedupe and the name-taken check key on host + path.
+- **`RemoteTurn`'s drop ends every remote turn** however it ends: it clears `current_job_id`,
+  `finalizing_on`, the outage re-queue marker and the phase, and empties staging. It empties only
+  `source/` and `result/`: `CONVERTBAR_STAGING_DIR` may name a directory holding anything.
+- **Cancel is refused while `finalizing_on` is set**, every done or no-encode booking writes only
+  a row still `encoding`/`paused`, and a cancel lifts the persisted pause only when it booked a
+  row. A failure of a job a Cancel already booked is the Cancel's (`pull_source` and the publish
+  arm turn it into `Killed`): `record_job_error_quiet` is unguarded, and an outage booking over a
+  Cancel would have the next Start take the cancelled job back.
+- **Finalize re-reads `cleanup_mode`** (`begin_finalize`, under the lock a Cancel books under):
+  a push can take many minutes, and a switch to `keep` during it must still keep the original.
+- **Containment compares resolved paths.** A root may itself be a symlink (a share reached
+  through one); anything below it must resolve to the resolved root plus the rest of the path as
+  named, or it is a symlink and refused, so finalize never renames over a link. Listings use
+  `find -H` and show symlinks as nothing, and answer in paths as named, as `/api/info`
+  advertises the roots as configured.
+- The shim tests need GNU coreutils ≥ 9.5 and findutils (Homebrew's `gnubin` locally; CI
+  installs them). `crates/convertbar-server/tests/live_remote_roots.rs` is the `#[ignore]`d live
+  run against a real host (default `unraid`), in a scratch directory it removes.
 
 ## Status Endpoint (`GET /api/status`)
 

@@ -34,6 +34,10 @@ pub struct JobPayload {
     pub failure_class: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// The ssh host the paths above live on; `None` for a local job.
+    pub remote_host: Option<String>,
+    /// `already_at_target` when a skipped job was never encoded; `None` otherwise.
+    pub skip_reason: Option<String>,
 }
 
 /// Every path-valued key in a payload object. Path mapping rewrites exactly these.
@@ -58,6 +62,8 @@ fn job_object(j: &JobPayload) -> Value {
         "failure_class": j.failure_class,
         "started_at": j.started_at,
         "completed_at": j.completed_at,
+        "remote_host": j.remote_host,
+        "skip_reason": j.skip_reason,
     })
 }
 
@@ -819,7 +825,8 @@ fn report_failure(ctx: &crate::ctx::Ctx, trigger: Trigger, reason: &str) {
 pub fn load_job_payload(db: &rusqlite::Connection, job_id: &str) -> Option<JobPayload> {
     db.query_row(
         "SELECT id, status, source_path, output_path, preset, kept_file, original_size, \
-         converted_size, space_saved, error_message, failure_class, started_at, completed_at \
+         converted_size, space_saved, error_message, failure_class, started_at, completed_at, \
+         remote_host, skip_reason \
          FROM jobs WHERE id = ?1",
         rusqlite::params![job_id],
         |r| {
@@ -837,6 +844,8 @@ pub fn load_job_payload(db: &rusqlite::Connection, job_id: &str) -> Option<JobPa
                 r.get(10)?,
                 r.get(11)?,
                 r.get(12)?,
+                r.get(13)?,
+                r.get(14)?,
             ))
         },
     )
@@ -858,6 +867,8 @@ fn row_to_payload(
     failure_class: Option<String>,
     started_at: Option<String>,
     completed_at: Option<String>,
+    remote_host: Option<String>,
+    skip_reason: Option<String>,
 ) -> JobPayload {
     // The file that EXISTS now, keyed on kept_file: "converted" is the re-encode; "original"
     // is the skipped case, where the converted file was discarded, AND `KeptFile::Neither`,
@@ -905,6 +916,8 @@ fn row_to_payload(
         failure_class,
         started_at,
         completed_at,
+        remote_host,
+        skip_reason,
     }
 }
 
@@ -961,7 +974,8 @@ pub fn load_jobs_since(
 ) -> Vec<JobPayload> {
     let mut stmt = match db.prepare(
         "SELECT id, status, source_path, output_path, preset, kept_file, original_size, \
-         converted_size, space_saved, error_message, failure_class, started_at, completed_at \
+         converted_size, space_saved, error_message, failure_class, started_at, completed_at, \
+         remote_host, skip_reason \
          FROM jobs WHERE completed_at IS NOT NULL AND completed_at > ?1 \
          ORDER BY completed_at ASC LIMIT ?2",
     ) {
@@ -986,6 +1000,8 @@ pub fn load_jobs_since(
             r.get(10)?,
             r.get(11)?,
             r.get(12)?,
+            r.get(13)?,
+            r.get(14)?,
         ))
     });
     match rows {
@@ -1170,6 +1186,8 @@ mod tests {
             failure_class: None,
             started_at: Some("2026-08-21T10:00:00+00:00".into()),
             completed_at: Some("2026-08-21T10:06:52+00:00".into()),
+            remote_host: None,
+            skip_reason: None,
         }
     }
 
@@ -1504,6 +1522,21 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(&get("CONVERTBAR_PAYLOAD")).expect("valid JSON");
         assert_eq!(payload["job_id"], "j1");
+        assert!(
+            env.iter()
+                .any(|(n, v)| n == "CONVERTBAR_REMOTE_HOST" && v.is_empty()),
+            "a local job's host is set, and empty"
+        );
+
+        let remote = post_convert_payload(&JobPayload {
+            remote_host: Some("unraid".into()),
+            skip_reason: Some("already_at_target".into()),
+            ..skipped()
+        });
+        let env = command_env(&remote);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("CONVERTBAR_REMOTE_HOST"), Some("unraid"));
+        assert_eq!(get("CONVERTBAR_SKIP_REASON"), Some("already_at_target"));
     }
 
     #[test]

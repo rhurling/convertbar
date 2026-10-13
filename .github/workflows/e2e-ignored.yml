@@ -35,4 +35,6 @@ jobs:
       - uses: swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: ". -> target"
-      - run: cargo test --workspace -- --ignored
+      # The live remote-roots run needs a real ssh host (`unraid` by default), which a runner
+      # has none of; it is run by hand (crates/convertbar-server/tests/live_remote_roots.rs).
+      - run: cargo test --workspace -- --ignored --skip a_remote_mp4_is_replaced_in_place

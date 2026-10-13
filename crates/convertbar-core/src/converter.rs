@@ -39,23 +39,30 @@ pub(crate) fn in_place_temp_path(source_path: &str) -> std::path::PathBuf {
 /// (mirrors `cancel_conversion`'s guard; deleting `output_path` here would destroy the user's file).
 pub fn recover_interrupted_jobs(db: &Connection) {
     let mut stmt = match db.prepare(
-        "SELECT id, source_path, output_path FROM jobs WHERE status IN ('encoding', 'paused')",
+        "SELECT id, source_path, output_path, remote_host FROM jobs \
+         WHERE status IN ('encoding', 'paused')",
     ) {
         Ok(s) => s,
         Err(_) => return,
     };
-    let interrupted: Vec<(String, String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    let interrupted: Vec<(String, String, String, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default();
 
-    for (id, source_path, output_path) in &interrupted {
-        let target = if is_in_place(source_path, output_path) {
-            in_place_temp_path(source_path)
-        } else {
-            std::path::PathBuf::from(output_path)
-        };
-        let _ = std::fs::remove_file(&target);
+    for (id, source_path, output_path, remote_host) in &interrupted {
+        // A remote row's paths name files on its host; its partial result lived in staging,
+        // which startup empties. Nothing local is deleted for it.
+        if remote_host.is_none() {
+            let target = if is_in_place(source_path, output_path) {
+                in_place_temp_path(source_path)
+            } else {
+                std::path::PathBuf::from(output_path)
+            };
+            let _ = std::fs::remove_file(&target);
+        }
         let _ = db.execute(
             // started_at is cleared with the status: the abandoned attempt's start time must
             // not survive into the next one. Four error paths in process_queue (vanished
@@ -206,6 +213,9 @@ pub struct ConverterState {
     pub(crate) is_paused: Mutex<bool>,
     pub is_running: Mutex<bool>,
     pub pause_after_current: Mutex<bool>,
+    /// Whether `pause_after_current` was armed by Pause (a remote job between transfers), not by
+    /// the user's own "Pause after this": a Resume with nothing frozen undoes only Pause's.
+    pub(crate) pause_armed_by_pause: Mutex<bool>,
     /// One-way app-teardown latch: armed by `kill_active_child`, checked by
     /// `process_queue` so the queue thread never spawns another encoder mid-quit.
     pub(crate) shutdown: std::sync::atomic::AtomicBool,
@@ -218,6 +228,12 @@ pub struct ConverterState {
     /// never hits the gate) doesn't leave a stale reason around. Lets the UI seed the banner from
     /// backend state on mount, not just the live `queue-paused-low-disk` event.
     pub(crate) low_disk_pause: Mutex<Option<LowDiskPause>>,
+    /// Why the queue stopped for an unreachable host (ADR 0003): held in memory like the
+    /// low-disk reason, and gone after a restart while the persisted pause stays.
+    pub(crate) unreachable_stop: Mutex<Option<UnreachableStop>>,
+    /// The host a remote job is finalizing on. Set and read under the `ctx.db` lock, so a
+    /// Cancel either books the job before finalize starts or is refused while it runs.
+    pub(crate) finalizing_on: Mutex<Option<String>>,
     /// Whether this queue run has already notified about a hook failure. Lives on the state
     /// rather than as a `process_queue` local because one fire point is inside
     /// `record_job_error_quiet`, a free function reached from nine places: threading `&mut`
@@ -247,9 +263,12 @@ impl ConverterState {
             is_paused: Mutex::new(false),
             is_running: Mutex::new(false),
             pause_after_current: Mutex::new(false),
+            pause_armed_by_pause: Mutex::new(false),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             installing: std::sync::atomic::AtomicBool::new(false),
             low_disk_pause: Mutex::new(None),
+            unreachable_stop: Mutex::new(None),
+            finalizing_on: Mutex::new(None),
             hook_failure_notified: Mutex::new(false),
             work_arrived_while_busy: std::sync::atomic::AtomicBool::new(false),
         }
@@ -268,6 +287,13 @@ impl ConverterState {
 
     pub fn low_disk_pause(&self) -> Option<LowDiskPause> {
         self.low_disk_pause
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(None)
+    }
+
+    pub fn unreachable_stop(&self) -> Option<UnreachableStop> {
+        self.unreachable_stop
             .lock()
             .map(|g| g.clone())
             .unwrap_or(None)
@@ -373,6 +399,13 @@ pub struct ConversionProgress {
     pub eta_seconds: u64,
 }
 
+/// The host a remote job could not reach, and the step it was at.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UnreachableStop {
+    pub host: String,
+    pub step: String,
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct LowDiskPause {
     pub path: String,
@@ -469,7 +502,7 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
         .prepare(
             "SELECT id, source_path, output_path, preset, status, original_size, converted_size,
                 kept_file, space_saved, error_message, failure_class, queue_order, created_at,
-                completed_at, started_at
+                completed_at, started_at, remote_host, skip_reason
          FROM jobs WHERE status = 'queued'
          ORDER BY queue_order ASC LIMIT 1",
         )
@@ -492,6 +525,8 @@ fn get_next_job(db: &Connection) -> Option<JobInfo> {
             created_at: row.get(12)?,
             completed_at: row.get(13)?,
             started_at: row.get(14)?,
+            remote_host: row.get(15)?,
+            skip_reason: row.get(16)?,
         })
     })
     .ok()
@@ -823,6 +858,9 @@ fn record_job_error(
 /// replaces the previous read-then-clear (two separate lock acquisitions) at the call site.
 fn take_pause_after_current(converter: &ConverterState) -> bool {
     let mut guard = converter.pause_after_current.lock().unwrap();
+    // Pause's marker lives only as long as the arming it marks: the desktop updater arms the flag
+    // directly, and a marker left over from a consumed pause must never let a Resume undo that.
+    *converter.pause_armed_by_pause.lock().unwrap() = false;
     std::mem::replace(&mut *guard, false)
 }
 
@@ -950,6 +988,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
     // Every run/resume starts fresh: a stale reason from a prior pause must not linger once
     // the queue is running again (and be gone entirely if this run never hits the gate).
     *ctx.converter.low_disk_pause.lock().unwrap() = None;
+    *ctx.converter.unreachable_stop.lock().unwrap() = None;
     // Once per run, not once per file: a broken receiver on a 200-file queue must produce one
     // notification, and the next run must be able to notify again.
     *ctx.converter.hook_failure_notified.lock().unwrap() = false;
@@ -960,7 +999,13 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
     // never reached at all by the low-disk and shutdown returns. Only this flag gates the
     // queue-drained hook.
     let mut drained = false;
+    // Set once a remote job's turn has ended. Its error paths `continue` past the done path's
+    // pause-after-current check, and Pause arms that flag between a remote job's transfers.
+    let mut after_remote_job = false;
     loop {
+        if after_remote_job && pause_if_armed(ctx) {
+            break;
+        }
         // Quit path: kill_active_child armed shutdown. Bail before picking up another
         // job — teardown would otherwise race a fresh HandBrakeCLI spawn and orphan it.
         // Return (not break) so no "Queue complete" notification fires mid-quit, and `Stopped`
@@ -1000,13 +1045,36 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             .unwrap_or("unknown")
             .to_string();
 
+        // A remote job (ADR 0005) runs the same encode on a staged copy. Its paths are paths on
+        // another machine, so no local gate below is ever asked about them.
+        let remote = match job.remote_host.as_deref() {
+            None => None,
+            Some(host) => match ctx.remote.get() {
+                Some(setup) if setup.knows_host(host) => Some((host.to_string(), setup)),
+                _ => {
+                    had_errors = true;
+                    record_job_error(
+                        ctx,
+                        &job.id,
+                        &file_name,
+                        &format!("{host} is not a configured remote host"),
+                        crate::failure_class::FailureClass::Environment,
+                    );
+                    continue;
+                }
+            },
+        };
+
         // Vanished-source gate: a queued file can be moved, trashed, or consumed by another tool
         // before its turn. Handing the dead path to HandBrakeCLI makes it fail with the reason
         // buried in a stderr dump, so stat first and record what actually happened. Quietly: the
         // user removed the file themselves, so the history entry is enough — no notification.
         // Ahead of the low-disk gate on purpose: a job that can never run must not hold up the
         // queue behind a disk pause, and the gate would size it from a source that isn't there.
-        if source_is_confirmed_missing(std::path::Path::new(&job.source_path).try_exists()) {
+        // A remote source is tested on its host, after the claim (`pull_source`).
+        if remote.is_none()
+            && source_is_confirmed_missing(std::path::Path::new(&job.source_path).try_exists())
+        {
             had_errors = true;
             record_job_error_quiet(
                 ctx,
@@ -1022,14 +1090,23 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
         // the run like "Pause after this" — leave the job 'queued', tell the UI why, and return
         // (nothing completed, so no "Queue complete" notification). Fail open: a 0 threshold, an
         // unresolvable parent, or a failed free-space query all let the encode proceed.
+        // A remote job's encode happens in staging: its source copy and its result, about twice
+        // the source, which is what the headroom factor already reserves.
+        let (gate_target, gate_path) = match &remote {
+            Some((_, setup)) => (
+                setup.staging.join("result").to_string_lossy().into_owned(),
+                setup.staging.to_string_lossy().into_owned(),
+            ),
+            None => (job.output_path.clone(), job.output_path.clone()),
+        };
         if low_disk_min_gb > 0.0 {
-            if let Some(available) = destination_available_bytes(&job.output_path) {
+            if let Some(available) = destination_available_bytes(&gate_target) {
                 let floor = gb_to_bytes(low_disk_min_gb);
                 let source_size = job.original_size.unwrap_or(0).max(0) as u64;
                 if !has_enough_disk(available, floor, source_size) {
                     let required = required_free_bytes(floor, source_size);
                     let pause = LowDiskPause {
-                        path: job.output_path.clone(),
+                        path: gate_path,
                         available_bytes: available,
                         required_bytes: required,
                     };
@@ -1155,15 +1232,138 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             },
         );
 
-        let in_place = is_in_place(&job.source_path, &job.output_path);
-        let encode_target = if in_place {
-            in_place_temp_path(&job.source_path)
-        } else {
-            std::path::PathBuf::from(&job.output_path)
+        after_remote_job = remote.is_some();
+        let _turn = remote.as_ref().map(|(_, setup)| RemoteTurn {
+            ctx,
+            setup,
+            job_id: job.id.clone(),
+        });
+
+        // Which local file HandBrake reads. For a remote job it is the staged copy, and the pull
+        // baseline is what every fingerprint of this job is taken from.
+        let mut baseline: Option<crate::remote::RemoteStat> = None;
+        let input_path: String = match &remote {
+            None => job.source_path.clone(),
+            Some((host, setup)) => {
+                emit_phase(ctx, &job.id, Some("Pulling…"));
+                match pull_source(ctx, setup, host, &job) {
+                    Ok((staged, stat)) => {
+                        baseline = Some(stat);
+                        staged.to_string_lossy().into_owned()
+                    }
+                    // Only a definite "not there" from a readable parent, like the local gate.
+                    Err(PullFailure::Gone) => {
+                        match published_before_outage(ctx, setup, host, &job) {
+                            Ok(Some(published)) => {
+                                let saved = job
+                                    .original_size
+                                    .map_or(0, |original| original - published.size);
+                                if !book_without_encode(
+                                    ctx,
+                                    &job.id,
+                                    &Booking {
+                                        status: "done",
+                                        kept_file: "converted",
+                                        converted_size: Some(published.size),
+                                        space_saved: saved,
+                                        skip_reason: None,
+                                    },
+                                ) {
+                                    continue;
+                                }
+                                notify_file_finished(
+                                    ctx,
+                                    false,
+                                    &format!(
+                                        "{} converted — saved {}",
+                                        file_name,
+                                        format_bytes_short(saved)
+                                    ),
+                                );
+                                if pause_if_armed(ctx) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(e @ crate::remote::RemoteError::Unreachable { .. }) => {
+                                stop_for_unreachable(ctx, &job.id, &file_name, &e);
+                                return PassOutcome::Stopped;
+                            }
+                            // Not that edge, or the host could not say: today's quiet booking.
+                            Ok(None) | Err(_) => {}
+                        }
+                        had_errors = true;
+                        record_job_error_quiet(
+                            ctx,
+                            &job.id,
+                            "Source file no longer exists",
+                            crate::failure_class::FailureClass::Environment,
+                        );
+                        continue;
+                    }
+                    Err(PullFailure::Failed(
+                        e @ crate::remote::RemoteError::Unreachable { .. },
+                    )) => {
+                        stop_for_unreachable(ctx, &job.id, &file_name, &e);
+                        return PassOutcome::Stopped;
+                    }
+                    Err(PullFailure::Failed(e)) => {
+                        had_errors = true;
+                        record_job_error(
+                            ctx,
+                            &job.id,
+                            &file_name,
+                            &e.message(),
+                            crate::failure_class::FailureClass::Environment,
+                        );
+                        continue;
+                    }
+                    Err(PullFailure::Killed) => continue,
+                }
+            }
         };
-        if in_place {
+
+        // Skip-by-source-media for a remote job probes the staged copy, the first moment the
+        // file can be probed at all: one already at the target is neither encoded nor pushed.
+        if remote.is_some() && already_at_target(ctx, &handbrake_path, &job, &input_path) {
+            if !book_without_encode(ctx, &job.id, &ALREADY_AT_TARGET) {
+                continue;
+            }
+            notify_file_finished(
+                ctx,
+                false,
+                &format!("{file_name} — already at the target, left as it is"),
+            );
+            if pause_if_armed(ctx) {
+                break;
+            }
+            continue;
+        }
+        // A Cancel since the pull (its re-stat, or the probe) had no child to kill: it only
+        // booked the row, and that is the only sign of it. Never encode a cancelled job.
+        if remote.is_some() && !job_still_running(ctx, &job.id) {
+            continue;
+        }
+
+        let in_place = is_in_place(&job.source_path, &job.output_path);
+        let encode_target = match &remote {
+            // Straight to staging under the result's name: there is no local in-place temp.
+            Some((_, setup)) => {
+                let target = setup.staged_result(&job.output_path);
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                target
+            }
+            None if in_place => in_place_temp_path(&job.source_path),
+            None => std::path::PathBuf::from(&job.output_path),
+        };
+        if in_place && remote.is_none() {
             // Clear any stale temp left by a previous crash so HandBrake writes a fresh file.
             let _ = std::fs::remove_file(&encode_target);
+        }
+        if remote.is_some() {
+            emit_phase(ctx, &job.id, None);
         }
 
         // Spawn HandBrakeCLI
@@ -1173,7 +1373,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
             .args(&import_args)
             .arg("-O")
             .arg("-i")
-            .arg(&job.source_path)
+            .arg(&input_path)
             .arg("-o")
             .arg(&encode_target)
             .stderr(Stdio::piped())
@@ -1296,7 +1496,10 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
 
         *ctx.converter.current_pid.lock().unwrap() = None;
         *ctx.converter.current_child.lock().unwrap() = None;
-        *ctx.converter.current_job_id.lock().unwrap() = None;
+        // A remote job is still current through its push and finalize: `RemoteTurn` clears it.
+        if remote.is_none() {
+            *ctx.converter.current_job_id.lock().unwrap() = None;
+        }
 
         // Joined here rather than inside individual arms: the child has already exited, so
         // the drain thread is at EOF and this returns promptly on every path. The success
@@ -1322,7 +1525,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                     let class =
                         crate::failure_class::classify(&crate::failure_class::FailureFacts {
                             exit_code: status.code(),
-                            source_readable: source_is_readable(&job.source_path),
+                            source_readable: source_is_readable(&input_path),
                             stderr_tail: &tail,
                         });
                     // Stamp the identity fingerprint to the source's CURRENT stat at the
@@ -1330,7 +1533,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                     // `record_condemned_identity`. Never for Environment/Unknown: those aren't
                     // a verdict on the file at all.
                     if class == crate::failure_class::FailureClass::BadSource {
-                        record_condemned_identity(&ctx.db, &job.id, &job.source_path);
+                        condemn_identity(ctx, &job, baseline, &job.source_path);
                     }
                     record_job_error(
                         ctx,
@@ -1358,7 +1561,7 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                         // Same re-stamp as the classify()-based site below: the truncation is
                         // discovered right now, so the fingerprint recorded at queue time is
                         // stale the instant it's condemned. See `record_condemned_identity`.
-                        record_condemned_identity(&ctx.db, &job.id, &job.source_path);
+                        condemn_identity(ctx, &job, baseline, &job.source_path);
                         record_job_error(
                             ctx,
                             &job.id,
@@ -1376,7 +1579,10 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                 }
 
                 // For in-place, the source is unchanged during the temp encode, so re-stat it now.
-                let original_size = if in_place {
+                // A remote source is sized by its pull baseline, never by a local path.
+                let original_size = if let Some(base) = baseline {
+                    base.size
+                } else if in_place {
                     std::fs::metadata(&job.source_path)
                         .map(|m| m.len() as i64)
                         .unwrap_or(job.original_size.unwrap_or(0))
@@ -1396,120 +1602,167 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                 // scoped and dropped before any emit below (never hold ctx.db across
                 // ctx.events.emit_t — the tray listener re-locks it synchronously and
                 // std::sync::Mutex is not reentrant).
-                let cleanup_mode = {
+                let mut cleanup_mode = {
                     let db = ctx.db.lock().unwrap();
                     get_cleanup_mode(&db)
                 };
 
-                // Set when the distinct-file cleanup left the loser on disk; carries which file
-                // that was so the error can name it.
-                let mut cleanup_failed: Option<KeptFile> = None;
-
-                // Which action was actually taken for an in-place job, so the fatality check
-                // below can key off the action rather than off `kept` — see
-                // `in_place_apply_is_fatal`'s doc.
-                let mut in_place_action_taken: Option<InPlaceAction> = None;
-
-                // Act on the decision. In-place replaces/keeps the source via the temp; the
-                // distinct-file path keeps both names and trashes/deletes the loser as before.
-                let in_place_apply_failed = if in_place {
-                    let action = in_place_action(kept, &cleanup_mode);
-                    in_place_action_taken = Some(action);
-                    apply_in_place_action(
-                        action,
-                        &encode_target,
-                        std::path::Path::new(&job.source_path),
-                        ctx.disposer.as_ref(),
-                    )
-                    .is_err()
-                } else if cleanup_mode == "keep" {
-                    // Keep both files. decide_cleanup still ran, so status and space_saved are
-                    // unchanged — only the disposal is skipped. cleanup_failed deliberately stays
-                    // None: under keep the loser is on disk BY DESIGN, so the exists() verdict
-                    // below must not run or every keep job would report a false cleanup failure.
-                    false
-                } else {
-                    // The loser of the size comparison — the file this job promises to remove.
-                    // Neither means there is nothing to remove (no usable output).
-                    let loser = match kept {
-                        KeptFile::Converted => Some(job.source_path.as_str()),
-                        KeptFile::Original => Some(job.output_path.as_str()),
-                        KeptFile::Neither => None,
-                    };
-                    if let Some(loser) = loser {
-                        if cleanup_mode == "delete" {
-                            let _ = std::fs::remove_file(loser);
-                        } else {
-                            let _ = ctx.disposer.dispose(loser);
-                        }
-                        // Read the verdict off the filesystem, not off the primitive's bool: a
-                        // loser that is gone satisfies the contract however the call reported
-                        // (a source that vanished mid-encode makes `dispose` report failure),
-                        // and a loser still sitting there is a failure however it reported.
-                        if std::path::Path::new(loser).exists() {
-                            cleanup_failed = Some(kept);
+                // A remote job publishes on its host instead (ADR 0005): nothing local is trashed,
+                // deleted or renamed. An original that wins pushes nothing, and an in-place result
+                // under `keep` is pushed nowhere — the backstop below discards it and drops the
+                // row, as it does locally.
+                let mut remote_identity: Option<crate::remote::RemoteStat> = None;
+                if let (Some((host, setup)), Some(base)) = (&remote, baseline) {
+                    if kept == KeptFile::Converted && !(in_place && cleanup_mode == "keep") {
+                        match publish_result(
+                            ctx,
+                            setup,
+                            host,
+                            &job,
+                            &encode_target,
+                            conv_size,
+                            base,
+                        ) {
+                            Ok(stat) => remote_identity = Some(stat),
+                            Err(PublishFailure::Killed) => continue,
+                            // A Cancel already booked it: its booking stands (see pull_source).
+                            Err(PublishFailure::Failed(_)) if !job_still_running(ctx, &job.id) => {
+                                continue
+                            }
+                            // Switched to `keep` during the push: the backstop below drops it.
+                            Err(PublishFailure::KeepInPlace) => cleanup_mode = "keep".to_string(),
+                            Err(PublishFailure::Failed(
+                                e @ crate::remote::RemoteError::Unreachable { .. },
+                            )) => {
+                                stop_for_unreachable(ctx, &job.id, &file_name, &e);
+                                return PassOutcome::Stopped;
+                            }
+                            Err(PublishFailure::Failed(e)) => {
+                                had_errors = true;
+                                record_job_error(
+                                    ctx,
+                                    &job.id,
+                                    &file_name,
+                                    &e.message(),
+                                    crate::failure_class::FailureClass::Environment,
+                                );
+                                continue;
+                            }
                         }
                     }
-                    false
-                };
-
-                // A failed in-place *rename* means the re-encode never replaced the source (and in
-                // trash mode the original may now be in Trash, with the temp left behind). Record an
-                // error instead of a false "done" so history never claims a success that left the
-                // file out of place. A failed temp *removal* is benign and handled as success.
-                if in_place_apply_is_fatal(in_place_action_taken, in_place_apply_failed) {
-                    had_errors = true;
-                    // Which of the two shapes this is, read off the filesystem rather than
-                    // inferred from the mode: the original is still in place both when the
-                    // rename failed (delete mode) and when the Trash step was refused, and is
-                    // in the Trash only when it genuinely left. Keying this on cleanup_mode
-                    // sent trash-mode users hunting in the Trash for a file still on disk.
-                    let err_msg = if std::path::Path::new(&job.source_path).exists() {
-                        "In-place replacement failed; original left unchanged"
-                    } else {
-                        "In-place replacement failed; original may be in Trash"
-                    };
-                    record_job_error(
-                        ctx,
-                        &job.id,
-                        &file_name,
-                        err_msg,
-                        crate::failure_class::FailureClass::Environment,
-                    );
-                    // Intentionally leave the temp (`.{stem}.convertbar-tmp.{ext}`): it holds the
-                    // re-encoded content, and when the original did reach the Trash it is the
-                    // only in-place copy, so removing it would force trash recovery. The marker
-                    // keeps it out of scans, and the next in-place encode pre-clears it.
-                    continue;
                 }
 
-                // The distinct-file counterpart: the encode itself succeeded, but the file this
-                // job promised to remove is still on disk, so both copies remain. Recording
-                // 'done'/'skipped' here would claim a cleanup that did not happen and book
-                // space_saved that was never freed — the shape of the v2.0.0 field regression,
-                // where macOS refused the Trash Apple Event and a whole queue silently kept
-                // every original while reporting gigabytes saved.
-                if let Some(stuck) = cleanup_failed {
-                    had_errors = true;
-                    let which = match stuck {
-                        KeptFile::Converted => "original",
-                        // Only reachable for Original: Neither never sets cleanup_failed.
-                        _ => "larger re-encode",
-                    };
-                    let verb = if cleanup_mode == "delete" {
-                        "deleted"
+                if remote.is_none() {
+                    // Set when the distinct-file cleanup left the loser on disk; carries which file
+                    // that was so the error can name it.
+                    let mut cleanup_failed: Option<KeptFile> = None;
+
+                    // Which action was actually taken for an in-place job, so the fatality check
+                    // below can key off the action rather than off `kept` — see
+                    // `in_place_apply_is_fatal`'s doc.
+                    let mut in_place_action_taken: Option<InPlaceAction> = None;
+
+                    // Act on the decision. In-place replaces/keeps the source via the temp; the
+                    // distinct-file path keeps both names and trashes/deletes the loser as before.
+                    let in_place_apply_failed = if in_place {
+                        let action = in_place_action(kept, &cleanup_mode);
+                        in_place_action_taken = Some(action);
+                        apply_in_place_action(
+                            action,
+                            &encode_target,
+                            std::path::Path::new(&job.source_path),
+                            ctx.disposer.as_ref(),
+                        )
+                        .is_err()
+                    } else if cleanup_mode == "keep" {
+                        // Keep both files. decide_cleanup still ran, so status and space_saved are
+                        // unchanged — only the disposal is skipped. cleanup_failed deliberately stays
+                        // None: under keep the loser is on disk BY DESIGN, so the exists() verdict
+                        // below must not run or every keep job would report a false cleanup failure.
+                        false
                     } else {
-                        "moved to Trash"
+                        // The loser of the size comparison — the file this job promises to remove.
+                        // Neither means there is nothing to remove (no usable output).
+                        let loser = match kept {
+                            KeptFile::Converted => Some(job.source_path.as_str()),
+                            KeptFile::Original => Some(job.output_path.as_str()),
+                            KeptFile::Neither => None,
+                        };
+                        if let Some(loser) = loser {
+                            if cleanup_mode == "delete" {
+                                let _ = std::fs::remove_file(loser);
+                            } else {
+                                let _ = ctx.disposer.dispose(loser);
+                            }
+                            // Read the verdict off the filesystem, not off the primitive's bool: a
+                            // loser that is gone satisfies the contract however the call reported
+                            // (a source that vanished mid-encode makes `dispose` report failure),
+                            // and a loser still sitting there is a failure however it reported.
+                            if std::path::Path::new(loser).exists() {
+                                cleanup_failed = Some(kept);
+                            }
+                        }
+                        false
                     };
-                    record_job_error(
+
+                    // A failed in-place *rename* means the re-encode never replaced the source (and in
+                    // trash mode the original may now be in Trash, with the temp left behind). Record an
+                    // error instead of a false "done" so history never claims a success that left the
+                    // file out of place. A failed temp *removal* is benign and handled as success.
+                    if in_place_apply_is_fatal(in_place_action_taken, in_place_apply_failed) {
+                        had_errors = true;
+                        // Which of the two shapes this is, read off the filesystem rather than
+                        // inferred from the mode: the original is still in place both when the
+                        // rename failed (delete mode) and when the Trash step was refused, and is
+                        // in the Trash only when it genuinely left. Keying this on cleanup_mode
+                        // sent trash-mode users hunting in the Trash for a file still on disk.
+                        let err_msg = if std::path::Path::new(&job.source_path).exists() {
+                            "In-place replacement failed; original left unchanged"
+                        } else {
+                            "In-place replacement failed; original may be in Trash"
+                        };
+                        record_job_error(
+                            ctx,
+                            &job.id,
+                            &file_name,
+                            err_msg,
+                            crate::failure_class::FailureClass::Environment,
+                        );
+                        // Intentionally leave the temp (`.{stem}.convertbar-tmp.{ext}`): it holds the
+                        // re-encoded content, and when the original did reach the Trash it is the
+                        // only in-place copy, so removing it would force trash recovery. The marker
+                        // keeps it out of scans, and the next in-place encode pre-clears it.
+                        continue;
+                    }
+
+                    // The distinct-file counterpart: the encode itself succeeded, but the file this
+                    // job promised to remove is still on disk, so both copies remain. Recording
+                    // 'done'/'skipped' here would claim a cleanup that did not happen and book
+                    // space_saved that was never freed — the shape of the v2.0.0 field regression,
+                    // where macOS refused the Trash Apple Event and a whole queue silently kept
+                    // every original while reporting gigabytes saved.
+                    if let Some(stuck) = cleanup_failed {
+                        had_errors = true;
+                        let which = match stuck {
+                            KeptFile::Converted => "original",
+                            // Only reachable for Original: Neither never sets cleanup_failed.
+                            _ => "larger re-encode",
+                        };
+                        let verb = if cleanup_mode == "delete" {
+                            "deleted"
+                        } else {
+                            "moved to Trash"
+                        };
+                        record_job_error(
                         ctx,
                         &job.id,
                         &file_name,
                         &format!("Encode finished, but the {which} could not be {verb}; both files remain"),
                         crate::failure_class::FailureClass::Environment,
                     );
-                    continue;
-                }
+                        continue;
+                    }
+                } // remote.is_none()
 
                 // In-place + keep is the backstop for the race where a job reaches
                 // 'encoding'/'paused' between the user choosing keep and this job's turn:
@@ -1544,17 +1797,30 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
 
                 let now = chrono::Utc::now().to_rfc3339();
 
-                {
+                // Only a row still running is booked: a remote job is current after HandBrake
+                // exits, so a Cancel may already have booked it. That Cancel stands.
+                let booked = {
                     let db = ctx.db.lock().unwrap();
-                    let _ = db.execute(
-                        "UPDATE jobs SET status = ?2, converted_size = ?3, kept_file = ?4, space_saved = ?5, completed_at = ?6 WHERE id = ?1",
+                    let booked = db.execute(
+                        "UPDATE jobs SET status = ?2, converted_size = ?3, kept_file = ?4, space_saved = ?5, completed_at = ?6 \
+                         WHERE id = ?1 AND status IN ('encoding', 'paused')",
                         params![job.id, status_str, converted_size, kept_file, space_saved, now],
                     );
                     // In-place encoding replaced the file at source_path, so its insert-time
-                    // fingerprint is stale. Refresh it to the final file's identity.
-                    if in_place {
+                    // fingerprint is stale. Refresh it to the final file's identity — for a
+                    // remote job, the host's stat of the replaced file, never a staging stat.
+                    if let Some(stat) = remote_identity.filter(|_| in_place) {
+                        let _ = db.execute(
+                            "UPDATE jobs SET source_size = ?2, source_mtime = ?3 WHERE id = ?1",
+                            params![job.id, stat.size, stat.mtime_ms],
+                        );
+                    } else if in_place && remote.is_none() {
                         record_source_identity(&db, &job.id, &job.source_path);
                     }
+                    !matches!(booked, Ok(0))
+                };
+                if !booked {
+                    continue;
                 }
 
                 ctx.events.emit_t(
@@ -1579,61 +1845,18 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                 // hold ctx.db across a hook, which is slower than an emit.
                 crate::hooks::fire_post_convert(ctx, &job.id);
 
-                // Notification logic for successful/skipped jobs
-                {
-                    let (notify_per_file, errors_only) = {
-                        let db = ctx.db.lock().unwrap();
-                        let get = |k: &str, default: bool| -> bool {
-                            db.query_row(
-                                "SELECT value FROM settings WHERE key=?1",
-                                params![k],
-                                |r| r.get::<_, String>(0),
-                            )
-                            .map(|v| v == "true")
-                            .unwrap_or(default)
-                        };
-                        (
-                            get("notifications_per_file", true),
-                            get("notifications_errors_only", false),
-                        )
-                    };
+                let body = match status_str {
+                    "done" => format!(
+                        "{} converted — saved {}",
+                        file_name,
+                        format_bytes_short(space_saved)
+                    ),
+                    "skipped" => format!("{} — kept original (converted was larger)", file_name),
+                    _ => format!("{} failed", file_name),
+                };
+                notify_file_finished(ctx, status_str == "error", &body);
 
-                    if notify_per_file {
-                        let is_error = status_str == "error";
-                        let should_notify = if errors_only { is_error } else { true };
-
-                        if should_notify {
-                            let body = match status_str {
-                                "done" => format!(
-                                    "{} converted — saved {}",
-                                    file_name,
-                                    format_bytes_short(space_saved)
-                                ),
-                                "skipped" => {
-                                    format!("{} — kept original (converted was larger)", file_name)
-                                }
-                                _ => format!("{} failed", file_name),
-                            };
-                            ctx.events.notify("ConvertBar", &body);
-                        }
-                    }
-                }
-
-                // Pause after this job if the one-shot flag is armed (consumed here so the next
-                // queued job does not also pause).
-                if take_pause_after_current(&ctx.converter) {
-                    set_queue_paused(&ctx.db.lock().unwrap(), true);
-                    ctx.events.emit_t(
-                        "menu-bar-update",
-                        MenuBarUpdate {
-                            status: "idle".to_string(),
-                            percent: None,
-                            file_name: None,
-                            eta_seconds: None,
-                            queue_count: None,
-                            fps: None,
-                        },
-                    );
+                if pause_if_armed(ctx) {
                     break;
                 }
             }
@@ -1669,12 +1892,12 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
                     let class =
                         crate::failure_class::classify(&crate::failure_class::FailureFacts {
                             exit_code,
-                            source_readable: source_is_readable(&job.source_path),
+                            source_readable: source_is_readable(&input_path),
                             stderr_tail: &tail,
                         });
                     // See `record_condemned_identity`: never for Environment/Unknown.
                     if class == crate::failure_class::FailureClass::BadSource {
-                        record_condemned_identity(&ctx.db, &job.id, &job.source_path);
+                        condemn_identity(ctx, &job, baseline, &job.source_path);
                     }
                     record_job_error(
                         ctx,
@@ -1732,6 +1955,547 @@ fn process_queue_pass(ctx: &Ctx) -> PassOutcome {
         PassOutcome::Drained
     } else {
         PassOutcome::Stopped
+    }
+}
+
+/// A remote job's turn. The job stays the current job through push and finalize, so Pause and
+/// Cancel reach its transfers. On every way out of the turn — each `continue` in the queue loop
+/// drops it — the current job and its phase label are cleared and staging is emptied, so staging
+/// holds at most one job's source and result. Dropped outside any `ctx.db` lock: locals declared
+/// after it drop first.
+struct RemoteTurn<'a> {
+    ctx: &'a Ctx,
+    setup: &'a crate::remote::RemoteSetup,
+    job_id: String,
+}
+
+impl Drop for RemoteTurn<'_> {
+    fn drop(&mut self) {
+        *self
+            .ctx
+            .converter
+            .current_job_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .ctx
+            .converter
+            .finalizing_on
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        if let Ok(db) = self.ctx.db.lock() {
+            if read_setting_opt(&db, REQUEUED_AFTER_OUTAGE_KEY).as_deref() == Some(&self.job_id) {
+                write_setting(&db, REQUEUED_AFTER_OUTAGE_KEY, None);
+            }
+        }
+        emit_phase(self.ctx, &self.job_id, None);
+        self.setup.empty_staging();
+    }
+}
+
+/// Backend-only settings row naming the job that hit an outage, which the next queue start
+/// re-queues (ADR 0003). Read with a default, never in `ALLOWED_KEYS`, like `queue_paused`.
+pub(crate) const UNREACHABLE_JOB_KEY: &str = "unreachable_job_id";
+
+/// Backend-only settings row naming a job re-queued after an outage, for the one case where its
+/// source being gone means it already finished: a new-name job whose connection dropped after
+/// finalize published the result and deleted the original.
+pub(crate) const REQUEUED_AFTER_OUTAGE_KEY: &str = "requeued_after_outage_job_id";
+
+pub(crate) fn read_setting_opt(db: &Connection, key: &str) -> Option<String> {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+pub(crate) fn write_setting(db: &Connection, key: &str, value: Option<&str>) {
+    let _ = match value {
+        Some(v) => db.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, v],
+        ),
+        None => db.execute("DELETE FROM settings WHERE key = ?1", params![key]),
+    };
+}
+
+/// The next queue start re-queues the job an outage stopped on (ADR 0003) and forgets it.
+/// Only that one row, only while it is still the unreachable error it was booked as, and not
+/// when its host and path already have an active row. Its timestamps and error are cleared and
+/// its place in the order is kept; it starts again from the pull. Returns whether it re-queued.
+pub(crate) fn requeue_after_outage(db: &Connection) -> bool {
+    let Some(id) = read_setting_opt(db, UNREACHABLE_JOB_KEY) else {
+        return false;
+    };
+    write_setting(db, UNREACHABLE_JOB_KEY, None);
+    let requeued = db
+        .execute(
+            "UPDATE jobs SET status = 'queued', error_message = NULL, failure_class = NULL,
+                    completed_at = NULL, started_at = NULL
+             WHERE id = ?1 AND status = 'error' AND failure_class = 'unreachable'
+               AND NOT EXISTS (
+                   SELECT 1 FROM jobs AS active
+                   WHERE active.remote_host IS jobs.remote_host
+                     AND active.source_path = jobs.source_path
+                     AND active.status IN ('queued', 'encoding', 'paused'))",
+            params![id],
+        )
+        .is_ok_and(|n| n > 0);
+    if requeued {
+        write_setting(db, REQUEUED_AFTER_OUTAGE_KEY, Some(&id));
+    }
+    requeued
+}
+
+/// An unreachable host stops the queue instead of failing every job behind it (ADR 0003). The
+/// pause and the remembered job are persisted first, so a restart in the middle neither retries
+/// into the outage nor forgets the job; then the job is booked through the notifying path, so
+/// its post-convert hook carries the class. The caller ends the pass as the low-disk stop does:
+/// no "Queue complete" and no queue-drained hook, because nothing drained.
+fn stop_for_unreachable(
+    ctx: &Ctx,
+    job_id: &str,
+    file_name: &str,
+    error: &crate::remote::RemoteError,
+) {
+    let crate::remote::RemoteError::Unreachable { host, step } = error else {
+        return;
+    };
+    {
+        let db = ctx.db.lock().unwrap();
+        set_user_queue_pause(&db);
+        write_setting(&db, UNREACHABLE_JOB_KEY, Some(job_id));
+    } // dropped before the emits below: the tray listener re-locks ctx.db on this thread
+    let stop = UnreachableStop {
+        host: host.clone(),
+        step: step.to_string(),
+    };
+    *ctx.converter.unreachable_stop.lock().unwrap() = Some(stop.clone());
+    ctx.events.emit_t("queue-paused-unreachable", &stop);
+    ctx.events.emit_t(
+        "menu-bar-update",
+        MenuBarUpdate {
+            status: final_run_status(true).to_string(),
+            percent: None,
+            file_name: None,
+            eta_seconds: None,
+            queue_count: None,
+            fps: None,
+        },
+    );
+    record_job_error(
+        ctx,
+        job_id,
+        file_name,
+        &error.message(),
+        crate::failure_class::FailureClass::Unreachable,
+    );
+}
+
+/// Sends a finished file's per-file notification, as the notification settings allow.
+fn notify_file_finished(ctx: &Ctx, is_error: bool, body: &str) {
+    let (notify_per_file, errors_only) = {
+        let db = ctx.db.lock().unwrap();
+        let get = |k: &str, default: bool| -> bool {
+            db.query_row("SELECT value FROM settings WHERE key=?1", params![k], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|v| v == "true")
+            .unwrap_or(default)
+        };
+        (
+            get("notifications_per_file", true),
+            get("notifications_errors_only", false),
+        )
+    };
+    if notify_per_file && (is_error || !errors_only) {
+        ctx.events.notify("ConvertBar", body);
+    }
+}
+
+/// Pauses the queue after this job if the one-shot flag is armed, consuming it so the next
+/// queued job does not also pause. True means the caller stops the pass.
+fn pause_if_armed(ctx: &Ctx) -> bool {
+    if !take_pause_after_current(&ctx.converter) {
+        return false;
+    }
+    set_queue_paused(&ctx.db.lock().unwrap(), true);
+    ctx.events.emit_t(
+        "menu-bar-update",
+        MenuBarUpdate {
+            status: "idle".to_string(),
+            percent: None,
+            file_name: None,
+            eta_seconds: None,
+            queue_count: None,
+            fps: None,
+        },
+    );
+    true
+}
+
+/// Whether skip-by-source-media is on and the staged copy already meets the target, by the
+/// same decision as a local add. Any uncertainty (no metadata, a failed probe) encodes.
+fn already_at_target(ctx: &Ctx, handbrake_path: &str, job: &JobInfo, staged: &str) -> bool {
+    let on = read_setting_opt(&ctx.db.lock().unwrap(), "skip_by_source_media");
+    if on.as_deref() != Some("true") {
+        return false;
+    }
+    let Ok(target) = crate::handbrake::cached_preset_metadata(ctx, handbrake_path, &job.preset)
+    else {
+        return false;
+    };
+    let Some(media) = crate::probe::probe_source(handbrake_path, staged) else {
+        return false;
+    };
+    crate::media_skip::should_skip_by_media(
+        &media.codec,
+        media.height,
+        &target.codec,
+        crate::media_skip::target_height_from_resolution(&target.resolution),
+    )
+}
+
+/// How a job that finished without an encode in this turn is booked.
+struct Booking<'a> {
+    status: &'a str,
+    kept_file: &'a str,
+    converted_size: Option<i64>,
+    space_saved: i64,
+    skip_reason: Option<&'a str>,
+}
+
+/// Already at the target: `skipped`, the original kept, no converted size, nothing saved.
+const ALREADY_AT_TARGET: Booking<'static> = Booking {
+    status: "skipped",
+    kept_file: "original",
+    converted_size: None,
+    space_saved: 0,
+    skip_reason: Some("already_at_target"),
+};
+
+/// Books a job that finished without an encode in this turn, emits as the encode path does, and
+/// fires its post-convert hook. Only a row still running is booked; false means a Cancel got
+/// there first, and nothing is emitted.
+fn book_without_encode(ctx: &Ctx, job_id: &str, b: &Booking) -> bool {
+    {
+        let db = ctx.db.lock().unwrap();
+        let booked = db.execute(
+            "UPDATE jobs SET status = ?2, kept_file = ?3, converted_size = ?4, space_saved = ?5, \
+             skip_reason = ?6, completed_at = ?7 WHERE id = ?1 AND status IN ('encoding', 'paused')",
+            params![
+                job_id,
+                b.status,
+                b.kept_file,
+                b.converted_size,
+                b.space_saved,
+                b.skip_reason,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        );
+        if matches!(booked, Ok(0)) {
+            return false;
+        }
+    } // dropped before the emits: the tray listener re-locks ctx.db on this thread
+    ctx.events.emit_t(
+        "job-completed",
+        serde_json::json!({
+            "job_id": job_id,
+            "status": b.status,
+            "kept_file": b.kept_file,
+            "space_saved": b.space_saved,
+        }),
+    );
+    ctx.events.emit_t(
+        "job-status-changed",
+        serde_json::json!({ "job_id": job_id, "status": b.status }),
+    );
+    crate::hooks::fire_post_convert(ctx, job_id);
+    true
+}
+
+/// ADR 0003's decided edge: a new-name job re-queued after an outage, whose source is now
+/// definitely gone and whose output name is present on the host, was finished by the finalize
+/// that the connection dropped after — it published the result and deleted the original. Returns
+/// the published file's stat. Consumes the re-queue marker. An in-place job never qualifies: its
+/// output path is its source path, which is gone.
+fn published_before_outage(
+    ctx: &Ctx,
+    setup: &crate::remote::RemoteSetup,
+    host: &str,
+    job: &JobInfo,
+) -> Result<Option<crate::remote::RemoteStat>, crate::remote::RemoteError> {
+    let marked = {
+        let db = ctx.db.lock().unwrap();
+        let marked = read_setting_opt(&db, REQUEUED_AFTER_OUTAGE_KEY).as_deref() == Some(&job.id);
+        if marked {
+            write_setting(&db, REQUEUED_AFTER_OUTAGE_KEY, None);
+        }
+        marked
+    };
+    if !marked {
+        return Ok(None);
+    }
+    match crate::remote::probe_source(setup, host, &job.output_path, "stat")? {
+        crate::remote::SourceState::Present(stat) => Ok(Some(stat)),
+        _ => Ok(None),
+    }
+}
+
+/// The remote phase shown on the encoding row: "Pulling…", "Pushing…", "Verifying…", or `None`
+/// while HandBrake reports its own progress. Never called under the `ctx.db` lock.
+fn emit_phase(ctx: &Ctx, job_id: &str, phase: Option<&str>) {
+    ctx.events.emit_t(
+        "job-phase",
+        serde_json::json!({ "job_id": job_id, "phase": phase }),
+    );
+}
+
+/// Runs a started transfer as the job's current child, so Pause stops it and Cancel kills it, and
+/// waits for it. `Ok(None)`: a cancel or a shutdown killed it, and the caller must not book.
+fn run_transfer(
+    ctx: &Ctx,
+    job_id: &str,
+    (mut child, transfer): (Child, crate::remote::Transfer),
+) -> Result<Option<()>, crate::remote::RemoteError> {
+    let stderr_tail = child
+        .stderr
+        .take()
+        .map(|s| std::thread::spawn(move || read_bounded_tail(s)));
+    *ctx.converter.current_pid.lock().unwrap() = Some(child.id());
+    *ctx.converter.current_child.lock().unwrap() = Some(child);
+    // The same spawn→store window as HandBrake's: a quit that armed shutdown in between found no
+    // child to kill.
+    if ctx.converter.is_shutting_down() {
+        kill_active_child(&ctx.converter);
+    }
+    let status = wait_for_active_child(&ctx.converter);
+    *ctx.converter.current_pid.lock().unwrap() = None;
+    *ctx.converter.current_child.lock().unwrap() = None;
+    let stderr = stderr_tail.and_then(|t| t.join().ok()).unwrap_or_default();
+    // Cancel books the row `error` before it kills; a shutdown leaves it for recovery.
+    let killed_by_us = ctx.converter.is_shutting_down()
+        || ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM jobs WHERE id = ?1",
+                params![job_id],
+                |r| r.get::<_, String>(0),
+            )
+            .is_ok_and(|s| s == "error");
+    transfer.finish(status, &stderr, killed_by_us)
+}
+
+/// How a remote job's pull ended, when it did not deliver a staged copy.
+enum PullFailure {
+    /// Definitely gone on the host: today's quiet "no longer exists".
+    Gone,
+    Failed(crate::remote::RemoteError),
+    /// Killed by a cancel or a shutdown, which own the booking.
+    Killed,
+}
+
+/// Tests for the source on the host, takes the pull baseline, streams it into staging, and
+/// re-stats it. Returns the staged path and the baseline. A failure of a job a Cancel has
+/// already booked is that Cancel's: an error or outage booking over it would replace "Cancelled
+/// by user", and an outage booking would have the next Start take the cancelled job back.
+fn pull_source(
+    ctx: &Ctx,
+    setup: &crate::remote::RemoteSetup,
+    host: &str,
+    job: &JobInfo,
+) -> Result<(std::path::PathBuf, crate::remote::RemoteStat), PullFailure> {
+    match pull_source_steps(ctx, setup, host, job) {
+        Err(PullFailure::Gone | PullFailure::Failed(_)) if !job_still_running(ctx, &job.id) => {
+            Err(PullFailure::Killed)
+        }
+        other => other,
+    }
+}
+
+fn pull_source_steps(
+    ctx: &Ctx,
+    setup: &crate::remote::RemoteSetup,
+    host: &str,
+    job: &JobInfo,
+) -> Result<(std::path::PathBuf, crate::remote::RemoteStat), PullFailure> {
+    use crate::remote::{RemoteError, SourceState};
+    // The roots bound what ConvertBar may replace or delete (ADR 0002), and they may have changed
+    // since the job was queued. Nothing is pulled for a job that would finalize outside them.
+    for path in [&job.source_path, &job.output_path] {
+        crate::remote::check_named_path(setup, host, path)
+            .map_err(|m| PullFailure::Failed(RemoteError::Failed(m)))?;
+    }
+    // Resolved on the host too, as at add time: a directory on the way that has since become a
+    // symlink would have finalize replace or delete through it. The output always sits beside
+    // the source, so the source's directory covers both.
+    if let Some(dir) = std::path::Path::new(&job.source_path).parent() {
+        crate::remote::inspect_paths(setup, host, &[dir.to_string_lossy().into_owned()])
+            .map_err(PullFailure::Failed)?;
+    }
+    let baseline = match crate::remote::probe_source(setup, host, &job.source_path, "stat") {
+        Ok(SourceState::Present(stat)) => stat,
+        Ok(SourceState::Missing) => return Err(PullFailure::Gone),
+        Ok(SourceState::Unknown(m)) => return Err(PullFailure::Failed(RemoteError::Failed(m))),
+        Err(e) => return Err(PullFailure::Failed(e)),
+    };
+    // A Cancel during the stat had no child to kill: it only booked the row.
+    if !job_still_running(ctx, &job.id) {
+        return Err(PullFailure::Killed);
+    }
+    let staged = setup.staged_source(&job.source_path);
+    let started = crate::remote::start_pull(setup, host, &job.source_path, &staged)
+        .map_err(PullFailure::Failed)?;
+    match run_transfer(ctx, &job.id, started) {
+        Ok(Some(())) => {}
+        Ok(None) => return Err(PullFailure::Killed),
+        Err(e) => return Err(PullFailure::Failed(e)),
+    }
+    let local_size = std::fs::metadata(&staged).map(|m| m.len() as i64).ok();
+    if local_size != Some(baseline.size) {
+        return Err(PullFailure::Failed(RemoteError::Failed(format!(
+            "The download from {host} was short ({} of {} bytes)",
+            local_size.unwrap_or(0),
+            baseline.size
+        ))));
+    }
+    match crate::remote::probe_source(setup, host, &job.source_path, "stat") {
+        Ok(SourceState::Present(after)) if after == baseline => Ok((staged, baseline)),
+        Ok(_) => Err(PullFailure::Failed(RemoteError::Failed(format!(
+            "{} changed on {host} while it was being pulled",
+            job.source_path
+        )))),
+        Err(e) => Err(PullFailure::Failed(e)),
+    }
+}
+
+/// How pushing and finalizing a remote result ended, when it did not publish.
+enum PublishFailure {
+    Failed(crate::remote::RemoteError),
+    /// Killed by a cancel or a shutdown, which own the booking.
+    Killed,
+    /// An in-place result the mode turned `keep` before finalize: nothing was published, and the
+    /// caller discards it as the local keep backstop does.
+    KeepInPlace,
+}
+
+/// Pushes the result into the marked temp beside the target and finalizes it on the host.
+/// Returns the stat of the file now at the output path.
+#[allow(clippy::too_many_arguments)]
+fn publish_result(
+    ctx: &Ctx,
+    setup: &crate::remote::RemoteSetup,
+    host: &str,
+    job: &JobInfo,
+    result: &std::path::Path,
+    result_size: i64,
+    baseline: crate::remote::RemoteStat,
+) -> Result<crate::remote::RemoteStat, PublishFailure> {
+    use crate::remote::RemoteError;
+    // HandBrake's exit and a Cancel can cross: never upload a result nobody wants any more.
+    if !job_still_running(ctx, &job.id) {
+        return Err(PublishFailure::Killed);
+    }
+    let remote_temp = crate::remote::remote_temp_path(&job.output_path);
+    emit_phase(ctx, &job.id, Some("Pushing…"));
+    let started = crate::remote::start_push(setup, host, result, &remote_temp)
+        .map_err(PublishFailure::Failed)?;
+    match run_transfer(ctx, &job.id, started) {
+        Ok(Some(())) => {}
+        Ok(None) => {
+            crate::remote::remove_temp(setup, host, &remote_temp);
+            return Err(PublishFailure::Killed);
+        }
+        Err(e) => {
+            if !matches!(e, RemoteError::Unreachable { .. }) {
+                crate::remote::remove_temp(setup, host, &remote_temp);
+            }
+            return Err(PublishFailure::Failed(e));
+        }
+    }
+    emit_phase(ctx, &job.id, Some("Verifying…"));
+    let sha = crate::remote::sha256_file(result).map_err(|e| {
+        PublishFailure::Failed(RemoteError::Failed(format!(
+            "Could not checksum the staged result: {e}"
+        )))
+    })?;
+    let Some(cleanup_mode) = begin_finalize(ctx, &job.id, host) else {
+        crate::remote::remove_temp(setup, host, &remote_temp);
+        return Err(PublishFailure::Killed);
+    };
+    let in_place = job.output_path == job.source_path;
+    if in_place && cleanup_mode == "keep" {
+        crate::remote::remove_temp(setup, host, &remote_temp);
+        return Err(PublishFailure::KeepInPlace);
+    }
+    let finalized = crate::remote::finalize(
+        setup,
+        host,
+        &crate::remote::FinalizeRequest {
+            source_path: &job.source_path,
+            output_path: &job.output_path,
+            remote_temp: &remote_temp,
+            result_size,
+            result_sha256: &sha,
+            baseline,
+            delete_original: cleanup_mode != "keep",
+        },
+    );
+    // `finalizing_on` stays set until the turn ends (`RemoteTurn`): once the host's file is
+    // replaced, a Cancel must not book the job before its done booking does.
+    finalized.map_err(PublishFailure::Failed)
+}
+
+/// Whether the job's row is still running: neither booked by a Cancel nor anything else.
+fn row_still_running(db: &rusqlite::Connection, job_id: &str) -> bool {
+    db.query_row(
+        "SELECT status FROM jobs WHERE id = ?1",
+        params![job_id],
+        |r| r.get::<_, String>(0),
+    )
+    .is_ok_and(|s| s == "encoding" || s == "paused")
+}
+
+fn job_still_running(ctx: &Ctx, job_id: &str) -> bool {
+    row_still_running(&ctx.db.lock().unwrap(), job_id)
+}
+
+/// Finalize cannot be cancelled: a script already past its last line has replaced or deleted a
+/// file on the host. So it starts only while the job is still running, decided under the lock a
+/// Cancel books under, and from then on Cancel is refused until it ends. Returns the cleanup mode
+/// read under that same lock: the push before it can take many minutes, and a switch to `keep`
+/// during it must still keep the original (the in-place rule's re-read at the cleanup decision).
+fn begin_finalize(ctx: &Ctx, job_id: &str, host: &str) -> Option<String> {
+    let db = ctx.db.lock().unwrap();
+    if !row_still_running(&db, job_id) {
+        return None;
+    }
+    *ctx.converter.finalizing_on.lock().unwrap() = Some(host.to_string());
+    Some(get_cleanup_mode(&db))
+}
+
+/// Stamps a condemned row's identity. A remote job's is its pull baseline: a stat of the staged
+/// copy would carry the pull time as its mtime and never match the file on the host.
+fn condemn_identity(
+    ctx: &Ctx,
+    job: &JobInfo,
+    baseline: Option<crate::remote::RemoteStat>,
+    source_path: &str,
+) {
+    match baseline {
+        Some(stat) => {
+            let db = ctx.db.lock().unwrap();
+            let _ = db.execute(
+                "UPDATE jobs SET source_size = ?2, source_mtime = ?3 WHERE id = ?1",
+                params![job.id, stat.size, stat.mtime_ms],
+            );
+        }
+        None => record_condemned_identity(&ctx.db, &job.id, source_path),
     }
 }
 
@@ -3280,6 +4044,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_consumed_pause_leaves_no_marker_for_a_later_resume_to_act_on() {
+        // Pause arms pause-after-current for a remote job between transfers; the queue consumes
+        // it. Whatever arms the flag next (the desktop updater writes it directly) must not see
+        // a Resume with nothing frozen take it back on the strength of that old marker.
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                               created_at, remote_host)
+             VALUES ('j1', '/share/a.mkv', '/share/a.mkv', 'p', 'encoding', 0,
+                     '2020-01-01T00:00:00Z', 'unraid')",
+            [],
+        )
+        .unwrap();
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(conn, Arc::new(crate::handbrake::AbsentLocator));
+        *ctx.converter.current_job_id.lock().unwrap() = Some("j1".into());
+        crate::control::pause_conversion(&ctx).unwrap();
+        assert!(take_pause_after_current(&ctx.converter));
+
+        *ctx.converter.pause_after_current.lock().unwrap() = true;
+        crate::control::resume_conversion(&ctx).unwrap();
+        assert!(ctx.converter.is_pause_after_current());
+    }
+
+    #[test]
     fn final_run_status_is_error_only_when_a_job_failed() {
         // The end-of-queue menu-bar transition: a clean run returns to idle; any failure leaves
         // the tray showing an error state until the next run starts.
@@ -4351,14 +5141,43 @@ HandBrake has exited.";
             params![source.to_str().unwrap(), output.to_str().unwrap()],
         ).unwrap();
 
+        // Remote rows whose host paths happen to exist here too: a distinct output, and an
+        // in-place job's temp sibling. Both name files on the host, so both local files survive.
+        let remote_out = dir.path().join("remote.h265.mkv");
+        let remote_in_place = dir.path().join("remote.mkv");
+        let remote_temp = dir.path().join(".remote.convertbar-tmp.mkv");
+        for f in [&remote_out, &remote_in_place, &remote_temp] {
+            std::fs::write(f, b"a local file").unwrap();
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                               created_at, remote_host)
+             VALUES ('r', '/elsewhere/remote.wmv', ?1, 'p', 'encoding', 1,
+                     '2020-01-01T00:00:00Z', 'unraid'),
+                    ('ri', ?2, ?2, 'p', 'paused', 2, '2020-01-01T00:00:00Z', 'unraid')",
+            params![
+                remote_out.to_str().unwrap(),
+                remote_in_place.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+
         recover_interrupted_jobs(&conn);
 
         assert!(source.exists(), "the source is never touched");
         assert!(!output.exists(), "the partial output is removed");
-        let status: String = conn
-            .query_row("SELECT status FROM jobs WHERE id='j'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(status, "queued");
+        for f in [&remote_out, &remote_in_place, &remote_temp] {
+            assert!(
+                f.exists(),
+                "nothing local is deleted for a remote row: {f:?}"
+            );
+        }
+        for id in ["j", "r", "ri"] {
+            let status: String = conn
+                .query_row("SELECT status FROM jobs WHERE id=?1", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(status, "queued", "{id}");
+        }
     }
 
     #[test]
@@ -5400,6 +6219,10 @@ HandBrake has exited.";
         assert_eq!(body["status"], "done");
         assert_eq!(body["result_path"], body["output_path"]);
         assert_eq!(body["job_id"], "j1");
+        // Present and null for a local job, so a receiver can read them unconditionally.
+        for key in ["remote_host", "skip_reason"] {
+            assert_eq!(body.get(key), Some(&serde_json::Value::Null), "{key}");
+        }
     }
 
     #[test]
@@ -5437,6 +6260,11 @@ HandBrake has exited.";
 
         let body = only_webhook_body(&hooks);
         assert_eq!(body["status"], "skipped");
+        assert_eq!(
+            body.get("skip_reason"),
+            Some(&serde_json::Value::Null),
+            "a larger re-encode is a skip with no reason: something WAS encoded"
+        );
         assert_eq!(body["result_path"], body["source_path"]);
         assert_ne!(
             body["result_path"], body["output_path"],
@@ -7097,5 +7925,1368 @@ HandBrake has exited.";
             "2026-01-01T00:00:00+00:00",
             "the key that had not advanced is still seeded"
         );
+    }
+
+    /// A fake HandBrakeCLI that writes `content` to its `-o` and records its `-i`.
+    #[cfg(unix)]
+    fn input_recording_fake_handbrake_script(
+        dir: &std::path::Path,
+        content: &str,
+        record_to: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("hb-remote.sh");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --scan ]; then\n  [ -f '{scan}.slow' ] && sleep 1\n  [ -f '{scan}' ] && cat '{scan}'\n  exit 0\nfi\nwhile [ $# -gt 0 ]; do\n  case $1 in\n    -i) printf '%s\\n' \"$2\" >> '{rec}' ;;\n    -o) out=$2 ;;\n  esac\n  shift\ndone\nprintf '%s' '{content}' > \"$out\"\nexit 0\n",
+                scan = dir.join("scan.out").display(),
+                rec = record_to.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// A remote world: a root directory standing in for the host's share, the ssh shim running the
+    /// real remote scripts against it, and a fake HandBrake. Paths are canonical so the host's
+    /// `realpath` agrees with them.
+    #[cfg(unix)]
+    struct RemoteWorld {
+        _tmp: tempfile::TempDir,
+        root: std::path::PathBuf,
+        hb_inputs: std::path::PathBuf,
+        ctx: Arc<Ctx>,
+        sink: Arc<TestSink>,
+        hooks: Arc<crate::hooks::RecordingHookRunner>,
+    }
+
+    #[cfg(unix)]
+    impl RemoteWorld {
+        fn new(result: &str) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let root = base.join("share");
+            std::fs::create_dir_all(&root).unwrap();
+            let hb_inputs = base.join("hb-inputs");
+            let hb = input_recording_fake_handbrake_script(&base, result, &hb_inputs);
+            let sink = Arc::new(TestSink::default());
+            let hooks = Arc::new(crate::hooks::RecordingHookRunner::default());
+            let ctx = Ctx::new(
+                test_conn(),
+                sink.clone(),
+                Arc::new(RecordingDisposer::default()),
+                Arc::new(crate::handbrake::StubLocator(hb.to_string_lossy().into())),
+                crate::hooks::HookSetup {
+                    runner: hooks.clone(),
+                    allow_stored_command: true,
+                },
+            );
+            set_setting(&ctx.db, "cleanup_mode", "delete");
+            let setup = crate::remote::testing::shim_setup(
+                &base,
+                &[("unraid", root.to_string_lossy().as_ref())],
+            );
+            std::fs::create_dir_all(&setup.staging).unwrap();
+            std::fs::write(setup.staging.join("not-ours.txt"), "someone else's").unwrap();
+            ctx.remote.set(setup).unwrap();
+            RemoteWorld {
+                _tmp: tmp,
+                root,
+                hb_inputs,
+                ctx,
+                sink,
+                hooks,
+            }
+        }
+
+        fn setup(&self) -> &crate::remote::RemoteSetup {
+            self.ctx.remote.get().unwrap()
+        }
+
+        fn host_file(&self, rel: &str, content: &str, mode: u32) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let p = self.root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            p.to_string_lossy().into_owned()
+        }
+
+        fn queue_remote(&self, id: &str, source: &str, output: &str) {
+            let size = std::fs::metadata(source).unwrap().len() as i64;
+            queue_job(&self.ctx.db, id, source, output, size);
+            self.ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET remote_host = 'unraid' WHERE id = ?1",
+                    params![id],
+                )
+                .unwrap();
+        }
+
+        fn row(
+            &self,
+            id: &str,
+        ) -> (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) {
+            self.ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT status, converted_size, source_size, source_mtime, error_message
+                     FROM jobs WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap()
+        }
+
+        /// Nothing of a job is left in staging, and what the staging directory held besides
+        /// ConvertBar's own files survived.
+        fn staging_is_empty(&self) -> bool {
+            let staging = &self.setup().staging;
+            assert_eq!(
+                std::fs::read_to_string(staging.join("not-ours.txt"))
+                    .ok()
+                    .as_deref(),
+                Some("someone else's"),
+                "emptying staging touched a file ConvertBar did not write"
+            );
+            ["source", "result"].iter().all(|sub| {
+                std::fs::read_dir(staging.join(sub)).map_or(true, |mut d| d.next().is_none())
+            })
+        }
+
+        fn pushed(&self) -> bool {
+            crate::remote::testing::shim_log(self.setup())
+                .iter()
+                .any(|s| s == "push")
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_in_place_job_replaces_the_original_on_its_host_keeping_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("show/film.mkv", "the original, much larger", 0o640);
+        world.queue_remote("j1", &film, &film);
+
+        process_queue(&world.ctx);
+
+        let (status, converted, size, mtime, error) = world.row("j1");
+        assert_eq!(status, "done", "{error:?}");
+        assert_eq!(converted, Some(7));
+        assert_eq!(std::fs::read_to_string(&film).unwrap(), "smaller");
+        assert_eq!(
+            std::fs::metadata(&film).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "the replaced file keeps the original's mode"
+        );
+        // The fingerprint is the host's stat of the replaced file, never a staging stat: a
+        // re-scan stats the file on the host, and only that can recognize it as done.
+        let now = crate::probe_cache::file_identity(&film).unwrap();
+        assert_eq!((size, mtime), (Some(now.size), Some(now.mtime)));
+        // HandBrake read the staged copy, never the path on the host.
+        let inputs = std::fs::read_to_string(&world.hb_inputs).unwrap();
+        assert_eq!(
+            inputs.trim(),
+            world
+                .setup()
+                .staged_source(&film)
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            crate::remote::testing::shim_log(world.setup()),
+            ["inspect", "stat", "pull", "stat", "push", "finalize"]
+        );
+        let left: Vec<_> = std::fs::read_dir(world.root.join("show"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(left, ["film.mkv"], "no marked temp is left beside it");
+        assert!(world.staging_is_empty(), "staging ends empty");
+        let phases: Vec<serde_json::Value> = world
+            .sink
+            .payloads("job-phase")
+            .into_iter()
+            .map(|p| p["phase"].clone())
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                serde_json::json!("Pulling…"),
+                serde_json::Value::Null,
+                serde_json::json!("Pushing…"),
+                serde_json::json!("Verifying…"),
+                serde_json::Value::Null
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_low_disk_gate_for_a_remote_job_measures_staging_and_leaves_it_queued() {
+        let world = RemoteWorld::new("smaller");
+        // A host path with no local counterpart: measuring it here fails open and never gates,
+        // so only a measurement of staging trips the gate.
+        let film = "/no-such-dir-on-this-machine/film.mkv";
+        queue_job(&world.ctx.db, "j1", film, film, 1);
+        world
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET remote_host = 'unraid'", [])
+            .unwrap();
+        // More than any disk has: the gate trips on staging's volume.
+        set_setting(&world.ctx.db, "low_disk_min_gb", "1000000000");
+
+        process_queue(&world.ctx);
+
+        assert_eq!(world.row("j1").0, "queued");
+        let pause = world.ctx.converter.low_disk_pause().expect("gated");
+        assert_eq!(
+            pause.path,
+            world.setup().staging.to_string_lossy(),
+            "the reason names staging, not a path on the host"
+        );
+        assert!(
+            crate::remote::testing::shim_log(world.setup()).is_empty(),
+            "nothing ran on the host"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_transfer_killed_by_nobody_here_is_booked_not_left_encoding() {
+        // Only a cancel or a shutdown owns a killed transfer. Anything else that kills ssh
+        // (the OOM killer, a stray `kill`) is a failure: unbooked, the row would sit at
+        // `encoding` until the next restart.
+        for step in ["pull", "push"] {
+            let world = RemoteWorld::new("smaller");
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            crate::remote::testing::hook_before(world.setup(), step, "kill -9 $PPID");
+
+            process_queue(&world.ctx);
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!(status, "error", "{step}");
+            assert!(
+                error.as_deref().unwrap_or_default().contains("interrupted"),
+                "{step}: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&film).unwrap(),
+                "the original, much larger",
+                "{step}"
+            );
+            assert!(world.staging_is_empty(), "{step}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_during_a_transfer_is_booked_and_leaves_the_original() {
+        // The push runs after HandBrake has exited; the job must still be current so Cancel
+        // reaches it, and no half-pushed temp may stay on the host. Nothing local is deleted.
+        for step in ["pull", "push"] {
+            let world = RemoteWorld::new("smaller");
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            // Off the transfer's pipes, or the orphaned sleep holds stderr open after the kill.
+            crate::remote::testing::hook_before(
+                world.setup(),
+                step,
+                "exec >/dev/null 2>&1\nsleep 30",
+            );
+
+            std::thread::scope(|s| {
+                let queue = s.spawn(|| process_queue(&world.ctx));
+                world.wait_for_step(step);
+                crate::control::cancel_conversion(&world.ctx).unwrap();
+                queue.join().unwrap();
+            });
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!(
+                (status.as_str(), error.as_deref()),
+                ("error", Some("Cancelled by user")),
+                "{step}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&film).unwrap(),
+                "the original, much larger",
+                "{step}"
+            );
+            assert!(
+                !world.root.join(".film.convertbar-tmp.mkv").exists(),
+                "{step}"
+            );
+            assert!(world.staging_is_empty(), "{step}");
+            assert!(
+                world.ctx.converter.current_job_id.lock().unwrap().is_none(),
+                "{step}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pause_freezes_a_transfer_and_between_transfers_waits_for_the_job() {
+        use std::time::Duration;
+        // During a transfer the ssh process is the current child: Pause stops it, Resume
+        // continues it.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        crate::remote::testing::hook_before(world.setup(), "pull", "exec >/dev/null 2>&1\nsleep 1");
+        std::thread::scope(|s| {
+            let queue = s.spawn(|| process_queue(&world.ctx));
+            world.wait_for_step("pull");
+            crate::control::pause_conversion(&world.ctx).unwrap();
+            assert_eq!(world.row("j1").0, "paused");
+            // Long enough for the hook to finish: a frozen ssh never starts the pull itself.
+            std::thread::sleep(Duration::from_millis(1500));
+            assert_eq!(world.row("j1").0, "paused");
+            assert!(!world.ran("stat", 2), "the pull is frozen, not finished");
+            crate::control::resume_conversion(&world.ctx).unwrap();
+            queue.join().unwrap();
+        });
+        assert_eq!(world.row("j1").0, "done");
+
+        // During finalize there is no child to stop: Pause arms pause-after-current, and Cancel
+        // is refused, because a finalize past its last line has already replaced the file.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        let other = world.host_file("other.mkv", "another original, larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        world.queue_remote("j2", &other, &other);
+        world
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET queue_order = 1 WHERE id = 'j2'", [])
+            .unwrap();
+        crate::remote::testing::hook_before(world.setup(), "finalize", "sleep 1");
+        std::thread::scope(|s| {
+            let queue = s.spawn(|| process_queue(&world.ctx));
+            world.wait_for_step("finalize");
+            crate::control::pause_conversion(&world.ctx).unwrap();
+            assert!(crate::control::get_pause_after_current(&world.ctx));
+            let refused = crate::control::cancel_conversion(&world.ctx).unwrap_err();
+            assert_eq!(refused, "finishing on unraid; try again in a moment");
+            queue.join().unwrap();
+        });
+        assert_eq!(world.row("j1").0, "done");
+        assert_eq!(std::fs::read_to_string(&film).unwrap(), "smaller");
+        assert_eq!(world.row("j2").0, "queued", "paused after the current job");
+        assert_eq!(world.setting("queue_paused").as_deref(), Some("true"));
+        assert!(
+            world.ctx.converter.finalizing_on.lock().unwrap().is_none(),
+            "Cancel works again once the turn is over"
+        );
+
+        // The job that Pause armed for ends in an error instead (its original changed during
+        // finalize): the queue still pauses after it, and only Resume with nothing frozen
+        // takes the pause back.
+        for resume in [false, true] {
+            let world = RemoteWorld::new("smaller");
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            let other = world.host_file("other.mkv", "another original, larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            world.queue_remote("j2", &other, &other);
+            world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute("UPDATE jobs SET queue_order = 1 WHERE id = 'j2'", [])
+                .unwrap();
+            crate::remote::testing::hook_before(
+                world.setup(),
+                "finalize",
+                &format!("sleep 1\nprintf ' edited' >> '{film}'"),
+            );
+            std::thread::scope(|s| {
+                let queue = s.spawn(|| process_queue(&world.ctx));
+                world.wait_for_step("finalize");
+                crate::control::pause_conversion(&world.ctx).unwrap();
+                if resume {
+                    crate::control::resume_conversion(&world.ctx).unwrap();
+                }
+                queue.join().unwrap();
+            });
+            assert_eq!(world.row("j1").0, "error", "resume {resume}");
+            if resume {
+                assert_eq!(world.row("j2").0, "done", "the pause was taken back");
+            } else {
+                assert_eq!(world.row("j2").0, "queued", "paused after the failed job");
+                assert_eq!(world.setting("queue_paused").as_deref(), Some("true"));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_finalize_stream_cut_short_runs_nothing_on_the_host() {
+        // The whole body arrives, but not the line that calls it: a connection dropped there
+        // must leave the host exactly as it was, so the script is a function called last.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        crate::remote::testing::cut_stream_after(world.setup(), "finalize", "^  stat -c");
+
+        process_queue(&world.ctx);
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(status, "error", "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(&film).unwrap(),
+            "the original, much larger",
+            "nothing replaced"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_job_outside_the_current_roots_is_refused_before_the_pull() {
+        // A row whose path lies under no configured root of its host (a root dropped from the
+        // configuration after the add): nothing there may be replaced.
+        let world = RemoteWorld::new("smaller");
+        let elsewhere = world.root.parent().unwrap().join("old-root/film.mkv");
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        std::fs::write(&elsewhere, "the original, much larger").unwrap();
+        let film = elsewhere.to_string_lossy().into_owned();
+        world.queue_remote("j1", &film, &film);
+
+        process_queue(&world.ctx);
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(status, "error");
+        assert!(error.unwrap().contains("outside the remote roots"));
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "the original, much larger"
+        );
+        assert!(crate::remote::testing::shim_log(world.setup()).is_empty());
+
+        // Named under the root, but a directory on the way became a symlink out of it after the
+        // add: only the host can tell, and finalize would replace through the link.
+        let world = RemoteWorld::new("smaller");
+        let outside = world.root.parent().unwrap().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("film.mkv"), "the original, much larger").unwrap();
+        std::os::unix::fs::symlink(&outside, world.root.join("Show")).unwrap();
+        let film = world
+            .root
+            .join("Show/film.mkv")
+            .to_string_lossy()
+            .into_owned();
+        world.queue_remote("j1", &film, &film);
+
+        process_queue(&world.ctx);
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(status, "error");
+        assert!(error.unwrap().contains("outside the remote roots"));
+        assert_eq!(
+            std::fs::read_to_string(outside.join("film.mkv")).unwrap(),
+            "the original, much larger"
+        );
+        assert!(!world.ran("pull", 1), "nothing pulled through the link");
+    }
+
+    #[cfg(unix)]
+    impl RemoteWorld {
+        fn names_in(&self, rel: &str) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(self.root.join(rel))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Queues an in-place job for a path that does not exist on the host.
+        fn queue_remote_missing(&self, id: &str, path: &str) {
+            queue_job(&self.ctx.db, id, path, path, 1);
+            self.ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET remote_host = 'unraid' WHERE id = ?1",
+                    params![id],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_new_name_is_published_and_the_original_deleted_or_kept_by_the_mode() {
+        for (mode, originals_left) in [("delete", false), ("keep", true)] {
+            let world = RemoteWorld::new("smaller");
+            set_setting(&world.ctx.db, "cleanup_mode", mode);
+            let wmv = world.host_file("talk.wmv", "the original, much larger", 0o600);
+            let mkv = world.root.join("talk.mkv").to_string_lossy().into_owned();
+            world.queue_remote("j1", &wmv, &mkv);
+
+            process_queue(&world.ctx);
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!(status, "done", "{mode}: {error:?}");
+            assert_eq!(std::fs::read_to_string(&mkv).unwrap(), "smaller", "{mode}");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&mkv).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{mode}: the new name takes over the original's mode"
+                );
+            }
+            let mut want = vec!["talk.mkv".to_string()];
+            if originals_left {
+                want.push("talk.wmv".to_string());
+            }
+            assert_eq!(world.names_in(""), want, "{mode}");
+            assert!(world.staging_is_empty(), "{mode}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_job_whose_original_wins_or_turns_keep_in_place_pushes_nothing() {
+        // The re-encode is larger: skipped, the original untouched, nothing uploaded.
+        let world = RemoteWorld::new("a re-encode far larger than the original");
+        let film = world.host_file("film.mkv", "small", 0o644);
+        world.queue_remote("j1", &film, &film);
+        process_queue(&world.ctx);
+        assert_eq!(world.row("j1").0, "skipped");
+        assert_eq!(std::fs::read_to_string(&film).unwrap(), "small");
+        assert!(!world.pushed());
+
+        // The mode became keep while an in-place job was already past the queue: its result is
+        // discarded and the row dropped, exactly as locally, and nothing reaches the host.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        set_setting(&world.ctx.db, "cleanup_mode", "keep");
+        process_queue(&world.ctx);
+        let rows: i64 = world
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(
+            std::fs::read_to_string(&film).unwrap(),
+            "the original, much larger"
+        );
+        assert!(!world.pushed());
+        assert!(world.staging_is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_mode_turning_keep_during_the_push_keeps_the_original() {
+        // A push can take many minutes. Finalize goes by the mode as it is when finalize begins,
+        // or a switch to keep mid-upload still deletes (or replaces) the original on the host.
+        for in_place in [true, false] {
+            let world = RemoteWorld::new("smaller");
+            set_setting(&world.ctx.db, "cleanup_mode", "delete");
+            let name = if in_place { "film.mkv" } else { "film.wmv" };
+            let source = world.host_file(name, "the original, much larger", 0o644);
+            let output = world.root.join("film.mkv").to_string_lossy().into_owned();
+            world.queue_remote("j1", &source, &output);
+            crate::remote::testing::hook_before(world.setup(), "push", "sleep 1");
+
+            std::thread::scope(|s| {
+                let queue = s.spawn(|| process_queue(&world.ctx));
+                world.wait_for_step("push");
+                set_setting(&world.ctx.db, "cleanup_mode", "keep");
+                queue.join().unwrap();
+            });
+
+            assert_eq!(
+                std::fs::read_to_string(&source).unwrap(),
+                "the original, much larger",
+                "in place: {in_place}"
+            );
+            if in_place {
+                // Discarded as the local keep backstop does: no row, and no temp left behind.
+                let rows: i64 = world
+                    .ctx
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(rows, 0);
+                assert_eq!(world.names_in(""), ["film.mkv"]);
+            } else {
+                assert_eq!(world.row("j1").0, "done");
+                assert_eq!(std::fs::read_to_string(&output).unwrap(), "smaller");
+                assert_eq!(world.names_in(""), ["film.mkv", "film.wmv"]);
+            }
+            assert!(world.staging_is_empty(), "in place: {in_place}");
+        }
+    }
+
+    /// One finalize refusal: what the host is made to do just before finalize, what the error
+    /// must say, and which files must be left behind.
+    #[cfg(unix)]
+    struct Refusal {
+        name: &'static str,
+        before_finalize: &'static str,
+        message: &'static str,
+        temp_left: bool,
+        original: &'static str,
+        target: Option<&'static str>,
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn every_finalize_refusal_names_what_happened_and_leaves_the_files_it_promises() {
+        let original = "the original, much larger";
+        let cases = [
+            Refusal {
+                name: "the original changed since the pull",
+                before_finalize: "printf ' edited' >> \"$ROOT/talk.wmv\"",
+                message: "changed since it was pulled",
+                temp_left: true,
+                original: "the original, much larger edited",
+                target: None,
+            },
+            Refusal {
+                name: "the pushed result does not match",
+                before_finalize: "printf 'x' >> \"$ROOT/.talk.convertbar-tmp.mkv\"",
+                message: "did not match",
+                temp_left: false,
+                original,
+                target: None,
+            },
+            Refusal {
+                name: "the name appeared on the host",
+                before_finalize: "printf 'somebody else' > \"$ROOT/talk.mkv\"",
+                message: "already exists",
+                temp_left: true,
+                original,
+                target: Some("somebody else"),
+            },
+        ];
+        for case in cases {
+            let world = RemoteWorld::new("smaller");
+            let wmv = world.host_file("talk.wmv", original, 0o644);
+            let mkv = world.root.join("talk.mkv");
+            world.queue_remote("j1", &wmv, &mkv.to_string_lossy());
+            crate::remote::testing::hook_before(
+                world.setup(),
+                "finalize",
+                &format!("ROOT='{}'\n{}", world.root.display(), case.before_finalize),
+            );
+
+            process_queue(&world.ctx);
+
+            let (status, _, _, _, error) = world.row("j1");
+            let error = error.unwrap_or_default();
+            assert_eq!(status, "error", "{}", case.name);
+            assert!(error.contains(case.message), "{}: {error}", case.name);
+            assert_eq!(
+                std::fs::read_to_string(&wmv).unwrap(),
+                case.original,
+                "{}",
+                case.name
+            );
+            let temp = world.root.join(".talk.convertbar-tmp.mkv");
+            assert_eq!(temp.exists(), case.temp_left, "{}", case.name);
+            if case.temp_left {
+                assert!(
+                    error.contains(&*temp.to_string_lossy()),
+                    "{}: the message names the temp left behind: {error}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&mkv).ok().as_deref(),
+                case.target,
+                "{}: nothing was published or overwritten",
+                case.name
+            );
+            assert!(world.staging_is_empty(), "{}", case.name);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_chown_failure_leaves_both_files() {
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        crate::remote::testing::failing_program(world.setup(), "finalize", "chown");
+
+        process_queue(&world.ctx);
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(status, "error");
+        assert!(error.unwrap().contains("owner, group and mode"));
+        assert_eq!(
+            std::fs::read_to_string(&film).unwrap(),
+            "the original, much larger"
+        );
+        assert!(world.root.join(".film.convertbar-tmp.mkv").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_short_download_is_an_error_and_nothing_is_encoded() {
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        // Truncated after the baseline stat, before the stream: fewer bytes arrive than expected.
+        crate::remote::testing::hook_before(
+            world.setup(),
+            "pull",
+            &format!("printf 'short' > '{film}'"),
+        );
+
+        process_queue(&world.ctx);
+
+        let (status, _, _, _, error) = world.row("j1");
+        assert_eq!(status, "error");
+        assert!(error.unwrap().contains("short"));
+        assert!(!world.hb_inputs.exists(), "HandBrake never ran");
+        assert!(!world.pushed());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_a_definitely_missing_remote_source_is_no_longer_there() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads any directory");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let world = RemoteWorld::new("smaller");
+        let gone = world.root.join("gone.mkv").to_string_lossy().into_owned();
+        world.queue_remote_missing("j1", &gone);
+        let locked = world.host_file("locked/film.mkv", "x", 0o644);
+        world.queue_remote("j2", &locked, &locked);
+        let dir = world.root.join("locked");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        process_queue(&world.ctx);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            world.row("j1").4.as_deref(),
+            Some("Source file no longer exists")
+        );
+        let (status, _, _, _, error) = world.row("j2");
+        assert_eq!(status, "error");
+        assert_ne!(
+            error.as_deref(),
+            Some("Source file no longer exists"),
+            "a source the host cannot look at is not a vanished one"
+        );
+        assert_eq!(
+            class_of(&world.ctx.db, "j2").as_deref(),
+            Some("environment")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_condemned_remote_source_is_fingerprinted_by_the_hosts_stat() {
+        let world = RemoteWorld::new("unused");
+        let base = world.root.parent().unwrap().to_path_buf();
+        let hb = bad_source_fake_handbrake_script(&base);
+        set_setting(&world.ctx.db, "handbrake_path", &hb.to_string_lossy());
+        let film = world.host_file("film.mkv", "broken bytes", 0o644);
+        world.queue_remote("j1", &film, &film);
+
+        process_queue(&world.ctx);
+
+        assert_eq!(class_of(&world.ctx.db, "j1").as_deref(), Some("bad_source"));
+        let on_host = crate::probe_cache::file_identity(&film).unwrap();
+        let (_, _, size, mtime, _) = world.row("j1");
+        assert_eq!((size, mtime), (Some(on_host.size), Some(on_host.mtime)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_file_already_at_the_target_is_skipped_after_the_pull_and_says_so() {
+        // The target is H.265 1080p. The add could not probe a file on the host, so the staged
+        // copy is probed: an HEVC 720p source cannot improve, an H.264 one can, and with the
+        // setting off nothing is probed at all.
+        for (case, setting, codec, skipped) in [
+            ("hevc 720p", "true", "hevc", true),
+            ("h264 720p", "true", "h264", false),
+            ("setting off", "false", "hevc", false),
+        ] {
+            let world = RemoteWorld::new("smaller");
+            let base = world.root.parent().unwrap().to_path_buf();
+            std::fs::write(
+                base.join("scan.out"),
+                format!(
+                    "JSON Title Set: {{\"TitleList\": [{{\"Geometry\": {{\"Height\": 720}}, \
+                     \"VideoCodec\": \"{codec}\"}}]}}\n"
+                ),
+            )
+            .unwrap();
+            let preset: String = world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT value FROM settings WHERE key = 'preset'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            world.ctx.preset_cache.lock().unwrap().insert(
+                preset,
+                crate::handbrake::PresetMetadata {
+                    codec: "h265".into(),
+                    resolution: "1080p".into(),
+                    quality: "22".into(),
+                    preset: "data".into(),
+                    device: String::new(),
+                    container: "mkv".into(),
+                },
+            );
+            set_setting(&world.ctx.db, "skip_by_source_media", setting);
+            set_setting(&world.ctx.db, "notifications_per_file", "true");
+            set_setting(
+                &world.ctx.db,
+                "post_convert_webhook_url",
+                "http://receiver.invalid/hook",
+            );
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+
+            process_queue(&world.ctx);
+
+            let body = only_webhook_body(&world.hooks);
+            assert_eq!(body["remote_host"], "unraid", "{case}");
+            let (status, kept, converted, saved, reason): (
+                String,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+            ) = world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT status, kept_file, converted_size, space_saved, skip_reason
+                     FROM jobs WHERE id = 'j1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            let notes = world.sink.notifications.lock().unwrap().clone();
+            if skipped {
+                assert_eq!(
+                    (status.as_str(), kept.as_deref(), converted, saved),
+                    ("skipped", Some("original"), None, Some(0)),
+                    "{case}"
+                );
+                assert_eq!(reason.as_deref(), Some("already_at_target"), "{case}");
+                assert_eq!(body["skip_reason"], "already_at_target", "{case}");
+                assert_eq!(body["status"], "skipped", "{case}");
+                assert!(!world.hb_inputs.exists(), "{case}: nothing encoded");
+                assert!(!world.pushed(), "{case}: nothing pushed");
+                assert_eq!(
+                    std::fs::read_to_string(&film).unwrap(),
+                    "the original, much larger",
+                    "{case}"
+                );
+                assert!(
+                    notes
+                        .iter()
+                        .any(|(_, b)| b.contains("already at the target")),
+                    "{case}: {notes:?}"
+                );
+                assert!(
+                    notes
+                        .iter()
+                        .all(|(_, b)| !b.contains("converted was larger")),
+                    "{case}: {notes:?}"
+                );
+            } else {
+                assert_eq!(status, "done", "{case}");
+                assert_eq!(reason, None, "{case}");
+                assert!(body["skip_reason"].is_null(), "{case}");
+                assert!(world.pushed(), "{case}");
+            }
+            assert!(world.staging_is_empty(), "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    impl RemoteWorld {
+        /// Whether the shim has run `step` at least `times` times.
+        fn ran(&self, step: &str, times: usize) -> bool {
+            crate::remote::testing::shim_log(self.setup())
+                .iter()
+                .filter(|s| *s == step)
+                .count()
+                >= times
+        }
+
+        fn wait_for_step(&self, step: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !self.ran(step, 1) {
+                assert!(std::time::Instant::now() < deadline, "{step} never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        fn setting(&self, key: &str) -> Option<String> {
+            read_setting_opt(&self.ctx.db.lock().unwrap(), key)
+        }
+
+        /// Starts the queue the way Start does, and waits for the run to end.
+        fn start_and_wait(&self) {
+            crate::control::start_queue(&self.ctx).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while self.ctx.converter.is_running() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the queue never stopped"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        fn webhook_events(&self) -> Vec<serde_json::Value> {
+            self.hooks
+                .webhooks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| serde_json::from_str(&r.body).unwrap())
+                .collect()
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unreachable_host_stops_the_queue_and_the_next_start_takes_the_job_back() {
+        for step in ["stat", "pull", "push", "finalize"] {
+            let world = RemoteWorld::new("smaller");
+            set_setting(
+                &world.ctx.db,
+                "post_convert_webhook_url",
+                "http://receiver.invalid/hook",
+            );
+            set_setting(
+                &world.ctx.db,
+                "queue_drained_webhook_url",
+                "http://receiver.invalid/drained",
+            );
+            set_setting(&world.ctx.db, "notifications_queue_done", "true");
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            let other = world.host_file("other.mkv", "another original, larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            world.queue_remote("j2", &other, &other);
+            world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute("UPDATE jobs SET queue_order = 1 WHERE id = 'j2'", [])
+                .unwrap();
+            crate::remote::testing::fail_unreachable(world.setup(), step);
+
+            process_queue(&world.ctx);
+
+            assert_eq!(world.row("j1").0, "error", "{step}");
+            assert_eq!(
+                class_of(&world.ctx.db, "j1").as_deref(),
+                Some("unreachable"),
+                "{step}"
+            );
+            let message = world.row("j1").4.unwrap();
+            assert!(
+                message.contains("unraid") && message.contains(step),
+                "{step}: {message}"
+            );
+            assert_eq!(
+                world.row("j2").0,
+                "queued",
+                "{step}: the job behind it waits"
+            );
+            assert_eq!(
+                world.setting("queue_paused").as_deref(),
+                Some("true"),
+                "{step}"
+            );
+            assert_eq!(
+                world.setting(UNREACHABLE_JOB_KEY).as_deref(),
+                Some("j1"),
+                "{step}"
+            );
+            let stop = UnreachableStop {
+                host: "unraid".into(),
+                step: step.into(),
+            };
+            assert_eq!(world.ctx.converter.unreachable_stop(), Some(stop), "{step}");
+            assert_eq!(
+                world.sink.payloads("queue-paused-unreachable"),
+                [serde_json::json!({"host": "unraid", "step": step})],
+                "{step}"
+            );
+            let sent = world.webhook_events();
+            assert_eq!(sent.len(), 1, "{step}: one post-convert, no queue-drained");
+            assert_eq!(sent[0]["event"], "post-convert", "{step}");
+            assert_eq!(sent[0]["failure_class"], "unreachable", "{step}");
+            assert_eq!(sent[0]["remote_host"], "unraid", "{step}");
+            assert!(
+                world
+                    .sink
+                    .notifications
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, b)| !b.contains("complete")),
+                "{step}: an outage is not a drain"
+            );
+            assert!(world.staging_is_empty(), "{step}");
+            assert_eq!(
+                world.root.join(".film.convertbar-tmp.mkv").exists(),
+                step == "finalize",
+                "{step}: only a push that landed leaves its temp, for the next push to overwrite"
+            );
+
+            crate::remote::testing::reachable_again(world.setup());
+            // Slow the re-run's first stat once, to look at the row while it runs again: its
+            // `completed_at` is gone, so the queue-drained batch cannot count it as finished.
+            crate::remote::testing::hook_before(world.setup(), "stat", "sleep 1\nrm -f \"$0\"");
+            let stats = |w: &RemoteWorld| {
+                crate::remote::testing::shim_log(w.setup())
+                    .iter()
+                    .filter(|s| *s == "stat")
+                    .count()
+            };
+            let before = stats(&world);
+            crate::control::start_queue(&world.ctx).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while stats(&world) == before {
+                assert!(std::time::Instant::now() < deadline, "{step}: never re-ran");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let completed_at: Option<String> = world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT completed_at FROM jobs WHERE id = 'j1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(completed_at, None, "{step}");
+            world.start_and_wait();
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!((status.as_str(), error), ("done", None), "{step}");
+            assert_eq!(
+                world.setting(REQUEUED_AFTER_OUTAGE_KEY),
+                None,
+                "{step}: the re-queue marker ends with the job's turn"
+            );
+            assert_eq!(class_of(&world.ctx.db, "j1"), None, "{step}");
+            assert_eq!(world.row("j2").0, "done", "{step}");
+            assert_eq!(std::fs::read_to_string(&film).unwrap(), "smaller", "{step}");
+            assert!(
+                !world.root.join(".film.convertbar-tmp.mkv").exists(),
+                "{step}"
+            );
+            assert_eq!(world.setting(UNREACHABLE_JOB_KEY), None, "{step}");
+            assert_eq!(
+                world.setting("queue_paused").as_deref(),
+                Some("false"),
+                "{step}"
+            );
+            assert_eq!(world.ctx.converter.unreachable_stop(), None, "{step}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_remembered_job_is_taken_back_only_while_nothing_else_holds_its_path() {
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        crate::remote::testing::fail_unreachable(world.setup(), "stat");
+        process_queue(&world.ctx);
+        assert_eq!(world.setting(UNREACHABLE_JOB_KEY).as_deref(), Some("j1"));
+
+        // The same file queued again by hand meanwhile: that row is the one that runs.
+        crate::remote::testing::reachable_again(world.setup());
+        world.queue_remote("j2", &film, &film);
+        world.start_and_wait();
+        assert_eq!(world.row("j1").0, "error");
+        assert_eq!(world.row("j2").0, "done");
+        assert_eq!(
+            world.setting(UNREACHABLE_JOB_KEY),
+            None,
+            "forgotten either way"
+        );
+
+        // Clearing the queue forgets the stop: the next start takes nothing back.
+        let world = RemoteWorld::new("smaller");
+        let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+        world.queue_remote("j1", &film, &film);
+        crate::remote::testing::fail_unreachable(world.setup(), "stat");
+        process_queue(&world.ctx);
+        crate::queue_ops::clear_queue(&world.ctx).unwrap();
+        assert_eq!(world.setting(UNREACHABLE_JOB_KEY), None);
+        assert_eq!(world.ctx.converter.unreachable_stop(), None);
+        crate::remote::testing::reachable_again(world.setup());
+        world.start_and_wait();
+        assert_eq!(world.row("j1").0, "error", "its error row stays in history");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_new_name_job_whose_finalize_landed_before_the_drop_is_booked_done() {
+        // The connection dropped after finalize published talk.mkv and deleted talk.wmv. Only
+        // that job, re-queued after its outage, is booked done from what is on the host; any
+        // other job whose source vanished is today's quiet "no longer exists".
+        // With no recorded original size, nothing is claimed as saved rather than a negative.
+        for (case, after_outage, original, saved) in [
+            ("the edge", true, Some(100), 91),
+            ("the edge, no original size", true, None, 0),
+            ("not after an outage", false, Some(100), 0),
+        ] {
+            let done = after_outage;
+            let world = RemoteWorld::new("unused");
+            set_setting(
+                &world.ctx.db,
+                "post_convert_webhook_url",
+                "http://receiver.invalid/hook",
+            );
+            let source = world.root.join("talk.wmv").to_string_lossy().into_owned();
+            let output = world.host_file("talk.mkv", "published", 0o644);
+            queue_job(&world.ctx.db, "j1", &source, &output, 100);
+            world
+                .ctx
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET remote_host = 'unraid', status = 'error',
+                            failure_class = 'unreachable', error_message = 'x',
+                            original_size = ?1",
+                    params![original],
+                )
+                .unwrap();
+            if after_outage {
+                write_setting(
+                    &world.ctx.db.lock().unwrap(),
+                    UNREACHABLE_JOB_KEY,
+                    Some("j1"),
+                );
+            } else {
+                world
+                    .ctx
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE jobs SET status = 'queued'", [])
+                    .unwrap();
+            }
+
+            world.start_and_wait();
+
+            let (status, converted, _, _, error) = world.row("j1");
+            if done {
+                assert_eq!((status.as_str(), converted), ("done", Some(9)), "{case}");
+                let booked_saved: i64 = world
+                    .ctx
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT space_saved FROM jobs WHERE id = 'j1'", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(booked_saved, saved, "{case}");
+                assert_eq!(world.webhook_events()[0]["status"], "done", "{case}");
+            } else {
+                assert_eq!(
+                    (status.as_str(), error.as_deref()),
+                    ("error", Some("Source file no longer exists")),
+                    "{case}"
+                );
+            }
+            assert!(!world.hb_inputs.exists(), "{case}: nothing encoded");
+        }
+    }
+
+    #[test]
+    fn finalize_begins_only_for_a_job_still_running() {
+        // The gap between the push and finalize holds only the local checksum, so no queue-level
+        // test can land a Cancel in it; this pins the decision taken there. A row Cancel booked
+        // in that gap must not be finalized, or the host's file is replaced under a job the
+        // user was told was cancelled.
+        let (ctx, _sink, _disposer) =
+            test_ctx_with_locator(test_conn(), Arc::new(crate::handbrake::AbsentLocator));
+        // Switched during the push: finalize decides by the mode as it is now, not at pickup.
+        write_setting(&ctx.db.lock().unwrap(), "cleanup_mode", Some("keep"));
+        for (status, begins) in [("encoding", true), ("paused", true), ("error", false)] {
+            queue_job(&ctx.db, "j1", "/share/a.mkv", "/share/a.mkv", 1);
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute("UPDATE jobs SET status = ?1", params![status])
+                .unwrap();
+
+            assert_eq!(
+                begin_finalize(&ctx, "j1", "unraid"),
+                begins.then(|| "keep".to_string()),
+                "{status}"
+            );
+            assert_eq!(
+                ctx.converter.finalizing_on.lock().unwrap().take(),
+                begins.then(|| "unraid".to_string()),
+                "{status}"
+            );
+            ctx.db
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM jobs", [])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_between_transfers_stops_the_job_where_it_is() {
+        // Neither the stat nor the staged copy's media probe has a child to kill: the Cancel
+        // only books the row, and the queue thread must notice before it does more. The probe
+        // is cancelled both when it finds the file at the target and when it does not. The
+        // cancelled stat may also come back failed or unreachable: the Cancel's booking stands,
+        // or an outage booking over it would have the next Start take the cancelled job back.
+        for (step, codec) in [
+            ("stat", ""),
+            ("stat", "then fails"),
+            ("stat", "then unreachable"),
+            ("probe", "hevc"),
+            ("probe", "h264"),
+        ] {
+            let step_case = format!("{step} {codec}");
+            let step_case = step_case.trim();
+            let world = RemoteWorld::new("smaller");
+            set_setting(
+                &world.ctx.db,
+                "post_convert_webhook_url",
+                "http://receiver.invalid/hook",
+            );
+            let film = world.host_file("film.mkv", "the original, much larger", 0o644);
+            world.queue_remote("j1", &film, &film);
+            let base = world.root.parent().unwrap().to_path_buf();
+            if step == "stat" {
+                let ending = match codec {
+                    "then fails" => "\nexit 1",
+                    "then unreachable" => "\nexit 255",
+                    _ => "",
+                };
+                crate::remote::testing::hook_before(
+                    world.setup(),
+                    "stat",
+                    &format!("sleep 1{ending}"),
+                );
+            } else {
+                // At the target (hevc) or not (h264), and slow to say so.
+                std::fs::write(
+                    base.join("scan.out"),
+                    format!(
+                        "JSON Title Set: {{\"TitleList\": [{{\"Geometry\": {{\"Height\": 720}}, \
+                         \"VideoCodec\": \"{codec}\"}}]}}\n"
+                    ),
+                )
+                .unwrap();
+                std::fs::write(base.join("scan.out.slow"), "").unwrap();
+                let preset: String =
+                    read_setting_opt(&world.ctx.db.lock().unwrap(), "preset").unwrap();
+                world.ctx.preset_cache.lock().unwrap().insert(
+                    preset,
+                    crate::handbrake::PresetMetadata {
+                        codec: "h265".into(),
+                        resolution: "1080p".into(),
+                        quality: "22".into(),
+                        preset: "data".into(),
+                        device: String::new(),
+                        container: "mkv".into(),
+                    },
+                );
+                set_setting(&world.ctx.db, "skip_by_source_media", "true");
+            }
+
+            std::thread::scope(|s| {
+                let queue = s.spawn(|| process_queue(&world.ctx));
+                if step == "stat" {
+                    world.wait_for_step("stat");
+                } else {
+                    // The second stat follows the pull; the slow probe starts right after it.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                    while !world.ran("stat", 2) {
+                        assert!(std::time::Instant::now() < deadline, "the pull never ended");
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                crate::control::cancel_conversion(&world.ctx).unwrap();
+                queue.join().unwrap();
+            });
+
+            let (status, _, _, _, error) = world.row("j1");
+            assert_eq!(
+                (status.as_str(), error.as_deref()),
+                ("error", Some("Cancelled by user")),
+                "{step_case}"
+            );
+            assert!(
+                world.webhook_events().is_empty(),
+                "{step_case}: nothing booked after it"
+            );
+            assert!(!world.hb_inputs.exists(), "{step_case}: nothing encoded");
+            assert!(!world.pushed(), "{step_case}");
+            if step == "stat" {
+                assert!(!world.ran("pull", 1), "nothing pulled for a cancelled job");
+            }
+            assert_eq!(
+                read_setting_opt(&world.ctx.db.lock().unwrap(), UNREACHABLE_JOB_KEY),
+                None::<String>,
+                "{step_case}: a cancelled job is never remembered for re-queueing"
+            );
+            assert_eq!(world.ctx.converter.unreachable_stop(), None, "{step_case}");
+            assert_eq!(
+                std::fs::read_to_string(&film).unwrap(),
+                "the original, much larger",
+                "{step_case}"
+            );
+            assert!(world.staging_is_empty(), "{step_case}");
+        }
     }
 }

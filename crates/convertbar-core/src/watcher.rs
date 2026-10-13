@@ -349,12 +349,14 @@ fn filter_watched(ctx: &Arc<Ctx>, paths: Vec<String>) -> Vec<String> {
     covered_paths(&configs, paths)
 }
 
-/// Paths with an unpurged `bad_source`/`bad_source_truncated` row — the same set the "Bad
-/// sources" review list shows (identical WHERE clause to `get_bad_sources_inner`). Fails open
+/// Paths with an unpurged local `bad_source`/`bad_source_truncated` row — the review list's
+/// WHERE clause, less remote rows: a watched folder is local, and a remote row's path names a
+/// file on its host, never one here (ADR 0005). Fails open
 /// (returns empty) on a DB error: a lock hiccup must not silently block a legitimate add.
 fn unpurged_bad_source_paths(conn: &rusqlite::Connection) -> std::collections::HashSet<String> {
     let mut stmt = match conn.prepare(
-        "SELECT source_path FROM jobs WHERE status = 'error' AND failure_class IN (?1, ?2)",
+        "SELECT source_path FROM jobs WHERE status = 'error' AND failure_class IN (?1, ?2) \
+         AND remote_host IS NULL",
     ) {
         Ok(s) => s,
         Err(_) => return std::collections::HashSet::new(),
@@ -1273,12 +1275,14 @@ mod tests {
             ("c", "/w/env.mkv", "error", Some("environment")),
             ("d", "/w/purged.mkv", "error", Some("bad_source_purged")),
             ("e", "/w/done.mkv", "done", Some("bad_source")),
+            // The same path string on a remote host: a different file on a different machine.
+            ("f", "/w/remote.mkv", "error", Some("bad_source")),
         ] {
             conn.execute(
                 "INSERT INTO jobs (id, source_path, output_path, preset, status, failure_class,
-                                   queue_order, created_at, completed_at)
+                                   queue_order, created_at, completed_at, remote_host)
                  VALUES (?1, ?2, '/o.mp4', 'p', ?3, ?4, 0, '2026-07-25T10:00:00Z',
-                         '2026-07-25T10:00:00Z')",
+                         '2026-07-25T10:00:00Z', CASE ?1 WHEN 'f' THEN 'unraid' END)",
                 rusqlite::params![id, source_path, status, class],
             )
             .unwrap();

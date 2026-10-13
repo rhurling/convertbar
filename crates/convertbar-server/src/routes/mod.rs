@@ -34,6 +34,22 @@ pub fn core_err(e: String) -> (axum::http::StatusCode, Json<Value>) {
     )
 }
 
+/// The answer to a request naming a remote host: 400 for something it may not name (unknown
+/// host, outside the roots, a symlink), 502 when the host cannot be reached, so a client can
+/// tell a wrong request from an outage.
+pub fn remote_json<T: serde::Serialize>(
+    result: Result<T, convertbar_core::queue_ops::RemoteAddError>,
+) -> axum::response::Response {
+    use convertbar_core::queue_ops::RemoteAddError;
+    let (status, message) = match result {
+        Ok(v) => return Json(v).into_response(),
+        Err(RemoteAddError::Refused(m)) => (axum::http::StatusCode::BAD_REQUEST, m),
+        Err(RemoteAddError::Unreachable(m)) => (axum::http::StatusCode::BAD_GATEWAY, m),
+        Err(RemoteAddError::Failed(m)) => return core_err(m).into_response(),
+    };
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
 /// Maps a `spawn_blocking` join failure — a panic in a blocking task, i.e. a bug in this
 /// server — to a 500 a client can tell apart from [`core_err`]'s deliberate failures.
 ///
@@ -183,6 +199,10 @@ pub fn api_router(state: ServerState) -> Router {
         .route(
             "/converter/low-disk-pause",
             get(converter::get_low_disk_pause),
+        )
+        .route(
+            "/converter/unreachable-stop",
+            get(converter::get_unreachable_stop),
         )
         .route("/settings", get(settings::get_settings))
         .route("/settings/{key}", put(settings::update_setting))
@@ -685,6 +705,252 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn a_remote_add_queues_without_starting_and_tells_a_refusal_from_an_outage() {
+        let state = test_state_installed();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let share = base.join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let film = share.join("film.wmv");
+        std::fs::write(&film, "x").unwrap();
+        let setup = convertbar_core::remote::testing::shim_setup(
+            &base,
+            &[("unraid", share.to_string_lossy().as_ref())],
+        );
+        state.ctx.remote.set(setup).unwrap();
+        let app = api_router(state.clone());
+        let add = |path: String| json!({"remote": "unraid", "paths": [path]});
+
+        let (status, json) = request_json(
+            app.clone(),
+            "POST",
+            "/api/queue/files",
+            Some(add(film.to_string_lossy().into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["added"][0]["remote_host"], "unraid");
+        assert_eq!(
+            json["added"][0].get("skip_reason"),
+            Some(&serde_json::Value::Null)
+        );
+        // `send` adds and then starts; the add alone must leave the queue idle.
+        assert!(!state.ctx.converter.is_running());
+
+        let outside = base.join("elsewhere.wmv");
+        std::fs::write(&outside, "x").unwrap();
+        let (status, json) = request_json(
+            app.clone(),
+            "POST",
+            "/api/queue/files",
+            Some(add(outside.to_string_lossy().into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("outside the remote roots"));
+
+        convertbar_core::remote::testing::fail_unreachable(
+            state.ctx.remote.get().unwrap(),
+            "inspect",
+        );
+        let other = share.join("other.wmv");
+        std::fs::write(&other, "x").unwrap();
+        let (status, json) = request_json(
+            app,
+            "POST",
+            "/api/queue/files",
+            Some(add(other.to_string_lossy().into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(json["error"].as_str().unwrap().contains("unraid"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_folder_is_browsed_scanned_and_added_through_its_host() {
+        use convertbar_core::remote::testing::{fail_unreachable, shim_setup};
+        let mut state = test_state_installed();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let share = base.join("share");
+        let show = share.join("Show");
+        std::fs::create_dir_all(show.join("Season 2")).unwrap();
+        std::fs::write(show.join("ep\n1.wmv"), "12345").unwrap();
+        std::fs::write(show.join("ep2.mkv"), "x").unwrap();
+        std::fs::write(show.join("notes.txt"), "x").unwrap();
+        std::fs::write(show.join(".ep2.convertbar-tmp.mkv"), "x").unwrap();
+        std::fs::write(show.join("Season 2/ep3.wmv"), "x").unwrap();
+        std::os::unix::fs::symlink(show.join("ep2.mkv"), show.join("alias.mkv")).unwrap();
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("out.wmv"), "x").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, show.join("Extras")).unwrap();
+        std::os::unix::fs::symlink(show.join("Season 2"), show.join("Latest")).unwrap();
+        // The same share as a second root reached through a symlink, as a NAS share can be.
+        let via = base.join("via");
+        std::os::unix::fs::symlink(&share, &via).unwrap();
+        let setup = shim_setup(&base, &[("unraid", &s(&share)), ("unraid", &s(&via))]);
+        let mut config = (*state.config).clone();
+        config.remote_roots = setup.roots.clone();
+        state.config = Arc::new(config);
+        state.ctx.remote.set(setup).unwrap();
+        let app = api_router(state.clone());
+        let encode = |p: &str| -> String {
+            p.bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"/-_.".contains(&b) {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect()
+        };
+        let list = |host: &str, p: &str| format!("/api/fs/list?remote={host}&path={}", encode(p));
+        let names = |json: &Value| -> Vec<String> {
+            json["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let (_, info) = request_json(app.clone(), "GET", "/api/info", None).await;
+        assert_eq!(
+            info["remote_roots"],
+            json!([{"host": "unraid", "dir": s(&share)}, {"host": "unraid", "dir": s(&via)}])
+        );
+
+        // A listing whose only (so last) entry is a directory.
+        let (status, json) =
+            request_json(app.clone(), "GET", &list("unraid", &s(&share)), None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json,
+            json!({"path": s(&share), "entries": [
+                {"name": "Show", "path": s(&show), "is_dir": true, "size": null}
+            ]})
+        );
+
+        let (status, json) = request_json(
+            app.clone(),
+            "GET",
+            &list("unraid", &format!("{}/", s(&show))),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["path"],
+            s(&show),
+            "answered as named, without the slash"
+        );
+        assert_eq!(
+            names(&json),
+            ["Season 2", "ep\n1.wmv", "ep2.mkv", "notes.txt"],
+            "no symlink, file or directory, and no marker temp"
+        );
+        assert_eq!(json["entries"][1]["path"], s(&show.join("ep\n1.wmv")));
+        assert_eq!(json["entries"][1]["size"], 5);
+
+        let (status, json) = request_json(
+            app.clone(),
+            "GET",
+            &list("unraid", &s(&via.join("Show"))),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["path"], s(&via.join("Show")));
+        assert_eq!(json["entries"][0]["path"], s(&via.join("Show/Season 2")));
+
+        for (host, path, want) in [
+            ("unraid", s(&show.join("Latest")), "symlink"),
+            (
+                "unraid",
+                s(&show.join("Extras")),
+                "outside the remote roots",
+            ),
+            ("unraid", s(&elsewhere), "outside the remote roots"),
+            ("hetzner", s(&show), "not a configured remote host"),
+        ] {
+            let (status, json) = request_json(app.clone(), "GET", &list(host, &path), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {json}");
+            assert!(json["error"].as_str().unwrap().contains(want), "{json}");
+        }
+
+        let folder = json!({"remote": "unraid", "path": s(&show)});
+        let (status, json) = request_json(
+            app.clone(),
+            "POST",
+            "/api/folders/scan",
+            Some(folder.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["file_count"], 3,
+            "the videos at any depth, nothing reached by a link"
+        );
+        assert_eq!(json["folder_name"], "Show");
+
+        let (status, json) = request_json(
+            app.clone(),
+            "POST",
+            "/api/queue/folder",
+            Some(folder.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let mut sources: Vec<&str> = json["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| {
+                assert_eq!(j["remote_host"], "unraid");
+                j["source_path"].as_str().unwrap()
+            })
+            .collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            [
+                s(&show.join("Season 2/ep3.wmv")),
+                s(&show.join("ep\n1.wmv")),
+                s(&show.join("ep2.mkv")),
+            ]
+        );
+        assert!(
+            !state.ctx.converter.is_running(),
+            "adding never starts the queue"
+        );
+
+        let remote = state.ctx.remote.get().unwrap();
+        fail_unreachable(remote, "list");
+        fail_unreachable(remote, "find");
+        for (method, uri, body) in [
+            ("GET", list("unraid", &s(&show)), None),
+            (
+                "POST",
+                "/api/folders/scan".to_string(),
+                Some(folder.clone()),
+            ),
+            ("POST", "/api/queue/folder".to_string(), Some(folder)),
+        ] {
+            let (status, json) = request_json(app.clone(), method, &uri, body).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}: {json}");
+            assert!(json["error"].as_str().unwrap().contains("unraid"), "{json}");
+        }
+    }
+
+    #[tokio::test]
     async fn remove_job_deletes_a_seeded_queued_row() {
         let app = api_router(test_state_installed());
 
@@ -831,6 +1097,48 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json, json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_remote_bad_source_is_listed_with_its_host_and_left_to_delete_by_hand() {
+        let state = test_state_installed();
+        // Its host path exists here too, with the class that needs no rescan: every local rung
+        // would pass for this unrelated local file.
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("film.wmv");
+        std::fs::write(&local, "a different file on this machine").unwrap();
+        let p = local.to_string_lossy().into_owned();
+        state
+            .ctx
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (id, source_path, output_path, preset, status, queue_order,
+                                   created_at, failure_class, remote_host)
+                 VALUES ('r1', ?1, ?1, 'p', 'error', 1, '2026-10-12T10:00:00Z',
+                         'bad_source_truncated', 'unraid')",
+                [&p],
+            )
+            .unwrap();
+        let app = api_router(state);
+
+        let (_, listed) = request_json(app.clone(), "GET", "/api/bad-sources", None).await;
+        assert_eq!(listed[0]["remote_host"], "unraid");
+
+        let (status, json) = request_json(
+            app,
+            "POST",
+            "/api/bad-sources/purge",
+            Some(json!({"ids": ["r1"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json,
+            json!([{"id": "r1", "outcome": "remote", "host": "unraid"}])
+        );
+        assert!(local.exists(), "a remote row's path is never touched here");
     }
 
     #[tokio::test]

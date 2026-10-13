@@ -33,6 +33,7 @@ const OUTCOME_LABELS: Partial<Record<PurgeOutcome, string>> = {
   recovered: "turned out to be readable after all",
   unverifiable: "couldn't be re-checked (drive unavailable?)",
   failed: "could not be removed",
+  remote: "to delete by hand on their host",
 };
 
 // Aggregates by outcome instead of dumping one entry per file — a raw enum list like
@@ -44,13 +45,19 @@ function buildOutcomeNote(results: PurgeResult[]): string | null {
   const skipped = results.filter((r) => r.outcome !== "purged");
   if (skipped.length === 0) return null;
 
-  const counts = new Map<string, number>();
+  // Remote files are counted per host, since the note has to say where to go and delete them.
+  const counts = new Map<string, { label: string; count: number }>();
   for (const r of skipped) {
-    counts.set(r.outcome, (counts.get(r.outcome) ?? 0) + 1);
+    const key = r.outcome === "remote" && r.host ? `remote:${r.host}` : r.outcome;
+    const label =
+      r.outcome === "remote" && r.host
+        ? `to delete by hand on ${r.host}`
+        : (OUTCOME_LABELS[r.outcome as PurgeOutcome] ?? "left alone");
+    const entry = counts.get(key) ?? { label, count: 0 };
+    entry.count++;
+    counts.set(key, entry);
   }
-  const parts = [...counts.entries()].map(
-    ([outcome, count]) => `${count} ${OUTCOME_LABELS[outcome as PurgeOutcome] ?? "left alone"}`,
-  );
+  const parts = [...counts.values()].map(({ label, count }) => `${count} ${label}`);
 
   return `${purgedCount} file(s) removed. ${parts.join(", ")}.`;
 }
@@ -251,10 +258,14 @@ export default function HistoryPage() {
                 {badSources.map((job) => (
                   <li key={job.id}>
                     <div className="bad-sources-text">
-                      <span className="bad-sources-name" title={job.source_path}>
+                      <span
+                        className="bad-sources-name"
+                        title={job.remote_host ? `${job.remote_host}:${job.source_path}` : job.source_path}
+                      >
                         {job.source_path.split(/[/\\]/).pop()}
                       </span>
                       <span className="bad-sources-reason">
+                        {job.remote_host ? `On ${job.remote_host} · ` : ""}
                         {BAD_SOURCE_REASONS[job.failure_class ?? ""] ??
                           (job.error_message ?? "").split("\n")[0]}
                       </span>

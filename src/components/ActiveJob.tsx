@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { JobInfo, ConversionProgress } from "../lib/tauri";
+import type { JobInfo, ConversionProgress, JobPhase } from "../lib/tauri";
 import { commands } from "../lib/tauri";
 import { fileName, formatEta } from "../lib/format";
 import { errorText } from "../lib/errors";
@@ -7,9 +7,11 @@ import { errorText } from "../lib/errors";
 interface ActiveJobProps {
   job: JobInfo;
   progress: ConversionProgress | null;
+  /** A remote job's transfer step ("Pulling…", "Pushing…", "Verifying…"), if any. */
+  phase?: JobPhase | null;
 }
 
-export default function ActiveJob({ job, progress }: ActiveJobProps) {
+export default function ActiveJob({ job, progress, phase }: ActiveJobProps) {
   const [pauseAfter, setPauseAfter] = useState(false);
   const [canPauseProcess, setCanPauseProcess] = useState(true);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -20,6 +22,7 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
     progress && progress.job_id === job.id ? progress.eta_seconds : null;
   const fps =
     progress && progress.job_id === job.id ? progress.fps : null;
+  const phaseLabel = phase && phase.job_id === job.id ? phase.phase : null;
 
   useEffect(() => {
     // getAppInfo() works on both heads (getPlatformCapabilities is desktop-only); can_pause_process
@@ -57,11 +60,11 @@ export default function ActiveJob({ job, progress }: ActiveJobProps) {
   return (
     <div className="active-job">
       <div className="active-job-header">
-        <span className="active-job-name" title={job.source_path}>
+        <span className="active-job-name" title={job.remote_host ? `${job.remote_host}:${job.source_path}` : job.source_path}>
           {fileName(job.source_path)}
         </span>
         <span className={`badge ${isPaused ? "badge-amber" : "badge-blue"}`}>
-          {isPaused ? "Paused" : "Encoding"}
+          {isPaused ? "Paused" : (phaseLabel ?? "Encoding")}
         </span>
       </div>
 

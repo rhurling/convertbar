@@ -16,6 +16,7 @@ import type {
   PurgeResult,
   StatusSnapshot,
   Transport,
+  UnreachableStop,
   WatchedDirectory,
 } from "./types";
 
@@ -136,6 +137,8 @@ export const httpCommands = {
     api("DELETE", "/api/converter/pause-after-current"),
   getPauseAfterCurrent: (): Promise<boolean> => api("GET", "/api/converter/pause-after-current"),
   getLowDiskPause: (): Promise<LowDiskPause | null> => api("GET", "/api/converter/low-disk-pause"),
+  getUnreachableStop: (): Promise<UnreachableStop | null> =>
+    api("GET", "/api/converter/unreachable-stop"),
   getPlatformCapabilities: notAvailable,
   validateHandbrake: (): Promise<HandbrakeStatus> => api("GET", "/api/handbrake/validate"),
   quitApp: notAvailable,
@@ -172,11 +175,24 @@ export const httpCommands = {
 
   // Extras beyond Transport (server-only):
   login: (token: string): Promise<void> => api("POST", "/api/login", { token }),
-  fsList: (path: string): Promise<FsListResult> =>
-    api("GET", `/api/fs/list?path=${encodeURIComponent(path)}`),
+  // `remote` names an ssh host from `remote_roots`; the path is then a path on that host.
+  fsList: (path: string, remote?: string): Promise<FsListResult> =>
+    api(
+      "GET",
+      `/api/fs/list?path=${encodeURIComponent(path)}${remote ? `&remote=${encodeURIComponent(remote)}` : ""}`,
+    ),
+  addRemoteFiles: (remote: string, paths: string[]): Promise<AddResult> =>
+    api("POST", "/api/queue/files", { remote, paths }, INTAKE_TIMEOUT_MS),
+  scanRemoteFolder: (remote: string, path: string): Promise<FolderScanResult> =>
+    api("POST", "/api/folders/scan", { remote, path }, INTAKE_TIMEOUT_MS),
+  confirmRemoteFolderAdd: (remote: string, path: string): Promise<AddResult> =>
+    api("POST", "/api/queue/folder", { remote, path }, INTAKE_TIMEOUT_MS),
   getStatus: (): Promise<StatusSnapshot> => api("GET", "/api/status"),
 } satisfies Transport & {
   login(token: string): Promise<void>;
-  fsList(path: string): Promise<FsListResult>;
+  fsList(path: string, remote?: string): Promise<FsListResult>;
+  addRemoteFiles(remote: string, paths: string[]): Promise<AddResult>;
+  scanRemoteFolder(remote: string, path: string): Promise<FolderScanResult>;
+  confirmRemoteFolderAdd(remote: string, path: string): Promise<AddResult>;
   getStatus(): Promise<StatusSnapshot>;
 };
