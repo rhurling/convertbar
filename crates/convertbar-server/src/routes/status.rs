@@ -20,8 +20,10 @@ pub struct StatusSnapshot {
     /// Every error row, as the Queue view lists them: cumulative until History → Clear, and
     /// including user cancellations, which the core records as errors.
     pub errors: i64,
-    /// The persisted queue pause: set by a stop by hand and by an unreachable host, and lifted
-    /// when the queue is started or resumed. A client that queues work reads it to decide
+    /// The persisted queue pause: set by a stop by hand (at once for a frozen encode, when the
+    /// current job ends for "pause after current") and by an unreachable host. Lifted by
+    /// anything that starts the queue: Start, Resume, a booked Cancel, clearing the queue, and
+    /// a file arriving in a watched folder. A client that queues work reads it to decide
     /// whether it may start the queue itself; `state` cannot tell, as a queue nobody started
     /// reads `stopped` too. A low-disk pause is not included: it lives in memory and is checked
     /// again on every start.
@@ -433,35 +435,39 @@ mod tests {
         insert_job(&state, "now", "encoding", 0);
         insert_job(&state, "next", "queued", 1);
         // Stand-in for the encode. A SIGSTOP pause keeps the queue thread, and with it the slot.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        *state.ctx.converter.current_pid.lock().unwrap() = Some(child.id());
+        // Killed on drop, so a failing assertion cannot leave a stopped `sleep` behind forever.
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                // SIGKILL ends a stopped process too.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        *state.ctx.converter.current_pid.lock().unwrap() = Some(child.0.id());
         *state.ctx.converter.current_job_id.lock().unwrap() = Some("now".to_string());
         set_running(&state, true);
 
         let (code, _) = send(&state, "POST", "/api/converter/pause", None).await;
         assert_eq!(code, StatusCode::NO_CONTENT);
-        let paused = status(&state).await;
+        let json = status(&state).await;
+        assert_eq!(json["state"], "paused");
+        assert_eq!(json["queue_paused"], true);
 
         // What a client ignoring the flag would do: the start is refused while the frozen
         // encode holds the slot, and the pause stands.
         let (code, _) = send(&state, "POST", "/api/converter/start", None).await;
         assert_eq!(code, StatusCode::NO_CONTENT);
-        let after_start = status(&state).await;
+        assert_eq!(status(&state).await["queue_paused"], true);
 
         let (code, _) = send(&state, "POST", "/api/converter/resume", None).await;
         assert_eq!(code, StatusCode::NO_CONTENT);
-        let resumed = status(&state).await;
-
-        // SIGKILL ends a stopped process too; reaped before any assertion can fail.
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert_eq!(paused["state"], "paused");
-        assert_eq!(paused["queue_paused"], true);
-        assert_eq!(after_start["queue_paused"], true);
-        assert_eq!(resumed["queue_paused"], false);
+        assert_eq!(status(&state).await["queue_paused"], false);
     }
 }
