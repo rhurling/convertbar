@@ -14,9 +14,68 @@ concurrency:
 permissions: {}
 
 jobs:
-  publish-tauri:
+  # One job creates the draft, and every other job uploads to it by id. When each matrix leg
+  # looked the draft up by tag and created it if missing, two legs racing on v2.7.1 created
+  # two drafts: publish-release published the macOS one, and the Linux and Windows assets and
+  # their latest.json platforms were stranded in the other. All jobs were green, and an
+  # immutable release cannot take them afterwards.
+  create-release:
+    runs-on: ubuntu-latest
     permissions:
-      contents: write # create the GitHub release and upload artifacts
+      contents: write # create the draft release
+    outputs:
+      release_id: ${{ steps.draft.outputs.id }}
+      body: ${{ steps.release_body.outputs.body }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Build release body
+        id: release_body
+        shell: bash
+        run: |
+          PREV=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
+          CURRENT=$(git describe --tags --abbrev=0)
+          ./scripts/release-notes.sh "$PREV" "$CURRENT" > "$RUNNER_TEMP/notes.md"
+          # Heredoc, not `echo "body=..."`: a multi-line value written as key=value makes the
+          # runner fail the step with "Invalid format", and any notes line containing `=`
+          # would be parsed as a further output.
+          {
+            echo "body<<CONVERTBAR_NOTES_EOF"
+            cat "$RUNNER_TEMP/notes.md"
+            echo "CONVERTBAR_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Re-running the whole workflow reuses the draft instead of creating a second one. A
+      # published release for the tag is refused: it is immutable, so nothing can be added.
+      - name: Create the draft release
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Only the list endpoint shows drafts; /releases/tags/{tag} does not.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.tag_name == $ENV.GITHUB_REF_NAME) | "\(.id) \(.draft)"' \
+            > "$RUNNER_TEMP/existing"
+          if grep -q ' false$' "$RUNNER_TEMP/existing"; then
+            echo "::error::$GITHUB_REF_NAME is already published"; exit 1
+          fi
+          case $(wc -l < "$RUNNER_TEMP/existing" | tr -d ' ') in
+            0) id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+                 -f tag_name="$GITHUB_REF_NAME" -f name="$GITHUB_REF_NAME" \
+                 -F draft=true -F prerelease=false -F body=@"$RUNNER_TEMP/notes.md" --jq .id) ;;
+            1) id=$(cut -d' ' -f1 "$RUNNER_TEMP/existing") ;;
+            *) echo "::error::several drafts carry $GITHUB_REF_NAME; delete all but one"
+               cat "$RUNNER_TEMP/existing"; exit 1 ;;
+          esac
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  publish-tauri:
+    needs: create-release
+    permissions:
+      contents: write # upload artifacts to the draft release
     strategy:
       fail-fast: false
       matrix:
@@ -39,21 +98,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-
-      - name: Build release body
-        id: release_body
-        shell: bash
-        run: |
-          PREV=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
-          CURRENT=$(git describe --tags --abbrev=0)
-          # Heredoc, not `echo "body=..."`: a multi-line value written as key=value makes the
-          # runner fail the step with "Invalid format", and any notes line containing `=`
-          # would be parsed as a further output.
-          {
-            echo "body<<CONVERTBAR_NOTES_EOF"
-            ./scripts/release-notes.sh "$PREV" "$CURRENT"
-            echo "CONVERTBAR_NOTES_EOF"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -141,14 +185,12 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
-          tagName: v__VERSION__
-          releaseName: "v__VERSION__"
-          releaseBody: ${{ steps.release_body.outputs.body }}
-          # Upload to a draft so every matrix platform can attach its assets.
-          # Immutable releases seal a release on publish, so it must stay a
-          # draft until all builds finish; publish-release finalizes it.
-          releaseDraft: true
-          prerelease: false
+          # Upload to the draft by id, never by tag (see create-release). Immutable
+          # releases seal a release on publish, so it must stay a draft until all
+          # builds finish; publish-release finalizes it.
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          # Becomes latest.json's `notes`.
+          releaseBody: ${{ needs.create-release.outputs.body }}
           args: ${{ matrix.args }}
 
       # tauri-action has already uploaded to the draft by now, but publish-release
@@ -201,10 +243,9 @@ jobs:
   # The headless server for macOS hosts (the Docker image is linux/amd64 only). It runs
   # under a LaunchAgent and reaches LAN hosts over ssh, and macOS keys that local-network
   # grant on the code signature, so it ships Developer ID-signed and notarized like the
-  # app (ADR 0001). Runs after the app legs because tauri-action creates the draft it
-  # uploads to.
+  # app (ADR 0001). Runs beside the app legs: create-release has made the draft it uploads to.
   publish-server-darwin:
-    needs: publish-tauri
+    needs: create-release
     runs-on: macos-latest
     # A stalled notarization must not pin the release as a draft for the 6h default.
     timeout-minutes: 60
@@ -314,20 +355,59 @@ jobs:
             exit 1
           fi
 
+      # By id, not `gh release upload <tag>`: gh resolves a tag to one arbitrary release when
+      # two drafts share it. Delete-then-upload replaces the asset on a re-run.
       - name: Upload to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" "$SERVER_ZIP" --clobber --repo "$GITHUB_REPOSITORY"
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --jq '.assets[] | select(.name == $ENV.SERVER_ZIP) | .id')
+          if [ -n "$old" ]; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+          fi
+          gh api -X POST \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$SERVER_ZIP" \
+            -H "Content-Type: application/zip" --input "$SERVER_ZIP" --silent
 
   # Publishing is the event that seals an immutable release, so it runs once,
   # after every platform has uploaded to the draft.
   publish-release:
-    needs: [publish-tauri, publish-server-darwin]
+    needs: [create-release, publish-tauri, publish-server-darwin]
     runs-on: ubuntu-latest
     permissions:
       contents: write # flip the drafted release to published
     steps:
+      # Green legs are not proof of a complete release: v2.7.1 published with half its
+      # platforms. The legs also merge their platforms into one shared latest.json, a
+      # read-modify-write that a near-simultaneous finish can lose. Publishing is the last
+      # moment anything can be added, so check the draft itself. On a failure, re-run the
+      # leg(s) whose platforms are missing, then this job.
+      - name: Refuse an incomplete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          release="repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+          gh api "$release" --jq '.assets[] | "\(.id) \(.name)"' > assets
+          grep -q ' convertbar-server_.*_aarch64-apple-darwin\.zip$' assets \
+            || { echo "::error::the darwin server asset is missing"; exit 1; }
+          manifest=$(grep ' latest\.json$' assets | cut -d' ' -f1) \
+            || { echo "::error::latest.json is missing"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$manifest" \
+            -H "Accept: application/octet-stream" > latest.json
+          missing=0
+          for platform in darwin-aarch64 darwin-x86_64 linux-x86_64 windows-x86_64; do
+            jq -e --arg p "$platform" '.platforms | has($p)' latest.json > /dev/null \
+              || { echo "::error::latest.json has no $platform"; missing=1; }
+          done
+          exit $missing
+
       - name: Publish the drafted release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false --silent
