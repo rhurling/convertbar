@@ -289,4 +289,6 @@ export interface StatusSnapshot {
   percent: number;
   queued: number;
   errors: number;
+  /** The persisted queue pause (by hand or after an unreachable host); not a low-disk pause. */
+  queue_paused: boolean;
 }

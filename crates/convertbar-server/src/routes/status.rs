@@ -1,9 +1,10 @@
 //! `GET /api/status`: a flat snapshot for pollers outside the app (the NAS dashboard's
-//! Homepage tile). The four field names are a contract with configs this repo cannot see, so
-//! change them only as a breaking change.
+//! Homepage tile). The four original field names are a contract with configs this repo cannot
+//! see, so change them only as a breaking change; `queue_paused` was added after them.
 
 use axum::extract::State;
 use axum::response::Response;
+use convertbar_core::converter;
 use serde::Serialize;
 
 use super::{blocking_json, ServerState};
@@ -19,14 +20,20 @@ pub struct StatusSnapshot {
     /// Every error row, as the Queue view lists them: cumulative until History → Clear, and
     /// including user cancellations, which the core records as errors.
     pub errors: i64,
+    /// The persisted queue pause: set by a stop by hand and by an unreachable host, and lifted
+    /// when the queue is started or resumed. A client that queues work reads it to decide
+    /// whether it may start the queue itself; `state` cannot tell, as a queue nobody started
+    /// reads `stopped` too. A low-disk pause is not included: it lives in memory and is checked
+    /// again on every start.
+    pub queue_paused: bool,
 }
 
 pub async fn get_status(State(s): State<ServerState>) -> Response {
     let progress = s.progress.borrow().clone();
     blocking_json(move || {
-        let (queued, errors, paused, encoding, in_flight) = {
+        let (queued, errors, paused, encoding, in_flight, queue_paused) = {
             let db = s.ctx.db.lock().map_err(|e| e.to_string())?;
-            db.query_row(
+            let counts = db.query_row(
                 "SELECT COALESCE(SUM(status = 'queued'), 0), COALESCE(SUM(status = 'error'), 0),
                         COALESCE(SUM(status = 'paused'), 0), COALESCE(SUM(status = 'encoding'), 0),
                         MAX(CASE WHEN status IN ('encoding', 'paused') THEN id END)
@@ -42,7 +49,16 @@ pub async fn get_status(State(s): State<ServerState>) -> Response {
                     ))
                 },
             )
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            let (queued, errors, paused, encoding, in_flight) = counts;
+            (
+                queued,
+                errors,
+                paused,
+                encoding,
+                in_flight,
+                converter::is_queue_paused(&db),
+            )
         };
         // Only the job in flight's own progress: the cache keeps the last value until the next
         // job's first progress line, which must not be shown as that job's.
@@ -74,6 +90,7 @@ pub async fn get_status(State(s): State<ServerState>) -> Response {
             percent,
             queued,
             errors,
+            queue_paused,
         })
     })
     .await
@@ -127,11 +144,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_install_is_idle_with_zeroed_counts() {
-        // The whole shape, pinned: these four names are what a dashboard's config refers to,
-        // so renaming one breaks every consumer while the server stays green.
+        // The whole shape, pinned: these names are what a dashboard's config and `send` refer
+        // to, so renaming one breaks every consumer while the server stays green. A fresh
+        // install has never been paused, so a client may start the queue.
         assert_eq!(
             status(&test_state()).await,
-            json!({"state": "idle", "percent": 0.0, "queued": 0, "errors": 0})
+            json!({"state": "idle", "percent": 0.0, "queued": 0, "errors": 0, "queue_paused": false})
         );
     }
 
@@ -381,13 +399,69 @@ mod tests {
             waited += Duration::from_millis(20);
         }
 
-        assert_eq!(status(&state).await["state"], "stopped");
+        // `stopped` is also what a queue nobody started reads; only `queue_paused` tells a
+        // client that this stop must hold until a person resumes it.
+        let json = status(&state).await;
+        assert_eq!(json["state"], "stopped");
+        assert_eq!(json["queue_paused"], true);
         let (code, reason) = send(&state, "GET", "/api/converter/unreachable-stop", None).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(reason, json!({"host": "unraid", "step": "stat"}));
 
         let (code, _) = send(&state, "DELETE", "/api/queue/jobs/j2", None).await;
         assert_eq!(code, StatusCode::NO_CONTENT);
-        assert_eq!(status(&state).await["state"], "idle");
+        let json = status(&state).await;
+        assert_eq!(json["state"], "idle");
+        // An emptied queue does not lift the pause: the next `send` must still not start it.
+        assert_eq!(json["queue_paused"], true);
+
+        // A start lifts it. The failed job goes first, or the start would take it back, hit the
+        // outage again and re-pause on the queue thread while this reads.
+        let (code, _) = send(&state, "DELETE", "/api/history/j1", None).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let (code, _) = send(&state, "POST", "/api/converter/start", None).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        assert_eq!(status(&state).await["queue_paused"], false);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_stop_by_hand_reads_queue_paused_until_it_is_resumed() {
+        // Unix only: on Windows a pause arms "pause after current", and the flag lands when the
+        // job ends.
+        let state = test_state();
+        insert_job(&state, "now", "encoding", 0);
+        insert_job(&state, "next", "queued", 1);
+        // Stand-in for the encode. A SIGSTOP pause keeps the queue thread, and with it the slot.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        *state.ctx.converter.current_pid.lock().unwrap() = Some(child.id());
+        *state.ctx.converter.current_job_id.lock().unwrap() = Some("now".to_string());
+        set_running(&state, true);
+
+        let (code, _) = send(&state, "POST", "/api/converter/pause", None).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let paused = status(&state).await;
+
+        // What a client ignoring the flag would do: the start is refused while the frozen
+        // encode holds the slot, and the pause stands.
+        let (code, _) = send(&state, "POST", "/api/converter/start", None).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let after_start = status(&state).await;
+
+        let (code, _) = send(&state, "POST", "/api/converter/resume", None).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let resumed = status(&state).await;
+
+        // SIGKILL ends a stopped process too; reaped before any assertion can fail.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(paused["state"], "paused");
+        assert_eq!(paused["queue_paused"], true);
+        assert_eq!(after_start["queue_paused"], true);
+        assert_eq!(resumed["queue_paused"], false);
     }
 }

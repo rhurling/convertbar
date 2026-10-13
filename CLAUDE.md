@@ -252,10 +252,13 @@ change here is most likely to break:
 
 ## Status Endpoint (`GET /api/status`)
 
-A flat `{state, percent, queued, errors}` snapshot for pollers outside the app — the NAS
-dashboard's Homepage `customapi` tile, configured in the dotfiles repo, which this repo cannot
-see. The four names and the `state` values are that config's contract: change them only as a
-breaking change. `percent` is 0, never null, because Homepage renders null as "NaN%".
+A flat `{state, percent, queued, errors, queue_paused}` snapshot for pollers outside the app —
+the NAS dashboard's Homepage `customapi` tile, configured in the dotfiles repo, which this repo
+cannot see. The first four names and the `state` values are that config's contract: change them
+only as a breaking change. `percent` is 0, never null, because Homepage renders null as "NaN%".
+`queue_paused` is the dotfiles `send` script's contract: it starts the queue after queueing work
+only while this is false, so it must stay the persisted `queue_paused` flag alone (a stop by hand
+or after an unreachable host), never folding in the in-memory low-disk pause or `state`.
 
 - Live progress comes from `progress::spawn_progress_cache`, a task on the SSE broadcast. Do
   not "simplify" it into `ServerSink` writing a slot: the sink runs on the converter thread
