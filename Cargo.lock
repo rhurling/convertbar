@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "convertbar"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "chrono",
  "convertbar-core",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "convertbar-core"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "chrono",
  "dirs 7.0.0",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "convertbar-server"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "axum",
  "axum-extra",
