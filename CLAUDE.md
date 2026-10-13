@@ -72,6 +72,14 @@ The script bumps all three manifests (`tauri.conf.json`, `package.json`, `Cargo.
 
 Never hand-edit the version — the script keeps the manifests and lockfile in sync and rebuilds before committing.
 
+Published releases are **immutable**: a missing asset can never be added, only shipped in the next
+version. So in `build.yml` the `create-release` job makes the one draft and every other job uploads
+to it by id. Never let a matrix leg find or create the release by tag again — two legs racing did
+that on v2.7.1 and split it across two drafts while every job stayed green. `publish-release`
+refuses a draft whose `latest.json` lacks a platform or that has no darwin server asset. That also
+catches the legs' read-modify-write of the shared `latest.json` losing an update. When it fails,
+re-run the leg whose platform is missing, then `publish-release`.
+
 ## Code Signing (macOS)
 
 Release builds are Developer ID–signed and notarized in CI. This is not cosmetic: an ad-hoc signature's designated requirement is the binary's cdhash, so macOS revoked every TCC permission grant on each new build. A Developer ID signature anchors the requirement to the team and bundle identifier instead, so grants survive version bumps.
