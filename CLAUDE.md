@@ -114,8 +114,10 @@ A successful install MUST restart the app. `updater.rs`'s `InstallAttempt::Insta
 `restart_after_install`; there is no safe "keep running the old binary until the user gets around
 to it" state on macOS or Linux, and it must not be softened back into one.
 
-tauri-plugin-updater's `install_inner` renames the **running** bundle into a `tempfile::TempDir`,
-then drops that TempDir the moment `install()` returns — deleting it. From that instant the
+tauri-plugin-updater's `install_inner` moves the **running** bundle into a `tempfile::TempDir`
+and drops that TempDir the moment `install()` returns — deleting it. Since 2.13.2 the move is an
+atomic `renamex_np(RENAME_SWAP)` into the `tauri_updated_app*` extraction dir (two renames on a
+volume that cannot swap); the outcome for the running process is unchanged. From that instant the
 process executes an unlinked bundle, so macOS can no longer validate its code identity against
 the TCC grants it holds (see the designated-requirement note above), and every `open()` of a
 protected path fails for it **and** for the HandBrakeCLI children it spawns. This is not the
@@ -125,8 +127,8 @@ The failure is silent and reads as data corruption: HandBrake logs only `hb_stre
 <path> failed` / `scan: unrecognized file type`. **The tell is the missing ffmpeg line** — a
 genuinely bad file logs `[mov,mp4,... @ 0x...] moov atom not found` first, because libavformat
 actually read bytes. No ffmpeg line means the file was never opened, so look at the process, not
-the file: `lsof -p <pid> | grep -i "txt.*convertbar"` pointing into `/private/tmp/tauri_*` is an
-orphaned process, and the fix is to relaunch from `/Applications`. v2.5.0 shipped the old
+the file: `lsof -p <pid> | grep -i "txt.*convertbar"` pointing into a `tauri_*` temp dir
+instead of `/Applications` is an orphaned process, and the fix is to relaunch from `/Applications`. v2.5.0 shipped the old
 behaviour and failed eight jobs this way against files that were fine.
 
 Restarting is free, which is why the old `resume_queue_after_install` is not worth reviving:
