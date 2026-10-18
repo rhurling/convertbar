@@ -5,15 +5,14 @@
 //! the frontend never needs to special-case the mode).
 
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::Deserialize;
-use serde_json::json;
 use std::net::SocketAddr;
 
-use crate::auth::{token_matches, TOKEN_COOKIE};
+use crate::auth::{token_matches, unauthorized, Refusal, TOKEN_COOKIE};
 use crate::config::AuthMode;
 use crate::throttle::{client_id, Gate};
 
@@ -41,21 +40,13 @@ pub async fn login(
     let now = std::time::Instant::now();
 
     if s.login_throttle.check(id, now) == Gate::Deny {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
-        )
-            .into_response();
+        return unauthorized(Refusal::Throttled, id, &Method::POST, "/api/login");
     }
 
     if !token_matches(&body.token, expected) {
         // `check` already recorded this attempt — there is nothing left to
         // do but answer.
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
-        )
-            .into_response();
+        return unauthorized(Refusal::WrongToken, id, &Method::POST, "/api/login");
     }
 
     s.login_throttle.record_success(id);

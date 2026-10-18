@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::config::AuthMode;
 use crate::routes::ServerState;
-use crate::throttle::{client_id, Gate};
+use crate::throttle::{client_id, ClientId, Gate};
 
 /// Name of the cookie `login` sets and `auth_guard`/SSE reads back. `EventSource` can't send
 /// an `Authorization` header, so the cookie is the only way `/api/events` can authenticate.
@@ -24,6 +24,41 @@ pub const TOKEN_COOKIE: &str = "convertbar_token";
 
 fn json_err(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
+}
+
+/// Why `auth_guard` or `login` answered 401. Only ever logged — the response body stays
+/// the same bare `unauthorized` for every reason, so a guesser learns nothing from it.
+#[derive(Clone, Copy, Debug)]
+pub enum Refusal {
+    /// No `Authorization: Bearer` header and no token cookie.
+    MissingCredential,
+    /// The throttle's gate was shut; the credential was never compared.
+    Throttled,
+    /// A credential was compared and did not match.
+    WrongToken,
+}
+
+impl Refusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::MissingCredential => "missing credential",
+            Self::Throttled => "throttled",
+            Self::WrongToken => "wrong token",
+        }
+    }
+}
+
+/// The one place a 401 leaves the server, so each one lands in the log with its reason
+/// and the throttle's view of who sent it. Never logs the credential or the query string.
+pub fn unauthorized(refusal: Refusal, client: ClientId, method: &Method, path: &str) -> Response {
+    tracing::warn!(
+        reason = refusal.reason(),
+        ?client,
+        %method,
+        path,
+        "401 unauthorized"
+    );
+    json_err(StatusCode::UNAUTHORIZED, "unauthorized")
 }
 
 /// True if `candidate` matches `expected`, compared in constant time (`constant_time_eq`
@@ -140,20 +175,21 @@ pub async fn auth_guard(State(s): State<ServerState>, req: Request, next: Next) 
         return next.run(req).await;
     }
 
+    let id = client_id(peer_ip(&req), req.headers(), &s.config.trusted_proxies);
+
     // A request with NO credential is not a guess — it is how the web UI
     // discovers it must show the login screen. Gating these would spend the
     // bucket's budget on rendering the login form.
     let Some(provided) = bearer_token(&req).or_else(|| cookie_token(&req)) else {
-        return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
+        return unauthorized(Refusal::MissingCredential, id, req.method(), &path);
     };
 
-    let id = client_id(peer_ip(&req), req.headers(), &s.config.trusted_proxies);
     let now = std::time::Instant::now();
 
     // BEFORE the comparison, not after. Comparing first would compute the
     // verdict the attacker wants regardless of what we do with the response.
     if s.login_throttle.check(id, now) == Gate::Deny {
-        return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
+        return unauthorized(Refusal::Throttled, id, req.method(), &path);
     }
 
     if token_matches(&provided, expected) {
@@ -163,7 +199,7 @@ pub async fn auth_guard(State(s): State<ServerState>, req: Request, next: Next) 
 
     // `check` already recorded this attempt — there is nothing left to do
     // but answer.
-    json_err(StatusCode::UNAUTHORIZED, "unauthorized")
+    unauthorized(Refusal::WrongToken, id, req.method(), &path)
 }
 
 /// CSRF belt: for POST/PUT/DELETE under `/api` (login included), require a `Content-Type`
@@ -990,6 +1026,116 @@ mod tests {
                 }
             }
             assert_eq!(refused, 0, "correct bearer answered 401 {refused} times");
+        }
+
+        /// What `tracing` wrote, process-wide. A global subscriber, not `set_default`: tracing
+        /// caches each callsite's interest, and scoped subscribers on parallel test threads
+        /// race that cache, so the event is sometimes never delivered. Tests pick their own
+        /// lines out by a client address no other test uses.
+        static LOG: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+        struct LogWriter;
+
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                LOG.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn capture_logs() {
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(|| LogWriter)
+                        .with_ansi(false)
+                        .finish(),
+                )
+                .expect("no other test installs a global subscriber");
+            });
+        }
+
+        /// A 401 in ~/Library/Logs/convertbar-server.log is the only way to tell, after the
+        /// fact, why the UI threw its token form up. Each reason must be named, the client
+        /// must be identifiable, and the token itself must never appear.
+        #[tokio::test]
+        async fn every_401_is_logged_with_its_reason_and_client_but_never_the_token() {
+            capture_logs();
+            let secret = "abcdefghijklmnop";
+            let mut state = gated_state(secret);
+            let mut config = (*state.config).clone();
+            config.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+            state.config = std::sync::Arc::new(config);
+            let app = app_from(state, "127.0.0.1:5555");
+            let via_proxy = |auth: Option<&'static str>| {
+                let mut h = vec![("Host", "localhost"), ("X-Forwarded-For", "198.51.100.77")];
+                if let Some(a) = auth {
+                    h.push(("Authorization", a));
+                }
+                h
+            };
+
+            send(app.clone(), "GET", "/api/queue", &via_proxy(None), None).await;
+            send(
+                app.clone(),
+                "GET",
+                "/api/queue?x=1",
+                &via_proxy(Some("Bearer wrong-guess")),
+                None,
+            )
+            .await;
+            // `free: 0` shut the gate with the wrong guess above, so this correct token is
+            // refused unevaluated.
+            send(
+                app.clone(),
+                "GET",
+                "/api/history",
+                &via_proxy(Some("Bearer abcdefghijklmnop")),
+                None,
+            )
+            .await;
+            send(
+                app,
+                "POST",
+                "/api/login",
+                &[
+                    ("Host", "localhost"),
+                    ("Content-Type", "application/json"),
+                    ("X-Forwarded-For", "198.51.100.77"),
+                ],
+                Some(json!({"token": "login-guess"})),
+            )
+            .await;
+
+            let all = String::from_utf8(LOG.lock().unwrap().clone()).unwrap();
+            let out: String = all
+                .lines()
+                .filter(|l| l.contains("198.51.100.77") && l.contains("401 unauthorized"))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines.len(), 4, "one WARN per 401:\n{out}");
+            for (line, (reason, path)) in lines.iter().zip([
+                ("missing credential", "/api/queue"),
+                ("wrong token", "/api/queue"),
+                ("throttled", "/api/history"),
+                ("throttled", "/api/login"),
+            ]) {
+                assert!(line.contains("WARN"), "{line}");
+                assert!(line.contains(reason), "want {reason}: {line}");
+                assert!(line.contains(path), "want {path}: {line}");
+                assert!(line.contains("198.51.100.77"), "want the client: {line}");
+            }
+            for secret in [secret, "wrong-guess", "login-guess", "x=1"] {
+                assert!(
+                    !out.contains(secret),
+                    "{secret} leaked into the log:\n{out}"
+                );
+            }
         }
 
         #[tokio::test]
