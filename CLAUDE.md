@@ -259,6 +259,17 @@ change here is most likely to break:
   installs them). `crates/convertbar-server/tests/live_remote_roots.rs` is the `#[ignore]`d live
   run against a real host (default `unraid`), in a scratch directory it removes.
 
+## Login Throttle and 401s
+
+`auth_guard` reads the clock *before* `LoginThrottle::check` takes its lock, so arrival order and
+timestamp order differ under concurrency. `check` therefore clamps the caller's instant to the
+bucket's latest (`last_at`); without it a correct bearer inside the free allowance was refused
+~1 in 10^4 requests and the UI's refetch burst after a job finished threw up the token form.
+Do not "simplify" the clamp away. Every 401 is logged by `auth::unauthorized` (reason, client id,
+method, path; never the credential or query), so a recurrence is identifiable in the server log.
+The web UI confirms a 401 with one `/api/status` probe (`tokenStillRejected`, deliberately not via
+`api`, which would re-raise the event) before showing the form.
+
 ## Status Endpoint (`GET /api/status`)
 
 A flat `{state, percent, queued, errors, queue_paused}` snapshot for pollers outside the app —
