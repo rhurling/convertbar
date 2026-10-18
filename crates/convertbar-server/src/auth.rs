@@ -949,6 +949,49 @@ mod tests {
             assert_eq!(other.status(), StatusCode::OK);
         }
 
+        /// The UI refetches queue + history + summary at once when a job finishes, all with
+        /// the proxy's correct bearer and the same forwarded client. Each of those is a
+        /// legitimate request inside the free allowance: not one may be answered 401. Run on
+        /// a multi-thread runtime so the requests really race for the throttle's lock.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+        async fn a_burst_of_correct_bearer_requests_behind_a_proxy_is_never_refused() {
+            let mut state = token_state("abcdefghijklmnop");
+            let mut config = (*state.config).clone();
+            config.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+            state.config = std::sync::Arc::new(config);
+            let app = app_from(state, "127.0.0.1:5555");
+
+            let mut refused = 0;
+            for _ in 0..1500 {
+                let burst: Vec<_> = (0..6)
+                    .map(|_| {
+                        let app = app.clone();
+                        tokio::spawn(async move {
+                            send(
+                                app,
+                                "GET",
+                                "/api/queue",
+                                &[
+                                    ("Host", "localhost"),
+                                    ("Authorization", "Bearer abcdefghijklmnop"),
+                                    ("X-Forwarded-For", "203.0.113.9"),
+                                ],
+                                None,
+                            )
+                            .await
+                            .status()
+                        })
+                    })
+                    .collect();
+                for handle in burst {
+                    if handle.await.unwrap() == StatusCode::UNAUTHORIZED {
+                        refused += 1;
+                    }
+                }
+            }
+            assert_eq!(refused, 0, "correct bearer answered 401 {refused} times");
+        }
+
         #[tokio::test]
         async fn rejection_body_and_headers_are_unchanged_and_carry_no_cookie() {
             let state = throttled_state("abcdefghijklmnop", Duration::ZERO);

@@ -152,6 +152,10 @@ struct Failures {
     first_at: Instant,
     /// Earliest instant at which this source may next be evaluated.
     next_at: Instant,
+    /// Latest instant any allowed evaluation carried. Callers read the clock before
+    /// they take the lock, so arrival order can differ from timestamp order; `check`
+    /// never lets a bucket's time run backwards.
+    last_at: Instant,
 }
 
 pub struct LoginThrottle {
@@ -187,17 +191,25 @@ impl LoginThrottle {
             count: 0,
             first_at: now,
             next_at: now,
+            last_at: now,
         });
+        // A request that read the clock earlier but locks later must not look
+        // "too soon" against a slot a peer reserved a few microseconds ahead of it:
+        // within the free allowance `next_at` is that peer's own instant, and
+        // comparing the stale one refused correct credentials.
+        let now = now.max(entry.last_at);
         if now.duration_since(entry.first_at) > self.policy.window {
             *entry = Failures {
                 count: 0,
                 first_at: now,
                 next_at: now,
+                last_at: now,
             };
         }
         if now < entry.next_at {
             return Gate::Deny;
         }
+        entry.last_at = now;
         entry.count += 1;
         let count = entry.count;
         entry.next_at = now + self.spacing_for(count);
@@ -552,6 +564,32 @@ mod throttle_tests {
         assert_eq!(t.check(a, now), Gate::Allow);
         // Now the bucket is spaced: an immediate retry is refused.
         assert_eq!(t.check(a, now), Gate::Deny);
+    }
+
+    #[test]
+    fn a_request_that_took_its_timestamp_earlier_but_locks_later_is_still_inside_the_allowance() {
+        // `auth_guard` reads the clock BEFORE `check` takes the lock, so under
+        // concurrency a request holding an earlier instant can be served after one
+        // holding a later instant. Inside the free allowance the bucket must not
+        // read that as "too soon": it refused a correct bearer ~1 in 10^4 requests.
+        let t = LoginThrottle::new(policy());
+        let early = Instant::now();
+        let late = early + Duration::from_micros(3);
+        let a = id("10.0.0.1");
+        assert_eq!(t.check(a, late), Gate::Allow);
+        assert_eq!(t.check(a, early), Gate::Allow);
+    }
+
+    #[test]
+    fn a_late_locking_request_is_still_gated_once_the_spacing_has_started() {
+        // The clamp that tolerates reordering must not become a way around the
+        // gate: the spacing is measured from the latest instant the bucket has seen.
+        let t = LoginThrottle::new(policy());
+        let early = Instant::now();
+        let late = early + Duration::from_micros(3);
+        let a = id("10.0.0.1");
+        fail_n(&t, a, late, 4);
+        assert_eq!(t.check(a, early), Gate::Deny);
     }
 
     #[test]
