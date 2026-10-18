@@ -33,6 +33,23 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 // value cannot be both short enough to be useful and long enough for that scan.
 const INTAKE_TIMEOUT_MS = 10 * 60_000;
 
+// Confirms a 401 before the app gives up its screen to the token form. One 401 on one
+// request can be spurious (a throttled burst, a proxy hiccup), and `api` raises the event that
+// shows the form, so this must not go through `api`: a 401 here would raise it again and loop.
+// Only a definite 401 counts as rejected; a failed or slow probe says nothing about the token.
+export const tokenStillRejected = async (): Promise<boolean> => {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const res = await fetch("/api/status", { credentials: "same-origin", signal: controller.signal });
+    return res.status === 401;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(deadline);
+  }
+};
+
 const api = async <T>(
   method: string,
   path: string,

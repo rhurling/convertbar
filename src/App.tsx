@@ -7,6 +7,7 @@ import SettingsPage from "./pages/SettingsPage";
 import LoginScreen from "./components/LoginScreen";
 import { commands, type HandbrakeStatus } from "./lib/tauri";
 import { isServerHead } from "./lib/head";
+import { tokenStillRejected } from "./lib/transport/http";
 import { useAddProgress } from "./hooks/useAddProgress";
 import { useFileIntake } from "./hooks/useFileIntake";
 import { useUpdate } from "./hooks/useUpdate";
@@ -43,11 +44,28 @@ function App() {
   const intake = useFileIntake({ onDrop: () => setActiveTab("queue") });
   const { state: updateState } = useUpdate();
 
-  // Server head only: desktop never dispatches this event.
+  // Server head only: desktop never dispatches this event. A single 401 is not proof the
+  // token is bad (the queue/history refetch burst after a job finishes once threw the form
+  // up on one throttled request), so ask again with one /api/status call and show the form
+  // only if that is refused too. A burst of 401s shares one probe.
   useEffect(() => {
-    const handler = () => setUnauthorized(true);
+    let probing = false;
+    let disposed = false;
+    const handler = async () => {
+      if (probing) return;
+      probing = true;
+      try {
+        const rejected = await tokenStillRejected();
+        if (!disposed) setUnauthorized(rejected);
+      } finally {
+        probing = false;
+      }
+    };
     window.addEventListener("convertbar:unauthorized", handler);
-    return () => window.removeEventListener("convertbar:unauthorized", handler);
+    return () => {
+      disposed = true;
+      window.removeEventListener("convertbar:unauthorized", handler);
+    };
   }, []);
 
   const refreshHbStatus = async () => {
